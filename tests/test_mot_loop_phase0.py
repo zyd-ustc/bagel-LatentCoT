@@ -295,11 +295,14 @@ def test_same_depth_runs_one_forward_per_timestep():
 def test_memory_slot_stats_detect_collapse():
     collapsed = torch.ones(8, 4)
     stats = Bagel.memory_slot_stats(collapsed)
-    assert stats["pairwise_cosine"] > 0.99
+    assert stats["mean_abs_pairwise_cosine"] > 0.99
     assert stats["effective_rank"] < 1.1
     diverse = torch.eye(4, 4)
     diverse_stats = Bagel.memory_slot_stats(diverse)
-    assert diverse_stats["effective_rank"] > 3.0
+    assert diverse_stats["effective_rank"] == pytest.approx(3.0, abs=1e-4)
+    anti = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
+    anti_stats = Bagel.memory_slot_stats(anti)
+    assert anti_stats["mean_abs_pairwise_cosine"] == pytest.approx(1.0, abs=1e-5)
 
 
 def test_forward_flow_loop_is_trainable_path_not_no_grad():
@@ -326,3 +329,341 @@ def test_bagel_config_exposes_phase0_fields():
     assert cfg.loop_uncond_memory == "zero"
     assert cfg.loop_recycle_mode == "same_depth"
     assert cfg.loop_memory_persist is False
+
+
+_DIAG = {"memory_rms": 1.0, "vae_hidden_rms": 1.0, "velocity_norm": 1.0}
+
+
+def _generate_kwargs(**overrides):
+    kwargs = {
+        "packed_text_ids": torch.tensor([1, 2]),
+        "packed_text_indexes": torch.tensor([0, 3]),
+        "packed_init_noises": torch.zeros(2, 4),
+        "packed_vae_position_ids": torch.zeros(2, dtype=torch.long),
+        "packed_vae_token_indexes": torch.tensor([1, 2]),
+        "packed_vae_seqlens": torch.tensor([2], dtype=torch.int),
+        "packed_boundary_token_indexes": torch.tensor([0, 3]),
+        "packed_loop_semantic_token_indexes": torch.tensor([], dtype=torch.long),
+        "packed_seqlens": torch.tensor([4], dtype=torch.int),
+        "packed_position_ids": torch.zeros(4, dtype=torch.long),
+        "packed_indexes": torch.arange(4),
+        "past_key_values": object(),
+        "key_values_lens": torch.tensor([0], dtype=torch.int),
+        "packed_key_value_indexes": torch.tensor([], dtype=torch.long),
+        "packed_loop_token_indexes": torch.tensor([1, 2]),
+        "num_timesteps": 2,
+        "timestep_shift": 1.0,
+        "cfg_interval": (0.0, 1.0),
+        "enable_taylorseer": False,
+        "loop_depth": 2,
+        "loop_recycle_mode": "same_depth",
+        "memory_loop_start": 1,
+        "memory_loop_end": 2,
+        "return_trajectory": True,
+        "sde_step_indices": (0, 1),
+        "sde_noise_level": 0.0,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _make_memory_dummy(*, persist: bool, recycle_mode: str, forward):
+    class Dummy(Bagel):
+        def __init__(self):
+            self.config = SimpleNamespace(
+                num_loop_tokens=2,
+                loop_depth=2,
+                loop_uncond_memory="m0",
+                loop_recycle_mode=recycle_mode,
+                loop_memory_persist=persist,
+                memory_loop_start_layer=1,
+                memory_loop_end_layer=2,
+            )
+            self.loop_memory = torch.zeros(2, 4)
+            self.loop_memory_persist = persist
+            self.last_loop_diagnostics = []
+            self.language_model = SimpleNamespace(
+                model=SimpleNamespace(enable_taylorseer=False)
+            )
+
+        def prepare_image_schedule(self, num_timesteps, timestep_shift, device):
+            t = torch.tensor([1.0, 0.4], device=device)
+            return t, torch.tensor([0.6, 0.4], device=device)
+
+        def predict_image_velocity(self, **kwargs):
+            raise AssertionError("K>0 must not use vanilla _forward_flow")
+
+        def _forward_flow_loop(self, **kwargs):
+            return forward(kwargs)
+
+        def image_euler_step(self, x_t, velocity, dt):
+            return x_t
+
+    dummy = Dummy.__new__(Dummy)
+    Dummy.__init__(dummy)
+    dummy.generate_image = Bagel.generate_image.__get__(dummy, Dummy)
+    return dummy
+
+
+def test_same_depth_body_recurrence_preserves_nonmemory_and_recycles_memory():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Model
+
+    class FakeLayer:
+        def __init__(self, idx: int):
+            self.idx = idx
+            self.inputs = []
+            self.outputs = []
+
+        def forward_inference(self, packed_query_sequence, **kwargs):
+            self.inputs.append(packed_query_sequence.detach().clone())
+            out = packed_query_sequence + float(self.idx + 1)
+            self.outputs.append(out.detach().clone())
+            return out, kwargs.get("past_key_values")
+
+    class FakeNavit:
+        def __init__(self):
+            self.layers = [FakeLayer(i) for i in range(4)]
+            self.use_moe = False
+            self.norm = lambda hidden: hidden
+            self.gradient_checkpointing = False
+            self.training = False
+            self.enable_taylorseer = False
+
+        def rotary_emb(self, seq, pos):
+            zeros = torch.zeros(1, seq.shape[0], seq.shape[1], dtype=seq.dtype)
+            ones = torch.ones(1, seq.shape[0], seq.shape[1], dtype=seq.dtype)
+            return ones, zeros
+
+    navit = FakeNavit()
+    seq = torch.tensor(
+        [
+            [0.0, 0.0],
+            [10.0, 10.0],
+            [20.0, 20.0],
+            [30.0, 30.0],
+        ]
+    )
+    mem = torch.tensor([1], dtype=torch.long)
+    nonmem = torch.tensor([0, 2, 3], dtype=torch.long)
+    out = Qwen2Model.forward_inference(
+        navit,
+        packed_query_sequence=seq.clone(),
+        query_lens=torch.tensor([4], dtype=torch.int),
+        packed_query_position_ids=torch.arange(4),
+        packed_query_indexes=torch.arange(4),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        update_past_key_values=False,
+        is_causal=False,
+        packed_memory_token_indexes=mem,
+        memory_loop_repeat=2,
+        memory_loop_start=1,
+        memory_loop_end=3,
+    )
+    counts = [len(layer.inputs) for layer in navit.layers]
+    assert counts == [1, 2, 2, 1]
+    h_base = navit.layers[0].outputs[0]
+    round1_body_out = navit.layers[2].outputs[0]
+    round2_body_in = navit.layers[1].inputs[1]
+    round2_body_out = navit.layers[2].outputs[1]
+    assert torch.equal(round2_body_in[nonmem], h_base[nonmem])
+    assert torch.equal(round2_body_in[mem], round1_body_out[mem])
+    assert torch.equal(out.memory_body_out, round2_body_out[mem])
+    assert not torch.equal(out.packed_query_sequence[mem], out.memory_body_out)
+
+    custom = torch.tensor([[7.0, 8.0]])
+    navit2 = FakeNavit()
+    out2 = Qwen2Model.forward_inference(
+        navit2,
+        packed_query_sequence=seq.clone(),
+        query_lens=torch.tensor([4], dtype=torch.int),
+        packed_query_position_ids=torch.arange(4),
+        packed_query_indexes=torch.arange(4),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        update_past_key_values=False,
+        is_causal=False,
+        packed_memory_token_indexes=mem,
+        memory_loop_repeat=2,
+        memory_loop_start=1,
+        memory_loop_end=3,
+        memory_body_in=custom,
+    )
+    round0_body_in = navit2.layers[1].inputs[0]
+    assert torch.equal(round0_body_in[nonmem], navit2.layers[0].outputs[0][nonmem])
+    assert torch.equal(round0_body_in[mem], custom)
+    assert out2.memory_body_out is not None
+
+
+def test_cfg_branches_keep_independent_recurrent_memory():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import BaseNavitOutputWithPast
+
+    branch_calls = []
+
+    class Dummy(Bagel):
+        def __init__(self):
+            self.hidden_size = 4
+            self.use_moe = True
+            self.config = SimpleNamespace(num_loop_tokens=1, loop_depth=2)
+
+            def embed_tokens(ids):
+                return torch.ones(int(ids.numel()), 4)
+
+            def forward_inference(**kwargs):
+                branch_calls.append(
+                    {
+                        "kv": kwargs["past_key_values"],
+                        "body_in": (
+                            None
+                            if kwargs.get("memory_body_in") is None
+                            else kwargs["memory_body_in"].detach().clone()
+                        ),
+                        "loop_embed": kwargs["packed_query_sequence"][
+                            kwargs["packed_memory_token_indexes"]
+                        ].detach().clone(),
+                    }
+                )
+                seq = kwargs["packed_query_sequence"].clone()
+                loop_idx = kwargs["packed_memory_token_indexes"]
+                body_in = kwargs.get("memory_body_in")
+                memory_out = (
+                    seq[loop_idx] + 1
+                    if body_in is None
+                    else body_in + 1
+                )
+                seq[loop_idx] = memory_out + 50
+                return BaseNavitOutputWithPast(
+                    packed_query_sequence=seq,
+                    past_key_values=kwargs["past_key_values"],
+                    memory_body_out=memory_out,
+                )
+
+            self.language_model = SimpleNamespace(
+                model=SimpleNamespace(embed_tokens=embed_tokens),
+                forward_inference=forward_inference,
+            )
+            self.latent_pos_embed = lambda pos: torch.zeros(int(pos.numel()), 4)
+            self.time_embedder = lambda t: torch.zeros(int(t.numel()), 4)
+            self.vae2llm = lambda x: torch.zeros(x.shape[0], 4)
+            self.llm2vae = lambda h: torch.zeros(h.shape[0], 4)
+
+    dummy = Dummy.__new__(Dummy)
+    Dummy.__init__(dummy)
+    dummy._forward_flow_loop = Bagel._forward_flow_loop.__get__(dummy, Dummy)
+    dummy._combine_cfg_velocities = Bagel._combine_cfg_velocities.__get__(
+        dummy, Dummy
+    )
+    dummy.mot_und_route_indexes = staticmethod(Bagel.mot_und_route_indexes)
+    dummy.memory_slot_stats = staticmethod(Bagel.memory_slot_stats)
+
+    kv_full, kv_text, kv_img = object(), object(), object()
+    m_full_in = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    m_text_in = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
+    m_img_in = torch.tensor([[0.0, 0.0, 1.0, 0.0]])
+    embed = torch.tensor([[0.2, 0.3, 0.4, 0.5]])
+    _, m_full, m_text, m_img, _ = dummy._forward_flow_loop(
+        x_t=torch.zeros(1, 4),
+        timestep=torch.tensor([0.7]),
+        packed_vae_token_indexes=torch.tensor([2]),
+        packed_vae_position_ids=torch.zeros(1, dtype=torch.long),
+        packed_text_ids=torch.tensor([1, 2]),
+        packed_text_indexes=torch.tensor([0, 3]),
+        packed_indexes=torch.arange(4),
+        packed_position_ids=torch.zeros(4, dtype=torch.long),
+        packed_seqlens=torch.tensor([4], dtype=torch.int),
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        past_key_values=kv_full,
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        packed_loop_token_indexes=torch.tensor([1]),
+        loop_memory=embed,
+        loop_memory_text=embed,
+        loop_memory_img=embed,
+        packed_boundary_token_indexes=torch.tensor([0, 3]),
+        cfg_text_scale=2.0,
+        cfg_img_scale=2.0,
+        cfg_text_packed_position_ids=torch.zeros(4, dtype=torch.long),
+        cfg_text_packed_query_indexes=torch.arange(4),
+        cfg_text_key_values_lens=torch.tensor([0], dtype=torch.int),
+        cfg_text_past_key_values=kv_text,
+        cfg_text_packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        cfg_img_packed_position_ids=torch.zeros(4, dtype=torch.long),
+        cfg_img_packed_query_indexes=torch.arange(4),
+        cfg_img_key_values_lens=torch.tensor([0], dtype=torch.int),
+        cfg_img_past_key_values=kv_img,
+        cfg_img_packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        recycle_mode="same_depth",
+        memory_loop_repeat=2,
+        memory_loop_start=1,
+        memory_loop_end=3,
+        memory_body_in=m_full_in,
+        memory_body_in_text=m_text_in,
+        memory_body_in_img=m_img_in,
+        embed_memory=embed,
+    )
+    assert [row["kv"] for row in branch_calls] == [kv_full, kv_text, kv_img]
+    assert torch.equal(branch_calls[0]["body_in"], m_full_in)
+    assert torch.equal(branch_calls[1]["body_in"], m_text_in)
+    assert torch.equal(branch_calls[2]["body_in"], m_img_in)
+    assert not torch.equal(m_full, m_text)
+    assert not torch.equal(m_full, m_img)
+    assert not torch.equal(m_text, m_img)
+    assert torch.equal(m_full, m_full_in + 1)
+    assert torch.equal(m_text, m_text_in + 1)
+    assert torch.equal(m_img, m_img_in + 1)
+
+
+def test_persist_true_carries_m_out_to_next_m_in_and_keeps_cfg_memories_apart():
+    recorded = []
+    step = [0]
+
+    def forward(kwargs):
+        m_full = torch.full((2, 4), float(step[0] + 1))
+        m_text = torch.full((2, 4), float(step[0] + 10))
+        m_img = torch.full((2, 4), float(step[0] + 100))
+        recorded.append(
+            {
+                "body": kwargs["memory_body_in"],
+                "text": kwargs["memory_body_in_text"],
+                "img": kwargs["memory_body_in_img"],
+            }
+        )
+        step[0] += 1
+        return kwargs["x_t"], m_full, m_text, m_img, dict(_DIAG)
+
+    dummy = _make_memory_dummy(persist=True, recycle_mode="same_depth", forward=forward)
+    _, traj = dummy.generate_image(**_generate_kwargs(loop_memory_persist=True))
+    assert recorded[0]["body"] is None
+    assert torch.equal(recorded[1]["body"], torch.full((2, 4), 1.0))
+    assert torch.equal(recorded[1]["text"], torch.full((2, 4), 10.0))
+    assert torch.equal(recorded[1]["img"], torch.full((2, 4), 100.0))
+    assert not torch.equal(recorded[1]["body"], recorded[1]["text"])
+    assert not torch.equal(recorded[1]["text"], recorded[1]["img"])
+    assert torch.equal(traj[0]["m_out"], traj[1]["m_in"])
+    assert traj[1]["m_in"] is not None
+
+
+def test_persist_false_resets_next_step_but_logs_current_m_out():
+    recorded = []
+    step = [0]
+
+    def forward(kwargs):
+        m_full = torch.full((2, 4), float(step[0] + 1))
+        m_text = torch.full((2, 4), float(step[0] + 10))
+        m_img = torch.full((2, 4), float(step[0] + 100))
+        recorded.append(kwargs["memory_body_in"])
+        step[0] += 1
+        return kwargs["x_t"], m_full, m_text, m_img, dict(_DIAG)
+
+    dummy = _make_memory_dummy(
+        persist=False, recycle_mode="same_depth", forward=forward
+    )
+    _, traj = dummy.generate_image(**_generate_kwargs(loop_memory_persist=False))
+    assert recorded[0] is None
+    assert recorded[1] is None
+    assert traj[0]["m_out"] is not None
+    assert torch.equal(traj[0]["m_out"], torch.full((2, 4), 1.0))
+    assert traj[1]["m_in"] is None
+    assert traj[1]["m_out"] is not None
+    assert torch.equal(traj[1]["m_out"], torch.full((2, 4), 2.0))

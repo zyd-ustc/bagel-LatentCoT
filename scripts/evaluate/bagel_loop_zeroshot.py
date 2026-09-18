@@ -251,12 +251,13 @@ def _jsonable(value: Any) -> Any:
 def summarize_diagnostics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {"n_steps": 0, "n_inner": 0}
-    pairwise = [
-        float(row["pairwise_cosine"])
-        for row in rows
-        if isinstance(row.get("pairwise_cosine"), (int, float))
-        and not math.isnan(float(row["pairwise_cosine"]))
-    ]
+    def _pairwise_value(row: Dict[str, Any]):
+        raw = row.get("mean_abs_pairwise_cosine", row.get("pairwise_cosine"))
+        if isinstance(raw, (int, float)) and not math.isnan(float(raw)):
+            return float(raw)
+        return None
+
+    pairwise = [value for value in (_pairwise_value(row) for row in rows) if value is not None]
     ranks = [
         float(row["effective_rank"])
         for row in rows
@@ -272,6 +273,9 @@ def summarize_diagnostics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "n_inner": len(rows),
         "n_steps": len({int(row["step"]) for row in rows if "step" in row}),
+        "mean_abs_pairwise_cosine": (
+            sum(pairwise) / len(pairwise) if pairwise else None
+        ),
         "mean_pairwise_cosine": (
             sum(pairwise) / len(pairwise) if pairwise else None
         ),

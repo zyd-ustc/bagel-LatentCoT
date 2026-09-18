@@ -220,12 +220,18 @@ class Bagel(PreTrainedModel):
         k = int(slots.shape[0])
         if k == 0:
             return {
+                "mean_abs_pairwise_cosine": float("nan"),
                 "pairwise_cosine": float("nan"),
                 "effective_rank": 0.0,
                 "sigma1_ratio": float("nan"),
             }
         if k == 1:
-            return {"pairwise_cosine": 1.0, "effective_rank": 1.0, "sigma1_ratio": 1.0}
+            return {
+                "mean_abs_pairwise_cosine": 1.0,
+                "pairwise_cosine": 1.0,
+                "effective_rank": 1.0,
+                "sigma1_ratio": 1.0,
+            }
         normed = torch.nn.functional.normalize(slots, dim=-1)
         gram = normed @ normed.T
         off = gram.fill_diagonal_(0)
@@ -238,6 +244,7 @@ class Bagel(PreTrainedModel):
         share = energy / total
         effective_rank = float(torch.exp(-(share * (share + 1e-12).log()).sum()))
         return {
+            "mean_abs_pairwise_cosine": pairwise,
             "pairwise_cosine": pairwise,
             "effective_rank": effective_rank,
             "sigma1_ratio": float(energy[0] / total),
@@ -1682,12 +1689,14 @@ class Bagel(PreTrainedModel):
                             **diag,
                         }
                     )
+                loop_state = None
+                m_out = (
+                    None if memory_full is None else memory_full.detach().clone()
+                )
                 if not persist_memory:
                     memory_full = None
                     memory_text = None
                     memory_img = None
-                loop_state = None
-                m_out = None if memory_full is None else memory_full.detach().clone()
             else:
                 m_in = None
                 m_out = None
