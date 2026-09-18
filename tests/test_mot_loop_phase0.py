@@ -157,9 +157,16 @@ def test_r2_calls_inner_loop_twice_but_euler_once_per_timestep():
     class Dummy(Bagel):
         def __init__(self):
             self.config = SimpleNamespace(
-                num_loop_tokens=2, loop_depth=2, loop_uncond_memory="m0"
+                num_loop_tokens=2,
+                loop_depth=2,
+                loop_uncond_memory="m0",
+                loop_recycle_mode="full_depth",
+                loop_memory_persist=True,
+                memory_loop_start_layer=1,
+                memory_loop_end_layer=2,
             )
             self.loop_memory = torch.ones(2, 4)
+            self.loop_memory_persist = True
             self.last_loop_diagnostics = []
             self.language_model = SimpleNamespace(
                 model=SimpleNamespace(enable_taylorseer=False)
@@ -176,7 +183,7 @@ def test_r2_calls_inner_loop_twice_but_euler_once_per_timestep():
             velocity_calls.append(float(kwargs["timestep"].reshape(-1)[0]))
             memory = kwargs["loop_memory"] + 1
             diag = {"memory_rms": 1.0, "vae_hidden_rms": 1.0, "velocity_norm": 1.0}
-            return kwargs["x_t"], memory, diag
+            return kwargs["x_t"], memory, memory, memory, diag
 
         def image_euler_step(self, x_t, velocity, dt):
             euler_calls.append(float(dt))
@@ -206,10 +213,93 @@ def test_r2_calls_inner_loop_twice_but_euler_once_per_timestep():
         cfg_interval=(0.0, 1.0),
         enable_taylorseer=False,
         loop_depth=2,
+        loop_recycle_mode="full_depth",
     )
     assert len(velocity_calls) == 4  # 2 timesteps * R=2
     assert len(euler_calls) == 2  # outer clock only
     assert [row["r"] for row in dummy.last_loop_diagnostics] == [0, 1, 0, 1]
+
+
+def test_same_depth_runs_one_forward_per_timestep():
+    velocity_calls = []
+    euler_calls = []
+
+    class Dummy(Bagel):
+        def __init__(self):
+            self.config = SimpleNamespace(
+                num_loop_tokens=2,
+                loop_depth=2,
+                loop_uncond_memory="m0",
+                loop_recycle_mode="same_depth",
+                loop_memory_persist=True,
+                memory_loop_start_layer=1,
+                memory_loop_end_layer=2,
+            )
+            self.loop_memory = torch.ones(2, 4)
+            self.loop_memory_persist = True
+            self.last_loop_diagnostics = []
+            self.language_model = SimpleNamespace(
+                model=SimpleNamespace(enable_taylorseer=False)
+            )
+
+        def prepare_image_schedule(self, num_timesteps, timestep_shift, device):
+            t = torch.tensor([1.0, 0.4], device=device)
+            return t, torch.tensor([0.6, 0.4], device=device)
+
+        def predict_image_velocity(self, **kwargs):
+            raise AssertionError("K>0 must not use vanilla _forward_flow")
+
+        def _forward_flow_loop(self, **kwargs):
+            velocity_calls.append(kwargs["memory_loop_repeat"])
+            assert kwargs["recycle_mode"] == "same_depth"
+            memory = torch.ones(2, 4)
+            diag = {"memory_rms": 1.0, "vae_hidden_rms": 1.0, "velocity_norm": 1.0}
+            return kwargs["x_t"], memory, memory, memory, diag
+
+        def image_euler_step(self, x_t, velocity, dt):
+            euler_calls.append(float(dt))
+            return x_t
+
+    dummy = Dummy.__new__(Dummy)
+    Dummy.__init__(dummy)
+    dummy.generate_image = Bagel.generate_image.__get__(dummy, Dummy)
+    dummy.generate_image(
+        packed_text_ids=torch.tensor([1, 2]),
+        packed_text_indexes=torch.tensor([0, 3]),
+        packed_init_noises=torch.zeros(2, 4),
+        packed_vae_position_ids=torch.zeros(2, dtype=torch.long),
+        packed_vae_token_indexes=torch.tensor([1, 2]),
+        packed_vae_seqlens=torch.tensor([2], dtype=torch.int),
+        packed_boundary_token_indexes=torch.tensor([0, 3]),
+        packed_loop_semantic_token_indexes=torch.tensor([], dtype=torch.long),
+        packed_seqlens=torch.tensor([4], dtype=torch.int),
+        packed_position_ids=torch.zeros(4, dtype=torch.long),
+        packed_indexes=torch.arange(4),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        packed_loop_token_indexes=torch.tensor([1, 2]),
+        num_timesteps=2,
+        timestep_shift=1.0,
+        cfg_interval=(0.0, 1.0),
+        enable_taylorseer=False,
+        loop_depth=2,
+        loop_recycle_mode="same_depth",
+        memory_loop_start=1,
+        memory_loop_end=2,
+    )
+    assert velocity_calls == [2, 2]
+    assert len(euler_calls) == 2
+
+
+def test_memory_slot_stats_detect_collapse():
+    collapsed = torch.ones(8, 4)
+    stats = Bagel.memory_slot_stats(collapsed)
+    assert stats["pairwise_cosine"] > 0.99
+    assert stats["effective_rank"] < 1.1
+    diverse = torch.eye(4, 4)
+    diverse_stats = Bagel.memory_slot_stats(diverse)
+    assert diverse_stats["effective_rank"] > 3.0
 
 
 def test_forward_flow_loop_is_trainable_path_not_no_grad():
@@ -224,7 +314,15 @@ def test_forward_flow_loop_is_trainable_path_not_no_grad():
 def test_bagel_config_exposes_phase0_fields():
     from qwen_latent_cot.bagel.modeling.bagel.bagel import BagelConfig
 
-    cfg = BagelConfig(num_loop_tokens=8, loop_depth=2, loop_uncond_memory="zero")
+    cfg = BagelConfig(
+        num_loop_tokens=8,
+        loop_depth=2,
+        loop_uncond_memory="zero",
+        loop_recycle_mode="same_depth",
+        loop_memory_persist=False,
+    )
     assert cfg.num_loop_tokens == 8
     assert cfg.loop_depth == 2
     assert cfg.loop_uncond_memory == "zero"
+    assert cfg.loop_recycle_mode == "same_depth"
+    assert cfg.loop_memory_persist is False

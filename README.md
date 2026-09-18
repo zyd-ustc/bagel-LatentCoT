@@ -10,7 +10,7 @@ BAGEL-7B-MoT 上的 **步内 understanding–generation hidden loop**。
 
 | 阶段 | 状态 |
 |---|---|
-| **Phase 0** | 已实现：`K` memory slots、`_forward_flow_loop`、`generate_image` 内固定 \(R\)。`K=0` 走原 `_forward_flow`。 |
+| **Phase 0** | 已实现。默认 **same-depth body loop**：prefix 一次、只在 \([s,e)\) 上把 memory slots recycle \(R\) 次、suffix 一次。`full_depth` 仍可作为对照。CFG 三条分支各自维护 memory。`K=0` 走原 `_forward_flow`。 |
 | Phase 1+ | 未做：双侧 attention LoRA、Loop-SFT / DS+LD、Flow-GRPO |
 | **B2 FlowEdit** | 官方速度场差速积分，对照「纯 flow 编辑」 |
 | **B3 显式反思链** | `draft_prefix_loop`：decode → UND 文本 → 官方 Editing |
@@ -31,7 +31,15 @@ tests/test_mot_loop_phase0.py
 启用 Phase-0 memory（默认 `K=0`，不改官方路径）：
 
 ```python
-BagelConfig(..., num_loop_tokens=8, loop_depth=2, loop_uncond_memory="m0")
+BagelConfig(
+    ...,
+    num_loop_tokens=8,
+    loop_depth=2,
+    loop_recycle_mode="same_depth",  # or "full_depth"
+    loop_memory_persist=True,        # False = reset m every timestep
+    memory_loop_start_layer=20,
+    memory_loop_end_layer=28,
+)
 # load checkpoint 后
 model.init_loop_memory_from_boundary_embeddings(
     [new_token_ids["start_of_image"], new_token_ids["end_of_image"]]

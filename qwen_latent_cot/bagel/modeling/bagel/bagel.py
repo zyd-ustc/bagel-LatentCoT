@@ -67,6 +67,10 @@ class BagelConfig(PretrainedConfig):
         num_loop_tokens=0,
         loop_depth=1,
         loop_uncond_memory="m0",
+        loop_recycle_mode="same_depth",
+        loop_memory_persist=True,
+        memory_loop_start_layer=20,
+        memory_loop_end_layer=28,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -84,6 +88,10 @@ class BagelConfig(PretrainedConfig):
         self.num_loop_tokens = int(num_loop_tokens)
         self.loop_depth = int(loop_depth)
         self.loop_uncond_memory = str(loop_uncond_memory)
+        self.loop_recycle_mode = str(loop_recycle_mode)
+        self.loop_memory_persist = bool(loop_memory_persist)
+        self.memory_loop_start_layer = int(memory_loop_start_layer)
+        self.memory_loop_end_layer = int(memory_loop_end_layer)
 
 
 class Bagel(PreTrainedModel):
@@ -142,6 +150,16 @@ class Bagel(PreTrainedModel):
         self.loop_uncond_memory = str(getattr(config, "loop_uncond_memory", "m0"))
         if self.loop_uncond_memory not in ("m0", "zero"):
             raise ValueError("loop_uncond_memory must be 'm0' or 'zero'")
+        self.loop_recycle_mode = str(
+            getattr(config, "loop_recycle_mode", "same_depth")
+        )
+        if self.loop_recycle_mode not in ("same_depth", "full_depth"):
+            raise ValueError("loop_recycle_mode must be 'same_depth' or 'full_depth'")
+        self.loop_memory_persist = bool(getattr(config, "loop_memory_persist", True))
+        self.memory_loop_start_layer = int(
+            getattr(config, "memory_loop_start_layer", 20)
+        )
+        self.memory_loop_end_layer = int(getattr(config, "memory_loop_end_layer", 28))
         if num_loop_tokens > 0:
             self.loop_memory = nn.Parameter(
                 torch.zeros(num_loop_tokens, self.hidden_size)
@@ -191,6 +209,39 @@ class Bagel(PreTrainedModel):
         if packed_loop_token_indexes is None or int(packed_loop_token_indexes.numel()) == 0:
             return packed_text_indexes
         return torch.cat([packed_text_indexes, packed_loop_token_indexes], dim=0)
+
+    @staticmethod
+    def memory_slot_stats(memory: torch.Tensor) -> Dict[str, float]:
+        """Pairwise cosine / effective rank of K memory slots. Detects collapse."""
+
+        slots = memory.detach().float()
+        if slots.ndim != 2:
+            slots = slots.reshape(-1, slots.shape[-1])
+        k = int(slots.shape[0])
+        if k == 0:
+            return {
+                "pairwise_cosine": float("nan"),
+                "effective_rank": 0.0,
+                "sigma1_ratio": float("nan"),
+            }
+        if k == 1:
+            return {"pairwise_cosine": 1.0, "effective_rank": 1.0, "sigma1_ratio": 1.0}
+        normed = torch.nn.functional.normalize(slots, dim=-1)
+        gram = normed @ normed.T
+        off = gram.fill_diagonal_(0)
+        denom = float(k * (k - 1))
+        pairwise = float(off.abs().sum() / max(denom, 1.0))
+        centered = slots - slots.mean(dim=0, keepdim=True)
+        singular = torch.linalg.svdvals(centered)
+        energy = singular.clamp_min(0)
+        total = float(energy.sum().clamp_min(1e-12))
+        share = energy / total
+        effective_rank = float(torch.exp(-(share * (share + 1e-12).log()).sum()))
+        return {
+            "pairwise_cosine": pairwise,
+            "effective_rank": effective_rank,
+            "sigma1_ratio": float(energy[0] / total),
+        }
 
     def forward(
         self,
@@ -1384,6 +1435,10 @@ class Bagel(PreTrainedModel):
         packed_loop_token_indexes: Optional[torch.LongTensor] = None,
         loop_depth: Optional[int] = None,
         loop_uncond_memory: Optional[str] = None,
+        loop_recycle_mode: Optional[str] = None,
+        loop_memory_persist: Optional[bool] = None,
+        memory_loop_start: Optional[int] = None,
+        memory_loop_end: Optional[int] = None,
         return_loop_diagnostics: bool = False,
         within_step_loop_start: Optional[int] = None,
         within_step_loop_end: Optional[int] = None,
@@ -1471,8 +1526,32 @@ class Bagel(PreTrainedModel):
         if memory_loop_enabled and self.loop_memory is None:
             raise ValueError("packed_loop_token_indexes is set but loop_memory is None")
         self.last_loop_diagnostics = []
-        memory_state = None
-        memory_uncond = None
+        recycle_mode = str(
+            loop_recycle_mode
+            if loop_recycle_mode is not None
+            else getattr(self.config, "loop_recycle_mode", "same_depth")
+        )
+        if recycle_mode not in ("same_depth", "full_depth"):
+            raise ValueError("loop_recycle_mode must be 'same_depth' or 'full_depth'")
+        persist_memory = (
+            bool(loop_memory_persist)
+            if loop_memory_persist is not None
+            else bool(getattr(self.config, "loop_memory_persist", True))
+        )
+        body_start = (
+            memory_loop_start
+            if memory_loop_start is not None
+            else int(getattr(self.config, "memory_loop_start_layer", 20))
+        )
+        body_end = (
+            memory_loop_end
+            if memory_loop_end is not None
+            else int(getattr(self.config, "memory_loop_end_layer", 28))
+        )
+        embed_memory = None
+        memory_full = None
+        memory_text = None
+        memory_img = None
         if memory_loop_enabled:
             n_samples = int(packed_vae_seqlens.numel())
             k_total = int(packed_loop_token_indexes.numel())
@@ -1480,11 +1559,10 @@ class Bagel(PreTrainedModel):
                 raise ValueError(
                     "packed_loop_token_indexes must tile equally across samples"
                 )
-            memory_state = self.loop_memory.to(device=x_t.device).repeat(n_samples, 1)
-            if uncond_mode == "zero":
-                memory_uncond = torch.zeros_like(memory_state)
-            else:
-                memory_uncond = memory_state.detach().clone()
+            embed_memory = self.loop_memory.to(device=x_t.device).repeat(n_samples, 1)
+            memory_full = None
+            memory_text = None
+            memory_img = None
 
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
@@ -1500,68 +1578,119 @@ class Bagel(PreTrainedModel):
                 cfg_img_scale_ = 1.0
             loop_state_in = loop_state if state_active else None
             if memory_loop_enabled:
+                m_in = None if memory_full is None else memory_full.detach().clone()
+                rounds = 1 if recycle_mode == "same_depth" else inner_depth
                 prev_memory = None
                 v_t = None
-                for inner_r in range(inner_depth):
-                    v_t, memory_state, diag = self._forward_flow_loop(
-                        x_t=x_t,
-                        timestep=timestep,
-                        packed_vae_token_indexes=packed_vae_token_indexes,
-                        packed_vae_position_ids=packed_vae_position_ids,
-                        packed_text_ids=packed_text_ids,
-                        packed_text_indexes=packed_text_indexes,
-                        packed_position_ids=packed_position_ids,
-                        packed_indexes=packed_indexes,
-                        packed_seqlens=packed_seqlens,
-                        key_values_lens=key_values_lens,
-                        past_key_values=past_key_values,
-                        packed_key_value_indexes=packed_key_value_indexes,
-                        packed_loop_token_indexes=packed_loop_token_indexes,
-                        loop_memory=memory_state,
-                        loop_memory_uncond=memory_uncond,
-                        packed_boundary_token_indexes=packed_boundary_token_indexes,
-                        cfg_renorm_min=cfg_renorm_min,
-                        cfg_renorm_type=cfg_renorm_type,
-                        cfg_text_scale=cfg_text_scale_,
-                        cfg_text_packed_position_ids=cfg_text_packed_position_ids,
-                        cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
-                        cfg_text_key_values_lens=cfg_text_key_values_lens,
-                        cfg_text_past_key_values=cfg_text_past_key_values,
-                        cfg_text_packed_key_value_indexes=(
-                            cfg_text_packed_key_value_indexes
-                        ),
-                        cfg_img_scale=cfg_img_scale_,
-                        cfg_img_packed_position_ids=cfg_img_packed_position_ids,
-                        cfg_img_packed_query_indexes=cfg_img_packed_query_indexes,
-                        cfg_img_key_values_lens=cfg_img_key_values_lens,
-                        cfg_img_past_key_values=cfg_img_past_key_values,
-                        cfg_img_packed_key_value_indexes=(
-                            cfg_img_packed_key_value_indexes
-                        ),
-                        cfg_type=cfg_type,
+                for inner_r in range(rounds):
+                    v_t, memory_full, memory_text, memory_img, diag = (
+                        self._forward_flow_loop(
+                            x_t=x_t,
+                            timestep=timestep,
+                            packed_vae_token_indexes=packed_vae_token_indexes,
+                            packed_vae_position_ids=packed_vae_position_ids,
+                            packed_text_ids=packed_text_ids,
+                            packed_text_indexes=packed_text_indexes,
+                            packed_position_ids=packed_position_ids,
+                            packed_indexes=packed_indexes,
+                            packed_seqlens=packed_seqlens,
+                            key_values_lens=key_values_lens,
+                            past_key_values=past_key_values,
+                            packed_key_value_indexes=packed_key_value_indexes,
+                            packed_loop_token_indexes=packed_loop_token_indexes,
+                            loop_memory=(
+                                memory_full
+                                if recycle_mode == "full_depth"
+                                and memory_full is not None
+                                else embed_memory
+                            ),
+                            loop_memory_text=(
+                                memory_text
+                                if recycle_mode == "full_depth"
+                                and memory_text is not None
+                                else (
+                                    torch.zeros_like(embed_memory)
+                                    if uncond_mode == "zero"
+                                    else embed_memory
+                                )
+                            ),
+                            loop_memory_img=(
+                                memory_img
+                                if recycle_mode == "full_depth"
+                                and memory_img is not None
+                                else (
+                                    torch.zeros_like(embed_memory)
+                                    if uncond_mode == "zero"
+                                    else embed_memory
+                                )
+                            ),
+                            packed_boundary_token_indexes=packed_boundary_token_indexes,
+                            cfg_renorm_min=cfg_renorm_min,
+                            cfg_renorm_type=cfg_renorm_type,
+                            cfg_text_scale=cfg_text_scale_,
+                            cfg_text_packed_position_ids=cfg_text_packed_position_ids,
+                            cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
+                            cfg_text_key_values_lens=cfg_text_key_values_lens,
+                            cfg_text_past_key_values=cfg_text_past_key_values,
+                            cfg_text_packed_key_value_indexes=(
+                                cfg_text_packed_key_value_indexes
+                            ),
+                            cfg_img_scale=cfg_img_scale_,
+                            cfg_img_packed_position_ids=cfg_img_packed_position_ids,
+                            cfg_img_packed_query_indexes=cfg_img_packed_query_indexes,
+                            cfg_img_key_values_lens=cfg_img_key_values_lens,
+                            cfg_img_past_key_values=cfg_img_past_key_values,
+                            cfg_img_packed_key_value_indexes=(
+                                cfg_img_packed_key_value_indexes
+                            ),
+                            cfg_type=cfg_type,
+                            recycle_mode=recycle_mode,
+                            memory_loop_repeat=inner_depth,
+                            memory_loop_start=body_start,
+                            memory_loop_end=body_end,
+                            memory_body_in=memory_full
+                            if recycle_mode == "same_depth"
+                            else None,
+                            memory_body_in_text=memory_text
+                            if recycle_mode == "same_depth"
+                            else None,
+                            memory_body_in_img=memory_img
+                            if recycle_mode == "same_depth"
+                            else None,
+                            embed_memory=embed_memory,
+                        )
                     )
                     if prev_memory is None:
                         cosine = float("nan")
                     else:
                         cosine = float(
                             F.cosine_similarity(
-                                memory_state.flatten().float(),
+                                memory_full.flatten().float(),
                                 prev_memory.flatten().float(),
                                 dim=0,
                             )
                         )
-                    prev_memory = memory_state.detach()
+                    prev_memory = memory_full.detach()
                     self.last_loop_diagnostics.append(
                         {
                             "step": int(i),
                             "t": float(t),
                             "r": int(inner_r),
+                            "recycle_mode": recycle_mode,
+                            "persist": persist_memory,
                             "memory_cosine_to_prev": cosine,
                             **diag,
                         }
                     )
+                if not persist_memory:
+                    memory_full = None
+                    memory_text = None
+                    memory_img = None
                 loop_state = None
+                m_out = None if memory_full is None else memory_full.detach().clone()
             else:
+                m_in = None
+                m_out = None
                 result = self.predict_image_velocity(
                     x_t=x_t,
                     timestep=timestep,
@@ -1667,6 +1796,8 @@ class Bagel(PreTrainedModel):
                             if loop_state_in is None
                             else loop_state_in.detach().clone()
                         ),
+                        "m_in": None if m_in is None else m_in.detach().clone(),
+                        "m_out": None if m_out is None else m_out.detach().clone(),
                     }
                 )
                 x_t = transition.next_sample
@@ -1893,6 +2024,46 @@ class Bagel(PreTrainedModel):
             return v_t, loop_state_out
         return v_t
 
+    def _combine_cfg_velocities(
+        self,
+        v_t,
+        cfg_text_v_t,
+        cfg_img_v_t,
+        *,
+        cfg_text_scale,
+        cfg_img_scale,
+        cfg_renorm_min,
+        cfg_renorm_type,
+    ):
+        if cfg_text_scale <= 1.0:
+            return v_t
+        if cfg_renorm_type == "text_channel":
+            v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+            norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+            norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
+            scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(
+                min=cfg_renorm_min, max=1.0
+            )
+            v_t_text = v_t_text_ * scale
+            if cfg_img_scale > 1.0:
+                return cfg_img_v_t + cfg_img_scale * (v_t_text - cfg_img_v_t)
+            return v_t_text
+        v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+        if cfg_img_scale > 1.0:
+            v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
+        else:
+            v_t_ = v_t_text_
+        if cfg_renorm_type == "global":
+            norm_v_t = torch.norm(v_t)
+            norm_v_t_ = torch.norm(v_t_)
+        elif cfg_renorm_type == "channel":
+            norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+            norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
+        else:
+            raise NotImplementedError(f"{cfg_renorm_type} is not suppoprted")
+        scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+        return v_t_ * scale
+
     def _forward_flow_loop(
         self,
         x_t: torch.Tensor,
@@ -1909,7 +2080,8 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         packed_loop_token_indexes: torch.LongTensor,
         loop_memory: torch.Tensor,
-        loop_memory_uncond: torch.Tensor,
+        loop_memory_text: Optional[torch.Tensor] = None,
+        loop_memory_img: Optional[torch.Tensor] = None,
         packed_boundary_token_indexes: Optional[torch.LongTensor] = None,
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
@@ -1926,10 +2098,19 @@ class Bagel(PreTrainedModel):
         cfg_img_past_key_values: Optional[NaiveCache] = None,
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
+        recycle_mode: str = "same_depth",
+        memory_loop_repeat: int = 1,
+        memory_loop_start: Optional[int] = None,
+        memory_loop_end: Optional[int] = None,
+        memory_body_in: Optional[torch.Tensor] = None,
+        memory_body_in_text: Optional[torch.Tensor] = None,
+        memory_body_in_img: Optional[torch.Tensor] = None,
+        embed_memory: Optional[torch.Tensor] = None,
     ):
-        """One inner semantic loop. Memory is a current query, never KV cache.
+        """Memory-loop velocity. Not @torch.no_grad.
 
-        Not @torch.no_grad: Phase-1+ must be able to train LoRA + loop_memory.
+        same_depth: prefix once, recycle memory only inside [s, e), suffix once.
+        full_depth: one full F_1:L; caller repeats R times at embedding level.
         """
 
         if int(packed_loop_token_indexes.numel()) == 0:
@@ -1939,9 +2120,10 @@ class Bagel(PreTrainedModel):
             (sum(packed_seqlens), self.hidden_size)
         )
         packed_sequence[packed_text_indexes] = packed_text_embedding
-        packed_sequence[packed_loop_token_indexes] = loop_memory.to(
+        embed_m = (embed_memory if embed_memory is not None else loop_memory).to(
             dtype=packed_sequence.dtype, device=packed_sequence.device
         )
+        packed_sequence[packed_loop_token_indexes] = embed_m
 
         assert timestep.unique().shape[0] == 1
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
@@ -1961,105 +2143,110 @@ class Bagel(PreTrainedModel):
                 "packed_vae_token_indexes": packed_vae_token_indexes,
                 "packed_text_indexes": und_indexes,
             }
+        same_depth = str(recycle_mode) == "same_depth"
+        if same_depth:
+            extra_inputs.update(
+                packed_memory_token_indexes=packed_loop_token_indexes,
+                memory_loop_repeat=int(memory_loop_repeat),
+                memory_loop_start=memory_loop_start,
+                memory_loop_end=memory_loop_end,
+            )
 
-        output = self.language_model.forward_inference(
-            packed_query_sequence=packed_sequence,
-            query_lens=packed_seqlens,
-            packed_query_position_ids=packed_position_ids,
-            packed_query_indexes=packed_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
-            update_past_key_values=False,
-            is_causal=False,
-            packed_boundary_token_indexes=packed_boundary_token_indexes,
-            **extra_inputs,
+        def run_branch(sequence, kv, pos_ids, query_indexes, kv_lens, kv_indexes, body_in):
+            kwargs = dict(extra_inputs)
+            if same_depth:
+                kwargs["memory_body_in"] = body_in
+            output = self.language_model.forward_inference(
+                packed_query_sequence=sequence,
+                query_lens=packed_seqlens,
+                packed_query_position_ids=pos_ids,
+                packed_query_indexes=query_indexes,
+                past_key_values=kv,
+                key_values_lens=kv_lens,
+                packed_key_value_indexes=kv_indexes,
+                update_past_key_values=False,
+                is_causal=False,
+                packed_boundary_token_indexes=packed_boundary_token_indexes,
+                **kwargs,
+            )
+            velocity = self.llm2vae(output.packed_query_sequence)[
+                packed_vae_token_indexes
+            ]
+            if same_depth and output.memory_body_out is not None:
+                memory_next = output.memory_body_out
+            else:
+                memory_next = output.packed_query_sequence[packed_loop_token_indexes]
+            vae_out = output.packed_query_sequence[packed_vae_token_indexes]
+            return velocity, memory_next, vae_out
+
+        v_t, m_full, vae_out = run_branch(
+            packed_sequence,
+            past_key_values,
+            packed_position_ids,
+            packed_indexes,
+            key_values_lens,
+            packed_key_value_indexes,
+            memory_body_in,
         )
-        v_t = self.llm2vae(output.packed_query_sequence)[packed_vae_token_indexes]
-        m_next = output.packed_query_sequence[packed_loop_token_indexes]
-        vae_out = output.packed_query_sequence[packed_vae_token_indexes]
-
-        packed_uncond = packed_sequence
-        if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
-            packed_uncond = packed_sequence.clone()
-            packed_uncond[packed_loop_token_indexes] = loop_memory_uncond.to(
+        m_text = m_full
+        m_img = m_full
+        cfg_text_v_t = None
+        cfg_img_v_t = None
+        if cfg_text_scale > 1.0:
+            seq_text = packed_sequence.clone()
+            text_embed = (
+                loop_memory_text if loop_memory_text is not None else embed_m
+            )
+            seq_text[packed_loop_token_indexes] = text_embed.to(
                 dtype=packed_sequence.dtype, device=packed_sequence.device
             )
-
-        if cfg_text_scale > 1.0:
-            cfg_text_output = self.language_model.forward_inference(
-                packed_query_sequence=packed_uncond,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_text_packed_position_ids,
-                packed_query_indexes=cfg_text_packed_query_indexes,
-                past_key_values=cfg_text_past_key_values,
-                key_values_lens=cfg_text_key_values_lens,
-                packed_key_value_indexes=cfg_text_packed_key_value_indexes,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
+            cfg_text_v_t, m_text, _ = run_branch(
+                seq_text,
+                cfg_text_past_key_values,
+                cfg_text_packed_position_ids,
+                cfg_text_packed_query_indexes,
+                cfg_text_key_values_lens,
+                cfg_text_packed_key_value_indexes,
+                memory_body_in_text,
             )
-            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)[
-                packed_vae_token_indexes
-            ]
-
         if cfg_img_scale > 1.0:
-            cfg_img_output = self.language_model.forward_inference(
-                packed_query_sequence=packed_uncond,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_img_packed_position_ids,
-                packed_query_indexes=cfg_img_packed_query_indexes,
-                past_key_values=cfg_img_past_key_values,
-                key_values_lens=cfg_img_key_values_lens,
-                packed_key_value_indexes=cfg_img_packed_key_value_indexes,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
+            seq_img = packed_sequence.clone()
+            img_embed = loop_memory_img if loop_memory_img is not None else embed_m
+            seq_img[packed_loop_token_indexes] = img_embed.to(
+                dtype=packed_sequence.dtype, device=packed_sequence.device
             )
-            cfg_img_v_t = self.llm2vae(cfg_img_output.packed_query_sequence)[
-                packed_vae_token_indexes
-            ]
-
-        if cfg_text_scale > 1.0:
-            if cfg_renorm_type == "text_channel":
-                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-                norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
-                norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
-                scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(
-                    min=cfg_renorm_min, max=1.0
-                )
-                v_t_text = v_t_text_ * scale
-                if cfg_img_scale > 1.0:
-                    v_t = cfg_img_v_t + cfg_img_scale * (v_t_text - cfg_img_v_t)
-                else:
-                    v_t = v_t_text
-            else:
-                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-                if cfg_img_scale > 1.0:
-                    v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
-                else:
-                    v_t_ = v_t_text_
-                if cfg_renorm_type == "global":
-                    norm_v_t = torch.norm(v_t)
-                    norm_v_t_ = torch.norm(v_t_)
-                elif cfg_renorm_type == "channel":
-                    norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
-                    norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
-                else:
-                    raise NotImplementedError(f"{cfg_renorm_type} is not suppoprted")
-                scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(
-                    min=cfg_renorm_min, max=1.0
-                )
-                v_t = v_t_ * scale
-
+            cfg_img_v_t, m_img, _ = run_branch(
+                seq_img,
+                cfg_img_past_key_values,
+                cfg_img_packed_position_ids,
+                cfg_img_packed_query_indexes,
+                cfg_img_key_values_lens,
+                cfg_img_packed_key_value_indexes,
+                memory_body_in_img,
+            )
+        v_t = self._combine_cfg_velocities(
+            v_t,
+            cfg_text_v_t,
+            cfg_img_v_t,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
+            cfg_renorm_min=cfg_renorm_min,
+            cfg_renorm_type=cfg_renorm_type,
+        )
+        stats = self.memory_slot_stats(m_full)
         diagnostics = {
-            "memory_rms": float(torch.linalg.vector_norm(m_next.float()) / max(m_next.numel() ** 0.5, 1.0)),
+            "memory_rms": float(
+                torch.linalg.vector_norm(m_full.float())
+                / max(m_full.numel() ** 0.5, 1.0)
+            ),
             "vae_hidden_rms": float(
-                torch.linalg.vector_norm(vae_out.float()) / max(vae_out.numel() ** 0.5, 1.0)
+                torch.linalg.vector_norm(vae_out.float())
+                / max(vae_out.numel() ** 0.5, 1.0)
             ),
             "velocity_norm": float(torch.linalg.vector_norm(v_t.float())),
+            **stats,
         }
-        return v_t, m_next, diagnostics
+        return v_t, m_full, m_text, m_img, diagnostics
 
     def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
         packed_start_tokens, packed_key_value_indexes = list(), list()

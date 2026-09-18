@@ -371,6 +371,7 @@ class BaseNavitOutputWithPast(ModelOutput):
     packed_query_sequence: torch.FloatTensor = None
     past_key_values: Optional[NaiveCache] = None
     loop_state_out: Optional[torch.FloatTensor] = None
+    memory_body_out: Optional[torch.FloatTensor] = None
 
 
 def pad_sequence(tensor, pad_size):
@@ -1563,6 +1564,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
         within_step_loop_end: Optional[int] = None,
         within_step_loop_repeat: int = 1,
         within_step_loop_damping: float = 1.0,
+        packed_memory_token_indexes: Optional[torch.Tensor] = None,
+        memory_loop_repeat: int = 1,
+        memory_loop_start: Optional[int] = None,
+        memory_loop_end: Optional[int] = None,
+        memory_body_in: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1695,9 +1701,63 @@ class Qwen2Model(Qwen2PreTrainedModel):
             or loop_state_scale is not None
         )
         loop_state_out = None
+        memory_body_out = None
 
         loop_repeat = int(within_step_loop_repeat)
-        if loop_repeat > 1 and not state_active:
+        mem_repeat = int(memory_loop_repeat)
+        mem_indexes = packed_memory_token_indexes
+        memory_body_active = (
+            mem_indexes is not None
+            and int(mem_indexes.numel()) > 0
+            and memory_loop_start is not None
+            and memory_loop_end is not None
+            and mem_repeat >= 1
+        )
+        if memory_body_active:
+            if update_past_key_values:
+                raise ValueError(
+                    "memory body loop cannot mutate the prompt KV cache; "
+                    "set update_past_key_values=False"
+                )
+            if state_active:
+                raise ValueError(
+                    "memory body loop cannot combine with loop_state_scale"
+                )
+            s = int(memory_loop_start)
+            e = int(memory_loop_end)
+            if not 0 <= s < e <= len(self.layers):
+                raise ValueError(
+                    f"memory loop range [{s}, {e}) is invalid for "
+                    f"{len(self.layers)} layers"
+                )
+            indexes = mem_indexes.to(
+                device=packed_query_sequence.device, dtype=torch.long
+            )
+            hidden = packed_query_sequence
+            for layer_idx in range(0, s):
+                hidden, past_key_values = run_layer(layer_idx, hidden)
+            h_base = hidden.clone()
+            if memory_body_in is not None:
+                hidden = h_base.clone()
+                hidden[indexes] = memory_body_in.to(
+                    dtype=hidden.dtype, device=hidden.device
+                )
+            else:
+                hidden = h_base
+            memory_r = hidden[indexes]
+            for _round in range(mem_repeat):
+                if _round > 0:
+                    nxt = h_base.clone()
+                    nxt[indexes] = memory_r
+                    hidden = nxt
+                for layer_idx in range(s, e):
+                    hidden, past_key_values = run_layer(layer_idx, hidden)
+                memory_r = hidden[indexes]
+            for layer_idx in range(e, len(self.layers)):
+                hidden, past_key_values = run_layer(layer_idx, hidden)
+            packed_query_sequence = normalize(hidden)
+            memory_body_out = memory_r
+        elif loop_repeat > 1 and not state_active:
             # Looped-MMDiT style: repeat a shared middle block inside one
             # denoising step. L=1 is exact parity with the native path.
             if within_step_loop_start is None or within_step_loop_end is None:
@@ -1899,6 +1959,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             packed_query_sequence=packed_query_sequence,
             past_key_values=past_key_values,
             loop_state_out=loop_state_out,
+            memory_body_out=memory_body_out,
         )
 
     def forward_kvcache(
@@ -2119,6 +2180,11 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         within_step_loop_end: Optional[int] = None,
         within_step_loop_repeat: int = 1,
         within_step_loop_damping: float = 1.0,
+        packed_memory_token_indexes: Optional[torch.Tensor] = None,
+        memory_loop_repeat: int = 1,
+        memory_loop_start: Optional[int] = None,
+        memory_loop_end: Optional[int] = None,
+        memory_body_in: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
 
         # This method is also used during LoRA training. Call the matching
@@ -2152,6 +2218,11 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             within_step_loop_end=within_step_loop_end,
             within_step_loop_repeat=within_step_loop_repeat,
             within_step_loop_damping=within_step_loop_damping,
+            packed_memory_token_indexes=packed_memory_token_indexes,
+            memory_loop_repeat=memory_loop_repeat,
+            memory_loop_start=memory_loop_start,
+            memory_loop_end=memory_loop_end,
+            memory_body_in=memory_body_in,
         )
 
         return outputs
