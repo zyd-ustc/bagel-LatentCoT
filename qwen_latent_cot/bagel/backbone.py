@@ -174,6 +174,12 @@ class BagelBackbone:
             connector_act="gelu_pytorch_tanh",
             latent_patch_size=2,
             max_latent_size=64,
+            num_loop_tokens=int(self.cfg.get("num_loop_tokens", 0) or 0),
+            loop_depth=int(self.cfg.get("loop_depth", 1) or 1),
+            loop_recycle_mode=str(self.cfg.get("loop_recycle_mode", "same_depth")),
+            loop_memory_persist=bool(self.cfg.get("loop_memory_persist", True)),
+            memory_loop_start_layer=int(self.cfg.get("memory_loop_start_layer", 20)),
+            memory_loop_end_layer=int(self.cfg.get("memory_loop_end_layer", 28)),
         )
 
         llm = Qwen2ForCausalLM(llm_config)

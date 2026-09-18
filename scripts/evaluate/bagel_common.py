@@ -107,6 +107,20 @@ def load_native_bagel(args):
             "disable_gen_expert": False,
             "disable_visual_gen": False,
             "num_image_tokens": patches * patches,
+            "num_loop_tokens": int(getattr(args, "num_loop_tokens", 0) or 0),
+            "loop_depth": int(getattr(args, "loop_depth", 1) or 1),
+            "loop_recycle_mode": str(
+                getattr(args, "loop_recycle_mode", "same_depth")
+            ),
+            "loop_memory_persist": bool(
+                getattr(args, "loop_memory_persist", True)
+            ),
+            "memory_loop_start_layer": int(
+                getattr(args, "memory_loop_start_layer", 20)
+            ),
+            "memory_loop_end_layer": int(
+                getattr(args, "memory_loop_end_layer", 28)
+            ),
         }
     ).load()
     device = accelerator.resolve_device(args.device)
