@@ -1,0 +1,54 @@
+# KV-prefix ablation. Keep every value aligned with loop_grpo.yaml except the
+# transport, initializer, and output directory.
+model_path: /private/yida_workspace/models/BAGEL-7B-MoT
+adapter_path: /private/yida_workspace/outputs/bagel_kv_prefix_state_flow_k16/semantic_state_flow_step_0000100.safetensors
+data_path: /private/yida_workspace/bagel-LatentCoT/experiments/data/geneval2_hard_rl_train.jsonl
+output_dir: /private/yida_workspace/outputs/bagel_loop_grpo_kv_prefix_k16_smoke
+
+seed: 42
+image_height: 512
+image_width: 512
+num_image_tokens: 4900
+num_steps: 30
+timestep_shift: 3.0
+cfg_text_scale: 4.0
+cfg_interval: [0.4, 1.0]
+
+loop_start_layer: 10
+loop_end_layer: 18
+loop_state_timestep_threshold: 0.75
+loop_state_scale: 0.20
+loop_draft_state_scale: 0.20
+loop_state_mode: kv_prefix
+loop_state_tokens: 16
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.0
+include_text_kv_lora: true
+
+sde_step_indices: [8]
+sde_noise_level: 0.8
+group_size: 4
+
+geneval_url: http://127.0.0.1:18086
+geneval_timeout_seconds: 120
+semantic_reward_type: geneval2_soft_tifa_log_gm
+min_atom_count: 7
+diffusion_rm_repo: /private/yida_workspace/diffusion-rm
+flux_rm_config: /private/yida_workspace/diffusion-rm/config/flux/thurstone-19layer-hpdv3.yaml
+flux_rm_checkpoint: /private/yida_workspace/outputs/dina_flux_rm/DiNa-FLUX-HPDv3-19layers_2026.09.12_08.55/checkpoints/epoch_001
+flux_rm_noise_level: 0.05
+# flux_rm_noise_levels: [0.05, 0.10]
+flux_rm_noise_seed: 17
+
+quality_tolerance: 0.0
+quality_penalty_weight: 1.0
+clip_range: 1.0e-4
+kl_beta: 0.01
+learning_rate: 1.0e-6
+policy_epochs: 1
+max_grad_norm: 1.0
+max_steps: 1
+logging_steps: 1
+save_steps: 1
+ratio_gate_tolerance: 5.0e-4

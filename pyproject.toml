@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bagel-latent-cot"
+version = "0.2.0"
+description = "BAGEL-7B-MoT native hidden-memory loop (Phase-0) and FlowEdit / reflection-loop baselines"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.5.1",
+  "einops>=0.7.0",
+  "transformers>=4.56.0",
+  "safetensors>=0.4.0",
+  "Pillow>=10.0.0",
+  "PyYAML>=6.0",
+  "tqdm>=4.66.0",
+  "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qwen_latent_cot*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
