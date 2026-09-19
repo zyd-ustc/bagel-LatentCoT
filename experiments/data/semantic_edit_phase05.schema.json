@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase-0.5 paired semantic edit",
+  "type": "object",
+  "required": ["id", "source_image", "source_prompt", "instruction", "target", "preserve"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "source_image": {"type": "string", "minLength": 1},
+    "source_prompt": {"type": "string", "minLength": 1},
+    "instruction": {"type": "string", "minLength": 1},
+    "target": {"type": "string", "minLength": 1},
+    "preserve": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "category": {
+      "enum": ["addition", "deletion", "count", "relation", "color", "binding", "material", "replacement"]
+    }
+  },
+  "additionalProperties": true
+}

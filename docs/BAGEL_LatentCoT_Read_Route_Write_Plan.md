@@ -58,7 +58,7 @@ GEN query 对 native context 的注意力随之变化。
 
 ---
 
-## 2. 原理：Read–Route–Write Loop
+## 2. 原理：Read–Write Loop with implicit context rerouting
 
 ### 2.1 BAGEL 的 joint attention 是 loop 的基础
 
@@ -310,12 +310,11 @@ Student 使用 latent loop：
 | ID | old prompt | Round-0 write | body | persist | 目的 |
 |---|---|---:|---|---:|---|
 | Z0 | vanilla | - | - | - | BAGEL editing baseline |
-| Z1 | 保留 | 开 | `[20,28)` | on | 当前 loop |
-| Z2 | 去掉 | 开 | `[20,28)` | off | 验证 old prompt / persistence 影响 |
-| Z3 | 去掉 | **关** | `[20,28)` | off | 验证 read-first 是否减少 blur |
-| Z4 | 去掉 | **关** | `[16,24)` | off | mid-layer 主候选 |
-| Z5 | 去掉 | **关** | `[12,20)` | off | 更早语义桥接 |
-| Z6 | 去掉 | **关** | `[16,24)` | on | 只在 zero-shot 稳定后测试 persistence |
+| Z1 | 保留 | 开 | `[20,28)` | on | old loop reference |
+| Z2 | 去掉 | **关** | `[16,24)` | off | strict read→write 主候选 |
+| Z3 | 去掉 | **关** | `[12,20)` | off | early-body ablation |
+| Z4 | 去掉 | **关** | `[20,28)` | off | late-body ablation |
+| Z5 | 去掉 | **关** | `[16,24)` | on | persistence ablation |
 | C0 | 去掉 | - | full-depth | off | repeated-compute control |
 
 任务优先选择“理解容易判断、生成容易犯结构错误”的编辑：
@@ -404,10 +403,10 @@ Student 使用 latent loop：
 | UND 是否读到当前 GEN？ | `ΔM` + perturb `x_t` mechanism test |  |
 | Memory 是否真正反馈 GEN？ | `ΔG` / mask `GEN←UND` |  |
 | Feedback 是否改变 flow？ | `Δv` |  |
-| read-first 是否减少 blur？ | Z2 vs Z3 |  |
-| mid-layer 是否更适合？ | Z3/Z4/Z5 |  |
+| strict read→write 是否减少 blur？ | Z1 vs Z2 |  |
+| mid-layer 是否更适合？ | Z2/Z3/Z4 |  |
 | old prompt 是否阻碍编辑？ | Z1 vs Z2 |  |
-| persistence 是否有益？ | Z4 vs Z6 |  |
+| persistence 是否有益？ | Z2 vs Z5 |  |
 | latent loop 是否优于 gen-only repeated compute？ | equal-compute |  |
 | text teacher 是否可被 latent loop 蒸馏？ | T1 vs T2 |  |
 
@@ -465,6 +464,11 @@ cfg_branch_memory: independent
 `num_read_rounds=1`、`num_write_rounds=memory_loop_repeat-1`；旧字段
 `round0_gen_reads_memory` 仅作为配置兼容别名。
 
+Phase 0.5 的 paired editing protocol 使用
+`experiments/data/semantic_edit_phase05.jsonl`，每条样本显式记录 source image、
+source prompt、instruction、target 与 preserve constraints。主矩阵固定为
+Z0–Z5/C0；K={1,4,8} 只在 strict mid-body Z2 上独立报告，不与主矩阵混合。
+
 训练进入 Phase 1 后：
 
 ```yaml
@@ -485,7 +489,7 @@ teacher:
 
 ## 8. 一句话论文主线
 
-> **BAGEL 的优势不应只是“一个模型同时理解和生成”，而应允许理解状态在生成过程中持续读取当前 trajectory，并动态重路由原生图像/文本条件。Read–Route–Write Loop 将这种能力限制在局部 same-depth recurrent body 内，以最小参数和最小 prior shift，把显式文本反思压缩成连续 latent reasoning。**
+> **BAGEL 的优势不应只是“一个模型同时理解和生成”，而应允许理解状态在生成过程中持续读取当前 trajectory，并隐式改变生成路径如何使用原生图像/文本条件。Read–Write Loop 将这种能力限制在局部 same-depth recurrent body 内，以最小参数和最小 prior shift，把显式文本反思压缩成连续 latent reasoning。**
 
 ---
 

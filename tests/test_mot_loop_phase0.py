@@ -615,8 +615,8 @@ def test_cfg_branches_keep_independent_recurrent_memory():
     dummy._combine_cfg_velocities = Bagel._combine_cfg_velocities.__get__(
         dummy, Dummy
     )
-    dummy.mot_und_route_indexes = staticmethod(Bagel.mot_und_route_indexes)
-    dummy.memory_slot_stats = staticmethod(Bagel.memory_slot_stats)
+    dummy.mot_und_route_indexes = Bagel.mot_und_route_indexes
+    dummy.memory_slot_stats = Bagel.memory_slot_stats
 
     kv_full, kv_text, kv_img = object(), object(), object()
     m_full_in = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
@@ -1130,9 +1130,9 @@ def test_diagnostics_populate_deltas_when_r_ge_2():
     dummy._combine_cfg_velocities = Bagel._combine_cfg_velocities.__get__(
         dummy, Dummy
     )
-    dummy.mot_und_route_indexes = staticmethod(Bagel.mot_und_route_indexes)
-    dummy.memory_slot_stats = staticmethod(Bagel.memory_slot_stats)
-    dummy.relative_l2 = staticmethod(Bagel.relative_l2)
+    dummy.mot_und_route_indexes = Bagel.mot_und_route_indexes
+    dummy.memory_slot_stats = Bagel.memory_slot_stats
+    dummy.relative_l2 = Bagel.relative_l2
     _, _, _, _, diag = dummy._forward_flow_loop(
         x_t=torch.zeros(1, 4),
         timestep=torch.tensor([0.7]),

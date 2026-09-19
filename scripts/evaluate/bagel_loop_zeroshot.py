@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.5 zero-shot editing: Z0–Z6 / C0 Read–Route–Write loop.
+"""Phase 0.5 paired zero-shot editing and isolated K ablation.
 
 Call path is the official notebook editor:
     inferencer(image=source, text=edit, init_noise=ε, **NOTEBOOK_EDIT_HYPER)
@@ -56,8 +56,8 @@ ARMS: List[Dict[str, Any]] = [
     },
     {
         "id": "Z1",
-        "slug": "z1_current_loop",
-        "title": "Z1 current loop",
+        "slug": "z1_old_loop",
+        "title": "Z1 old loop",
         "K": 8,
         "R": 2,
         "recycle_mode": "same_depth",
@@ -69,34 +69,8 @@ ARMS: List[Dict[str, Any]] = [
     },
     {
         "id": "Z2",
-        "slug": "z2_drop_old_prompt",
-        "title": "Z2 drop old prompt / persist",
-        "K": 8,
-        "R": 2,
-        "recycle_mode": "same_depth",
-        "persist": False,
-        "start_layer": 20,
-        "end_layer": 28,
-        "remove_old_prompt": True,
-        "round0_memory_write_enabled": True,
-    },
-    {
-        "id": "Z3",
-        "slug": "z3_read_first",
-        "title": "Z3 read-first",
-        "K": 8,
-        "R": 2,
-        "recycle_mode": "same_depth",
-        "persist": False,
-        "start_layer": 20,
-        "end_layer": 28,
-        "remove_old_prompt": True,
-        "round0_memory_write_enabled": False,
-    },
-    {
-        "id": "Z4",
-        "slug": "z4_mid_layer",
-        "title": "Z4 mid-layer main",
+        "slug": "z2_read_write",
+        "title": "Z2 strict read→write",
         "K": 8,
         "R": 2,
         "recycle_mode": "same_depth",
@@ -107,9 +81,9 @@ ARMS: List[Dict[str, Any]] = [
         "round0_memory_write_enabled": False,
     },
     {
-        "id": "Z5",
-        "slug": "z5_early_bridge",
-        "title": "Z5 earlier semantic bridge",
+        "id": "Z3",
+        "slug": "z3_early",
+        "title": "Z3 early body",
         "K": 8,
         "R": 2,
         "recycle_mode": "same_depth",
@@ -120,9 +94,22 @@ ARMS: List[Dict[str, Any]] = [
         "round0_memory_write_enabled": False,
     },
     {
-        "id": "Z6",
-        "slug": "z6_persist",
-        "title": "Z6 persist after zero-shot",
+        "id": "Z4",
+        "slug": "z4_late",
+        "title": "Z4 late body",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 20,
+        "end_layer": 28,
+        "remove_old_prompt": True,
+        "round0_memory_write_enabled": False,
+    },
+    {
+        "id": "Z5",
+        "slug": "z5_persist",
+        "title": "Z5 persistent memory",
         "K": 8,
         "R": 2,
         "recycle_mode": "same_depth",
@@ -147,6 +134,15 @@ ARMS: List[Dict[str, Any]] = [
     },
 ]
 
+PAIRED_EDIT_FIELDS = (
+    "id",
+    "source_image",
+    "source_prompt",
+    "instruction",
+    "target",
+    "preserve",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -154,6 +150,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-file",
         default="experiments/data/geneval2_hard_16.txt",
+    )
+    parser.add_argument(
+        "--edit-file",
+        default="",
+        help="Paired-edit JSONL. When set, source image/prompt are read per case.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image-size", type=int, default=1024)
@@ -163,7 +164,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arms",
         default="",
-        help="Comma-separated arm ids, e.g. A0,A2. Empty = all.",
+        help="Comma-separated main arm ids, e.g. Z0,Z2. Empty = all.",
+    )
+    parser.add_argument(
+        "--k-values",
+        default="",
+        help="Run only strict mid-body K ablation, e.g. 1,4,8; cannot combine with --arms.",
     )
     parser.add_argument(
         "--num-loop-tokens",
@@ -199,6 +205,90 @@ def load_prompts(path: str, max_prompts: int = 0) -> List[str]:
     return prompts
 
 
+def load_edit_cases(path: str, max_cases: int = 0) -> List[Dict[str, Any]]:
+    """Load paired semantic edits and resolve source images relative to JSONL."""
+
+    jsonl_path = Path(path).expanduser().resolve()
+    cases: List[Dict[str, Any]] = []
+    seen = set()
+    for line_number, raw in enumerate(
+        jsonl_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        try:
+            case = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{jsonl_path}:{line_number}: invalid JSON: {exc}") from exc
+        missing = [field for field in PAIRED_EDIT_FIELDS if field not in case]
+        if missing:
+            raise ValueError(f"{jsonl_path}:{line_number}: missing fields {missing}")
+        case_id = str(case["id"]).strip()
+        if not case_id or case_id in seen:
+            raise ValueError(f"{jsonl_path}:{line_number}: empty or duplicate id {case_id!r}")
+        seen.add(case_id)
+        for field in ("source_image", "source_prompt", "instruction", "target"):
+            if not str(case[field]).strip():
+                raise ValueError(f"{jsonl_path}:{line_number}: {field} must be non-empty")
+        preserve = case["preserve"]
+        if not isinstance(preserve, list) or not all(
+            isinstance(item, str) and item.strip() for item in preserve
+        ):
+            raise ValueError(f"{jsonl_path}:{line_number}: preserve must be a string list")
+        source_path = Path(str(case["source_image"])).expanduser()
+        if not source_path.is_absolute():
+            source_path = jsonl_path.parent / source_path
+        case = dict(case)
+        case["id"] = case_id
+        case["source_image"] = str(source_path.resolve())
+        cases.append(case)
+    if not cases:
+        raise ValueError(f"no edit cases in {jsonl_path}")
+    if int(max_cases) > 0:
+        cases = cases[: int(max_cases)]
+    return cases
+
+
+def parse_k_values(raw: str) -> List[int]:
+    values: List[int] = []
+    for part in str(raw).split(","):
+        if not part.strip():
+            continue
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(f"invalid K value: {part!r}") from exc
+        if value < 1:
+            raise ValueError("K ablation values must be >= 1")
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def make_k_ablation_arms(values: Sequence[int]) -> List[Dict[str, Any]]:
+    base = next(arm for arm in ARMS if arm["id"] == "Z2")
+    arms = []
+    for value in values:
+        arm = deepcopy(base)
+        arm.update(
+            id=f"K{int(value)}",
+            slug=f"k{int(value)}_read_write",
+            title=f"K={int(value)} strict read→write",
+            K=int(value),
+        )
+        arms.append(arm)
+    return arms
+
+
+def resolve_arms(raw_arms: str, raw_k_values: str) -> List[Dict[str, Any]]:
+    k_values = parse_k_values(raw_k_values)
+    if k_values:
+        if str(raw_arms).strip():
+            raise ValueError("--k-values and --arms are separate protocols; choose one")
+        return make_k_ablation_arms(k_values)
+    return select_arms(raw_arms)
+
+
 def select_arms(raw: str) -> List[Dict[str, Any]]:
     if not str(raw).strip():
         return list(ARMS)
@@ -223,7 +313,7 @@ def shard_indices(n: int, shard_id: int, num_shards: int) -> List[int]:
 
 
 def apply_loop_config(model, arm: Dict[str, Any]) -> None:
-    """Swap Read–Route–Write fields. Does not touch the inferencer API."""
+    """Swap Read–Write loop fields. Does not touch the inferencer API."""
 
     k = int(arm["K"])
     r = int(arm["R"])
@@ -432,7 +522,7 @@ def merge_gallery(output_dir: Path, arms: Sequence[Dict[str, Any]]) -> None:
         if not manifest_path.is_file():
             continue
         meta = json.loads(manifest_path.read_text(encoding="utf-8"))
-        prompt = str(meta.get("prompt", ""))
+        prompt = str(meta.get("instruction", meta.get("prompt", "")))
         rel = prompt_dir.name
         cells = [
             f"<td class='id'>{html.escape(rel)}</td>"
@@ -453,7 +543,7 @@ def merge_gallery(output_dir: Path, arms: Sequence[Dict[str, Any]]) -> None:
             )
         rows.append("<tr>" + "".join(cells) + "</tr>")
     page = f"""<!doctype html><meta charset='utf-8'>
-<title>BAGEL Read–Route–Write loop zero-shot Z0–C0</title>
+<title>BAGEL Read–Write loop zero-shot Z0–C0</title>
 <style>
 body{{font:13px system-ui;background:#111;color:#eee;margin:20px}}
 table{{border-collapse:collapse}}
@@ -464,7 +554,7 @@ img{{width:192px;height:192px;object-fit:contain;background:#000}}
 .id{{color:#9cf;white-space:nowrap}}
 .cap,.mae{{font-size:11px;color:#aaa}}
 </style>
-<h1>Read–Route–Write loop zero-shot</h1>
+<h1>Read–Write loop zero-shot</h1>
 <p>Official <code>inferencer(image=I, text=e, init_noise=ε, **EDIT_hyper)</code>,
 no FlowEdit / SDE / TaylorSeer.</p>
 <table>
@@ -480,16 +570,17 @@ def run_prompt(
     args,
     inferencer,
     prompt_dir: Path,
-    prompt: str,
+    case: Dict[str, Any],
     prompt_index: int,
     arms: Sequence[Dict[str, Any]],
     source_image,
-    old_prompt: str,
 ) -> None:
     prompt_dir.mkdir(parents=True, exist_ok=True)
     model = inferencer.model
     image_shape = (int(args.image_size), int(args.image_size))
-    noise_seed = stable_noise_seed(int(args.seed), prompt)
+    prompt = str(case["instruction"])
+    old_prompt = str(case["source_prompt"])
+    noise_seed = stable_noise_seed(int(args.seed), f"{case['id']}\n{prompt}")
     init_noise = make_noise(model, image_shape, noise_seed)
     noise_hash = tensor_digest(init_noise)
     (prompt_dir / "prompt.txt").write_text(prompt + "\n", encoding="utf-8")
@@ -562,9 +653,15 @@ def run_prompt(
                 mae[arm["id"]] = pixel_mae(images[arm["id"]], images["Z0"])
 
     meta = {
-        "schema": "bagel_loop_zeroshot_v2",
+        "schema": "bagel_loop_paired_edit_v3",
         "prompt_index": int(prompt_index),
+        "id": str(case["id"]),
         "prompt": prompt,
+        "instruction": prompt,
+        "source_image": str(case["source_image"]),
+        "source_prompt": old_prompt,
+        "target": str(case.get("target", "")),
+        "preserve": list(case.get("preserve", [])),
         "old_prompt": old_prompt,
         "seed": int(args.seed),
         "noise_seed": int(noise_seed),
@@ -591,15 +688,43 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    arms = select_arms(args.arms)
+    arms = resolve_arms(args.arms, args.k_values)
+    if arms and max(int(arm["K"]) for arm in arms) > int(args.num_loop_tokens):
+        raise ValueError(
+            f"selected arms require K={max(int(arm['K']) for arm in arms)}, "
+            f"but --num-loop-tokens={int(args.num_loop_tokens)}"
+        )
     if args.merge_only:
         merge_gallery(output_dir, arms)
         return
 
-    prompts = load_prompts(args.prompt_file, int(args.max_prompts))
-    assigned = shard_indices(len(prompts), int(args.shard_id), int(args.num_shards))
+    edit_file = str(args.edit_file or "").strip()
+    if edit_file:
+        cases = load_edit_cases(edit_file, int(args.max_prompts))
+    else:
+        source_path = str(args.source_image or "").strip()
+        if not source_path:
+            raise ValueError("--source-image is required when --edit-file is not set")
+        source_prompt = str(args.old_prompt or args.source_prompt or "").strip()
+        if any(not bool(arm["remove_old_prompt"]) for arm in arms) and not source_prompt:
+            raise ValueError(
+                "arms that keep the old prompt require --old-prompt or --source-prompt"
+            )
+        prompts = load_prompts(args.prompt_file, int(args.max_prompts))
+        cases = [
+            {
+                "id": f"legacy-{index:03d}",
+                "source_image": str(Path(source_path).expanduser().resolve()),
+                "source_prompt": source_prompt,
+                "instruction": prompt,
+                "target": prompt,
+                "preserve": [],
+            }
+            for index, prompt in enumerate(prompts)
+        ]
+    assigned = shard_indices(len(cases), int(args.shard_id), int(args.num_shards))
     print(
-        f"[run] prompts={len(prompts)} shard={args.shard_id}/{args.num_shards} "
+        f"[run] cases={len(cases)} shard={args.shard_id}/{args.num_shards} "
         f"assigned={assigned} arms={[arm['id'] for arm in arms]}",
         flush=True,
     )
@@ -607,37 +732,43 @@ def main() -> None:
         print("[run] nothing assigned to this shard", flush=True)
         return
 
+    missing_sources = [
+        f"{cases[index]['id']}: {cases[index]['source_image']}"
+        for index in assigned
+        if not Path(str(cases[index]["source_image"])).is_file()
+    ]
+    if missing_sources:
+        raise FileNotFoundError(
+            "missing paired source images before model load:\n"
+            + "\n".join(missing_sources)
+        )
+
     print("[model] loading frozen BAGEL with loop_memory K="
           f"{int(args.num_loop_tokens)}", flush=True)
     backbone, inferencer = load_native_bagel(args)
     m0_hash = init_frozen_memory(backbone.bagel)
     print(f"[model] m0_sha256={m0_hash}", flush=True)
 
-    source_path = str(args.source_image or "").strip()
-    if not source_path:
-        raise ValueError("--source-image is required for the editing zeroshot protocol")
     from PIL import Image
-
-    source_image = Image.open(source_path).convert("RGB")
-    old_prompt = str(args.old_prompt or args.source_prompt or "").strip()
-    if any(not bool(arm["remove_old_prompt"]) for arm in arms) and not old_prompt:
-        raise ValueError(
-            "arms that keep the old prompt require --old-prompt or --source-prompt"
-        )
 
     for index in assigned:
         tag = f"p{index:03d}"
-        prompt = prompts[index]
-        print(f"[{tag}] {prompt!r}", flush=True)
+        case = cases[index]
+        source_path = Path(str(case["source_image"]))
+        if not source_path.is_file():
+            raise FileNotFoundError(
+                f"case {case['id']}: source image does not exist: {source_path}"
+            )
+        source_image = Image.open(source_path).convert("RGB")
+        print(f"[{tag}] {case['id']}: {case['instruction']!r}", flush=True)
         run_prompt(
             args,
             inferencer,
             output_dir / tag,
-            prompt,
+            case,
             index,
             arms,
             source_image,
-            old_prompt,
         )
         print(f"[{tag}] done", flush=True)
     merge_gallery(output_dir, arms)

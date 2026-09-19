@@ -66,6 +66,25 @@ pytest -q tests/test_mot_loop_phase0.py tests/test_bagel_flowedit.py
 
 ## 对照实验
 
+Phase 0.5 使用 paired semantic-edit JSONL；每行必须包含
+`id/source_image/source_prompt/instruction/target/preserve`。仓库提供 24 条覆盖
+addition、deletion、count、relation、color、binding、material、replacement 的
+清单 `experiments/data/semantic_edit_phase05.jsonl`。先把固定 source image 放到
+`experiments/data/semantic_edit_sources/`，再运行主矩阵：
+
+```bash
+bash scripts/evaluate/run_bagel_loop_zeroshot.sh /path/to/out
+```
+
+K 消融与主矩阵分开运行（仅比较 strict mid-body Z2 的 K）：
+
+```bash
+K_VALUES=1,4,8 bash scripts/evaluate/run_bagel_loop_zeroshot.sh /path/to/k_ablation
+```
+
+主矩阵固定为 Z0 vanilla、Z1 old loop、Z2 strict read→write、Z3 early、
+Z4 late、Z5 persist 与 C0 full-depth。`K_VALUES` 非空时不得同时设置 `ARMS`。
+
 FlowEdit 4.1（文档 B2），16 卡：
 
 ```bash
