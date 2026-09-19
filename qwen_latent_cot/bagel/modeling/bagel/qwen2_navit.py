@@ -88,6 +88,43 @@ def round0_blocked_slices(
     return slices
 
 
+def und_memory_row_mask(
+    packed_text_indexes: Optional[torch.Tensor],
+    packed_memory_token_indexes: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if packed_text_indexes is None:
+        return None
+    n = int(packed_text_indexes.shape[0])
+    if (
+        packed_memory_token_indexes is None
+        or int(packed_memory_token_indexes.numel()) == 0
+    ):
+        return packed_text_indexes.new_zeros((n,), dtype=torch.bool)
+    return torch.isin(
+        packed_text_indexes,
+        packed_memory_token_indexes.to(
+            device=packed_text_indexes.device, dtype=packed_text_indexes.dtype
+        ),
+    )
+
+
+def project_und_queries(
+    q_proj,
+    hidden: torch.Tensor,
+    packed_text_indexes: Optional[torch.Tensor],
+    packed_memory_token_indexes: Optional[torch.Tensor],
+) -> torch.Tensor:
+    forward_rows = getattr(q_proj, "forward_rows", None)
+    if not callable(forward_rows):
+        return q_proj(hidden)
+    return forward_rows(
+        hidden,
+        row_mask=und_memory_row_mask(
+            packed_text_indexes, packed_memory_token_indexes
+        ),
+    )
+
+
 def _sdpa_varlen_inference(
     *,
     query: torch.Tensor,
@@ -840,8 +877,11 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
             packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
-            packed_query_states[packed_text_indexes] = self.q_proj(
-                packed_text_query_sequence
+            packed_query_states[packed_text_indexes] = project_und_queries(
+                self.q_proj,
+                packed_text_query_sequence,
+                packed_text_indexes,
+                packed_memory_token_indexes,
             )
             packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(
                 packed_vae_query_sequence

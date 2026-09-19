@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -102,15 +102,39 @@ class LoopLoRALinear(nn.Module):
     def set_loop_enabled(self, enabled: bool) -> None:
         self.set_loop_mode("write" if enabled else "off")
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        output = self.base_layer(inputs)
-        if self.loop_mode == "off" or (
-            self.loop_mode == "read" and not self.read_enabled
-        ):
-            return output
+    def adapter_residual(self, inputs: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=inputs.device.type, enabled=False):
-            residual = self.lora_B(self.lora_A(self.dropout(inputs.float())))
-        return output + residual.to(output.dtype) * self.scaling
+            return self.lora_B(self.lora_A(self.dropout(inputs.float())))
+
+    def forward_rows(
+        self,
+        inputs: torch.Tensor,
+        row_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        output = self.base_layer(inputs)
+        if self.loop_mode == "off":
+            return output
+        if self.loop_mode == "read" and (not self.read_enabled or row_mask is None):
+            return output
+        if self.loop_mode not in ("read", "write"):
+            raise ValueError("loop mode must be 'off', 'read', or 'write'")
+        if row_mask is None:
+            residual = self.adapter_residual(inputs)
+            return output + residual.to(output.dtype) * self.scaling
+        selected = row_mask.to(device=inputs.device, dtype=torch.bool)
+        if selected.shape[0] != inputs.shape[0]:
+            raise ValueError(
+                "row_mask length must match the packed input: "
+                f"{int(selected.shape[0])} != {int(inputs.shape[0])}"
+            )
+        result = output.clone()
+        if bool(selected.any()):
+            residual = self.adapter_residual(inputs[selected])
+            result[selected] = result[selected] + residual.to(result.dtype) * self.scaling
+        return result
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.forward_rows(inputs, row_mask=None)
 
 
 def _actual_layer(layer: nn.Module) -> nn.Module:
@@ -161,8 +185,6 @@ def inject_loop_lora(
                     rank=int(rank),
                     alpha=int(alpha),
                     dropout=float(dropout),
-                    # The read round learns only the UND route. Generation
-                    # projections become active once memory is allowed to write.
                     read_enabled=projection in UND_Q_PROJECTIONS,
                 ),
             )

@@ -88,10 +88,78 @@ def test_generation_lora_is_off_in_read_mode_and_on_in_write_mode():
         layer.lora_A.weight.fill_(1.0)
         layer.lora_B.weight.fill_(1.0)
     inputs = torch.tensor([[1.0, 2.0]])
+    base = layer.base_layer(inputs)
     layer.set_loop_mode("read")
-    assert torch.equal(layer(inputs), torch.tensor([[2.0, 4.0]]))
+    q_read = layer(inputs)
     layer.set_loop_mode("write")
-    assert torch.equal(layer(inputs), torch.tensor([[5.0, 7.0]]))
+    q_write = layer(inputs)
+    assert torch.equal(q_read, base)
+    assert not torch.equal(q_write, base)
+    assert torch.equal(q_read, torch.tensor([[2.0, 4.0]]))
+    assert torch.equal(q_write, torch.tensor([[5.0, 7.0]]))
+
+
+def test_und_q_lora_read_changes_memory_rows_only():
+    layer = LoopLoRALinear(_linear(2.0), rank=1, alpha=1, read_enabled=True)
+    with torch.no_grad():
+        layer.lora_A.weight.fill_(1.0)
+        layer.lora_B.weight.fill_(1.0)
+    inputs = torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]])
+    base = layer.base_layer(inputs)
+    mask = torch.tensor([False, True, False])
+    layer.set_loop_mode("read")
+    read = layer.forward_rows(inputs, row_mask=mask)
+    assert torch.allclose(read[0], base[0])
+    assert torch.allclose(read[2], base[2])
+    assert not torch.allclose(read[1], base[1])
+    unmasked = layer.forward_rows(inputs, row_mask=None)
+    assert torch.equal(unmasked, base)
+
+
+def test_und_memory_row_mask_selects_memory_indexes_in_und_pack():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import und_memory_row_mask
+
+    und = torch.tensor([10, 11, 12, 13])
+    mem = torch.tensor([11, 12])
+    mask = und_memory_row_mask(und, mem)
+    assert mask.tolist() == [False, True, True, False]
+    empty = und_memory_row_mask(und, torch.tensor([], dtype=torch.long))
+    assert empty.tolist() == [False, False, False, False]
+
+
+def test_project_und_queries_scopes_adapter_to_memory_rows():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import project_und_queries
+
+    layer = LoopLoRALinear(_linear(2.0), rank=1, alpha=1, read_enabled=True)
+    with torch.no_grad():
+        layer.lora_A.weight.fill_(1.0)
+        layer.lora_B.weight.fill_(1.0)
+    hidden = torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]])
+    text = torch.tensor([0, 1, 2])
+    mem = torch.tensor([1])
+    base = layer.base_layer(hidden)
+    layer.set_loop_mode("read")
+    out = project_und_queries(layer, hidden, text, mem)
+    assert torch.allclose(out[0], base[0])
+    assert torch.allclose(out[2], base[2])
+    assert not torch.allclose(out[1], base[1])
+    layer.set_loop_mode("off")
+    assert torch.equal(project_und_queries(layer, hidden, text, mem), base)
+
+
+def test_und_q_lora_write_is_also_memory_rows_only():
+    layer = LoopLoRALinear(_linear(2.0), rank=1, alpha=1, read_enabled=True)
+    with torch.no_grad():
+        layer.lora_A.weight.fill_(1.0)
+        layer.lora_B.weight.fill_(1.0)
+    inputs = torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]])
+    base = layer.base_layer(inputs)
+    mask = torch.tensor([False, True, False])
+    layer.set_loop_mode("write")
+    written = layer.forward_rows(inputs, row_mask=mask)
+    assert torch.allclose(written[0], base[0])
+    assert torch.allclose(written[2], base[2])
+    assert not torch.allclose(written[1], base[1])
 
 
 class _Attention(nn.Module):
