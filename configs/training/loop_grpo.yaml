@@ -19,7 +19,7 @@ memory_loop_end_layer: 24
 loop_depth: 2
 num_loop_tokens: 8
 loop_memory_persist: false
-round0_gen_reads_memory: false
+round0_memory_write_enabled: false
 lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.0

@@ -121,8 +121,11 @@ def load_native_bagel(args):
             "memory_loop_end_layer": int(
                 getattr(args, "memory_loop_end_layer", 24)
             ),
-            "round0_gen_reads_memory": bool(
-                getattr(args, "round0_gen_reads_memory", False)
+            "round0_memory_write_enabled": getattr(
+                args, "round0_memory_write_enabled", None
+            ),
+            "round0_gen_reads_memory": getattr(
+                args, "round0_gen_reads_memory", None
             ),
         }
     ).load()

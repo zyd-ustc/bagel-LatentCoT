@@ -2,7 +2,10 @@
 
 BAGEL-7B-MoT 上的 **步内 understanding–generation hidden loop**。
 
-主方案不是外循环编辑 agent，也不是 FlowEdit。每个去噪步里固定跑 \(R\) 轮：\(K\) 个 memory token 走 understanding expert，和当前 VAE/gen token 做原生 joint attention，只用最后一轮速度推进 \(x_t\)。
+主方案不是外循环编辑 agent，也不是 FlowEdit。每个去噪步里固定跑
+`1 read + (loop_depth - 1) write`：\(K\) 个 memory token 走 understanding
+expert，和当前 VAE/gen token 做原生 joint attention，只用最后一轮速度推进
+\(x_t\)。当前方法称为 **Read–Write Loop with implicit context rerouting**。
 
 设计文档：[docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx](docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx)
 
@@ -39,6 +42,7 @@ BagelConfig(
     loop_memory_persist=False,
     memory_loop_start_layer=16,
     memory_loop_end_layer=24,
+    round0_memory_write_enabled=False,  # strict read round
 )
 # BagelBackbone.load() 会用原生 SOI/EOI embedding 确定性初始化 m0。
 ```
@@ -46,6 +50,10 @@ BagelConfig(
 `return_loop_diagnostics=False` 是正式推理/训练默认值，此时严格只跑
 `prefix ×1 + body ×R + suffix ×1`；机制探针显式设为 `True` 才计算逐轮
 `ΔM / ΔG / Δv`。
+
+旧配置 `round0_gen_reads_memory` 仍可读取，但已由语义准确的
+`round0_memory_write_enabled` 取代。实验 metadata 同时记录
+`num_read_rounds` / `num_write_rounds`，例如 `loop_depth=2` 表示 `1R + 1W`。
 
 ## 安装
 

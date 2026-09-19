@@ -21,14 +21,14 @@ from bagel_loop_zeroshot import (  # noqa: E402
 
 def test_arm_table_matches_read_route_write_protocol():
     expected = {
-        "Z0": dict(K=0, R=1, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
-        "Z1": dict(K=8, R=2, recycle_mode="same_depth", persist=True, start_layer=20, end_layer=28, remove_old_prompt=False, round0_gen_reads_memory=True),
-        "Z2": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=20, end_layer=28, remove_old_prompt=True, round0_gen_reads_memory=True),
-        "Z3": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=20, end_layer=28, remove_old_prompt=True, round0_gen_reads_memory=False),
-        "Z4": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
-        "Z5": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=12, end_layer=20, remove_old_prompt=True, round0_gen_reads_memory=False),
-        "Z6": dict(K=8, R=2, recycle_mode="same_depth", persist=True, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
-        "C0": dict(K=8, R=2, recycle_mode="full_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
+        "Z0": dict(K=0, R=1, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_memory_write_enabled=False),
+        "Z1": dict(K=8, R=2, recycle_mode="same_depth", persist=True, start_layer=20, end_layer=28, remove_old_prompt=False, round0_memory_write_enabled=True),
+        "Z2": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=20, end_layer=28, remove_old_prompt=True, round0_memory_write_enabled=True),
+        "Z3": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=20, end_layer=28, remove_old_prompt=True, round0_memory_write_enabled=False),
+        "Z4": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_memory_write_enabled=False),
+        "Z5": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=12, end_layer=20, remove_old_prompt=True, round0_memory_write_enabled=False),
+        "Z6": dict(K=8, R=2, recycle_mode="same_depth", persist=True, start_layer=16, end_layer=24, remove_old_prompt=True, round0_memory_write_enabled=False),
+        "C0": dict(K=8, R=2, recycle_mode="full_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_memory_write_enabled=False),
     }
     by_id = {arm["id"]: arm for arm in ARMS}
     assert list(by_id) == list(expected)
@@ -68,13 +68,17 @@ def test_apply_loop_config_writes_bagelconfig_fields():
     assert model.config.loop_memory_persist is False
     assert model.config.memory_loop_start_layer == 16
     assert model.config.memory_loop_end_layer == 24
-    assert model.config.round0_gen_reads_memory is False
+    assert model.config.round0_memory_write_enabled is False
+    assert model.config.num_read_rounds == 1
+    assert model.config.num_write_rounds == 1
     apply_loop_config(model, select_arms("Z0")[0])
     assert model.config.num_loop_tokens == 0
     assert model.config.loop_depth == 1
     apply_loop_config(model, select_arms("Z1")[0])
     assert model.config.loop_memory_persist is True
-    assert model.config.round0_gen_reads_memory is True
+    assert model.config.round0_memory_write_enabled is True
+    assert model.config.num_read_rounds == 0
+    assert model.config.num_write_rounds == 2
     apply_loop_config(model, select_arms("C0")[0])
     assert model.config.loop_recycle_mode == "full_depth"
 

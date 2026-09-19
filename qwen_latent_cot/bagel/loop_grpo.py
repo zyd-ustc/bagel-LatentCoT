@@ -144,6 +144,9 @@ def _flow_kwargs(
     )
     loop_idx = replay_context.get("packed_loop_token_indexes")
     if loop_idx is not None and int(getattr(loop_idx, "numel", lambda: 0)()) > 0:
+        round0_write = replay_context.get("round0_memory_write_enabled")
+        if round0_write is None:
+            round0_write = replay_context.get("round0_gen_reads_memory", False)
         kwargs.update(
             packed_loop_token_indexes=loop_idx,
             loop_memory=replay_context.get("embed_memory"),
@@ -152,9 +155,7 @@ def _flow_kwargs(
             memory_loop_repeat=int(replay_context.get("memory_loop_repeat", 2)),
             memory_loop_start=replay_context.get("memory_loop_start"),
             memory_loop_end=replay_context.get("memory_loop_end"),
-            round0_gen_reads_memory=bool(
-                replay_context.get("round0_gen_reads_memory", False)
-            ),
+            round0_memory_write_enabled=bool(round0_write),
         )
         if transition is not None:
             kwargs.update(

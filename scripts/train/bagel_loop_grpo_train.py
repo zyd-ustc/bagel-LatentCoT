@@ -35,6 +35,13 @@ from qwen_latent_cot.bagel.loop_grpo import clone_loop_adapter_state, replay_gro
 LOGGER = logging.getLogger("bagel.loop_grpo.train")
 
 
+def _round0_memory_write_enabled(config: Mapping[str, Any]) -> bool:
+    value = config.get("round0_memory_write_enabled")
+    if value is None:
+        value = config.get("round0_gen_reads_memory", False)
+    return bool(value)
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/training/loop_grpo.yaml")
@@ -198,6 +205,8 @@ def _save_adapter(model, output_dir: Path, step: int, config: Mapping[str, Any])
     stem = f"loop_grpo_adapter_step_{step:07d}"
     state = loop_adapter_state_dict(model)
     save_file(state, str(output_dir / f"{stem}.safetensors"))
+    loop_depth = int(config.get("loop_depth", 2))
+    round0_write = _round0_memory_write_enabled(config)
     metadata = {
         "schema": "bagel_semantic_state_grpo_adapter_v7",
         "objective": "quality_constrained_grpo",
@@ -205,12 +214,12 @@ def _save_adapter(model, output_dir: Path, step: int, config: Mapping[str, Any])
         "base_adapter": str(config["adapter_path"]),
         "memory_loop_start_layer": int(config.get("memory_loop_start_layer", 16)),
         "memory_loop_end_layer": int(config.get("memory_loop_end_layer", 24)),
-        "loop_depth": int(config.get("loop_depth", 2)),
+        "loop_depth": loop_depth,
+        "num_read_rounds": 0 if round0_write else 1,
+        "num_write_rounds": loop_depth if round0_write else loop_depth - 1,
         "num_loop_tokens": int(config.get("num_loop_tokens", 8)),
         "loop_memory_persist": bool(config.get("loop_memory_persist", False)),
-        "round0_gen_reads_memory": bool(
-            config.get("round0_gen_reads_memory", False)
-        ),
+        "round0_memory_write_enabled": round0_write,
         "lora_rank": int(config["lora_rank"]),
         "lora_alpha": int(config["lora_alpha"]),
         "k_v_lora": bool(config.get("k_v_lora", False)),
@@ -326,9 +335,7 @@ def main() -> None:
             "loop_memory_persist": bool(config.get("loop_memory_persist", False)),
             "memory_loop_start_layer": int(config.get("memory_loop_start_layer", 16)),
             "memory_loop_end_layer": int(config.get("memory_loop_end_layer", 24)),
-            "round0_gen_reads_memory": bool(
-                config.get("round0_gen_reads_memory", False)
-            ),
+            "round0_memory_write_enabled": _round0_memory_write_enabled(config),
         }
     ).load()
     model = backbone.bagel

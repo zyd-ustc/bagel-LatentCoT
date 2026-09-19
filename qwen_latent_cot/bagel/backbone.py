@@ -179,9 +179,10 @@ class BagelBackbone:
             loop_memory_persist=bool(self.cfg.get("loop_memory_persist", False)),
             memory_loop_start_layer=int(self.cfg.get("memory_loop_start_layer", 16)),
             memory_loop_end_layer=int(self.cfg.get("memory_loop_end_layer", 24)),
-            round0_gen_reads_memory=bool(
-                self.cfg.get("round0_gen_reads_memory", False)
+            round0_memory_write_enabled=self.cfg.get(
+                "round0_memory_write_enabled"
             ),
+            round0_gen_reads_memory=self.cfg.get("round0_gen_reads_memory"),
         )
 
         llm = Qwen2ForCausalLM(llm_config)

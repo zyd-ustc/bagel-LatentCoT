@@ -1,4 +1,4 @@
-# BAGEL LatentCoT：Read–Route–Write Loop 研究方案
+# BAGEL LatentCoT：Read–Write Loop with Implicit Context Rerouting
 
 > **版本**：v2 · 2026-09-19  
 > **定位**：BAGEL-7B-MoT 上的轻量后训练与推理期 recurrent reasoning 方案  
@@ -52,7 +52,9 @@ x_t \rightarrow Q_{gen}(x_t) \rightarrow K/V(C_{native}).
 
 > **让 understanding path 读取当前 generation trajectory，形成紧凑的 latent semantic state，并动态改变 generation path 如何使用它本来就熟悉的原生 source/text context。**
 
-这条主线称为 **Read–Route–Write Loop**。
+这条主线称为 **Read–Write Loop with implicit context rerouting**。当前版本
+没有显式 attention routing operator；memory 改变 GEN hidden 后，下一层
+GEN query 对 native context 的注意力随之变化。
 
 ---
 
@@ -455,9 +457,13 @@ memory_loop_repeat: 2
 num_loop_tokens: 8
 loop_memory_persist: false    # zero-shot first
 remove_old_prompt: true
-round0_gen_reads_memory: false
+round0_memory_write_enabled: false
 cfg_branch_memory: independent
 ```
+
+`memory_loop_repeat=2` 应报告为 `1R + 1W`。一般地 strict read 配置记录
+`num_read_rounds=1`、`num_write_rounds=memory_loop_repeat-1`；旧字段
+`round0_gen_reads_memory` 仅作为配置兼容别名。
 
 训练进入 Phase 1 后：
 

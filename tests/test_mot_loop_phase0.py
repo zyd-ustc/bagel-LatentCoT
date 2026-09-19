@@ -322,7 +322,27 @@ def test_bagel_config_defaults_match_plan():
     assert cfg.loop_memory_persist is False
     assert cfg.memory_loop_start_layer == 16
     assert cfg.memory_loop_end_layer == 24
+    assert cfg.round0_memory_write_enabled is False
     assert cfg.round0_gen_reads_memory is False
+    assert cfg.num_read_rounds == 1
+    assert cfg.num_write_rounds == 1
+
+
+def test_round0_write_name_prefers_new_field_and_accepts_legacy_alias():
+    from qwen_latent_cot.bagel.modeling.bagel.bagel import BagelConfig
+
+    legacy = BagelConfig(loop_depth=3, round0_gen_reads_memory=True)
+    assert legacy.round0_memory_write_enabled is True
+    assert legacy.num_read_rounds == 0
+    assert legacy.num_write_rounds == 3
+    canonical = BagelConfig(
+        loop_depth=3,
+        round0_memory_write_enabled=False,
+        round0_gen_reads_memory=True,
+    )
+    assert canonical.round0_memory_write_enabled is False
+    assert canonical.num_read_rounds == 1
+    assert canonical.num_write_rounds == 2
 
 
 def test_bagel_config_exposes_phase0_fields():
@@ -1197,7 +1217,7 @@ def test_full_depth_control_still_runs():
     velocity_calls = []
 
     def forward(kwargs):
-        velocity_calls.append(kwargs.get("round0_gen_reads_memory"))
+        velocity_calls.append(kwargs.get("round0_memory_write_enabled"))
         memory = torch.ones(2, 4)
         return kwargs["x_t"], memory, memory, memory, dict(_DIAG)
 

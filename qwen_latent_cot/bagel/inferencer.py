@@ -545,8 +545,14 @@ class InterleaveInferencer:
                 "memory_loop_end": int(
                     getattr(self.model.config, "memory_loop_end_layer", 24)
                 ),
-                "round0_gen_reads_memory": bool(
-                    getattr(self.model.config, "round0_gen_reads_memory", False)
+                "round0_memory_write_enabled": bool(
+                    getattr(
+                        self.model.config,
+                        "round0_memory_write_enabled",
+                        getattr(
+                            self.model.config, "round0_gen_reads_memory", False
+                        ),
+                    )
                 ),
                 "embed_memory": getattr(self.model, "loop_memory", None),
             }

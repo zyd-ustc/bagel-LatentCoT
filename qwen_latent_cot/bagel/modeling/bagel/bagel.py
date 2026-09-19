@@ -50,6 +50,30 @@ from ...flow_grpo import sde_step_with_logprob
 from tqdm import tqdm
 
 
+def resolve_round0_memory_write_enabled(
+    *,
+    round0_memory_write_enabled=None,
+    round0_gen_reads_memory=None,
+    default: bool = False,
+) -> bool:
+    if round0_memory_write_enabled is not None:
+        return bool(round0_memory_write_enabled)
+    if round0_gen_reads_memory is not None:
+        return bool(round0_gen_reads_memory)
+    return bool(default)
+
+
+def loop_round_counts(
+    loop_depth: int, round0_memory_write_enabled: bool
+) -> Tuple[int, int]:
+    depth = int(loop_depth)
+    if depth < 1:
+        raise ValueError("loop_depth must be >= 1")
+    if bool(round0_memory_write_enabled):
+        return 0, depth
+    return 1, depth - 1
+
+
 class BagelConfig(PretrainedConfig):
     def __init__(
         self,
@@ -71,7 +95,8 @@ class BagelConfig(PretrainedConfig):
         loop_memory_persist=False,
         memory_loop_start_layer=16,
         memory_loop_end_layer=24,
-        round0_gen_reads_memory=False,
+        round0_memory_write_enabled=None,
+        round0_gen_reads_memory=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -93,7 +118,18 @@ class BagelConfig(PretrainedConfig):
         self.loop_memory_persist = bool(loop_memory_persist)
         self.memory_loop_start_layer = int(memory_loop_start_layer)
         self.memory_loop_end_layer = int(memory_loop_end_layer)
-        self.round0_gen_reads_memory = bool(round0_gen_reads_memory)
+        write_enabled = resolve_round0_memory_write_enabled(
+            round0_memory_write_enabled=round0_memory_write_enabled,
+            round0_gen_reads_memory=round0_gen_reads_memory,
+            default=False,
+        )
+        self.round0_memory_write_enabled = write_enabled
+        self.round0_gen_reads_memory = write_enabled
+        read_rounds, write_rounds = loop_round_counts(
+            self.loop_depth, write_enabled
+        )
+        self.num_read_rounds = read_rounds
+        self.num_write_rounds = write_rounds
 
 
 class Bagel(PreTrainedModel):
@@ -164,9 +200,18 @@ class Bagel(PreTrainedModel):
             getattr(config, "memory_loop_start_layer", 16)
         )
         self.memory_loop_end_layer = int(getattr(config, "memory_loop_end_layer", 24))
-        self.round0_gen_reads_memory = bool(
-            getattr(config, "round0_gen_reads_memory", False)
+        write_enabled = resolve_round0_memory_write_enabled(
+            round0_memory_write_enabled=getattr(
+                config, "round0_memory_write_enabled", None
+            ),
+            round0_gen_reads_memory=getattr(config, "round0_gen_reads_memory", None),
+            default=False,
         )
+        self.round0_memory_write_enabled = write_enabled
+        self.round0_gen_reads_memory = write_enabled
+        read_rounds, write_rounds = loop_round_counts(loop_depth, write_enabled)
+        self.num_read_rounds = read_rounds
+        self.num_write_rounds = write_rounds
         if num_loop_tokens > 0:
             self.loop_memory = nn.Parameter(
                 torch.zeros(num_loop_tokens, self.hidden_size)
@@ -1364,6 +1409,7 @@ class Bagel(PreTrainedModel):
         loop_memory_persist: Optional[bool] = None,
         memory_loop_start: Optional[int] = None,
         memory_loop_end: Optional[int] = None,
+        round0_memory_write_enabled: Optional[bool] = None,
         round0_gen_reads_memory: Optional[bool] = None,
         return_loop_diagnostics: bool = False,
         enable_taylorseer=False,
@@ -1433,11 +1479,18 @@ class Bagel(PreTrainedModel):
             if loop_memory_persist is not None
             else bool(getattr(self.config, "loop_memory_persist", False))
         )
-        round0_write = (
-            bool(round0_gen_reads_memory)
-            if round0_gen_reads_memory is not None
-            else bool(getattr(self.config, "round0_gen_reads_memory", False))
+        round0_write = resolve_round0_memory_write_enabled(
+            round0_memory_write_enabled=round0_memory_write_enabled,
+            round0_gen_reads_memory=round0_gen_reads_memory,
+            default=bool(
+                getattr(
+                    self.config,
+                    "round0_memory_write_enabled",
+                    getattr(self.config, "round0_gen_reads_memory", False),
+                )
+            ),
         )
+        read_rounds, write_rounds = loop_round_counts(inner_depth, round0_write)
         body_start = (
             memory_loop_start
             if memory_loop_start is not None
@@ -1568,7 +1621,7 @@ class Bagel(PreTrainedModel):
                             if recycle_mode == "same_depth"
                             else None,
                             embed_memory=embed_memory,
-                            round0_gen_reads_memory=(
+                            round0_memory_write_enabled=(
                                 True
                                 if recycle_mode == "full_depth" and inner_r > 0
                                 else round0_write
@@ -1604,6 +1657,9 @@ class Bagel(PreTrainedModel):
                                 "step": int(i),
                                 "t": float(t),
                                 "r": int(inner_r),
+                                "num_read_rounds": int(read_rounds),
+                                "num_write_rounds": int(write_rounds),
+                                "round0_memory_write_enabled": bool(round0_write),
                                 "recycle_mode": recycle_mode,
                                 "persist": persist_memory,
                                 "memory_cosine_to_prev": cosine,
@@ -1979,7 +2035,8 @@ class Bagel(PreTrainedModel):
         memory_body_in_text: Optional[torch.Tensor] = None,
         memory_body_in_img: Optional[torch.Tensor] = None,
         embed_memory: Optional[torch.Tensor] = None,
-        round0_gen_reads_memory: bool = False,
+        round0_memory_write_enabled: Optional[bool] = None,
+        round0_gen_reads_memory: Optional[bool] = None,
         collect_round_diagnostics: bool = False,
     ):
         """Memory-loop velocity. Not @torch.no_grad.
@@ -2019,7 +2076,15 @@ class Bagel(PreTrainedModel):
                 "packed_text_indexes": und_indexes,
             }
         same_depth = str(recycle_mode) == "same_depth"
-        block_gen = not bool(round0_gen_reads_memory)
+        round0_write = resolve_round0_memory_write_enabled(
+            round0_memory_write_enabled=round0_memory_write_enabled,
+            round0_gen_reads_memory=round0_gen_reads_memory,
+            default=False,
+        )
+        block_gen = not bool(round0_write)
+        read_rounds, write_rounds = loop_round_counts(
+            int(memory_loop_repeat), round0_write
+        )
         if same_depth:
             extra_inputs.update(
                 packed_memory_token_indexes=packed_loop_token_indexes,
@@ -2173,6 +2238,9 @@ class Bagel(PreTrainedModel):
             "delta_m": delta_m,
             "delta_g": delta_g,
             "delta_v": delta_v,
+            "num_read_rounds": int(read_rounds),
+            "num_write_rounds": int(write_rounds),
+            "round0_memory_write_enabled": bool(round0_write),
             **stats,
         }
         return v_t, m_full, m_text, m_img, diagnostics

@@ -52,7 +52,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 16,
         "end_layer": 24,
         "remove_old_prompt": True,
-        "round0_gen_reads_memory": False,
+        "round0_memory_write_enabled": False,
     },
     {
         "id": "Z1",
@@ -65,7 +65,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 20,
         "end_layer": 28,
         "remove_old_prompt": False,
-        "round0_gen_reads_memory": True,
+        "round0_memory_write_enabled": True,
     },
     {
         "id": "Z2",
@@ -78,7 +78,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 20,
         "end_layer": 28,
         "remove_old_prompt": True,
-        "round0_gen_reads_memory": True,
+        "round0_memory_write_enabled": True,
     },
     {
         "id": "Z3",
@@ -91,7 +91,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 20,
         "end_layer": 28,
         "remove_old_prompt": True,
-        "round0_gen_reads_memory": False,
+        "round0_memory_write_enabled": False,
     },
     {
         "id": "Z4",
@@ -104,7 +104,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 16,
         "end_layer": 24,
         "remove_old_prompt": True,
-        "round0_gen_reads_memory": False,
+        "round0_memory_write_enabled": False,
     },
     {
         "id": "Z5",
@@ -117,7 +117,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 12,
         "end_layer": 20,
         "remove_old_prompt": True,
-        "round0_gen_reads_memory": False,
+        "round0_memory_write_enabled": False,
     },
     {
         "id": "Z6",
@@ -130,7 +130,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 16,
         "end_layer": 24,
         "remove_old_prompt": True,
-        "round0_gen_reads_memory": False,
+        "round0_memory_write_enabled": False,
     },
     {
         "id": "C0",
@@ -143,7 +143,7 @@ ARMS: List[Dict[str, Any]] = [
         "start_layer": 16,
         "end_layer": 24,
         "remove_old_prompt": True,
-        "round0_gen_reads_memory": False,
+        "round0_memory_write_enabled": False,
     },
 ]
 
@@ -231,7 +231,7 @@ def apply_loop_config(model, arm: Dict[str, Any]) -> None:
     persist = bool(arm["persist"])
     start = int(arm["start_layer"])
     end = int(arm["end_layer"])
-    round0_write = bool(arm["round0_gen_reads_memory"])
+    round0_write = bool(arm["round0_memory_write_enabled"])
     if k < 0:
         raise ValueError("K must be >= 0")
     if r < 1:
@@ -251,14 +251,22 @@ def apply_loop_config(model, arm: Dict[str, Any]) -> None:
     model.config.loop_memory_persist = persist
     model.config.memory_loop_start_layer = start
     model.config.memory_loop_end_layer = end
+    model.config.round0_memory_write_enabled = round0_write
+    # Keep the deprecated alias synchronized for checkpoints/config readers that
+    # have not migrated yet. New call sites use the canonical name above.
     model.config.round0_gen_reads_memory = round0_write
+    model.config.num_read_rounds = 0 if round0_write else 1
+    model.config.num_write_rounds = r if round0_write else r - 1
     model.num_loop_tokens = k
     model.loop_depth = r
     model.loop_recycle_mode = mode
     model.loop_memory_persist = persist
     model.memory_loop_start_layer = start
     model.memory_loop_end_layer = end
+    model.round0_memory_write_enabled = round0_write
     model.round0_gen_reads_memory = round0_write
+    model.num_read_rounds = 0 if round0_write else 1
+    model.num_write_rounds = r if round0_write else r - 1
 
 
 def official_edit(
@@ -495,7 +503,7 @@ def run_prompt(
             f"{arm['recycle_mode']} persist={arm['persist']} "
             f"layers=[{arm['start_layer']},{arm['end_layer']}) "
             f"old_prompt={not arm['remove_old_prompt']} "
-            f"round0_write={arm['round0_gen_reads_memory']}",
+            f"round0_write={arm['round0_memory_write_enabled']}",
             flush=True,
         )
         image = official_edit(
@@ -526,7 +534,15 @@ def run_prompt(
                 "start_layer": arm["start_layer"],
                 "end_layer": arm["end_layer"],
                 "remove_old_prompt": arm["remove_old_prompt"],
-                "round0_gen_reads_memory": arm["round0_gen_reads_memory"],
+                "round0_memory_write_enabled": arm[
+                    "round0_memory_write_enabled"
+                ],
+                "num_read_rounds": 0
+                if arm["round0_memory_write_enabled"]
+                else 1,
+                "num_write_rounds": arm["R"]
+                if arm["round0_memory_write_enabled"]
+                else arm["R"] - 1,
                 "image": image_path.name,
                 "diagnostics": diag,
             }

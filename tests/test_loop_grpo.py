@@ -5,6 +5,7 @@ from torch import nn
 
 from qwen_latent_cot.bagel.flow_grpo import sde_step_with_logprob
 from qwen_latent_cot.bagel.loop_grpo import (
+    _flow_kwargs,
     clone_loop_adapter_state,
     replay_group,
     replay_transition,
@@ -147,6 +148,19 @@ def test_replay_uses_memory_loop_when_packed_loop_indexes_are_set():
     )
     assert "loop" in policy.calls
     assert "vanilla" not in policy.calls
+
+
+def test_replay_prefers_canonical_round0_write_flag_and_accepts_legacy():
+    context = _context()
+    context["packed_loop_token_indexes"] = torch.tensor([1], dtype=torch.long)
+    context["embed_memory"] = torch.zeros(1, 1)
+    context["round0_gen_reads_memory"] = True
+    legacy = _flow_kwargs(context, torch.tensor([0.9]))
+    assert legacy["round0_memory_write_enabled"] is True
+
+    context["round0_memory_write_enabled"] = False
+    canonical = _flow_kwargs(context, torch.tensor([0.9]))
+    assert canonical["round0_memory_write_enabled"] is False
 
 
 def test_exact_replay_starts_at_ratio_one_and_reaches_adapter_gradient():
