@@ -1,8 +1,8 @@
 # One-update smoke configuration. Raise max_steps only after all gates pass.
 model_path: /private/yida_workspace/models/BAGEL-7B-MoT
-adapter_path: /private/yida_workspace/outputs/bagel_semantic_state_flow_k16/semantic_state_flow_step_0000100.safetensors
+adapter_path: /private/yida_workspace/outputs/bagel_read_route_write_k8/loop_step_0000100.safetensors
 data_path: /private/yida_workspace/bagel-LatentCoT/experiments/data/geneval2_hard_rl_train.jsonl
-output_dir: /private/yida_workspace/outputs/bagel_loop_grpo_semantic_k16_smoke
+output_dir: /private/yida_workspace/outputs/bagel_loop_grpo_k8_smoke
 
 seed: 42
 image_height: 512
@@ -13,24 +13,23 @@ timestep_shift: 3.0
 cfg_text_scale: 4.0
 cfg_interval: [0.4, 1.0]
 
-loop_start_layer: 10
-loop_end_layer: 18
-loop_state_timestep_threshold: 0.75
-loop_state_scale: 0.20
-loop_draft_state_scale: 0.20
-loop_state_mode: semantic_token
-loop_state_tokens: 16
+loop_recycle_mode: same_depth
+memory_loop_start_layer: 16
+memory_loop_end_layer: 24
+loop_depth: 2
+num_loop_tokens: 8
+loop_memory_persist: false
+round0_gen_reads_memory: false
 lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.0
-include_text_kv_lora: true
+gen_attention_o_lora: false
+k_v_lora: false
 
-# One high-noise stochastic transition is enough for the first memory-safe gate.
 sde_step_indices: [8]
 sde_noise_level: 0.8
 group_size: 4
 
-# This endpoint must implement GenEval2 per-atom Soft-TIFA, not GenEval-v1 boxes.
 geneval_url: http://127.0.0.1:18086
 geneval_timeout_seconds: 120
 semantic_reward_type: geneval2_soft_tifa_log_gm
@@ -39,8 +38,6 @@ diffusion_rm_repo: /private/yida_workspace/diffusion-rm
 flux_rm_config: /private/yida_workspace/diffusion-rm/config/flux/thurstone-19layer-hpdv3.yaml
 flux_rm_checkpoint: /private/yida_workspace/outputs/dina_flux_rm/DiNa-FLUX-HPDv3-19layers_2026.09.12_08.55/checkpoints/epoch_001
 flux_rm_noise_level: 0.05
-# Optional stability ensemble. Keep one value for the cheapest smoke gate.
-# flux_rm_noise_levels: [0.05, 0.10]
 flux_rm_noise_seed: 17
 
 quality_tolerance: 0.0

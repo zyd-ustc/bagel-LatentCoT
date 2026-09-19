@@ -107,19 +107,22 @@ def load_native_bagel(args):
             "disable_gen_expert": False,
             "disable_visual_gen": False,
             "num_image_tokens": patches * patches,
-            "num_loop_tokens": int(getattr(args, "num_loop_tokens", 0) or 0),
-            "loop_depth": int(getattr(args, "loop_depth", 1) or 1),
+            "num_loop_tokens": int(getattr(args, "num_loop_tokens", 8) or 0),
+            "loop_depth": int(getattr(args, "loop_depth", 2) or 1),
             "loop_recycle_mode": str(
                 getattr(args, "loop_recycle_mode", "same_depth")
             ),
             "loop_memory_persist": bool(
-                getattr(args, "loop_memory_persist", True)
+                getattr(args, "loop_memory_persist", False)
             ),
             "memory_loop_start_layer": int(
-                getattr(args, "memory_loop_start_layer", 20)
+                getattr(args, "memory_loop_start_layer", 16)
             ),
             "memory_loop_end_layer": int(
-                getattr(args, "memory_loop_end_layer", 28)
+                getattr(args, "memory_loop_end_layer", 24)
+            ),
+            "round0_gen_reads_memory": bool(
+                getattr(args, "round0_gen_reads_memory", False)
             ),
         }
     ).load()
@@ -163,9 +166,6 @@ def predict_velocity(
     bundle,
     args,
     *,
-    loop_state_in=None,
-    loop_state_scale=None,
-    return_loop_state=False,
     cfg=None,
     within_step_loop=None,
 ):
@@ -186,9 +186,6 @@ def predict_velocity(
         x_t=x_t,
         timestep=float(timestep),
         condition=bundle,
-        loop_state_in=loop_state_in,
-        loop_state_scale=loop_state_scale,
-        return_loop_state=return_loop_state,
         **cfg_kwargs,
     )
 

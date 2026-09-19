@@ -5,7 +5,6 @@ from importlib import import_module
 
 _LAZY_EXPORTS = {
     "BagelBackbone": (".backbone", "BagelBackbone"),
-    "BagelLoopFlowModule": (".loop", "BagelLoopFlowModule"),
     "LoopLoRALinear": (".loop", "LoopLoRALinear"),
     "LoopFlowDataset": (".loop_data", "LoopFlowDataset"),
     "LoopFlowCollator": (".loop_data", "LoopFlowCollator"),

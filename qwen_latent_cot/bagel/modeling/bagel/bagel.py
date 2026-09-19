@@ -42,7 +42,7 @@ except ImportError:
             get_flattened_position_ids_extrapolate = None
             get_flattened_position_ids_interpolate = None
             patchify = None
-from .qwen2_navit import NaiveCache, bounded_residual_merge
+from .qwen2_navit import NaiveCache
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from ..cache_utils.taylorseer import cache_init
 from ...flow_grpo import sde_step_with_logprob
@@ -64,13 +64,14 @@ class BagelConfig(PretrainedConfig):
         connector_act="gelu_pytorch_tanh",
         interpolate_pos=False,
         timestep_shift=1.0,
-        num_loop_tokens=0,
-        loop_depth=1,
+        num_loop_tokens=8,
+        loop_depth=2,
         loop_uncond_memory="m0",
         loop_recycle_mode="same_depth",
-        loop_memory_persist=True,
-        memory_loop_start_layer=20,
-        memory_loop_end_layer=28,
+        loop_memory_persist=False,
+        memory_loop_start_layer=16,
+        memory_loop_end_layer=24,
+        round0_gen_reads_memory=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -92,6 +93,7 @@ class BagelConfig(PretrainedConfig):
         self.loop_memory_persist = bool(loop_memory_persist)
         self.memory_loop_start_layer = int(memory_loop_start_layer)
         self.memory_loop_end_layer = int(memory_loop_end_layer)
+        self.round0_gen_reads_memory = bool(round0_gen_reads_memory)
 
 
 class Bagel(PreTrainedModel):
@@ -139,8 +141,8 @@ class Bagel(PreTrainedModel):
             self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
 
         self.config = config
-        num_loop_tokens = int(getattr(config, "num_loop_tokens", 0) or 0)
-        loop_depth = int(getattr(config, "loop_depth", 1) or 1)
+        num_loop_tokens = int(getattr(config, "num_loop_tokens", 8) or 0)
+        loop_depth = int(getattr(config, "loop_depth", 2) or 1)
         if num_loop_tokens < 0:
             raise ValueError("num_loop_tokens must be >= 0")
         if loop_depth < 1:
@@ -155,11 +157,16 @@ class Bagel(PreTrainedModel):
         )
         if self.loop_recycle_mode not in ("same_depth", "full_depth"):
             raise ValueError("loop_recycle_mode must be 'same_depth' or 'full_depth'")
-        self.loop_memory_persist = bool(getattr(config, "loop_memory_persist", True))
-        self.memory_loop_start_layer = int(
-            getattr(config, "memory_loop_start_layer", 20)
+        self.loop_memory_persist = bool(
+            getattr(config, "loop_memory_persist", False)
         )
-        self.memory_loop_end_layer = int(getattr(config, "memory_loop_end_layer", 28))
+        self.memory_loop_start_layer = int(
+            getattr(config, "memory_loop_start_layer", 16)
+        )
+        self.memory_loop_end_layer = int(getattr(config, "memory_loop_end_layer", 24))
+        self.round0_gen_reads_memory = bool(
+            getattr(config, "round0_gen_reads_memory", False)
+        )
         if num_loop_tokens > 0:
             self.loop_memory = nn.Parameter(
                 torch.zeros(num_loop_tokens, self.hidden_size)
@@ -249,6 +256,13 @@ class Bagel(PreTrainedModel):
             "effective_rank": effective_rank,
             "sigma1_ratio": float(energy[0] / total),
         }
+
+    @staticmethod
+    def relative_l2(current: torch.Tensor, reference: torch.Tensor) -> float:
+        ref = torch.linalg.vector_norm(reference.detach().float()).clamp_min(1e-12)
+        return float(
+            torch.linalg.vector_norm((current - reference).detach().float()) / ref
+        )
 
     def forward(
         self,
@@ -1099,7 +1113,6 @@ class Bagel(PreTrainedModel):
         curr_rope,
         image_sizes,
         new_token_ids,
-        semantic_text_ids=None,
         num_loop_tokens=None,
     ):
         packed_text_ids, packed_text_indexes = list(), list()
@@ -1111,10 +1124,7 @@ class Bagel(PreTrainedModel):
         packed_position_ids, packed_seqlens, packed_indexes = list(), list(), list()
         packed_vae_seqlens = list()
         packed_key_value_indexes = list()
-        packed_boundary_token_indexes, packed_loop_semantic_token_indexes = (
-            list(),
-            list(),
-        )
+        packed_boundary_token_indexes = list()
         packed_loop_token_indexes: list = []
         if num_loop_tokens is None:
             num_loop_tokens = int(getattr(self.config, "num_loop_tokens", 0) or 0)
@@ -1122,37 +1132,13 @@ class Bagel(PreTrainedModel):
         if num_loop_tokens < 0:
             raise ValueError("num_loop_tokens must be >= 0")
 
-        if semantic_text_ids is None:
-            semantic_text_ids = [()] * len(image_sizes)
-        if len(semantic_text_ids) != len(image_sizes):
-            raise ValueError(
-                "semantic_text_ids must contain one token-id sequence per image"
-            )
-
         query_curr = curr = 0
-        for (H, W), curr_kvlen, curr_position_id, semantic_ids in zip(
-            image_sizes, curr_kvlens, curr_rope, semantic_text_ids
+        for (H, W), curr_kvlen, curr_position_id in zip(
+            image_sizes, curr_kvlens, curr_rope
         ):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
-
-            semantic_ids = [int(token_id) for token_id in semantic_ids]
-            semantic_count = len(semantic_ids)
-            if semantic_count:
-                packed_text_ids.extend(semantic_ids)
-                packed_text_indexes.extend(
-                    range(query_curr, query_curr + semantic_count)
-                )
-                packed_loop_semantic_token_indexes.extend(
-                    range(query_curr, query_curr + semantic_count)
-                )
-                packed_indexes.extend(range(curr, curr + semantic_count))
-                packed_position_ids.extend(
-                    range(curr_position_id, curr_position_id + semantic_count)
-                )
-                curr += semantic_count
-                query_curr += semantic_count
-            image_position_id = curr_position_id + semantic_count
+            image_position_id = curr_position_id
 
             packed_text_ids.append(new_token_ids["start_of_image"])
             packed_text_indexes.append(query_curr)
@@ -1202,9 +1188,7 @@ class Bagel(PreTrainedModel):
             packed_position_ids.extend(
                 [image_position_id] * (num_image_tokens + 2 + num_loop_tokens)
             )
-            packed_seqlens.append(
-                semantic_count + num_image_tokens + 2 + num_loop_tokens
-            )
+            packed_seqlens.append(num_image_tokens + 2 + num_loop_tokens)
 
         generation_input = {
             "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
@@ -1217,9 +1201,6 @@ class Bagel(PreTrainedModel):
             "packed_vae_seqlens": torch.tensor(packed_vae_seqlens, dtype=torch.int),
             "packed_boundary_token_indexes": torch.tensor(
                 packed_boundary_token_indexes, dtype=torch.long
-            ),
-            "packed_loop_semantic_token_indexes": torch.tensor(
-                packed_loop_semantic_token_indexes, dtype=torch.long
             ),
             "packed_loop_token_indexes": torch.tensor(
                 packed_loop_token_indexes, dtype=torch.long
@@ -1240,7 +1221,6 @@ class Bagel(PreTrainedModel):
         curr_kvlens,
         curr_rope,
         image_sizes,
-        semantic_token_counts=None,
         num_loop_tokens=None,
     ):
         packed_position_ids, packed_indexes, packed_key_value_indexes = (
@@ -1249,52 +1229,34 @@ class Bagel(PreTrainedModel):
             list(),
         )
 
-        if semantic_token_counts is None:
-            semantic_token_counts = [0] * len(image_sizes)
-        if len(semantic_token_counts) != len(image_sizes):
-            raise ValueError("semantic_token_counts must contain one count per image")
         if num_loop_tokens is None:
             num_loop_tokens = int(getattr(self.config, "num_loop_tokens", 0) or 0)
         num_loop_tokens = int(num_loop_tokens)
         if num_loop_tokens < 0:
             raise ValueError("num_loop_tokens must be >= 0")
 
-        query_curr = curr = 0
-        for (H, W), curr_kvlen, curr_position_id, semantic_count in zip(
-            image_sizes, curr_kvlens, curr_rope, semantic_token_counts
+        curr = 0
+        for (H, W), curr_kvlen, curr_position_id in zip(
+            image_sizes, curr_kvlens, curr_rope
         ):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
-
-            semantic_count = int(semantic_count)
-            if semantic_count < 0:
-                raise ValueError("semantic token count must be non-negative")
-            packed_indexes.extend(range(curr, curr + semantic_count))
-            packed_position_ids.extend(
-                range(curr_position_id, curr_position_id + semantic_count)
-            )
-            curr += semantic_count
-            query_curr += semantic_count
-            image_position_id = curr_position_id + semantic_count
+            image_position_id = curr_position_id
 
             packed_indexes.append(curr)
             curr += 1
-            query_curr += 1
 
             if num_loop_tokens:
                 packed_indexes.extend(range(curr, curr + num_loop_tokens))
                 curr += num_loop_tokens
-                query_curr += num_loop_tokens
 
             h, w = H // self.latent_downsample, W // self.latent_downsample
             num_image_tokens = h * w
             packed_indexes.extend(range(curr, curr + num_image_tokens))
             curr += num_image_tokens
-            query_curr += num_image_tokens
 
             packed_indexes.append(curr)
             curr += 1
-            query_curr += 1
 
             packed_position_ids.extend(
                 [image_position_id] * (num_image_tokens + 2 + num_loop_tokens)
@@ -1343,49 +1305,6 @@ class Bagel(PreTrainedModel):
 
         return x_t - velocity.to(x_t.device) * dt
 
-    def fuse_loop_draft_state(
-        self,
-        loop_state: torch.Tensor,
-        x0_hat: torch.Tensor,
-        packed_vae_seqlens: torch.IntTensor,
-        *,
-        state_tokens_per_sample: int,
-        residual_scale: float,
-    ) -> torch.Tensor:
-        """Fuse a clean draft into K UND-state rows using native ``vae2llm``.
-
-        Adaptive pooling is parameter-free.  The only learned mapping is
-        BAGEL's pretrained VAE-to-LLM bridge, so this does not add a projector
-        or latent representation.
-        """
-
-        k = int(state_tokens_per_sample)
-        if k < 1:
-            raise ValueError("state_tokens_per_sample must be >= 1")
-        lengths = [int(value) for value in packed_vae_seqlens.tolist()]
-        if sum(lengths) != int(x0_hat.shape[0]):
-            raise ValueError("packed_vae_seqlens do not cover x0_hat")
-        if int(loop_state.shape[0]) != len(lengths) * k:
-            raise ValueError(
-                "loop state rows must equal batch_size * state_tokens_per_sample"
-            )
-        projected = self.vae2llm(x0_hat.to(self.vae2llm.weight.dtype))
-        pooled = []
-        for chunk in projected.split(lengths, dim=0):
-            pooled.append(
-                F.adaptive_avg_pool1d(chunk.transpose(0, 1).unsqueeze(0), output_size=k)
-                .squeeze(0)
-                .transpose(0, 1)
-            )
-        draft_state = torch.cat(pooled, dim=0).to(
-            device=loop_state.device, dtype=loop_state.dtype
-        )
-        return bounded_residual_merge(
-            loop_state,
-            draft_state,
-            residual_scale=float(residual_scale),
-        )
-
     def predict_image_velocity(self, **kwargs) -> torch.Tensor:
         """Public pause/resume boundary around BAGEL's unchanged flow forward."""
 
@@ -1401,7 +1320,6 @@ class Bagel(PreTrainedModel):
         packed_vae_token_indexes: torch.LongTensor,
         packed_vae_seqlens: torch.IntTensor,
         packed_boundary_token_indexes: torch.LongTensor,
-        packed_loop_semantic_token_indexes: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
         packed_position_ids: torch.LongTensor,
         packed_indexes: torch.LongTensor,
@@ -1428,13 +1346,6 @@ class Bagel(PreTrainedModel):
         cfg_img_key_values_lens: Optional[torch.IntTensor] = None,
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
-        loop_start_layer: Optional[int] = None,
-        loop_end_layer: Optional[int] = None,
-        loop_state_scale: Optional[float] = None,
-        loop_state_mode: str = "semantic_token",
-        loop_draft_state_scale: float = 0.2,
-        loop_state_timestep_threshold: Optional[float] = None,
-        loop_residual_alpha: float = 1.0,
         sde_step_indices: Optional[Tuple[int, ...]] = None,
         sde_noise_level: float = 0.0,
         sde_seed: int = 0,
@@ -1446,12 +1357,8 @@ class Bagel(PreTrainedModel):
         loop_memory_persist: Optional[bool] = None,
         memory_loop_start: Optional[int] = None,
         memory_loop_end: Optional[int] = None,
+        round0_gen_reads_memory: Optional[bool] = None,
         return_loop_diagnostics: bool = False,
-        within_step_loop_start: Optional[int] = None,
-        within_step_loop_end: Optional[int] = None,
-        within_step_loop_repeat: int = 1,
-        within_step_loop_damping: float = 1.0,
-        # cache_args
         enable_taylorseer=False,
     ):
         if enable_taylorseer:
@@ -1484,28 +1391,6 @@ class Bagel(PreTrainedModel):
                 f"got {invalid_sde_steps}"
             )
         trajectory = []
-        loop_state = None
-        loop_enabled = loop_state_scale is not None
-        if loop_enabled and int(packed_loop_semantic_token_indexes.numel()) == 0:
-            raise ValueError(
-                "loop_state_scale requires semantic state slots; prepare the "
-                "generation layout with loop_state_tokens >= 1"
-            )
-        if float(loop_draft_state_scale) < 0.0:
-            raise ValueError("loop_draft_state_scale must be non-negative")
-        state_tokens_per_sample = (
-            int(packed_loop_semantic_token_indexes.numel())
-            // int(packed_vae_seqlens.numel())
-            if loop_enabled
-            else 0
-        )
-        if loop_enabled and (
-            state_tokens_per_sample * int(packed_vae_seqlens.numel())
-            != int(packed_loop_semantic_token_indexes.numel())
-        ):
-            raise ValueError(
-                "each packed sample must use the same semantic state width"
-            )
         if packed_loop_token_indexes is None:
             packed_loop_token_indexes = packed_text_ids.new_empty(
                 (0,), dtype=torch.long
@@ -1514,7 +1399,7 @@ class Bagel(PreTrainedModel):
         inner_depth = int(
             loop_depth
             if loop_depth is not None
-            else getattr(self.config, "loop_depth", 1) or 1
+            else getattr(self.config, "loop_depth", 2) or 1
         )
         if inner_depth < 1:
             raise ValueError("loop_depth must be >= 1")
@@ -1524,10 +1409,6 @@ class Bagel(PreTrainedModel):
         )
         if uncond_mode not in ("m0", "zero"):
             raise ValueError("loop_uncond_memory must be 'm0' or 'zero'")
-        if memory_loop_enabled and loop_enabled:
-            raise ValueError(
-                "MoT hidden memory loop cannot combine with loop_state_scale"
-            )
         if memory_loop_enabled and enable_taylorseer:
             raise ValueError("TaylorSeer is disabled for the MoT hidden memory loop")
         if memory_loop_enabled and self.loop_memory is None:
@@ -1543,17 +1424,22 @@ class Bagel(PreTrainedModel):
         persist_memory = (
             bool(loop_memory_persist)
             if loop_memory_persist is not None
-            else bool(getattr(self.config, "loop_memory_persist", True))
+            else bool(getattr(self.config, "loop_memory_persist", False))
+        )
+        round0_write = (
+            bool(round0_gen_reads_memory)
+            if round0_gen_reads_memory is not None
+            else bool(getattr(self.config, "round0_gen_reads_memory", False))
         )
         body_start = (
             memory_loop_start
             if memory_loop_start is not None
-            else int(getattr(self.config, "memory_loop_start_layer", 20))
+            else int(getattr(self.config, "memory_loop_start_layer", 16))
         )
         body_end = (
             memory_loop_end
             if memory_loop_end is not None
-            else int(getattr(self.config, "memory_loop_end_layer", 28))
+            else int(getattr(self.config, "memory_loop_end_layer", 24))
         )
         embed_memory = None
         memory_full = None
@@ -1573,22 +1459,22 @@ class Bagel(PreTrainedModel):
 
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-            state_active = loop_enabled and (
-                loop_state_timestep_threshold is None
-                or float(t) >= float(loop_state_timestep_threshold)
-            )
             if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
                 cfg_img_scale_ = cfg_img_scale
             else:
                 cfg_text_scale_ = 1.0
                 cfg_img_scale_ = 1.0
-            loop_state_in = loop_state if state_active else None
             if memory_loop_enabled:
                 m_in = None if memory_full is None else memory_full.detach().clone()
+                m_in_text = (
+                    None if memory_text is None else memory_text.detach().clone()
+                )
+                m_in_img = None if memory_img is None else memory_img.detach().clone()
                 rounds = 1 if recycle_mode == "same_depth" else inner_depth
                 prev_memory = None
                 v_t = None
+                step_velocities = []
                 for inner_r in range(rounds):
                     v_t, memory_full, memory_text, memory_img, diag = (
                         self._forward_flow_loop(
@@ -1665,6 +1551,11 @@ class Bagel(PreTrainedModel):
                             if recycle_mode == "same_depth"
                             else None,
                             embed_memory=embed_memory,
+                            round0_gen_reads_memory=(
+                                True
+                                if recycle_mode == "full_depth" and inner_r > 0
+                                else round0_write
+                            ),
                         )
                     )
                     if prev_memory is None:
@@ -1678,6 +1569,12 @@ class Bagel(PreTrainedModel):
                             )
                         )
                     prev_memory = memory_full.detach()
+                    step_velocities.append(v_t.detach())
+                    if recycle_mode == "full_depth" and len(step_velocities) > 1:
+                        diag = dict(diag)
+                        diag["delta_v"] = [
+                            self.relative_l2(step_velocities[-1], step_velocities[0])
+                        ]
                     self.last_loop_diagnostics.append(
                         {
                             "step": int(i),
@@ -1689,7 +1586,6 @@ class Bagel(PreTrainedModel):
                             **diag,
                         }
                     )
-                loop_state = None
                 m_out = (
                     None if memory_full is None else memory_full.detach().clone()
                 )
@@ -1699,6 +1595,8 @@ class Bagel(PreTrainedModel):
                     memory_img = None
             else:
                 m_in = None
+                m_in_text = None
+                m_in_img = None
                 m_out = None
                 result = self.predict_image_velocity(
                     x_t=x_t,
@@ -1730,22 +1628,7 @@ class Bagel(PreTrainedModel):
                     cfg_img_past_key_values=cfg_img_past_key_values,
                     cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
                     cfg_type=cfg_type,
-                    loop_start_layer=loop_start_layer,
-                    loop_end_layer=loop_end_layer,
-                    loop_state_in=loop_state_in,
-                    loop_state_scale=(loop_state_scale if state_active else None),
-                    loop_state_mode=loop_state_mode,
-                    loop_residual_alpha=loop_residual_alpha,
-                    within_step_loop_start=within_step_loop_start,
-                    within_step_loop_end=within_step_loop_end,
-                    within_step_loop_repeat=within_step_loop_repeat,
-                    within_step_loop_damping=within_step_loop_damping,
                     packed_boundary_token_indexes=packed_boundary_token_indexes,
-                    packed_loop_semantic_token_indexes=(
-                        packed_loop_semantic_token_indexes
-                    ),
-                    return_loop_state=state_active,
-                    # cache
                     model_pred_cache_dic=model_pred_cache_dic,
                     model_pred_current=model_pred_current,
                     model_pred_text_cache_dic=model_pred_text_cache_dic,
@@ -1754,18 +1637,7 @@ class Bagel(PreTrainedModel):
                     model_pred_img_current=model_pred_img_current,
                 )
             if not memory_loop_enabled:
-                if state_active and isinstance(result, tuple):
-                    v_t, loop_state = result
-                    x0_hat = x_t - t.to(dtype=x_t.dtype) * v_t.to(dtype=x_t.dtype)
-                    loop_state = self.fuse_loop_draft_state(
-                        loop_state,
-                        x0_hat.detach(),
-                        packed_vae_seqlens,
-                        state_tokens_per_sample=state_tokens_per_sample,
-                        residual_scale=float(loop_draft_state_scale),
-                    )
-                else:
-                    v_t, loop_state = result, None
+                v_t = result
 
             if i in selected_sde_steps:
                 next_t = timesteps[i + 1] if i + 1 < len(timesteps) else t.new_zeros(())
@@ -1800,12 +1672,13 @@ class Bagel(PreTrainedModel):
                             else t.new_tensor(0.999)
                         ),
                         "noise_level": float(sde_noise_level),
-                        "loop_state_in": (
-                            None
-                            if loop_state_in is None
-                            else loop_state_in.detach().clone()
-                        ),
                         "m_in": None if m_in is None else m_in.detach().clone(),
+                        "m_in_text": (
+                            None if m_in_text is None else m_in_text.detach().clone()
+                        ),
+                        "m_in_img": (
+                            None if m_in_img is None else m_in_img.detach().clone()
+                        ),
                         "m_out": None if m_out is None else m_out.detach().clone(),
                     }
                 )
@@ -1840,7 +1713,6 @@ class Bagel(PreTrainedModel):
         past_key_values: NaiveCache,
         packed_key_value_indexes: torch.LongTensor,
         packed_boundary_token_indexes: Optional[torch.LongTensor] = None,
-        packed_loop_semantic_token_indexes: Optional[torch.LongTensor] = None,
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
         # cfg_text
@@ -1858,16 +1730,6 @@ class Bagel(PreTrainedModel):
         cfg_img_past_key_values: Optional[NaiveCache] = None,
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
-        # cross-timestep recurrent loop state
-        loop_start_layer: Optional[int] = None,
-        loop_end_layer: Optional[int] = None,
-        loop_state_in: Optional[torch.Tensor] = None,
-        loop_state_scale: Optional[float] = None,
-        loop_external_state: Optional[torch.Tensor] = None,
-        loop_external_state_scale: Optional[float] = None,
-        loop_residual_alpha: float = 1.0,
-        loop_state_mode: str = "semantic_token",
-        return_loop_state: bool = False,
         within_step_loop_start: Optional[int] = None,
         within_step_loop_end: Optional[int] = None,
         within_step_loop_repeat: int = 1,
@@ -1905,12 +1767,13 @@ class Bagel(PreTrainedModel):
                 "packed_text_indexes": packed_text_indexes,
             }
 
-        extra_inputs.update(
-            within_step_loop_start=within_step_loop_start,
-            within_step_loop_end=within_step_loop_end,
-            within_step_loop_repeat=int(within_step_loop_repeat),
-            within_step_loop_damping=float(within_step_loop_damping),
-        )
+        if int(within_step_loop_repeat) > 1:
+            extra_inputs.update(
+                within_step_loop_start=within_step_loop_start,
+                within_step_loop_end=within_step_loop_end,
+                within_step_loop_repeat=int(within_step_loop_repeat),
+                within_step_loop_damping=float(within_step_loop_damping),
+            )
 
         if getattr(self.language_model.model, "enable_taylorseer", False):
             self.language_model.model.cache_dic = model_pred_cache_dic
@@ -1926,29 +1789,13 @@ class Bagel(PreTrainedModel):
             packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=False,
             is_causal=False,
-            loop_start_layer=loop_start_layer,
-            loop_end_layer=loop_end_layer,
-            loop_state_in=loop_state_in,
-            loop_state_scale=loop_state_scale,
-            loop_external_state=loop_external_state,
-            loop_external_state_scale=loop_external_state_scale,
-            loop_residual_alpha=loop_residual_alpha,
             packed_boundary_token_indexes=packed_boundary_token_indexes,
-            packed_loop_semantic_token_indexes=(packed_loop_semantic_token_indexes),
-            loop_state_mode=loop_state_mode,
-            return_loop_state=return_loop_state,
             **extra_inputs,
         )
         v_t = self.llm2vae(output.packed_query_sequence)
         v_t = v_t[packed_vae_token_indexes]
-        loop_state_out = output.loop_state_out
 
         if cfg_text_scale > 1.0:
-            # External UND state is deliberately absent from CFG controls.
-            # It is a positive semantic condition whose effect should remain
-            # in (and be amplified from) the conditional velocity only. The
-            # self-recurrent state likewise lives only in the conditional
-            # branch: CFG controls define the native guidance axis.
             if getattr(self.language_model.model, "enable_taylorseer", False):
                 self.language_model.model.cache_dic = model_pred_text_cache_dic
                 self.language_model.model.current = model_pred_text_current
@@ -2024,13 +1871,6 @@ class Bagel(PreTrainedModel):
             # No CFG
             pass
 
-        if return_loop_state:
-            if loop_state_out is None:
-                raise RuntimeError(
-                    "loop state was requested but the language model did not "
-                    "return a body-exit state"
-                )
-            return v_t, loop_state_out
         return v_t
 
     def _combine_cfg_velocities(
@@ -2115,6 +1955,7 @@ class Bagel(PreTrainedModel):
         memory_body_in_text: Optional[torch.Tensor] = None,
         memory_body_in_img: Optional[torch.Tensor] = None,
         embed_memory: Optional[torch.Tensor] = None,
+        round0_gen_reads_memory: bool = False,
     ):
         """Memory-loop velocity. Not @torch.no_grad.
 
@@ -2153,12 +1994,19 @@ class Bagel(PreTrainedModel):
                 "packed_text_indexes": und_indexes,
             }
         same_depth = str(recycle_mode) == "same_depth"
+        block_gen = not bool(round0_gen_reads_memory)
         if same_depth:
             extra_inputs.update(
                 packed_memory_token_indexes=packed_loop_token_indexes,
                 memory_loop_repeat=int(memory_loop_repeat),
                 memory_loop_start=memory_loop_start,
                 memory_loop_end=memory_loop_end,
+                block_gen_reads_memory=block_gen,
+            )
+        else:
+            extra_inputs.update(
+                packed_memory_token_indexes=packed_loop_token_indexes,
+                block_gen_reads_memory=block_gen,
             )
 
         def run_branch(sequence, kv, pos_ids, query_indexes, kv_lens, kv_indexes, body_in):
@@ -2186,9 +2034,9 @@ class Bagel(PreTrainedModel):
             else:
                 memory_next = output.packed_query_sequence[packed_loop_token_indexes]
             vae_out = output.packed_query_sequence[packed_vae_token_indexes]
-            return velocity, memory_next, vae_out
+            return velocity, memory_next, vae_out, output
 
-        v_t, m_full, vae_out = run_branch(
+        v_t, m_full, vae_out, cond_out = run_branch(
             packed_sequence,
             past_key_values,
             packed_position_ids,
@@ -2209,7 +2057,7 @@ class Bagel(PreTrainedModel):
             seq_text[packed_loop_token_indexes] = text_embed.to(
                 dtype=packed_sequence.dtype, device=packed_sequence.device
             )
-            cfg_text_v_t, m_text, _ = run_branch(
+            cfg_text_v_t, m_text, _, text_out = run_branch(
                 seq_text,
                 cfg_text_past_key_values,
                 cfg_text_packed_position_ids,
@@ -2218,13 +2066,15 @@ class Bagel(PreTrainedModel):
                 cfg_text_packed_key_value_indexes,
                 memory_body_in_text,
             )
+        else:
+            text_out = None
         if cfg_img_scale > 1.0:
             seq_img = packed_sequence.clone()
             img_embed = loop_memory_img if loop_memory_img is not None else embed_m
             seq_img[packed_loop_token_indexes] = img_embed.to(
                 dtype=packed_sequence.dtype, device=packed_sequence.device
             )
-            cfg_img_v_t, m_img, _ = run_branch(
+            cfg_img_v_t, m_img, _, img_out = run_branch(
                 seq_img,
                 cfg_img_past_key_values,
                 cfg_img_packed_position_ids,
@@ -2233,6 +2083,8 @@ class Bagel(PreTrainedModel):
                 cfg_img_packed_key_value_indexes,
                 memory_body_in_img,
             )
+        else:
+            img_out = None
         v_t = self._combine_cfg_velocities(
             v_t,
             cfg_text_v_t,
@@ -2243,6 +2095,42 @@ class Bagel(PreTrainedModel):
             cfg_renorm_type=cfg_renorm_type,
         )
         stats = self.memory_slot_stats(m_full)
+        delta_m: List[float] = []
+        delta_g: List[float] = []
+        delta_v: List[float] = []
+        mem_rounds = getattr(cond_out, "memory_round_hiddens", None) or ()
+        gen_rounds = getattr(cond_out, "gen_round_hiddens", None) or ()
+        for prev, nxt in zip(mem_rounds, mem_rounds[1:]):
+            delta_m.append(self.relative_l2(nxt, prev))
+        for prev, nxt in zip(gen_rounds, gen_rounds[1:]):
+            delta_g.append(self.relative_l2(nxt, prev))
+
+        def _suffix_velocities(output) -> List[torch.Tensor]:
+            hidden_rounds = getattr(output, "gen_suffix_round_hiddens", None) or ()
+            return [self.llm2vae(hidden) for hidden in hidden_rounds]
+
+        cond_vs = _suffix_velocities(cond_out)
+        text_vs = _suffix_velocities(text_out) if text_out is not None else []
+        img_vs = _suffix_velocities(img_out) if img_out is not None else []
+        combined = []
+        for index, cond_v in enumerate(cond_vs):
+            text_v = text_vs[index] if index < len(text_vs) else None
+            img_v = img_vs[index] if index < len(img_vs) else None
+            combined.append(
+                self._combine_cfg_velocities(
+                    cond_v,
+                    text_v,
+                    img_v,
+                    cfg_text_scale=cfg_text_scale,
+                    cfg_img_scale=cfg_img_scale,
+                    cfg_renorm_min=cfg_renorm_min,
+                    cfg_renorm_type=cfg_renorm_type,
+                )
+            )
+        if combined:
+            v1 = combined[0]
+            for nxt in combined[1:]:
+                delta_v.append(self.relative_l2(nxt, v1))
         diagnostics = {
             "memory_rms": float(
                 torch.linalg.vector_norm(m_full.float())
@@ -2253,6 +2141,9 @@ class Bagel(PreTrainedModel):
                 / max(vae_out.numel() ** 0.5, 1.0)
             ),
             "velocity_norm": float(torch.linalg.vector_norm(v_t.float())),
+            "delta_m": delta_m,
+            "delta_g": delta_g,
+            "delta_v": delta_v,
             **stats,
         }
         return v_t, m_full, m_text, m_img, diagnostics

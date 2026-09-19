@@ -52,64 +52,39 @@ if _enable_dynamo_flex_attention():
     flex_attention = torch.compile(flex_attention)
 
 
-def bounded_residual_merge(
-    base_hidden: torch.Tensor,
-    reviewed_hidden: torch.Tensor,
-    *,
-    residual_scale: float,
-    alpha: float = 1.0,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """Merge a loop update without moving BAGEL far from its native state.
+def round0_blocked_slices(
+    query_lens: torch.Tensor,
+    key_value_lens: torch.Tensor,
+    packed_vae_token_indexes: Optional[torch.Tensor],
+    packed_memory_token_indexes: Optional[torch.Tensor],
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Per-sample (GEN query local, memory key local) index pairs to block.
 
-    The cap is computed independently for every token over the hidden width.
-    ``alpha=0`` is deliberately an exact identity operation, which lets the
-    sampler bypass the loop at low-noise timesteps without changing BAGEL's
-    original depth-1 trajectory.
+    Memory keys sit in the query half of the merged KV slice, after the past
+    prefix of length ``K - Q``.
     """
 
-    if float(residual_scale) < 0:
-        raise ValueError("residual_scale must be non-negative")
-    if float(alpha) == 0.0 or float(residual_scale) == 0.0:
-        return base_hidden
-    if base_hidden.shape != reviewed_hidden.shape:
-        raise ValueError(
-            "base_hidden and reviewed_hidden must have identical shapes, got "
-            f"{tuple(base_hidden.shape)} and {tuple(reviewed_hidden.shape)}"
-        )
-
-    delta = reviewed_hidden - base_hidden
-    base_rms = base_hidden.float().square().mean(dim=-1, keepdim=True).sqrt()
-    delta_rms = delta.float().square().mean(dim=-1, keepdim=True).sqrt()
-    cap = (float(residual_scale) * base_rms / (delta_rms + float(eps))).clamp(max=1.0)
-    weight = (cap * float(alpha)).to(dtype=delta.dtype)
-    return base_hidden + delta * weight
-
-
-def _resolve_loop_state_positions(
-    *,
-    packed_query_sequence: torch.Tensor,
-    packed_loop_semantic_token_indexes: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Resolve BAGEL's native pre-image semantic slots as recurrent state."""
-
-    if (
-        packed_loop_semantic_token_indexes is None
-        or int(packed_loop_semantic_token_indexes.numel()) == 0
-    ):
-        raise ValueError(
-            "cross-step loop state requires non-empty semantic token indexes; "
-            "set loop_state_tokens >= 1 when preparing the VAE latent"
-        )
-    indexes = packed_loop_semantic_token_indexes
-    indexes = indexes.to(device=packed_query_sequence.device, dtype=torch.long)
-    if int(indexes.unique().numel()) != int(indexes.numel()):
-        raise ValueError("loop semantic token indexes must be unique")
-    if int(indexes.min()) < 0 or int(indexes.max()) >= int(
-        packed_query_sequence.shape[0]
-    ):
-        raise ValueError("loop state positions are outside the query sequence")
-    return indexes
+    if packed_vae_token_indexes is None or packed_memory_token_indexes is None:
+        return []
+    if int(packed_vae_token_indexes.numel()) == 0 or int(
+        packed_memory_token_indexes.numel()
+    ) == 0:
+        return []
+    query_lengths = [int(length) for length in query_lens.tolist()]
+    key_lengths = [int(length) for length in key_value_lens.tolist()]
+    vae = packed_vae_token_indexes.to(dtype=torch.long)
+    mem = packed_memory_token_indexes.to(dtype=torch.long)
+    slices: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    query_offset = 0
+    for query_length, key_length in zip(query_lengths, key_lengths):
+        past = key_length - query_length
+        gen_local = vae - query_offset
+        gen_in = gen_local[(gen_local >= 0) & (gen_local < query_length)]
+        mem_local = mem - query_offset
+        mem_in = mem_local[(mem_local >= 0) & (mem_local < query_length)]
+        slices.append((gen_in, past + mem_in))
+        query_offset += query_length
+    return slices
 
 
 def _sdpa_varlen_inference(
@@ -120,6 +95,7 @@ def _sdpa_varlen_inference(
     query_lens: torch.Tensor,
     key_value_lens: torch.Tensor,
     causal: bool,
+    blocked_slices: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> torch.Tensor:
     """Exact PyTorch fallback for FlashAttention's packed varlen contract.
 
@@ -150,6 +126,7 @@ def _sdpa_varlen_inference(
             f"query heads ({query_heads}) must be divisible by KV heads ({key_heads})"
         )
     groups = query_heads // key_heads
+    sample_index = 0
     for query_length, key_length in zip(query_lengths, key_lengths):
         if query_length <= 0 or key_length < query_length:
             raise ValueError(
@@ -174,6 +151,24 @@ def _sdpa_varlen_inference(
             )
             attention_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
             attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+        if blocked_slices is not None and sample_index < len(blocked_slices):
+            gen_local, mem_keys = blocked_slices[sample_index]
+            if int(gen_local.numel()) > 0 and int(mem_keys.numel()) > 0:
+                if attention_mask is None:
+                    attention_mask = torch.ones(
+                        1,
+                        1,
+                        query_length,
+                        key_length,
+                        device=query.device,
+                        dtype=torch.bool,
+                    )
+                else:
+                    attention_mask = attention_mask.clone()
+                gen_idx = gen_local.to(device=query.device)
+                mem_idx = mem_keys.to(device=query.device)
+                attention_mask[0, 0, gen_idx[:, None], mem_idx[None, :]] = False
+        sample_index += 1
         sample_output = scaled_dot_product_attention(
             sample_query.transpose(0, 1).unsqueeze(0),
             sample_key.transpose(0, 1).unsqueeze(0),
@@ -370,8 +365,10 @@ class NaiveCache:
 class BaseNavitOutputWithPast(ModelOutput):
     packed_query_sequence: torch.FloatTensor = None
     past_key_values: Optional[NaiveCache] = None
-    loop_state_out: Optional[torch.FloatTensor] = None
     memory_body_out: Optional[torch.FloatTensor] = None
+    memory_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
+    gen_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
+    gen_suffix_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
 
 
 def pad_sequence(tensor, pad_size):
@@ -804,8 +801,8 @@ class PackedAttentionMoT(Qwen2Attention):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        packed_loop_semantic_token_indexes=None,
-        loop_kv_prefix_hidden=None,
+        packed_memory_token_indexes=None,
+        block_gen_reads_memory=False,
     ):
         if mode == "und":
             packed_query_states = self.q_proj(packed_query_sequence).view(
@@ -860,34 +857,6 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(
                 packed_vae_query_sequence
             )
-
-            if loop_kv_prefix_hidden is not None:
-                state_indexes = packed_loop_semantic_token_indexes
-                if state_indexes is None or int(state_indexes.numel()) == 0:
-                    raise ValueError("KV-prefix state requires semantic token indexes")
-                state_indexes = state_indexes.to(
-                    device=packed_query_sequence.device, dtype=torch.long
-                )
-                prefix_hidden = loop_kv_prefix_hidden.to(
-                    device=packed_query_sequence.device,
-                    dtype=packed_query_sequence.dtype,
-                )
-                if prefix_hidden.ndim != 2 or int(prefix_hidden.shape[0]) != int(
-                    state_indexes.numel()
-                ):
-                    raise ValueError(
-                        "loop_kv_prefix_hidden must have one hidden row per "
-                        "semantic state token"
-                    )
-                if int(prefix_hidden.shape[-1]) != int(self.hidden_size):
-                    raise ValueError("KV-prefix hidden width does not match BAGEL")
-                # KV-channel ablation: the recurrent UND representation replaces
-                # only K/V at the native semantic-prefix positions. Queries and
-                # residual state slots stay on the ordinary UND update stream.
-                packed_key_states = packed_key_states.clone()
-                packed_value_states = packed_value_states.clone()
-                packed_key_states[state_indexes] = self.k_proj(prefix_hidden)
-                packed_value_states[state_indexes] = self.v_proj(prefix_hidden)
 
             packed_query_states = packed_query_states.view(
                 -1, self.num_heads, self.head_dim
@@ -963,7 +932,21 @@ class PackedAttentionMoT(Qwen2Attention):
             torch.cumsum(key_values_lens, dim=0), (1, 0)
         )
 
-        if flash_attn_varlen_func is None:
+        blocked_slices = None
+        if bool(block_gen_reads_memory) and mode == "gen":
+            blocked_slices = round0_blocked_slices(
+                query_lens,
+                key_values_lens,
+                packed_vae_token_indexes,
+                packed_memory_token_indexes,
+            )
+            if not any(
+                int(gen.numel()) > 0 and int(mem.numel()) > 0
+                for gen, mem in blocked_slices
+            ):
+                blocked_slices = None
+
+        if flash_attn_varlen_func is None or blocked_slices is not None:
             packed_attn_output = _sdpa_varlen_inference(
                 query=packed_query_states,
                 key=merged_key_states,
@@ -971,6 +954,7 @@ class PackedAttentionMoT(Qwen2Attention):
                 query_lens=query_lens,
                 key_value_lens=key_values_lens,
                 causal=bool(is_causal),
+                blocked_slices=blocked_slices,
             )
         else:
             packed_attn_output = flash_attn_varlen_func(
@@ -1190,8 +1174,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        packed_loop_semantic_token_indexes=None,
-        loop_kv_prefix_hidden=None,
+        packed_memory_token_indexes=None,
+        block_gen_reads_memory=False,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1218,12 +1202,6 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 )
                 packed_query_sequence = packed_query_sequence_
 
-            normalized_loop_kv_prefix = None
-            if loop_kv_prefix_hidden is not None:
-                if mode != "gen":
-                    raise ValueError("loop KV prefix is only valid in gen mode")
-                normalized_loop_kv_prefix = self.input_layernorm(loop_kv_prefix_hidden)
-
             # Self Attention
             packed_query_sequence, past_key_values = self.self_attn.forward_inference(
                 packed_query_sequence=packed_query_sequence,
@@ -1238,8 +1216,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 mode=mode,
                 packed_vae_token_indexes=packed_vae_token_indexes,
                 packed_text_indexes=packed_text_indexes,
-                packed_loop_semantic_token_indexes=(packed_loop_semantic_token_indexes),
-                loop_kv_prefix_hidden=normalized_loop_kv_prefix,
+                packed_memory_token_indexes=packed_memory_token_indexes,
+                block_gen_reads_memory=block_gen_reads_memory,
             )
             packed_query_sequence = residual + packed_query_sequence
 
@@ -1549,17 +1527,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        loop_start_layer: Optional[int] = None,
-        loop_end_layer: Optional[int] = None,
-        loop_state_in: Optional[torch.Tensor] = None,
-        loop_state_scale: Optional[float] = None,
-        loop_external_state: Optional[torch.Tensor] = None,
-        loop_external_state_scale: Optional[float] = None,
-        loop_residual_alpha: float = 1.0,
         packed_boundary_token_indexes: Optional[torch.Tensor] = None,
-        packed_loop_semantic_token_indexes: Optional[torch.Tensor] = None,
-        loop_state_mode: str = "semantic_token",
-        return_loop_state: bool = False,
         within_step_loop_start: Optional[int] = None,
         within_step_loop_end: Optional[int] = None,
         within_step_loop_repeat: int = 1,
@@ -1569,6 +1537,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         memory_loop_start: Optional[int] = None,
         memory_loop_end: Optional[int] = None,
         memory_body_in: Optional[torch.Tensor] = None,
+        block_gen_reads_memory: bool = True,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1601,8 +1570,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
             *,
             checkpoint=False,
             loop_adapter_enabled=False,
-            loop_kv_prefix_hidden=None,
-            packed_loop_semantic_token_indexes=None,
+            packed_memory_token_indexes=None,
+            block_gen_reads_memory=False,
         ):
             decoder_layer = self.layers[layer_idx]
             if enable_taylorseer:
@@ -1624,34 +1593,36 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 is_causal=is_causal,
                 **extra_inputs,
             )
-            if loop_kv_prefix_hidden is not None:
-                layer_kwargs.update(
-                    loop_kv_prefix_hidden=loop_kv_prefix_hidden,
-                    packed_loop_semantic_token_indexes=(
-                        packed_loop_semantic_token_indexes
-                    ),
-                )
+            if packed_memory_token_indexes is not None:
+                layer_kwargs["packed_memory_token_indexes"] = packed_memory_token_indexes
+                layer_kwargs["block_gen_reads_memory"] = bool(block_gen_reads_memory)
             use_checkpoint = (
                 bool(checkpoint)
                 and bool(getattr(self, "gradient_checkpointing", False))
                 and self.training
                 and torch.is_grad_enabled()
             )
+            def _enable_loop_adapters():
+                local_states = []
+                if loop_adapter_enabled:
+                    modules_fn = getattr(actual_layer, "modules", None)
+                    iterable = modules_fn() if callable(modules_fn) else ()
+                    for module in iterable:
+                        setter = getattr(module, "set_loop_enabled", None)
+                        if callable(setter):
+                            local_states.append(
+                                (
+                                    module,
+                                    bool(getattr(module, "loop_enabled", False)),
+                                )
+                            )
+                            setter(True)
+                return local_states
+
             if use_checkpoint:
 
                 def checkpointed_layer(layer_hidden):
-                    local_states = []
-                    if loop_adapter_enabled:
-                        for module in actual_layer.modules():
-                            setter = getattr(module, "set_loop_enabled", None)
-                            if callable(setter):
-                                local_states.append(
-                                    (
-                                        module,
-                                        bool(getattr(module, "loop_enabled", False)),
-                                    )
-                                )
-                                setter(True)
+                    local_states = _enable_loop_adapters()
                     try:
                         layer_output, _ = actual_layer.forward_inference(
                             packed_query_sequence=layer_hidden,
@@ -1669,10 +1640,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 )
                 cache = past_key_values
             else:
-                hidden, cache = actual_layer.forward_inference(
-                    packed_query_sequence=hidden,
-                    **layer_kwargs,
-                )
+                local_states = _enable_loop_adapters()
+                try:
+                    hidden, cache = actual_layer.forward_inference(
+                        packed_query_sequence=hidden,
+                        **layer_kwargs,
+                    )
+                finally:
+                    for module, was_enabled in local_states:
+                        module.set_loop_enabled(was_enabled)
             return hidden, cache
 
         def normalize(hidden):
@@ -1691,17 +1667,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 raise ValueError(f"unsupported MoT mode: {mode}")
             return self.norm(hidden)
 
-        # Bootstrap semantics: the first state-active step has no incoming
-        # state yet. A requested output state with a valid scale still takes
-        # the state path (body runs natively, adapters enabled, state
-        # extracted) so the recurrence can start mid-trajectory.
-        state_active = (
-            loop_state_in is not None
-            or loop_external_state is not None
-            or loop_state_scale is not None
-        )
-        loop_state_out = None
         memory_body_out = None
+        memory_round_hiddens = None
+        gen_round_hiddens = None
+        gen_suffix_round_hiddens = None
 
         loop_repeat = int(within_step_loop_repeat)
         mem_repeat = int(memory_loop_repeat)
@@ -1719,10 +1688,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     "memory body loop cannot mutate the prompt KV cache; "
                     "set update_past_key_values=False"
                 )
-            if state_active:
-                raise ValueError(
-                    "memory body loop cannot combine with loop_state_scale"
-                )
             s = int(memory_loop_start)
             e = int(memory_loop_end)
             if not 0 <= s < e <= len(self.layers):
@@ -1733,9 +1698,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
             indexes = mem_indexes.to(
                 device=packed_query_sequence.device, dtype=torch.long
             )
+            block_round0 = bool(block_gen_reads_memory)
             hidden = packed_query_sequence
             for layer_idx in range(0, s):
-                hidden, past_key_values = run_layer(layer_idx, hidden)
+                hidden, past_key_values = run_layer(
+                    layer_idx,
+                    hidden,
+                    packed_memory_token_indexes=indexes,
+                    block_gen_reads_memory=block_round0,
+                )
             h_base = hidden.clone()
             if memory_body_in is not None:
                 hidden = h_base.clone()
@@ -1745,19 +1716,64 @@ class Qwen2Model(Qwen2PreTrainedModel):
             else:
                 hidden = h_base
             memory_r = hidden[indexes]
+            round_memory = []
+            round_gen = []
+            round_suffix_gen = []
+            gen_idx = packed_vae_token_indexes
+            has_gen = gen_idx is not None and int(gen_idx.numel()) > 0
+
+            def suffix_gen(body_hidden):
+                cloned = body_hidden.clone()
+                for layer_idx in range(e, len(self.layers)):
+                    cloned, _ = run_layer(
+                        layer_idx,
+                        cloned,
+                        packed_memory_token_indexes=indexes,
+                        block_gen_reads_memory=False,
+                    )
+                cloned = normalize(cloned)
+                return cloned[gen_idx] if has_gen else None
+
             for _round in range(mem_repeat):
                 if _round > 0:
                     nxt = h_base.clone()
                     nxt[indexes] = memory_r
                     hidden = nxt
+                block_this = block_round0 and _round == 0
                 for layer_idx in range(s, e):
-                    hidden, past_key_values = run_layer(layer_idx, hidden)
+                    hidden, past_key_values = run_layer(
+                        layer_idx,
+                        hidden,
+                        checkpoint=True,
+                        loop_adapter_enabled=True,
+                        packed_memory_token_indexes=indexes,
+                        block_gen_reads_memory=block_this,
+                    )
                 memory_r = hidden[indexes]
+                round_memory.append(memory_r)
+                if has_gen:
+                    round_gen.append(hidden[gen_idx])
+                if _round + 1 < mem_repeat:
+                    suffix_hidden = suffix_gen(hidden)
+                    if suffix_hidden is not None:
+                        round_suffix_gen.append(suffix_hidden)
             for layer_idx in range(e, len(self.layers)):
-                hidden, past_key_values = run_layer(layer_idx, hidden)
+                hidden, past_key_values = run_layer(
+                    layer_idx,
+                    hidden,
+                    packed_memory_token_indexes=indexes,
+                    block_gen_reads_memory=False,
+                )
             packed_query_sequence = normalize(hidden)
             memory_body_out = memory_r
-        elif loop_repeat > 1 and not state_active:
+            memory_round_hiddens = tuple(round_memory)
+            gen_round_hiddens = tuple(round_gen) if round_gen else None
+            if has_gen:
+                round_suffix_gen.append(packed_query_sequence[gen_idx])
+            gen_suffix_round_hiddens = (
+                tuple(round_suffix_gen) if round_suffix_gen else None
+            )
+        elif loop_repeat > 1:
             # Looped-MMDiT style: repeat a shared middle block inside one
             # denoising step. L=1 is exact parity with the native path.
             if within_step_loop_start is None or within_step_loop_end is None:
@@ -1785,172 +1801,23 @@ class Qwen2Model(Qwen2PreTrainedModel):
             for layer_idx in range(e, len(self.layers)):
                 hidden, past_key_values = run_layer(layer_idx, hidden)
             packed_query_sequence = normalize(hidden)
-        elif not state_active:
-            # Keep the original sequential path untouched. This is the hard
-            # parity baseline for every loop experiment.
+        else:
+            seq_mem = (
+                packed_memory_token_indexes
+                if bool(block_gen_reads_memory)
+                and packed_memory_token_indexes is not None
+                and int(packed_memory_token_indexes.numel()) > 0
+                else None
+            )
             for layer_idx in range(len(self.layers)):
                 packed_query_sequence, past_key_values = run_layer(
-                    layer_idx, packed_query_sequence
+                    layer_idx,
+                    packed_query_sequence,
+                    packed_memory_token_indexes=seq_mem,
+                    block_gen_reads_memory=bool(block_gen_reads_memory)
+                    and seq_mem is not None,
                 )
             packed_query_sequence = normalize(packed_query_sequence)
-        else:
-            if mode != "gen":
-                raise ValueError("cross-step loop state is only valid in gen mode")
-            if update_past_key_values:
-                raise ValueError(
-                    "cross-step loop state cannot mutate the prompt KV cache; "
-                    "set update_past_key_values=False"
-                )
-            if enable_taylorseer:
-                raise ValueError(
-                    "TaylorSeer and cross-step loop state cannot run together"
-                )
-            state_mode = str(loop_state_mode).strip().lower()
-            if state_mode not in {"semantic_token", "kv_prefix"}:
-                raise ValueError(
-                    "loop_state_mode must be 'semantic_token' or 'kv_prefix', "
-                    f"got {loop_state_mode!r}"
-                )
-            start = int(loop_start_layer) if loop_start_layer is not None else -1
-            end = int(loop_end_layer) if loop_end_layer is not None else -1
-            if not 0 <= start < end <= len(self.layers):
-                raise ValueError(
-                    "loop layer range must satisfy "
-                    f"0 <= start < end <= {len(self.layers)}, got [{start}, {end})"
-                )
-
-            state_positions = _resolve_loop_state_positions(
-                packed_query_sequence=packed_query_sequence,
-                packed_loop_semantic_token_indexes=(packed_loop_semantic_token_indexes),
-            )
-
-            if loop_external_state is not None:
-                if loop_external_state_scale is None:
-                    raise ValueError(
-                        "loop_external_state_scale is required when an external state is provided"
-                    )
-                if float(loop_external_state_scale) < 0.0:
-                    raise ValueError("loop_external_state_scale must be non-negative")
-            if loop_state_in is not None and loop_state_scale is None:
-                raise ValueError(
-                    "loop_state_scale is required when a recurrent state is provided"
-                )
-            if loop_state_scale is not None and float(loop_state_scale) < 0.0:
-                raise ValueError("loop_state_scale must be non-negative")
-
-            adapter_states = []
-            for module in self.modules():
-                setter = getattr(module, "set_loop_enabled", None)
-                if callable(setter):
-                    adapter_states.append(
-                        (module, bool(getattr(module, "loop_enabled", False)))
-                    )
-                    setter(False)
-            try:
-                hidden = packed_query_sequence
-                for layer_idx in range(0, start):
-                    hidden, past_key_values = run_layer(layer_idx, hidden)
-                body_entry_hidden = hidden.clone()
-
-                base_state = body_entry_hidden[state_positions]
-                recurrent_state = None
-                if loop_external_state is not None:
-                    # Multi-round edit event: the reflection write replaces the
-                    # self-recurrent state for this step.
-                    reviewed_state = loop_external_state.to(
-                        device=base_state.device,
-                        dtype=base_state.dtype,
-                    )
-                    if reviewed_state.ndim == 1:
-                        reviewed_state = reviewed_state.unsqueeze(0)
-                    if reviewed_state.ndim != 2:
-                        raise ValueError(
-                            "loop_external_state must have shape [hidden], "
-                            "[1, hidden], or [num_state_positions, hidden]"
-                        )
-                    if int(reviewed_state.shape[-1]) != int(base_state.shape[-1]):
-                        raise ValueError(
-                            "loop_external_state hidden width does not match BAGEL"
-                        )
-                    if int(reviewed_state.shape[0]) == 1:
-                        reviewed_state = reviewed_state.expand_as(base_state)
-                    elif tuple(reviewed_state.shape) != tuple(base_state.shape):
-                        raise ValueError(
-                            "loop_external_state token count must be 1 or match "
-                            "the loop state position count"
-                        )
-                    recurrent_state = bounded_residual_merge(
-                        base_state,
-                        reviewed_state,
-                        residual_scale=float(loop_external_state_scale),
-                        alpha=float(loop_residual_alpha),
-                    )
-                elif loop_state_in is not None:
-                    # Looped-Flows / RLT entry merge: stop-gradient on the
-                    # incoming state, then an RMS-capped residual update so the
-                    # body starts near its native entry distribution.
-                    reviewed_state = loop_state_in.detach().to(
-                        device=base_state.device,
-                        dtype=base_state.dtype,
-                    )
-                    if reviewed_state.ndim != 2 or tuple(reviewed_state.shape) != tuple(
-                        base_state.shape
-                    ):
-                        raise ValueError(
-                            "loop_state_in must match the loop state positions: "
-                            f"expected {tuple(base_state.shape)}, "
-                            f"got {tuple(reviewed_state.shape)}"
-                        )
-                    recurrent_state = bounded_residual_merge(
-                        base_state,
-                        reviewed_state,
-                        residual_scale=float(loop_state_scale),
-                        alpha=float(loop_residual_alpha),
-                    )
-                # Direct-attention transport writes the recurrent state into
-                # the K native semantic query slots. KV-prefix transport keeps
-                # those queries native and substitutes only their per-layer
-                # UND keys/values.
-                hidden = body_entry_hidden
-                kv_prefix_hidden = None
-                if recurrent_state is not None:
-                    if state_mode == "semantic_token":
-                        hidden = body_entry_hidden.clone()
-                        hidden[state_positions] = recurrent_state
-                    else:
-                        kv_prefix_hidden = recurrent_state
-
-                for module, _ in adapter_states:
-                    module.set_loop_enabled(True)
-                for layer_idx in range(start, end):
-                    hidden, past_key_values = run_layer(
-                        layer_idx,
-                        hidden,
-                        checkpoint=True,
-                        loop_adapter_enabled=True,
-                        loop_kv_prefix_hidden=(
-                            kv_prefix_hidden if state_mode == "kv_prefix" else None
-                        ),
-                        packed_loop_semantic_token_indexes=(
-                            state_positions if state_mode == "kv_prefix" else None
-                        ),
-                    )
-                    if state_mode == "kv_prefix":
-                        kv_prefix_hidden = hidden[state_positions]
-                for module, _ in adapter_states:
-                    module.set_loop_enabled(False)
-
-                # State update: the body-exit features at the state positions
-                # become the next step's recurrent state (Looped Flows z).
-                if return_loop_state:
-                    loop_state_out = hidden[state_positions].clone()
-
-                for layer_idx in range(end, len(self.layers)):
-                    hidden, past_key_values = run_layer(layer_idx, hidden)
-                packed_query_sequence = normalize(hidden)
-            finally:
-                for module, was_enabled in adapter_states:
-                    module.set_loop_enabled(was_enabled)
 
         if enable_taylorseer:
             self.current["step"] += 1
@@ -1958,8 +1825,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         return BaseNavitOutputWithPast(
             packed_query_sequence=packed_query_sequence,
             past_key_values=past_key_values,
-            loop_state_out=loop_state_out,
             memory_body_out=memory_body_out,
+            memory_round_hiddens=memory_round_hiddens,
+            gen_round_hiddens=gen_round_hiddens,
+            gen_suffix_round_hiddens=gen_suffix_round_hiddens,
         )
 
     def forward_kvcache(
@@ -2165,17 +2034,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        loop_start_layer: Optional[int] = None,
-        loop_end_layer: Optional[int] = None,
-        loop_state_in: Optional[torch.Tensor] = None,
-        loop_state_scale: Optional[float] = None,
-        loop_external_state: Optional[torch.Tensor] = None,
-        loop_external_state_scale: Optional[float] = None,
-        loop_residual_alpha: float = 1.0,
         packed_boundary_token_indexes: Optional[torch.Tensor] = None,
-        packed_loop_semantic_token_indexes: Optional[torch.Tensor] = None,
-        loop_state_mode: str = "semantic_token",
-        return_loop_state: bool = False,
         within_step_loop_start: Optional[int] = None,
         within_step_loop_end: Optional[int] = None,
         within_step_loop_repeat: int = 1,
@@ -2185,11 +2044,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         memory_loop_start: Optional[int] = None,
         memory_loop_end: Optional[int] = None,
         memory_body_in: Optional[torch.Tensor] = None,
+        block_gen_reads_memory: bool = True,
     ) -> BaseNavitOutputWithPast:
 
-        # This method is also used during LoRA training. Call the matching
-        # cache-native implementation explicitly instead of redispatching on
-        # the inner module's ``training`` flag.
         outputs = self.model.forward_inference(
             packed_query_sequence=packed_query_sequence,
             query_lens=query_lens,
@@ -2203,17 +2060,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             mode=mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
-            loop_start_layer=loop_start_layer,
-            loop_end_layer=loop_end_layer,
-            loop_state_in=loop_state_in,
-            loop_state_scale=loop_state_scale,
-            loop_external_state=loop_external_state,
-            loop_external_state_scale=loop_external_state_scale,
-            loop_residual_alpha=loop_residual_alpha,
             packed_boundary_token_indexes=packed_boundary_token_indexes,
-            packed_loop_semantic_token_indexes=(packed_loop_semantic_token_indexes),
-            loop_state_mode=loop_state_mode,
-            return_loop_state=return_loop_state,
             within_step_loop_start=within_step_loop_start,
             within_step_loop_end=within_step_loop_end,
             within_step_loop_repeat=within_step_loop_repeat,
@@ -2223,6 +2070,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             memory_loop_start=memory_loop_start,
             memory_loop_end=memory_loop_end,
             memory_body_in=memory_body_in,
+            block_gen_reads_memory=block_gen_reads_memory,
         )
 
         return outputs

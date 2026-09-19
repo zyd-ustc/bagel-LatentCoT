@@ -26,9 +26,8 @@ from .special_tokens import (
     resolve_bagel_special_token_ids,
 )
 from .loop import (
-    GENERATION_ATTENTION_PROJECTIONS,
-    TEXT_ATTENTION_PROJECTIONS,
     inject_loop_lora,
+    loop_lora_projections,
     loop_trainable_names,
 )
 
@@ -174,12 +173,15 @@ class BagelBackbone:
             connector_act="gelu_pytorch_tanh",
             latent_patch_size=2,
             max_latent_size=64,
-            num_loop_tokens=int(self.cfg.get("num_loop_tokens", 0) or 0),
-            loop_depth=int(self.cfg.get("loop_depth", 1) or 1),
+            num_loop_tokens=int(self.cfg.get("num_loop_tokens", 8) or 0),
+            loop_depth=int(self.cfg.get("loop_depth", 2) or 1),
             loop_recycle_mode=str(self.cfg.get("loop_recycle_mode", "same_depth")),
-            loop_memory_persist=bool(self.cfg.get("loop_memory_persist", True)),
-            memory_loop_start_layer=int(self.cfg.get("memory_loop_start_layer", 20)),
-            memory_loop_end_layer=int(self.cfg.get("memory_loop_end_layer", 28)),
+            loop_memory_persist=bool(self.cfg.get("loop_memory_persist", False)),
+            memory_loop_start_layer=int(self.cfg.get("memory_loop_start_layer", 16)),
+            memory_loop_end_layer=int(self.cfg.get("memory_loop_end_layer", 24)),
+            round0_gen_reads_memory=bool(
+                self.cfg.get("round0_gen_reads_memory", False)
+            ),
         )
 
         llm = Qwen2ForCausalLM(llm_config)
@@ -260,7 +262,8 @@ class BagelBackbone:
         rank: int = 8,
         alpha: int = 16,
         dropout: float = 0.0,
-        include_text_kv: bool = False,
+        gen_attention_o_lora: bool = False,
+        k_v_lora: bool = False,
     ) -> List[str]:
         """Freeze BAGEL and open only loop-gated attention LoRA in the body."""
 
@@ -282,11 +285,13 @@ class BagelBackbone:
             rank=int(rank),
             alpha=int(alpha),
             dropout=float(dropout),
-            include_text_kv=bool(include_text_kv),
+            gen_attention_o_lora=bool(gen_attention_o_lora),
+            k_v_lora=bool(k_v_lora),
         )
 
-        allowed_projections = GENERATION_ATTENTION_PROJECTIONS + (
-            TEXT_ATTENTION_PROJECTIONS if include_text_kv else ()
+        allowed_projections = loop_lora_projections(
+            gen_attention_o_lora=bool(gen_attention_o_lora),
+            k_v_lora=bool(k_v_lora),
         )
         for name, parameter in model.named_parameters():
             parameter.requires_grad = bool(
@@ -300,7 +305,8 @@ class BagelBackbone:
             model,
             start_layer=int(start_layer),
             end_layer=int(end_layer),
-            include_text_kv=bool(include_text_kv),
+            gen_attention_o_lora=bool(gen_attention_o_lora),
+            k_v_lora=bool(k_v_lora),
         )
         count = sum(
             parameter.numel()

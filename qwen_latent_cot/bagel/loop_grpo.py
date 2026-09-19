@@ -116,7 +116,6 @@ def _flow_kwargs(
         "packed_text_ids",
         "packed_text_indexes",
         "packed_boundary_token_indexes",
-        "packed_loop_semantic_token_indexes",
         "packed_position_ids",
         "packed_indexes",
         "packed_seqlens",
@@ -135,22 +134,45 @@ def _flow_kwargs(
         "cfg_img_key_values_lens",
         "cfg_img_past_key_values",
         "cfg_img_packed_key_value_indexes",
-        "loop_start_layer",
-        "loop_end_layer",
     )
-    kwargs = {key: replay_context[key] for key in keys}
-    replay_state = None if transition is None else transition.get("loop_state_in")
+    kwargs = {key: replay_context[key] for key in keys if key in replay_context}
     kwargs.update(
         timestep=timestep,
         cfg_text_scale=(float(replay_context["cfg_text_scale"]) if cfg_active else 1.0),
         cfg_img_scale=(float(replay_context["cfg_img_scale"]) if cfg_active else 1.0),
         cfg_type=replay_context.get("cfg_type", "parallel"),
-        loop_state_in=replay_state,
-        loop_state_scale=replay_context.get("loop_state_scale"),
-        loop_state_mode=replay_context.get("loop_state_mode", "semantic_token"),
-        loop_residual_alpha=float(replay_context.get("loop_residual_alpha", 1.0)),
     )
+    loop_idx = replay_context.get("packed_loop_token_indexes")
+    if loop_idx is not None and int(getattr(loop_idx, "numel", lambda: 0)()) > 0:
+        kwargs.update(
+            packed_loop_token_indexes=loop_idx,
+            loop_memory=replay_context.get("embed_memory"),
+            embed_memory=replay_context.get("embed_memory"),
+            recycle_mode=str(replay_context.get("recycle_mode", "same_depth")),
+            memory_loop_repeat=int(replay_context.get("memory_loop_repeat", 2)),
+            memory_loop_start=replay_context.get("memory_loop_start"),
+            memory_loop_end=replay_context.get("memory_loop_end"),
+            round0_gen_reads_memory=bool(
+                replay_context.get("round0_gen_reads_memory", False)
+            ),
+        )
+        if transition is not None:
+            kwargs.update(
+                memory_body_in=transition.get("m_in"),
+                memory_body_in_text=transition.get("m_in_text"),
+                memory_body_in_img=transition.get("m_in_img"),
+                loop_memory_text=transition.get("m_in_text"),
+                loop_memory_img=transition.get("m_in_img"),
+            )
     return kwargs
+
+
+def _policy_velocity(model: nn.Module, sample: torch.Tensor, kwargs: Dict[str, Any]):
+    loop_idx = kwargs.get("packed_loop_token_indexes")
+    if loop_idx is not None and int(getattr(loop_idx, "numel", lambda: 0)()) > 0:
+        result = model._forward_flow_loop(x_t=sample, **kwargs)
+        return result[0] if isinstance(result, tuple) else result
+    return model._forward_flow(x_t=sample, **kwargs)
 
 
 def replay_transition(
@@ -177,7 +199,7 @@ def replay_transition(
     # autograd graph. This avoids parameter-version changes after policy forward.
     with temporary_loop_adapter_state(model, reference_adapter_state):
         with torch.no_grad():
-            reference_velocity = model._forward_flow(x_t=sample, **kwargs)
+            reference_velocity = _policy_velocity(model, sample, kwargs)
 
     with torch.no_grad():
         reference_transition = sde_step_with_logprob(
@@ -219,7 +241,7 @@ def _replay_transition_with_reference(
     ).reshape(())
     timestep = scalar_t.expand(int(sample.shape[0]))
     kwargs = _flow_kwargs(replay_context, timestep, transition)
-    policy_velocity = model._forward_flow(x_t=sample, **kwargs)
+    policy_velocity = _policy_velocity(model, sample, kwargs)
     policy_transition = sde_step_with_logprob(
         policy_velocity,
         timestep=scalar_t,
@@ -303,7 +325,7 @@ def replay_group(
                 timestep = scalar_t.expand(int(sample.shape[0]))
                 kwargs = _flow_kwargs(context, timestep, transition)
                 with torch.no_grad():
-                    reference_velocity = model._forward_flow(x_t=sample, **kwargs)
+                    reference_velocity = _policy_velocity(model, sample, kwargs)
                     reference_transition = sde_step_with_logprob(
                         reference_velocity,
                         timestep=scalar_t,

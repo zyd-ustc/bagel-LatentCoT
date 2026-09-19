@@ -45,17 +45,22 @@ def _move_to_device(generation_input, device):
     return generation_input
 
 
-def _semantic_state_ids(
-    *, count: int, batch_size: int, token_id: int
-) -> Optional[List[Tuple[int, ...]]]:
-    """Build K native text placeholders without extending the vocabulary."""
-
-    count = int(count)
-    if count < 0:
-        raise ValueError("loop_state_tokens must be non-negative")
-    if count == 0:
-        return None
-    return [(int(token_id),) * count for _ in range(int(batch_size))]
+def filter_old_prompt(input_lists, enabled: bool = True):
+    if not enabled:
+        return list(input_lists)
+    image_indices = [
+        index
+        for index, item in enumerate(input_lists)
+        if isinstance(item, Image.Image)
+    ]
+    if not image_indices:
+        return list(input_lists)
+    last_image = image_indices[-1]
+    return [
+        item
+        for index, item in enumerate(input_lists)
+        if not (isinstance(item, str) and index < last_image)
+    ]
 
 
 def flowedit_time_branch(timestep: float, n_min: float, n_max: float) -> str:
@@ -227,15 +232,9 @@ class InterleaveInferencer:
         contexts: Dict[str, Any],
         image_shape: Tuple[int, int],
         init_noise: Optional[torch.Tensor] = None,
-        loop_state_tokens: int = 0,
-        loop_state_token_id: Optional[int] = None,
-        semantic_token_ids: Optional[List[List[int]]] = None,
+        num_loop_tokens: Optional[int] = 0,
     ) -> ImageConditionBundle:
-        """Materialize BAGEL's native GEN/dual-CFG layouts for one cache set.
-
-        ``semantic_token_ids`` overrides ``loop_state_tokens``/``loop_state_token_id``
-        with an explicit per-sample token sequence (e.g. a real edit instruction).
-        """
+        """Materialize BAGEL's native GEN/dual-CFG layouts for one cache set."""
 
         required = {"full", "text_removed", "image_removed"}
         missing = required.difference(contexts)
@@ -245,35 +244,13 @@ class InterleaveInferencer:
         full = contexts["full"]
         text_removed = contexts["text_removed"]
         image_removed = contexts["image_removed"]
-        if semantic_token_ids is not None:
-            if len(semantic_token_ids) != len(full["kv_lens"]):
-                raise ValueError("semantic_token_ids must match the batch size")
-            semantic_text_ids = [
-                tuple(int(token_id) for token_id in sequence)
-                for sequence in semantic_token_ids
-            ]
-        else:
-            state_token_id = (
-                int(self.new_token_ids["bos_token_id"])
-                if loop_state_token_id is None
-                else int(loop_state_token_id)
-            )
-            semantic_text_ids = _semantic_state_ids(
-                count=int(loop_state_tokens),
-                batch_size=len(full["kv_lens"]),
-                token_id=state_token_id,
-            )
-        semantic_token_counts = (
-            [0] * len(full["kv_lens"])
-            if semantic_text_ids is None
-            else [len(sequence) for sequence in semantic_text_ids]
-        )
+        loop_k = 0 if num_loop_tokens is None else int(num_loop_tokens)
         flow_input = self.model.prepare_vae_latent(
             curr_kvlens=full["kv_lens"],
             curr_rope=full["ropes"],
             image_sizes=[tuple(image_shape)],
             new_token_ids=self.new_token_ids,
-            semantic_text_ids=semantic_text_ids,
+            num_loop_tokens=loop_k,
         )
         flow_input = _move_to_device(flow_input, self.device)
         if init_noise is not None:
@@ -290,13 +267,13 @@ class InterleaveInferencer:
             curr_kvlens=text_removed["kv_lens"],
             curr_rope=text_removed["ropes"],
             image_sizes=[tuple(image_shape)],
-            semantic_token_counts=semantic_token_counts,
+            num_loop_tokens=loop_k,
         )
         cfg_img_input = self.model.prepare_vae_latent_cfg(
             curr_kvlens=image_removed["kv_lens"],
             curr_rope=image_removed["ropes"],
             image_sizes=[tuple(image_shape)],
-            semantic_token_counts=semantic_token_counts,
+            num_loop_tokens=loop_k,
         )
         return ImageConditionBundle(
             name=str(name),
@@ -321,25 +298,12 @@ class InterleaveInferencer:
         cfg_interval: Tuple[float, float] = (0.4, 1.0),
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
-        loop_start_layer: Optional[int] = None,
-        loop_end_layer: Optional[int] = None,
-        loop_state_in: Optional[torch.Tensor] = None,
-        loop_state_scale: Optional[float] = None,
-        loop_state_mode: str = "semantic_token",
         within_step_loop_start: Optional[int] = None,
         within_step_loop_end: Optional[int] = None,
         within_step_loop_repeat: int = 1,
         within_step_loop_damping: float = 1.0,
-        loop_external_state: Optional[torch.Tensor] = None,
-        loop_external_state_scale: Optional[float] = None,
-        return_loop_state: bool = False,
     ):
-        """Evaluate one native BAGEL guided velocity without advancing ``x_t``.
-
-        With ``return_loop_state=True`` the call returns ``(velocity,
-        loop_state_out)`` where the state is the body-exit recurrent feature
-        to feed into the next denoising step's ``loop_state_in``.
-        """
+        """Evaluate one native BAGEL guided velocity without advancing ``x_t``."""
 
         self.model.language_model.model.enable_taylorseer = False
         value = float(timestep)
@@ -386,22 +350,11 @@ class InterleaveInferencer:
             cfg_img_key_values_lens=cfg_img["cfg_key_values_lens"],
             cfg_img_past_key_values=condition.image_removed_context["past_key_values"],
             cfg_img_packed_key_value_indexes=cfg_img["cfg_packed_key_value_indexes"],
-            loop_start_layer=loop_start_layer,
-            loop_end_layer=loop_end_layer,
-            loop_state_in=loop_state_in,
-            loop_state_scale=loop_state_scale,
-            loop_state_mode=loop_state_mode,
             within_step_loop_start=within_step_loop_start,
             within_step_loop_end=within_step_loop_end,
             within_step_loop_repeat=within_step_loop_repeat,
             within_step_loop_damping=within_step_loop_damping,
-            loop_external_state=loop_external_state,
-            loop_external_state_scale=loop_external_state_scale,
-            return_loop_state=return_loop_state,
             packed_boundary_token_indexes=flow["packed_boundary_token_indexes"],
-            packed_loop_semantic_token_indexes=flow[
-                "packed_loop_semantic_token_indexes"
-            ],
         )
 
     @torch.no_grad()
@@ -421,15 +374,6 @@ class InterleaveInferencer:
         enable_taylorseer=False,
         init_noise: Optional[torch.Tensor] = None,
         return_latent: bool = False,
-        loop_start_layer: Optional[int] = None,
-        loop_end_layer: Optional[int] = None,
-        loop_state_scale: Optional[float] = None,
-        loop_state_mode: str = "semantic_token",
-        loop_state_tokens: int = 16,
-        loop_state_token_id: Optional[int] = None,
-        loop_draft_state_scale: float = 0.2,
-        loop_state_timestep_threshold: Optional[float] = None,
-        loop_residual_alpha: float = 1.0,
         sde_step_indices: Optional[tuple[int, ...]] = None,
         sde_noise_level: float = 0.0,
         sde_seed: int = 0,
@@ -439,26 +383,11 @@ class InterleaveInferencer:
         past_key_values = gen_context["past_key_values"]
         kv_lens = gen_context["kv_lens"]
         ropes = gen_context["ropes"]
-        state_token_count = (
-            int(loop_state_tokens) if loop_state_scale is not None else 0
-        )
-        state_token_id = (
-            int(self.new_token_ids["bos_token_id"])
-            if loop_state_token_id is None
-            else int(loop_state_token_id)
-        )
-        semantic_text_ids = _semantic_state_ids(
-            count=state_token_count,
-            batch_size=len(kv_lens),
-            token_id=state_token_id,
-        )
-        semantic_token_counts = [state_token_count]
         generation_input = self.model.prepare_vae_latent(
             curr_kvlens=kv_lens,
             curr_rope=ropes,
             image_sizes=[image_shape],
             new_token_ids=self.new_token_ids,
-            semantic_text_ids=semantic_text_ids,
         )
         generation_input = _move_to_device(generation_input, self.device)
         if init_noise is not None:
@@ -486,7 +415,6 @@ class InterleaveInferencer:
             curr_kvlens=kv_lens_cfg,
             curr_rope=ropes_cfg,
             image_sizes=[image_shape],
-            semantic_token_counts=semantic_token_counts,
         )
         generation_input_cfg_text = _move_to_device(
             generation_input_cfg_text, self.device
@@ -500,7 +428,6 @@ class InterleaveInferencer:
             curr_kvlens=kv_lens_cfg,
             curr_rope=ropes_cfg,
             image_sizes=[image_shape],
-            semantic_token_counts=semantic_token_counts,
         )
         generation_input_cfg_img = _move_to_device(
             generation_input_cfg_img, self.device
@@ -539,13 +466,6 @@ class InterleaveInferencer:
                 "cfg_packed_key_value_indexes"
             ],
             enable_taylorseer=enable_taylorseer,
-            loop_start_layer=loop_start_layer,
-            loop_end_layer=loop_end_layer,
-            loop_state_scale=loop_state_scale,
-            loop_state_mode=loop_state_mode,
-            loop_draft_state_scale=loop_draft_state_scale,
-            loop_state_timestep_threshold=loop_state_timestep_threshold,
-            loop_residual_alpha=loop_residual_alpha,
             sde_step_indices=sde_step_indices,
             sde_noise_level=sde_noise_level,
             sde_seed=sde_seed,
@@ -570,9 +490,6 @@ class InterleaveInferencer:
                 "packed_text_indexes": generation_input["packed_text_indexes"],
                 "packed_boundary_token_indexes": generation_input[
                     "packed_boundary_token_indexes"
-                ],
-                "packed_loop_semantic_token_indexes": generation_input[
-                    "packed_loop_semantic_token_indexes"
                 ],
                 "packed_position_ids": generation_input["packed_position_ids"],
                 "packed_indexes": generation_input["packed_indexes"],
@@ -613,14 +530,23 @@ class InterleaveInferencer:
                 "cfg_img_packed_key_value_indexes": generation_input_cfg_img[
                     "cfg_packed_key_value_indexes"
                 ],
-                "loop_start_layer": loop_start_layer,
-                "loop_end_layer": loop_end_layer,
-                "loop_state_scale": loop_state_scale,
-                "loop_state_mode": loop_state_mode,
-                "loop_state_tokens": state_token_count,
-                "loop_draft_state_scale": float(loop_draft_state_scale),
-                "loop_state_timestep_threshold": loop_state_timestep_threshold,
-                "loop_residual_alpha": loop_residual_alpha,
+                "packed_loop_token_indexes": generation_input.get(
+                    "packed_loop_token_indexes"
+                ),
+                "recycle_mode": str(
+                    getattr(self.model.config, "loop_recycle_mode", "same_depth")
+                ),
+                "memory_loop_repeat": int(getattr(self.model.config, "loop_depth", 2)),
+                "memory_loop_start": int(
+                    getattr(self.model.config, "memory_loop_start_layer", 16)
+                ),
+                "memory_loop_end": int(
+                    getattr(self.model.config, "memory_loop_end_layer", 24)
+                ),
+                "round0_gen_reads_memory": bool(
+                    getattr(self.model.config, "round0_gen_reads_memory", False)
+                ),
+                "embed_memory": getattr(self.model, "loop_memory", None),
             }
             return {
                 "image": image,
@@ -662,6 +588,7 @@ class InterleaveInferencer:
             curr_rope=ctx["ropes"],
             image_sizes=[image_shape],
             new_token_ids=self.new_token_ids,
+            num_loop_tokens=0,
         )
         generation_input = _move_to_device(generation_input, self.device)
         cfg_text_input = _move_to_device(
@@ -669,6 +596,7 @@ class InterleaveInferencer:
                 curr_kvlens=cfg_text_ctx["kv_lens"],
                 curr_rope=cfg_text_ctx["ropes"],
                 image_sizes=[image_shape],
+                num_loop_tokens=0,
             ),
             self.device,
         )
@@ -677,6 +605,7 @@ class InterleaveInferencer:
                 curr_kvlens=cfg_img_ctx["kv_lens"],
                 curr_rope=cfg_img_ctx["ropes"],
                 image_sizes=[image_shape],
+                num_loop_tokens=0,
             ),
             self.device,
         )
@@ -713,9 +642,6 @@ class InterleaveInferencer:
             packed_key_value_indexes=generation_input["packed_key_value_indexes"],
             packed_boundary_token_indexes=generation_input[
                 "packed_boundary_token_indexes"
-            ],
-            packed_loop_semantic_token_indexes=generation_input[
-                "packed_loop_semantic_token_indexes"
             ],
             cfg_renorm_min=float(cfg_renorm_min),
             cfg_renorm_type=str(cfg_renorm_type),
@@ -952,15 +878,9 @@ class InterleaveInferencer:
         cfg_renorm_type="global",
         image_shapes=(1024, 1024),
         enable_taylorseer=False,
-        loop_start_layer: Optional[int] = None,
-        loop_end_layer: Optional[int] = None,
-        loop_state_scale: Optional[float] = None,
-        loop_state_mode: str = "semantic_token",
-        loop_state_tokens: int = 16,
-        loop_draft_state_scale: float = 0.2,
-        loop_state_timestep_threshold: Optional[float] = None,
         init_noise: Optional[torch.Tensor] = None,
         return_latent: bool = False,
+        remove_old_prompt: Optional[bool] = None,
     ) -> List[Union[str, Image.Image]]:
         """Official interleaved entry point.
 
@@ -970,6 +890,9 @@ class InterleaveInferencer:
         """
 
         output_list = []
+        if remove_old_prompt is None:
+            remove_old_prompt = True
+        input_lists = filter_old_prompt(input_lists, bool(remove_old_prompt))
         gen_context = self.init_gen_context()
         cfg_text_context = deepcopy(gen_context)
         cfg_img_context = deepcopy(gen_context)
@@ -1040,13 +963,6 @@ class InterleaveInferencer:
                     cfg_renorm_min=cfg_renorm_min,
                     cfg_renorm_type=cfg_renorm_type,
                     enable_taylorseer=enable_taylorseer,
-                    loop_start_layer=loop_start_layer,
-                    loop_end_layer=loop_end_layer,
-                    loop_state_scale=loop_state_scale,
-                    loop_state_mode=loop_state_mode,
-                    loop_state_tokens=loop_state_tokens,
-                    loop_draft_state_scale=loop_draft_state_scale,
-                    loop_state_timestep_threshold=loop_state_timestep_threshold,
                     init_noise=init_noise,
                     return_latent=bool(return_latent),
                 )

@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
 
 from bagel_loop_zeroshot import (  # noqa: E402
     ARMS,
-    NOTEBOOK_T2I_HYPER,
+    NOTEBOOK_EDIT_HYPER,
     apply_loop_config,
     select_arms,
     shard_indices,
@@ -19,29 +19,31 @@ from bagel_loop_zeroshot import (  # noqa: E402
 )
 
 
-def test_arm_table_matches_phase0_protocol():
+def test_arm_table_matches_read_route_write_protocol():
+    expected = {
+        "Z0": dict(K=0, R=1, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
+        "Z1": dict(K=8, R=2, recycle_mode="same_depth", persist=True, start_layer=20, end_layer=28, remove_old_prompt=False, round0_gen_reads_memory=True),
+        "Z2": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=20, end_layer=28, remove_old_prompt=True, round0_gen_reads_memory=True),
+        "Z3": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=20, end_layer=28, remove_old_prompt=True, round0_gen_reads_memory=False),
+        "Z4": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
+        "Z5": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=12, end_layer=20, remove_old_prompt=True, round0_gen_reads_memory=False),
+        "Z6": dict(K=8, R=2, recycle_mode="same_depth", persist=True, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
+        "C0": dict(K=8, R=2, recycle_mode="full_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_gen_reads_memory=False),
+    }
     by_id = {arm["id"]: arm for arm in ARMS}
-    assert list(by_id) == ["A0", "A1", "A2", "A3", "A4", "A5"]
-    assert by_id["A0"]["K"] == 0 and by_id["A0"]["R"] == 1
-    assert by_id["A1"]["K"] == 8 and by_id["A1"]["R"] == 1
-    assert by_id["A2"]["K"] == 8
-    assert by_id["A2"]["R"] == 2
-    assert by_id["A2"]["recycle_mode"] == "same_depth"
-    assert by_id["A2"]["persist"] is True
-    assert by_id["A2"]["start_layer"] == 20
-    assert by_id["A2"]["end_layer"] == 28
-    assert by_id["A3"]["R"] == 3 and by_id["A3"]["recycle_mode"] == "same_depth"
-    assert by_id["A4"]["recycle_mode"] == "full_depth" and by_id["A4"]["R"] == 2
-    assert by_id["A5"]["persist"] is False and by_id["A5"]["recycle_mode"] == "same_depth"
+    assert list(by_id) == list(expected)
+    for arm_id, row in expected.items():
+        for key, value in row.items():
+            assert by_id[arm_id][key] == value, (arm_id, key)
 
 
-def test_notebook_hyper_keeps_cfg_open_and_avoids_extra_knobs():
-    assert NOTEBOOK_T2I_HYPER["cfg_interval"] == [0.0, 1.0]
-    assert NOTEBOOK_T2I_HYPER["cfg_text_scale"] == 4.0
-    assert NOTEBOOK_T2I_HYPER["cfg_img_scale"] == 1.0
-    assert NOTEBOOK_T2I_HYPER["num_timesteps"] == 50
-    assert NOTEBOOK_T2I_HYPER["timestep_shift"] == 3.0
-    assert NOTEBOOK_T2I_HYPER["cfg_renorm_type"] == "global"
+def test_notebook_edit_hyper_matches_official_editing():
+    assert NOTEBOOK_EDIT_HYPER["cfg_interval"] == [0.0, 1.0]
+    assert NOTEBOOK_EDIT_HYPER["cfg_text_scale"] == 4.0
+    assert NOTEBOOK_EDIT_HYPER["cfg_img_scale"] == 2.0
+    assert NOTEBOOK_EDIT_HYPER["num_timesteps"] == 50
+    assert NOTEBOOK_EDIT_HYPER["timestep_shift"] == 3.0
+    assert NOTEBOOK_EDIT_HYPER["cfg_renorm_type"] == "text_channel"
     for banned in (
         "enable_taylorseer",
         "think",
@@ -50,7 +52,7 @@ def test_notebook_hyper_keeps_cfg_open_and_avoids_extra_knobs():
         "n_min",
         "n_max",
     ):
-        assert banned not in NOTEBOOK_T2I_HYPER
+        assert banned not in NOTEBOOK_EDIT_HYPER
 
 
 def test_apply_loop_config_writes_bagelconfig_fields():
@@ -59,19 +61,21 @@ def test_apply_loop_config_writes_bagelconfig_fields():
         config=SimpleNamespace(),
         loop_memory=memory,
     )
-    apply_loop_config(model, select_arms("A2")[0])
+    apply_loop_config(model, select_arms("Z4")[0])
     assert model.config.num_loop_tokens == 8
     assert model.config.loop_depth == 2
     assert model.config.loop_recycle_mode == "same_depth"
-    assert model.config.loop_memory_persist is True
-    assert model.config.memory_loop_start_layer == 20
-    assert model.config.memory_loop_end_layer == 28
-    apply_loop_config(model, select_arms("A0")[0])
+    assert model.config.loop_memory_persist is False
+    assert model.config.memory_loop_start_layer == 16
+    assert model.config.memory_loop_end_layer == 24
+    assert model.config.round0_gen_reads_memory is False
+    apply_loop_config(model, select_arms("Z0")[0])
     assert model.config.num_loop_tokens == 0
     assert model.config.loop_depth == 1
-    apply_loop_config(model, select_arms("A5")[0])
-    assert model.config.loop_memory_persist is False
-    apply_loop_config(model, select_arms("A4")[0])
+    apply_loop_config(model, select_arms("Z1")[0])
+    assert model.config.loop_memory_persist is True
+    assert model.config.round0_gen_reads_memory is True
+    apply_loop_config(model, select_arms("C0")[0])
     assert model.config.loop_recycle_mode == "full_depth"
 
 
@@ -81,7 +85,18 @@ def test_one_prompt_per_shard_round_robin():
     assert shard_indices(16, 3, 8) == [3, 11]
 
 
+def test_removed_loop_state_kwargs_are_gone_from_public_generate():
+    import inspect
+    from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
+    from qwen_latent_cot.bagel.modeling.bagel.bagel import Bagel
+
+    for banned in ("loop_state_scale", "loop_state_mode"):
+        assert banned not in inspect.signature(Bagel.generate_image).parameters
+        assert banned not in inspect.signature(InterleaveInferencer.gen_image).parameters
+
+
 def test_empty_diagnostics_for_vanilla_path():
     summary = summarize_diagnostics([])
     assert summary["n_steps"] == 0
     assert summary["n_inner"] == 0
+    assert summary["mean_delta_m"] is None

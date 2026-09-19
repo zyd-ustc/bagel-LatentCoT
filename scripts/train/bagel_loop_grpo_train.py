@@ -24,7 +24,7 @@ from safetensors.torch import load_file, save_file
 
 from qwen_latent_cot.bagel.flow_grpo import quality_constrained_advantages
 from qwen_latent_cot.bagel.loop import (
-    TEXT_ATTENTION_PROJECTIONS,
+    K_V_PROJECTIONS,
     load_loop_adapter_state_dict,
     loop_adapter_state_dict,
     loop_trainable_names,
@@ -79,13 +79,11 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("GRPO requires at least one selected stochastic SDE step")
     if int(config.get("policy_epochs", 1)) < 1:
         raise ValueError("policy_epochs must be at least 1")
-    if str(config.get("loop_state_mode", "semantic_token")) not in {
-        "semantic_token",
-        "kv_prefix",
+    if str(config.get("loop_recycle_mode", "same_depth")) not in {
+        "same_depth",
+        "full_depth",
     }:
-        raise ValueError("loop_state_mode must be semantic_token or kv_prefix")
-    if int(config.get("loop_state_tokens", 16)) < 1:
-        raise ValueError("loop_state_tokens must be at least 1")
+        raise ValueError("loop_recycle_mode must be same_depth or full_depth")
     if config.get("semantic_reward_type") != "geneval2_soft_tifa_log_gm":
         raise ValueError(
             "RL requires semantic_reward_type=geneval2_soft_tifa_log_gm"
@@ -136,28 +134,30 @@ def _validate_adapter_contract(config: Mapping[str, Any]) -> dict[str, Any]:
             "GRPO requires a compatible v6 initializer or v7 semantic-state adapter; "
             f"got schema={metadata.get('schema')!r}"
         )
-    expected = {
-        "loop_start_layer": int(config["loop_start_layer"]),
-        "loop_end_layer": int(config["loop_end_layer"]),
-        "lora_rank": int(config.get("lora_rank", 8)),
-        "lora_alpha": int(config.get("lora_alpha", 16)),
-        "include_text_kv_lora": bool(config.get("include_text_kv_lora", False)),
+    start_layer = int(config.get("memory_loop_start_layer", 16))
+    end_layer = int(config.get("memory_loop_end_layer", 24))
+    metadata_start = metadata.get(
+        "memory_loop_start_layer", metadata.get("loop_start_layer")
+    )
+    metadata_end = metadata.get(
+        "memory_loop_end_layer", metadata.get("loop_end_layer")
+    )
+    checks = {
+        "memory_loop_start_layer": (metadata_start, start_layer),
+        "memory_loop_end_layer": (metadata_end, end_layer),
+        "lora_rank": (
+            metadata.get("lora_rank"),
+            int(config.get("lora_rank", 8)),
+        ),
+        "lora_alpha": (
+            metadata.get("lora_alpha"),
+            int(config.get("lora_alpha", 16)),
+        ),
     }
-    if metadata.get("schema") in {
-        "bagel_semantic_state_flow_adapter_v7",
-        "bagel_semantic_state_grpo_adapter_v7",
-    }:
-        expected.update(
-            loop_state_mode=str(config.get("loop_state_mode", "semantic_token")),
-            loop_state_tokens=int(config.get("loop_state_tokens", 16)),
-            loop_draft_state_scale=float(
-                config.get("loop_draft_state_scale", 0.2)
-            ),
-        )
     mismatches = [
-        f"{key}: adapter={metadata.get(key)!r}, GRPO={value!r}"
-        for key, value in expected.items()
-        if metadata.get(key) != value
+        f"{key}: adapter={got!r}, GRPO={want!r}"
+        for key, (got, want) in checks.items()
+        if got != want
     ]
     if metadata.get("objective") not in {
         "depth1_velocity_format_distillation",
@@ -203,21 +203,18 @@ def _save_adapter(model, output_dir: Path, step: int, config: Mapping[str, Any])
         "objective": "quality_constrained_grpo",
         "step": int(step),
         "base_adapter": str(config["adapter_path"]),
-        "loop_start_layer": int(config["loop_start_layer"]),
-        "loop_end_layer": int(config["loop_end_layer"]),
-        "loop_state_scale": float(config["loop_state_scale"]),
-        "loop_draft_state_scale": float(config.get("loop_draft_state_scale", 0.2)),
-        "loop_state_mode": str(config.get("loop_state_mode", "semantic_token")),
-        "loop_state_tokens": int(config.get("loop_state_tokens", 16)),
-        "loop_draft_state_scale": float(
-            config.get("loop_draft_state_scale", 0.2)
-        ),
-        "loop_state_timestep_threshold": float(
-            config.get("loop_state_timestep_threshold", 0.0)
+        "memory_loop_start_layer": int(config.get("memory_loop_start_layer", 16)),
+        "memory_loop_end_layer": int(config.get("memory_loop_end_layer", 24)),
+        "loop_depth": int(config.get("loop_depth", 2)),
+        "num_loop_tokens": int(config.get("num_loop_tokens", 8)),
+        "loop_memory_persist": bool(config.get("loop_memory_persist", False)),
+        "round0_gen_reads_memory": bool(
+            config.get("round0_gen_reads_memory", False)
         ),
         "lora_rank": int(config["lora_rank"]),
         "lora_alpha": int(config["lora_alpha"]),
-        "include_text_kv_lora": bool(config.get("include_text_kv_lora", False)),
+        "k_v_lora": bool(config.get("k_v_lora", False)),
+        "gen_attention_o_lora": bool(config.get("gen_attention_o_lora", False)),
         "policy_epochs": int(config.get("policy_epochs", 1)),
     }
     (output_dir / f"{stem}.json").write_text(
@@ -323,29 +320,37 @@ def main() -> None:
             "disable_visual_gen": False,
             "disable_gen_expert": False,
             "num_image_tokens": int(config.get("num_image_tokens", 4900)),
+            "num_loop_tokens": int(config.get("num_loop_tokens", 8)),
+            "loop_depth": int(config.get("loop_depth", 2)),
+            "loop_recycle_mode": str(config.get("loop_recycle_mode", "same_depth")),
+            "loop_memory_persist": bool(config.get("loop_memory_persist", False)),
+            "memory_loop_start_layer": int(config.get("memory_loop_start_layer", 16)),
+            "memory_loop_end_layer": int(config.get("memory_loop_end_layer", 24)),
+            "round0_gen_reads_memory": bool(
+                config.get("round0_gen_reads_memory", False)
+            ),
         }
     ).load()
     model = backbone.bagel
     vae = backbone.vae_model
     assert model is not None and vae is not None
     vae_contract = audit_bagel_flux_vae_contract(vae)
-    start_layer = int(config["loop_start_layer"])
-    end_layer = int(config["loop_end_layer"])
+    start_layer = int(config.get("memory_loop_start_layer", 16))
+    end_layer = int(config.get("memory_loop_end_layer", 24))
     backbone.apply_loop_trainable_policy(
         start_layer=start_layer,
         end_layer=end_layer,
         rank=int(config.get("lora_rank", 8)),
         alpha=int(config.get("lora_alpha", 16)),
         dropout=float(config.get("lora_dropout", 0.0)),
-        include_text_kv=bool(config.get("include_text_kv_lora", False)),
+        gen_attention_o_lora=bool(config.get("gen_attention_o_lora", False)),
+        k_v_lora=bool(config.get("k_v_lora", False)),
     )
     missing_adapter_keys = load_loop_adapter_state_dict(
         model,
         load_file(str(config["adapter_path"]), device="cpu"),
         allow_missing_projections=(
-            TEXT_ATTENTION_PROJECTIONS
-            if bool(config.get("include_text_kv_lora", False))
-            else ()
+            K_V_PROJECTIONS if bool(config.get("k_v_lora", False)) else ()
         ),
     )
     model.to(device).eval()
@@ -354,7 +359,8 @@ def main() -> None:
         model,
         start_layer=start_layer,
         end_layer=end_layer,
-        include_text_kv=bool(config.get("include_text_kv_lora", False)),
+        gen_attention_o_lora=bool(config.get("gen_attention_o_lora", False)),
+        k_v_lora=bool(config.get("k_v_lora", False)),
     )
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     _broadcast_parameters(trainable, distributed)
@@ -412,7 +418,7 @@ def main() -> None:
             end_layer,
             len(names),
             sum(parameter.numel() for parameter in trainable),
-            bool(config.get("include_text_kv_lora", False)),
+            bool(config.get("k_v_lora", False)),
             len(missing_adapter_keys),
         )
     if distributed:
@@ -434,8 +440,6 @@ def main() -> None:
         "timestep_shift": float(config.get("timestep_shift", 3.0)),
         "sde_step_indices": sde_steps,
         "sde_noise_level": float(config.get("sde_noise_level", 0.8)),
-        "loop_state_mode": str(config.get("loop_state_mode", "semantic_token")),
-        "loop_state_tokens": int(config.get("loop_state_tokens", 16)),
     }
     log_path = output_dir / f"metrics_rank{rank:02d}.jsonl"
     for step in range(1, max_steps + 1):
@@ -471,12 +475,6 @@ def main() -> None:
                     cfg_img_precontext=loop_text_only,
                     init_noise=init_noise,
                     return_trajectory=True,
-                    loop_start_layer=start_layer,
-                    loop_end_layer=end_layer,
-                    loop_state_scale=float(config.get("loop_state_scale", 0.2)),
-                    loop_state_timestep_threshold=float(
-                        config.get("loop_state_timestep_threshold", 0.0)
-                    ),
                     sde_seed=rollout_seed,
                     **generation_common,
                 )

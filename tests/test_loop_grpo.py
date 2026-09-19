@@ -43,7 +43,6 @@ def _context():
         "packed_text_ids": value,
         "packed_text_indexes": value,
         "packed_boundary_token_indexes": value,
-        "packed_loop_semantic_token_indexes": value,
         "packed_position_ids": value,
         "packed_indexes": value,
         "packed_seqlens": value,
@@ -66,11 +65,6 @@ def _context():
         "cfg_img_past_key_values": object(),
         "cfg_img_packed_key_value_indexes": value,
         "loop_depth": 2,
-        "loop_start_layer": 8,
-        "loop_end_layer": 20,
-        "loop_timestep_threshold": 0.75,
-        "loop_residual_scale": 0.05,
-        "loop_state_mode": "boundary",
     }
 
 
@@ -112,6 +106,47 @@ def test_temporary_reference_adapter_restores_policy():
         ])
     restored = clone_loop_adapter_state(policy)
     assert all(torch.equal(current[name], restored[name]) for name in current)
+
+
+def test_replay_uses_memory_loop_when_packed_loop_indexes_are_set():
+    class Policy(_TinyPolicy):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def _forward_flow(self, x_t, **kwargs):
+            self.calls.append("vanilla")
+            return super()._forward_flow(x_t, **kwargs)
+
+        def _forward_flow_loop(self, x_t, **kwargs):
+            self.calls.append("loop")
+            assert kwargs["packed_loop_token_indexes"].numel() > 0
+            assert kwargs.get("memory_body_in") is not None
+            return super()._forward_flow(x_t, **kwargs)
+
+    policy = Policy()
+    reference = clone_loop_adapter_state(policy)
+    context = _context()
+    context["packed_loop_token_indexes"] = torch.tensor([1, 2], dtype=torch.long)
+    context["embed_memory"] = torch.zeros(2, 1)
+    context["recycle_mode"] = "same_depth"
+    context["memory_loop_repeat"] = 2
+    context["memory_loop_start"] = 1
+    context["memory_loop_end"] = 3
+    transition = _rollout(policy)
+    transition["m_in"] = torch.zeros(2, 1)
+    policy.calls.clear()
+    replay_transition(
+        policy,
+        transition,
+        context,
+        reference,
+        advantage=torch.tensor(1.0),
+        clip_range=1e-4,
+        kl_beta=0.0,
+    )
+    assert "loop" in policy.calls
+    assert "vanilla" not in policy.calls
 
 
 def test_exact_replay_starts_at_ratio_one_and_reaches_adapter_gradient():

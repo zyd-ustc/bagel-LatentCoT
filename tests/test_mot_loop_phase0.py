@@ -133,7 +133,6 @@ def test_k0_and_r1_defaults_do_not_enable_memory_loop(monkeypatch):
         "packed_vae_token_indexes": torch.arange(4),
         "packed_vae_seqlens": torch.tensor([4], dtype=torch.int),
         "packed_boundary_token_indexes": torch.tensor([0, 1]),
-        "packed_loop_semantic_token_indexes": torch.tensor([], dtype=torch.long),
         "packed_seqlens": torch.tensor([2], dtype=torch.int),
         "packed_position_ids": torch.zeros(2, dtype=torch.long),
         "packed_indexes": torch.arange(2),
@@ -200,7 +199,6 @@ def test_r2_calls_inner_loop_twice_but_euler_once_per_timestep():
         packed_vae_token_indexes=torch.tensor([1, 2]),
         packed_vae_seqlens=torch.tensor([2], dtype=torch.int),
         packed_boundary_token_indexes=torch.tensor([0, 3]),
-        packed_loop_semantic_token_indexes=torch.tensor([], dtype=torch.long),
         packed_seqlens=torch.tensor([4], dtype=torch.int),
         packed_position_ids=torch.zeros(4, dtype=torch.long),
         packed_indexes=torch.arange(4),
@@ -271,7 +269,6 @@ def test_same_depth_runs_one_forward_per_timestep():
         packed_vae_token_indexes=torch.tensor([1, 2]),
         packed_vae_seqlens=torch.tensor([2], dtype=torch.int),
         packed_boundary_token_indexes=torch.tensor([0, 3]),
-        packed_loop_semantic_token_indexes=torch.tensor([], dtype=torch.long),
         packed_seqlens=torch.tensor([4], dtype=torch.int),
         packed_position_ids=torch.zeros(4, dtype=torch.long),
         packed_indexes=torch.arange(4),
@@ -314,6 +311,19 @@ def test_forward_flow_loop_is_trainable_path_not_no_grad():
     assert Bagel._forward_flow_loop.__dict__.get("_orig_mod", None) is None
 
 
+def test_bagel_config_defaults_match_plan():
+    from qwen_latent_cot.bagel.modeling.bagel.bagel import BagelConfig
+
+    cfg = BagelConfig()
+    assert cfg.num_loop_tokens == 8
+    assert cfg.loop_depth == 2
+    assert cfg.loop_recycle_mode == "same_depth"
+    assert cfg.loop_memory_persist is False
+    assert cfg.memory_loop_start_layer == 16
+    assert cfg.memory_loop_end_layer == 24
+    assert cfg.round0_gen_reads_memory is False
+
+
 def test_bagel_config_exposes_phase0_fields():
     from qwen_latent_cot.bagel.modeling.bagel.bagel import BagelConfig
 
@@ -331,7 +341,14 @@ def test_bagel_config_exposes_phase0_fields():
     assert cfg.loop_memory_persist is False
 
 
-_DIAG = {"memory_rms": 1.0, "vae_hidden_rms": 1.0, "velocity_norm": 1.0}
+_DIAG = {
+    "memory_rms": 1.0,
+    "vae_hidden_rms": 1.0,
+    "velocity_norm": 1.0,
+    "delta_m": [0.2],
+    "delta_g": [0.1],
+    "delta_v": [0.05],
+}
 
 
 def _generate_kwargs(**overrides):
@@ -343,7 +360,6 @@ def _generate_kwargs(**overrides):
         "packed_vae_token_indexes": torch.tensor([1, 2]),
         "packed_vae_seqlens": torch.tensor([2], dtype=torch.int),
         "packed_boundary_token_indexes": torch.tensor([0, 3]),
-        "packed_loop_semantic_token_indexes": torch.tensor([], dtype=torch.long),
         "packed_seqlens": torch.tensor([4], dtype=torch.int),
         "packed_position_ids": torch.zeros(4, dtype=torch.long),
         "packed_indexes": torch.arange(4),
@@ -462,7 +478,7 @@ def test_same_depth_body_recurrence_preserves_nonmemory_and_recycles_memory():
         memory_loop_end=3,
     )
     counts = [len(layer.inputs) for layer in navit.layers]
-    assert counts == [1, 2, 2, 1]
+    assert counts == [1, 2, 2, 2]
     h_base = navit.layers[0].outputs[0]
     round1_body_out = navit.layers[2].outputs[0]
     round2_body_in = navit.layers[1].inputs[1]
@@ -612,6 +628,12 @@ def test_cfg_branches_keep_independent_recurrent_memory():
     assert torch.equal(m_full, m_full_in + 1)
     assert torch.equal(m_text, m_text_in + 1)
     assert torch.equal(m_img, m_img_in + 1)
+    assert m_full.data_ptr() != m_text.data_ptr()
+    assert m_full.data_ptr() != m_img.data_ptr()
+    assert m_text.data_ptr() != m_img.data_ptr()
+    m_full.add_(1)
+    assert torch.equal(m_text, m_text_in + 1)
+    assert torch.equal(m_img, m_img_in + 1)
 
 
 def test_persist_true_carries_m_out_to_next_m_in_and_keeps_cfg_memories_apart():
@@ -667,3 +689,496 @@ def test_persist_false_resets_next_step_but_logs_current_m_out():
     assert traj[1]["m_in"] is None
     assert traj[1]["m_out"] is not None
     assert torch.equal(traj[1]["m_out"], torch.full((2, 4), 2.0))
+    assert dummy.last_loop_diagnostics
+    for row in dummy.last_loop_diagnostics:
+        assert "delta_m" in row
+        assert "delta_g" in row
+        assert "delta_v" in row
+
+
+class TinySdpaLayer:
+    def __init__(self):
+        self.blocks = []
+
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        past_key_values=None,
+        packed_vae_token_indexes=None,
+        packed_memory_token_indexes=None,
+        block_gen_reads_memory=False,
+        **kwargs,
+    ):
+        from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import (
+            _sdpa_varlen_inference,
+            round0_blocked_slices,
+        )
+
+        self.blocks.append(bool(block_gen_reads_memory))
+        qkv = packed_query_sequence.unsqueeze(1)
+        kv_lens = query_lens
+        blocked = None
+        if bool(block_gen_reads_memory):
+            blocked = round0_blocked_slices(
+                query_lens,
+                kv_lens,
+                packed_vae_token_indexes,
+                packed_memory_token_indexes,
+            )
+        attn = _sdpa_varlen_inference(
+            query=qkv,
+            key=qkv,
+            value=qkv,
+            query_lens=query_lens,
+            key_value_lens=kv_lens,
+            causal=False,
+            blocked_slices=blocked,
+        )
+        return attn.squeeze(1), past_key_values
+
+
+class TinySdpaNavit:
+    def __init__(self, n_layers: int = 3):
+        self.layers = [TinySdpaLayer() for _ in range(n_layers)]
+        self.use_moe = True
+        self.gradient_checkpointing = False
+        self.training = False
+        self.enable_taylorseer = False
+
+    def rotary_emb(self, seq, pos):
+        zeros = torch.zeros(1, seq.shape[0], seq.shape[1], dtype=seq.dtype)
+        ones = torch.ones(1, seq.shape[0], seq.shape[1], dtype=seq.dtype)
+        return ones, zeros
+
+    def norm(self, hidden):
+        return hidden
+
+    def norm_moe_gen(self, hidden):
+        return hidden
+
+
+def _sdpa_layout():
+    mem = torch.tensor([1], dtype=torch.long)
+    gen = torch.tensor([2], dtype=torch.long)
+    text = torch.tensor([0, 1, 3], dtype=torch.long)
+    seq = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    return seq, mem, gen, text
+
+
+def _run_tiny_sdpa(seq, *, block: bool, repeat: int = 1, body: bool = True, n_layers: int = 3):
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Model
+
+    navit = TinySdpaNavit(n_layers)
+    _, mem, gen, text = _sdpa_layout()
+    kwargs = dict(
+        packed_query_sequence=seq.clone(),
+        query_lens=torch.tensor([4], dtype=torch.int),
+        packed_query_position_ids=torch.arange(4),
+        packed_query_indexes=torch.arange(4),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        update_past_key_values=False,
+        is_causal=False,
+        mode="gen",
+        packed_vae_token_indexes=gen,
+        packed_text_indexes=text,
+        packed_memory_token_indexes=mem,
+        block_gen_reads_memory=block,
+    )
+    if body:
+        kwargs.update(
+            memory_loop_repeat=repeat,
+            memory_loop_start=0,
+            memory_loop_end=1,
+        )
+    return Qwen2Model.forward_inference(navit, **kwargs), navit
+
+
+def test_round0_blocked_slices_accounts_for_past_and_batch():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import round0_blocked_slices
+
+    query_lens = torch.tensor([4, 4], dtype=torch.int)
+    key_lens = torch.tensor([7, 6], dtype=torch.int)
+    vae = torch.tensor([2, 6], dtype=torch.long)
+    mem = torch.tensor([1, 5], dtype=torch.long)
+    slices = round0_blocked_slices(query_lens, key_lens, vae, mem)
+    gen0, mem0 = slices[0]
+    gen1, mem1 = slices[1]
+    assert list(gen0.tolist()) == [2]
+    assert list(mem0.tolist()) == [3 + 1]
+    assert list(gen1.tolist()) == [2]
+    assert list(mem1.tolist()) == [2 + 1]
+
+
+def test_sdpa_round0_block_and_read():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import (
+        _sdpa_varlen_inference,
+        round0_blocked_slices,
+    )
+
+    query_lens = torch.tensor([4], dtype=torch.int)
+    mem = torch.tensor([1], dtype=torch.long)
+    gen = torch.tensor([2], dtype=torch.long)
+    hidden = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 0.0],
+        ]
+    )
+    qk = hidden.unsqueeze(1)
+    v = hidden.unsqueeze(1)
+    blocked = round0_blocked_slices(query_lens, query_lens, gen, mem)
+    gen_local, mem_keys = blocked[0]
+    assert list(mem_keys.tolist()) == [1]
+    v_mem = v.clone()
+    v_mem[1] = torch.tensor([[0.0, -1.0]])
+    v_gen = v.clone()
+    v_gen[2] = torch.tensor([[-1.0, 1.0]])
+    out_block = _sdpa_varlen_inference(
+        query=qk,
+        key=qk,
+        value=v,
+        query_lens=query_lens,
+        key_value_lens=query_lens,
+        causal=False,
+        blocked_slices=blocked,
+    ).squeeze(1)
+    out_block_mem = _sdpa_varlen_inference(
+        query=qk,
+        key=qk,
+        value=v_mem,
+        query_lens=query_lens,
+        key_value_lens=query_lens,
+        causal=False,
+        blocked_slices=blocked,
+    ).squeeze(1)
+    out_block_gen = _sdpa_varlen_inference(
+        query=qk,
+        key=qk,
+        value=v_gen,
+        query_lens=query_lens,
+        key_value_lens=query_lens,
+        causal=False,
+        blocked_slices=blocked,
+    ).squeeze(1)
+    assert torch.allclose(out_block[2], out_block_mem[2], atol=1e-5)
+    assert not torch.allclose(out_block[1], out_block_gen[1], atol=1e-4)
+    out_open = _sdpa_varlen_inference(
+        query=qk,
+        key=qk,
+        value=v,
+        query_lens=query_lens,
+        key_value_lens=query_lens,
+        causal=False,
+        blocked_slices=None,
+    ).squeeze(1)
+    out_open_mem = _sdpa_varlen_inference(
+        query=qk,
+        key=qk,
+        value=v_mem,
+        query_lens=query_lens,
+        key_value_lens=query_lens,
+        causal=False,
+        blocked_slices=None,
+    ).squeeze(1)
+    assert not torch.allclose(out_open[2], out_open_mem[2], atol=1e-4)
+
+    past = 3
+    key_lens = torch.tensor([4 + past], dtype=torch.int)
+    past_kv = torch.ones(past, 1, 2)
+    key = torch.cat([past_kv, qk], dim=0)
+    value = torch.cat([past_kv, v], dim=0)
+    slices = round0_blocked_slices(query_lens, key_lens, gen, mem)
+    assert list(slices[0][1].tolist()) == [past + 1]
+    out_past = _sdpa_varlen_inference(
+        query=qk,
+        key=key,
+        value=value,
+        query_lens=query_lens,
+        key_value_lens=key_lens,
+        causal=False,
+        blocked_slices=slices,
+    ).squeeze(1)
+    value_mem = value.clone()
+    value_mem[past + 1] = torch.tensor([[0.0, -1.0]])
+    out_past_mem = _sdpa_varlen_inference(
+        query=qk,
+        key=key,
+        value=value_mem,
+        query_lens=query_lens,
+        key_value_lens=key_lens,
+        causal=False,
+        blocked_slices=slices,
+    ).squeeze(1)
+    assert torch.allclose(out_past[2], out_past_mem[2], atol=1e-5)
+    value_gen = value.clone()
+    value_gen[past + 2] = torch.tensor([[-1.0, 1.0]])
+    out_past_gen = _sdpa_varlen_inference(
+        query=qk,
+        key=key,
+        value=value_gen,
+        query_lens=query_lens,
+        key_value_lens=key_lens,
+        causal=False,
+        blocked_slices=slices,
+    ).squeeze(1)
+    assert not torch.allclose(out_past[1], out_past_gen[1], atol=1e-4)
+
+
+def test_same_depth_round0_block_round1_write_and_read():
+    seq, _, gen, _ = _sdpa_layout()
+    blocked, navit_b = _run_tiny_sdpa(seq, block=True, repeat=2, body=True, n_layers=2)
+    assert navit_b.layers[0].blocks == [True, False]
+    seq_mem = seq.clone()
+    seq_mem[1] = torch.tensor([0.0, -1.0])
+    seq_gen = seq.clone()
+    seq_gen[2] = torch.tensor([-1.0, 1.0])
+    blocked_mem, _ = _run_tiny_sdpa(seq_mem, block=True, repeat=2, body=True, n_layers=2)
+    blocked_gen, _ = _run_tiny_sdpa(seq_gen, block=True, repeat=2, body=True, n_layers=2)
+    assert torch.allclose(
+        blocked.gen_round_hiddens[0][0],
+        blocked_mem.gen_round_hiddens[0][0],
+        atol=1e-4,
+    )
+    assert not torch.equal(blocked.memory_body_out, blocked_gen.memory_body_out)
+    opened, _ = _run_tiny_sdpa(seq, block=False, repeat=2, body=True, n_layers=2)
+    opened_mem, _ = _run_tiny_sdpa(seq_mem, block=False, repeat=2, body=True, n_layers=2)
+    assert not torch.allclose(
+        opened.gen_round_hiddens[0][0],
+        opened_mem.gen_round_hiddens[0][0],
+        atol=1e-4,
+    )
+    assert not torch.equal(blocked.gen_round_hiddens[0], blocked.gen_round_hiddens[1])
+    assert blocked.gen_suffix_round_hiddens is not None
+    assert len(blocked.gen_suffix_round_hiddens) == 2
+
+
+def test_full_depth_block_flag_uses_sequential_path():
+    seq, _, gen, _ = _sdpa_layout()
+    blocked, navit_b = _run_tiny_sdpa(seq, block=True, body=False, n_layers=1)
+    assert all(layer.blocks == [True] for layer in navit_b.layers)
+    seq_mem = seq.clone()
+    seq_mem[1] = torch.tensor([0.0, -1.0])
+    seq_gen = seq.clone()
+    seq_gen[2] = torch.tensor([-1.0, 1.0])
+    blocked_mem, _ = _run_tiny_sdpa(seq_mem, block=True, body=False, n_layers=1)
+    blocked_gen, _ = _run_tiny_sdpa(seq_gen, block=True, body=False, n_layers=1)
+    assert torch.allclose(
+        blocked.packed_query_sequence[gen],
+        blocked_mem.packed_query_sequence[gen],
+        atol=1e-4,
+    )
+    mem = torch.tensor([1], dtype=torch.long)
+    assert not torch.equal(
+        blocked.packed_query_sequence[mem],
+        blocked_gen.packed_query_sequence[mem],
+    )
+    opened, navit_o = _run_tiny_sdpa(seq, block=False, body=False, n_layers=1)
+    assert all(layer.blocks == [False] for layer in navit_o.layers)
+    opened_mem, _ = _run_tiny_sdpa(seq_mem, block=False, body=False, n_layers=1)
+    assert not torch.allclose(
+        opened.packed_query_sequence[gen],
+        opened_mem.packed_query_sequence[gen],
+        atol=1e-4,
+    )
+
+
+def test_diagnostics_populate_deltas_when_r_ge_2():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import BaseNavitOutputWithPast
+
+    class Dummy(Bagel):
+        def __init__(self):
+            self.hidden_size = 4
+            self.use_moe = True
+            self.config = SimpleNamespace(num_loop_tokens=1, loop_depth=2)
+
+            def embed_tokens(ids):
+                return torch.ones(int(ids.numel()), 4)
+
+            def forward_inference(**kwargs):
+                seq = kwargs["packed_query_sequence"].clone()
+                loop_idx = kwargs["packed_memory_token_indexes"]
+                gen_idx = kwargs["packed_vae_token_indexes"]
+                m0 = seq[loop_idx].clone()
+                g0 = seq[gen_idx].clone()
+                m1 = m0 + 1
+                g1 = g0 + 2
+                seq[loop_idx] = m1
+                seq[gen_idx] = g1
+                return BaseNavitOutputWithPast(
+                    packed_query_sequence=seq,
+                    past_key_values=kwargs["past_key_values"],
+                    memory_body_out=m1,
+                    memory_round_hiddens=(m0, m1),
+                    gen_round_hiddens=(g0, g1),
+                    gen_suffix_round_hiddens=(g0, g1),
+                )
+
+            self.language_model = SimpleNamespace(
+                model=SimpleNamespace(embed_tokens=embed_tokens),
+                forward_inference=forward_inference,
+            )
+            self.latent_pos_embed = lambda pos: torch.zeros(int(pos.numel()), 4)
+            self.time_embedder = lambda t: torch.zeros(int(t.numel()), 4)
+            self.vae2llm = lambda x: torch.zeros(x.shape[0], 4)
+            self.llm2vae = lambda h: h
+
+    dummy = Dummy.__new__(Dummy)
+    Dummy.__init__(dummy)
+    dummy._forward_flow_loop = Bagel._forward_flow_loop.__get__(dummy, Dummy)
+    dummy._combine_cfg_velocities = Bagel._combine_cfg_velocities.__get__(
+        dummy, Dummy
+    )
+    dummy.mot_und_route_indexes = staticmethod(Bagel.mot_und_route_indexes)
+    dummy.memory_slot_stats = staticmethod(Bagel.memory_slot_stats)
+    dummy.relative_l2 = staticmethod(Bagel.relative_l2)
+    _, _, _, _, diag = dummy._forward_flow_loop(
+        x_t=torch.zeros(1, 4),
+        timestep=torch.tensor([0.7]),
+        packed_vae_token_indexes=torch.tensor([2]),
+        packed_vae_position_ids=torch.zeros(1, dtype=torch.long),
+        packed_text_ids=torch.tensor([1, 2]),
+        packed_text_indexes=torch.tensor([0, 3]),
+        packed_indexes=torch.arange(4),
+        packed_position_ids=torch.zeros(4, dtype=torch.long),
+        packed_seqlens=torch.tensor([4], dtype=torch.int),
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        past_key_values=object(),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        packed_loop_token_indexes=torch.tensor([1]),
+        loop_memory=torch.ones(1, 4),
+        recycle_mode="same_depth",
+        memory_loop_repeat=2,
+        memory_loop_start=1,
+        memory_loop_end=3,
+        embed_memory=torch.ones(1, 4),
+        round0_gen_reads_memory=False,
+    )
+    assert diag["delta_m"]
+    assert diag["delta_g"]
+    assert diag["delta_v"]
+    assert diag["delta_m"][0] > 0
+    assert diag["delta_g"][0] > 0
+    assert diag["delta_v"][0] > 0
+    base = torch.ones(1, 4)
+    assert Bagel.relative_l2(base + 1, base) == pytest.approx(
+        float(torch.linalg.vector_norm(torch.ones(1, 4)) / torch.linalg.vector_norm(base)),
+        abs=1e-6,
+    )
+
+
+def test_k0_diagnostics_empty():
+    dummy = DummyK0()
+    dummy.generate_image(
+        packed_text_ids=torch.tensor([1, 2]),
+        packed_text_indexes=torch.tensor([0, 1]),
+        packed_init_noises=torch.zeros(4, 8),
+        packed_vae_position_ids=torch.zeros(4, dtype=torch.long),
+        packed_vae_token_indexes=torch.arange(4),
+        packed_vae_seqlens=torch.tensor([4], dtype=torch.int),
+        packed_boundary_token_indexes=torch.tensor([0, 1]),
+        packed_seqlens=torch.tensor([2], dtype=torch.int),
+        packed_position_ids=torch.zeros(2, dtype=torch.long),
+        packed_indexes=torch.arange(2),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        num_timesteps=2,
+        timestep_shift=1.0,
+        cfg_interval=(0.0, 1.0),
+        enable_taylorseer=False,
+    )
+    assert dummy.last_loop_diagnostics == []
+
+
+class DummyK0(Bagel):
+    def __init__(self):
+        self.config = SimpleNamespace(num_loop_tokens=0, loop_depth=1)
+        self.loop_memory = None
+        self.last_loop_diagnostics = []
+        self.language_model = SimpleNamespace(
+            model=SimpleNamespace(enable_taylorseer=False)
+        )
+
+    def prepare_image_schedule(self, num_timesteps, timestep_shift, device):
+        t = torch.tensor([1.0, 0.5], device=device)
+        return t, torch.tensor([0.5, 0.5], device=device)
+
+    def predict_image_velocity(self, **kwargs):
+        return kwargs["x_t"]
+
+    def image_euler_step(self, x_t, velocity, dt):
+        return x_t
+
+
+def test_full_depth_control_still_runs():
+    velocity_calls = []
+
+    def forward(kwargs):
+        velocity_calls.append(kwargs.get("round0_gen_reads_memory"))
+        memory = torch.ones(2, 4)
+        return kwargs["x_t"], memory, memory, memory, dict(_DIAG)
+
+    dummy = _make_memory_dummy(
+        persist=False, recycle_mode="full_depth", forward=forward
+    )
+    dummy.generate_image(
+        **_generate_kwargs(
+            loop_recycle_mode="full_depth",
+            loop_memory_persist=False,
+            return_trajectory=False,
+            sde_step_indices=(),
+        )
+    )
+    assert len(velocity_calls) == 4
+    assert velocity_calls == [False, True, False, True]
+
+
+def test_generate_image_rejects_removed_loop_state_kwargs():
+    dummy = DummyK0()
+    kwargs = dict(
+        packed_text_ids=torch.tensor([1, 2]),
+        packed_text_indexes=torch.tensor([0, 1]),
+        packed_init_noises=torch.zeros(4, 8),
+        packed_vae_position_ids=torch.zeros(4, dtype=torch.long),
+        packed_vae_token_indexes=torch.arange(4),
+        packed_vae_seqlens=torch.tensor([4], dtype=torch.int),
+        packed_boundary_token_indexes=torch.tensor([0, 1]),
+        packed_seqlens=torch.tensor([2], dtype=torch.int),
+        packed_position_ids=torch.zeros(2, dtype=torch.long),
+        packed_indexes=torch.arange(2),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        num_timesteps=2,
+        timestep_shift=1.0,
+        cfg_interval=(0.0, 1.0),
+        enable_taylorseer=False,
+    )
+    with pytest.raises(TypeError):
+        dummy.generate_image(**kwargs, loop_state_scale=0.2)
+    with pytest.raises(TypeError):
+        dummy.generate_image(**kwargs, loop_state_mode="semantic_token")
+
+
+def test_filter_old_prompt_keeps_edit_instruction():
+    from PIL import Image
+    from qwen_latent_cot.bagel.inferencer import filter_old_prompt
+
+    image = Image.new("RGB", (8, 8))
+    items = ["old prompt", image, "make it blue"]
+    assert filter_old_prompt(items, True) == [image, "make it blue"]
+    assert filter_old_prompt(items, False) == items
+

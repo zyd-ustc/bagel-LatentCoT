@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Phase-0 zero-shot T2I: A0–A5 hidden memory loop, identical ε.
+"""Phase 0.5 zero-shot editing: Z0–Z6 / C0 Read–Route–Write loop.
 
-Call path is the official notebook T2I:
-    inferencer(text=prompt, init_noise=ε, **NOTEBOOK_T2I_HYPER)
+Call path is the official notebook editor:
+    inferencer(image=source, text=edit, init_noise=ε, **NOTEBOOK_EDIT_HYPER)
 
-Only two intentional deltas vs inference.ipynb:
-    1. cfg_interval = [0.0, 1.0]  (notebook T2I uses [0.4, 1.0])
-    2. BagelConfig loop fields are swapped per arm; inferencer kwargs stay
-       vanilla (no think / FlowEdit / SDE / TaylorSeer / loop_state_scale).
-
-Shared across arms of one prompt: prompt, seed, init_noise, steps, CFG, image size.
+Inferencer kwargs stay notebook-like (no think / FlowEdit / SDE / TaylorSeer).
+Shared across arms: source, instruction, seed, init noise, CFG, NFE.
 """
 
 from __future__ import annotations
@@ -34,84 +30,120 @@ from bagel_common import (
 )
 
 
-# Official inference.ipynb T2I hyper, with cfg_interval opened for the whole
-# reverse trajectory as specified for this round.
-NOTEBOOK_T2I_HYPER = dict(
+NOTEBOOK_EDIT_HYPER = dict(
     cfg_text_scale=4.0,
-    cfg_img_scale=1.0,
+    cfg_img_scale=2.0,
     cfg_interval=[0.0, 1.0],
     timestep_shift=3.0,
     num_timesteps=50,
     cfg_renorm_min=0.0,
-    cfg_renorm_type="global",
+    cfg_renorm_type="text_channel",
 )
 
 ARMS: List[Dict[str, Any]] = [
     {
-        "id": "A0",
-        "slug": "a0_vanilla",
-        "title": "A0 Vanilla",
+        "id": "Z0",
+        "slug": "z0_vanilla",
+        "title": "Z0 Vanilla",
         "K": 0,
         "R": 1,
         "recycle_mode": "same_depth",
-        "persist": True,
-        "start_layer": 20,
-        "end_layer": 28,
+        "persist": False,
+        "start_layer": 16,
+        "end_layer": 24,
+        "remove_old_prompt": True,
+        "round0_gen_reads_memory": False,
     },
     {
-        "id": "A1",
-        "slug": "a1_token_only",
-        "title": "A1 Token-only",
-        "K": 8,
-        "R": 1,
-        "recycle_mode": "same_depth",
-        "persist": True,
-        "start_layer": 20,
-        "end_layer": 28,
-    },
-    {
-        "id": "A2",
-        "slug": "a2_main",
-        "title": "A2 Main same_depth R=2 persist",
+        "id": "Z1",
+        "slug": "z1_current_loop",
+        "title": "Z1 current loop",
         "K": 8,
         "R": 2,
         "recycle_mode": "same_depth",
         "persist": True,
         "start_layer": 20,
         "end_layer": 28,
+        "remove_old_prompt": False,
+        "round0_gen_reads_memory": True,
     },
     {
-        "id": "A3",
-        "slug": "a3_depth_r3",
-        "title": "A3 Depth scaling R=3",
-        "K": 8,
-        "R": 3,
-        "recycle_mode": "same_depth",
-        "persist": True,
-        "start_layer": 20,
-        "end_layer": 28,
-    },
-    {
-        "id": "A4",
-        "slug": "a4_full_depth",
-        "title": "A4 Full-depth control",
-        "K": 8,
-        "R": 2,
-        "recycle_mode": "full_depth",
-        "persist": True,
-        "start_layer": 20,
-        "end_layer": 28,
-    },
-    {
-        "id": "A5",
-        "slug": "a5_no_persist",
-        "title": "A5 No temporal memory",
+        "id": "Z2",
+        "slug": "z2_drop_old_prompt",
+        "title": "Z2 drop old prompt / persist",
         "K": 8,
         "R": 2,
         "recycle_mode": "same_depth",
         "persist": False,
         "start_layer": 20,
         "end_layer": 28,
+        "remove_old_prompt": True,
+        "round0_gen_reads_memory": True,
+    },
+    {
+        "id": "Z3",
+        "slug": "z3_read_first",
+        "title": "Z3 read-first",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 20,
+        "end_layer": 28,
+        "remove_old_prompt": True,
+        "round0_gen_reads_memory": False,
+    },
+    {
+        "id": "Z4",
+        "slug": "z4_mid_layer",
+        "title": "Z4 mid-layer main",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 16,
+        "end_layer": 24,
+        "remove_old_prompt": True,
+        "round0_gen_reads_memory": False,
+    },
+    {
+        "id": "Z5",
+        "slug": "z5_early_bridge",
+        "title": "Z5 earlier semantic bridge",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 12,
+        "end_layer": 20,
+        "remove_old_prompt": True,
+        "round0_gen_reads_memory": False,
+    },
+    {
+        "id": "Z6",
+        "slug": "z6_persist",
+        "title": "Z6 persist after zero-shot",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "same_depth",
+        "persist": True,
+        "start_layer": 16,
+        "end_layer": 24,
+        "remove_old_prompt": True,
+        "round0_gen_reads_memory": False,
+    },
+    {
+        "id": "C0",
+        "slug": "c0_full_depth",
+        "title": "C0 full-depth control",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "full_depth",
+        "persist": False,
+        "start_layer": 16,
+        "end_layer": 24,
+        "remove_old_prompt": True,
+        "round0_gen_reads_memory": False,
     },
 ]
 
@@ -138,6 +170,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Allocate loop_memory at load time (max K across arms).",
+    )
+    parser.add_argument("--source-image", default="")
+    parser.add_argument("--source-prompt", default="")
+    parser.add_argument(
+        "--old-prompt",
+        default="",
+        help="Original T2I prompt for Z1 keep-old-prompt arms. Defaults to source-prompt.",
     )
     parser.add_argument(
         "--merge-only",
@@ -184,7 +223,7 @@ def shard_indices(n: int, shard_id: int, num_shards: int) -> List[int]:
 
 
 def apply_loop_config(model, arm: Dict[str, Any]) -> None:
-    """Swap Phase-0 memory-loop fields. Does not touch the inferencer API."""
+    """Swap Read–Route–Write fields. Does not touch the inferencer API."""
 
     k = int(arm["K"])
     r = int(arm["R"])
@@ -192,6 +231,7 @@ def apply_loop_config(model, arm: Dict[str, Any]) -> None:
     persist = bool(arm["persist"])
     start = int(arm["start_layer"])
     end = int(arm["end_layer"])
+    round0_write = bool(arm["round0_gen_reads_memory"])
     if k < 0:
         raise ValueError("K must be >= 0")
     if r < 1:
@@ -211,23 +251,46 @@ def apply_loop_config(model, arm: Dict[str, Any]) -> None:
     model.config.loop_memory_persist = persist
     model.config.memory_loop_start_layer = start
     model.config.memory_loop_end_layer = end
+    model.config.round0_gen_reads_memory = round0_write
     model.num_loop_tokens = k
     model.loop_depth = r
     model.loop_recycle_mode = mode
     model.loop_memory_persist = persist
     model.memory_loop_start_layer = start
     model.memory_loop_end_layer = end
+    model.round0_gen_reads_memory = round0_write
 
 
-def official_t2i(inferencer, prompt: str, init_noise: torch.Tensor, image_shape):
-    """Notebook-identical T2I entry. Loop behaviour comes only from BagelConfig."""
-
-    return inferencer(
-        text=prompt,
+def official_edit(
+    inferencer,
+    source_image,
+    edit_text: str,
+    init_noise: torch.Tensor,
+    image_shape,
+    *,
+    old_prompt: str = "",
+    remove_old_prompt: bool = True,
+):
+    kwargs = dict(
         init_noise=init_noise,
         image_shapes=tuple(image_shape),
         enable_taylorseer=False,
-        **NOTEBOOK_T2I_HYPER,
+        remove_old_prompt=bool(remove_old_prompt),
+        **NOTEBOOK_EDIT_HYPER,
+    )
+    if old_prompt and not remove_old_prompt:
+        outputs = inferencer.interleave_inference(
+            [str(old_prompt), source_image, str(edit_text)],
+            **kwargs,
+        )
+        for item in outputs:
+            if hasattr(item, "save"):
+                return item
+        raise RuntimeError("edit inference produced no image")
+    return inferencer(
+        image=source_image,
+        text=edit_text,
+        **kwargs,
     )["image"]
 
 
@@ -250,7 +313,13 @@ def _jsonable(value: Any) -> Any:
 
 def summarize_diagnostics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
-        return {"n_steps": 0, "n_inner": 0}
+        return {
+            "n_steps": 0,
+            "n_inner": 0,
+            "mean_delta_m": None,
+            "mean_delta_g": None,
+            "mean_delta_v": None,
+        }
     def _pairwise_value(row: Dict[str, Any]):
         raw = row.get("mean_abs_pairwise_cosine", row.get("pairwise_cosine"))
         if isinstance(raw, (int, float)) and not math.isnan(float(raw)):
@@ -270,6 +339,19 @@ def summarize_diagnostics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if isinstance(row.get("memory_cosine_to_prev"), (int, float))
         and not math.isnan(float(row["memory_cosine_to_prev"]))
     ]
+
+    def _mean_list(key: str):
+        values = []
+        for row in rows:
+            raw = row.get(key)
+            if isinstance(raw, (list, tuple)):
+                values.extend(
+                    float(item)
+                    for item in raw
+                    if isinstance(item, (int, float)) and not math.isnan(float(item))
+                )
+        return sum(values) / len(values) if values else None
+
     return {
         "n_inner": len(rows),
         "n_steps": len({int(row["step"]) for row in rows if "step" in row}),
@@ -283,6 +365,9 @@ def summarize_diagnostics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "mean_memory_cosine_to_prev": (
             sum(cos_prev) / len(cos_prev) if cos_prev else None
         ),
+        "mean_delta_m": _mean_list("delta_m"),
+        "mean_delta_g": _mean_list("delta_g"),
+        "mean_delta_v": _mean_list("delta_v"),
         "last": _jsonable(rows[-1]),
     }
 
@@ -309,8 +394,8 @@ def write_prompt_gallery(
         name = f"{arm['slug']}.png"
         if not (prompt_dir / name).is_file():
             continue
-        mae = meta.get("pixel_mae_vs_A0", {}).get(arm["id"])
-        mae_txt = "" if mae is None else f" mae_A0={mae:.2f}"
+        mae = meta.get("pixel_mae_vs_Z0", {}).get(arm["id"])
+        mae_txt = "" if mae is None else f" mae_Z0={mae:.2f}"
         cells.append(
             "<td><img src='"
             + html.escape(name)
@@ -349,7 +434,7 @@ def merge_gallery(output_dir: Path, arms: Sequence[Dict[str, Any]]) -> None:
             f"<td class='id'>{html.escape(rel)}</td>"
             f"<td class='prompt'>{html.escape(prompt)}</td>"
         ]
-        mae_map = meta.get("pixel_mae_vs_A0", {})
+        mae_map = meta.get("pixel_mae_vs_Z0", {})
         for arm in arms:
             name = f"{arm['slug']}.png"
             path = prompt_dir / name
@@ -357,14 +442,14 @@ def merge_gallery(output_dir: Path, arms: Sequence[Dict[str, Any]]) -> None:
                 cells.append("<td></td>")
                 continue
             mae = mae_map.get(arm["id"])
-            mae_txt = "" if mae is None else f"<div class='mae'>mae_A0={mae:.2f}</div>"
+            mae_txt = "" if mae is None else f"<div class='mae'>mae_Z0={mae:.2f}</div>"
             cells.append(
                 f"<td><img src='{html.escape(rel + '/' + name)}'>"
                 f"<div class='cap'>{html.escape(arm['id'])}</div>{mae_txt}</td>"
             )
         rows.append("<tr>" + "".join(cells) + "</tr>")
     page = f"""<!doctype html><meta charset='utf-8'>
-<title>BAGEL Phase-0 loop zero-shot A0–A5</title>
+<title>BAGEL Read–Route–Write loop zero-shot Z0–C0</title>
 <style>
 body{{font:13px system-ui;background:#111;color:#eee;margin:20px}}
 table{{border-collapse:collapse}}
@@ -375,9 +460,9 @@ img{{width:192px;height:192px;object-fit:contain;background:#000}}
 .id{{color:#9cf;white-space:nowrap}}
 .cap,.mae{{font-size:11px;color:#aaa}}
 </style>
-<h1>Phase-0 memory-loop zero-shot</h1>
-<p>Official <code>inferencer(text=P, init_noise=ε, **T2I_hyper)</code>,
-<code>cfg_interval=[0,1]</code>, no FlowEdit / SDE / TaylorSeer.</p>
+<h1>Read–Route–Write loop zero-shot</h1>
+<p>Official <code>inferencer(image=I, text=e, init_noise=ε, **EDIT_hyper)</code>,
+no FlowEdit / SDE / TaylorSeer.</p>
 <table>
 <tr><th>id</th><th>prompt</th>{header}</tr>
 {''.join(rows) or '<tr><td>no prompt dirs yet</td></tr>'}
@@ -394,6 +479,8 @@ def run_prompt(
     prompt: str,
     prompt_index: int,
     arms: Sequence[Dict[str, Any]],
+    source_image,
+    old_prompt: str,
 ) -> None:
     prompt_dir.mkdir(parents=True, exist_ok=True)
     model = inferencer.model
@@ -410,14 +497,19 @@ def run_prompt(
         print(
             f"[{prompt_dir.name} {arm['id']}] K={arm['K']} R={arm['R']} "
             f"{arm['recycle_mode']} persist={arm['persist']} "
-            f"layers=[{arm['start_layer']},{arm['end_layer']})",
+            f"layers=[{arm['start_layer']},{arm['end_layer']}) "
+            f"old_prompt={not arm['remove_old_prompt']} "
+            f"round0_write={arm['round0_gen_reads_memory']}",
             flush=True,
         )
-        image = official_t2i(
+        image = official_edit(
             inferencer,
+            source_image,
             prompt,
             init_noise.clone(),
             image_shape,
+            old_prompt=old_prompt,
+            remove_old_prompt=bool(arm["remove_old_prompt"]),
         )
         image_path = prompt_dir / f"{arm['slug']}.png"
         image.save(image_path)
@@ -437,6 +529,8 @@ def run_prompt(
                 "persist": arm["persist"],
                 "start_layer": arm["start_layer"],
                 "end_layer": arm["end_layer"],
+                "remove_old_prompt": arm["remove_old_prompt"],
+                "round0_gen_reads_memory": arm["round0_gen_reads_memory"],
                 "image": image_path.name,
                 "diagnostics": diag,
             }
@@ -448,31 +542,30 @@ def run_prompt(
         )
 
     mae = {}
-    if "A0" in images:
+    if "Z0" in images:
         for arm in arms:
-            if arm["id"] == "A0":
+            if arm["id"] == "Z0":
                 continue
             if arm["id"] in images:
-                mae[arm["id"]] = pixel_mae(images[arm["id"]], images["A0"])
+                mae[arm["id"]] = pixel_mae(images[arm["id"]], images["Z0"])
 
     meta = {
-        "schema": "bagel_loop_zeroshot_v1",
+        "schema": "bagel_loop_zeroshot_v2",
         "prompt_index": int(prompt_index),
         "prompt": prompt,
+        "old_prompt": old_prompt,
         "seed": int(args.seed),
         "noise_seed": int(noise_seed),
         "noise_sha256": noise_hash,
         "image_shape": list(image_shape),
-        "hyper": NOTEBOOK_T2I_HYPER,
-        "notebook_cfg_interval_default": [0.4, 1.0],
+        "hyper": NOTEBOOK_EDIT_HYPER,
         "forbidden": {
             "flowedit": False,
             "sde": False,
             "taylorseer": False,
             "think": False,
-            "loop_state_scale": None,
         },
-        "pixel_mae_vs_A0": mae,
+        "pixel_mae_vs_Z0": mae,
         "arms": arm_rows,
     }
     (prompt_dir / "run_manifest.json").write_text(
@@ -508,6 +601,18 @@ def main() -> None:
     m0_hash = init_frozen_memory(backbone.bagel, inferencer, int(args.seed))
     print(f"[model] m0_sha256={m0_hash}", flush=True)
 
+    source_path = str(args.source_image or "").strip()
+    if not source_path:
+        raise ValueError("--source-image is required for the editing zeroshot protocol")
+    from PIL import Image
+
+    source_image = Image.open(source_path).convert("RGB")
+    old_prompt = str(args.old_prompt or args.source_prompt or "").strip()
+    if any(not bool(arm["remove_old_prompt"]) for arm in arms) and not old_prompt:
+        raise ValueError(
+            "arms that keep the old prompt require --old-prompt or --source-prompt"
+        )
+
     for index in assigned:
         tag = f"p{index:03d}"
         prompt = prompts[index]
@@ -519,6 +624,8 @@ def main() -> None:
             prompt,
             index,
             arms,
+            source_image,
+            old_prompt,
         )
         print(f"[{tag}] done", flush=True)
     merge_gallery(output_dir, arms)
