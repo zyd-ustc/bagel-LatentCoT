@@ -80,6 +80,20 @@ def test_loop_lora_keeps_trainable_weights_and_gradients_in_fp32():
     assert layer.lora_B.weight.grad.dtype == torch.float32
 
 
+def test_generation_lora_is_off_in_read_mode_and_on_in_write_mode():
+    layer = LoopLoRALinear(
+        _linear(2.0), rank=1, alpha=1, read_enabled=False
+    )
+    with torch.no_grad():
+        layer.lora_A.weight.fill_(1.0)
+        layer.lora_B.weight.fill_(1.0)
+    inputs = torch.tensor([[1.0, 2.0]])
+    layer.set_loop_mode("read")
+    assert torch.equal(layer(inputs), torch.tensor([[2.0, 4.0]]))
+    layer.set_loop_mode("write")
+    assert torch.equal(layer(inputs), torch.tensor([[5.0, 7.0]]))
+
+
 class _Attention(nn.Module):
     def __init__(self):
         super().__init__()

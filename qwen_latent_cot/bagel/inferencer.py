@@ -378,6 +378,7 @@ class InterleaveInferencer:
         sde_noise_level: float = 0.0,
         sde_seed: int = 0,
         return_trajectory: bool = False,
+        return_loop_diagnostics: bool = False,
     ):
         # print(cfg_renorm_type)
         past_key_values = gen_context["past_key_values"]
@@ -470,6 +471,7 @@ class InterleaveInferencer:
             sde_noise_level=sde_noise_level,
             sde_seed=sde_seed,
             return_trajectory=return_trajectory,
+            return_loop_diagnostics=bool(return_loop_diagnostics),
         )
 
         if return_trajectory:
@@ -881,6 +883,7 @@ class InterleaveInferencer:
         init_noise: Optional[torch.Tensor] = None,
         return_latent: bool = False,
         remove_old_prompt: Optional[bool] = None,
+        return_loop_diagnostics: bool = False,
     ) -> List[Union[str, Image.Image]]:
         """Official interleaved entry point.
 
@@ -965,6 +968,7 @@ class InterleaveInferencer:
                     enable_taylorseer=enable_taylorseer,
                     init_noise=init_noise,
                     return_latent=bool(return_latent),
+                    return_loop_diagnostics=bool(return_loop_diagnostics),
                 )
                 if return_latent:
                     img, self.last_latent = gen_result

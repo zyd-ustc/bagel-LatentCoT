@@ -64,7 +64,7 @@ class BagelConfig(PretrainedConfig):
         connector_act="gelu_pytorch_tanh",
         interpolate_pos=False,
         timestep_shift=1.0,
-        num_loop_tokens=8,
+        num_loop_tokens=0,
         loop_depth=2,
         loop_uncond_memory="m0",
         loop_recycle_mode="same_depth",
@@ -141,7 +141,7 @@ class Bagel(PreTrainedModel):
             self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
 
         self.config = config
-        num_loop_tokens = int(getattr(config, "num_loop_tokens", 8) or 0)
+        num_loop_tokens = int(getattr(config, "num_loop_tokens", 0) or 0)
         loop_depth = int(getattr(config, "loop_depth", 2) or 1)
         if num_loop_tokens < 0:
             raise ValueError("num_loop_tokens must be >= 0")
@@ -183,7 +183,7 @@ class Bagel(PreTrainedModel):
             nn.init.constant_(self.llm2vae.bias, 0)
 
     def init_loop_memory_from_boundary_embeddings(
-        self, token_ids: Optional[List[int]] = None
+        self, token_ids: Optional[List[int]] = None, *, seed: int = 0
     ) -> None:
         """Copy native token embeddings into m0. Phase-0: no new projector."""
 
@@ -200,7 +200,14 @@ class Bagel(PreTrainedModel):
             )
         with torch.no_grad():
             base = embed(ids).float().mean(dim=0)
-            noise = 1e-4 * torch.randn_like(self.loop_memory)
+            generator = torch.Generator(device="cpu").manual_seed(int(seed))
+            noise = torch.randn(
+                tuple(self.loop_memory.shape),
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            ).to(device=self.loop_memory.device, dtype=self.loop_memory.dtype)
+            noise = 1e-4 * noise
             self.loop_memory.copy_(
                 base.to(device=self.loop_memory.device, dtype=self.loop_memory.dtype)
                 .unsqueeze(0)
@@ -1452,7 +1459,17 @@ class Bagel(PreTrainedModel):
                 raise ValueError(
                     "packed_loop_token_indexes must tile equally across samples"
                 )
-            embed_memory = self.loop_memory.to(device=x_t.device).repeat(n_samples, 1)
+            slots_per_sample = k_total // n_samples
+            if slots_per_sample > int(self.loop_memory.shape[0]):
+                raise ValueError(
+                    "packed loop K exceeds allocated loop_memory: "
+                    f"requested={slots_per_sample}, allocated={self.loop_memory.shape[0]}"
+                )
+            embed_memory = (
+                self.loop_memory[:slots_per_sample]
+                .to(device=x_t.device)
+                .repeat(n_samples, 1)
+            )
             memory_full = None
             memory_text = None
             memory_img = None
@@ -1556,36 +1573,43 @@ class Bagel(PreTrainedModel):
                                 if recycle_mode == "full_depth" and inner_r > 0
                                 else round0_write
                             ),
+                            collect_round_diagnostics=bool(return_loop_diagnostics),
                         )
                     )
-                    if prev_memory is None:
-                        cosine = float("nan")
-                    else:
-                        cosine = float(
-                            F.cosine_similarity(
-                                memory_full.flatten().float(),
-                                prev_memory.flatten().float(),
-                                dim=0,
+                    if return_loop_diagnostics:
+                        if prev_memory is None:
+                            cosine = float("nan")
+                        else:
+                            cosine = float(
+                                F.cosine_similarity(
+                                    memory_full.flatten().float(),
+                                    prev_memory.flatten().float(),
+                                    dim=0,
+                                )
                             )
+                        prev_memory = memory_full.detach()
+                        step_velocities.append(v_t.detach())
+                        if (
+                            recycle_mode == "full_depth"
+                            and len(step_velocities) > 1
+                        ):
+                            diag = dict(diag)
+                            diag["delta_v"] = [
+                                self.relative_l2(
+                                    step_velocities[-1], step_velocities[0]
+                                )
+                            ]
+                        self.last_loop_diagnostics.append(
+                            {
+                                "step": int(i),
+                                "t": float(t),
+                                "r": int(inner_r),
+                                "recycle_mode": recycle_mode,
+                                "persist": persist_memory,
+                                "memory_cosine_to_prev": cosine,
+                                **diag,
+                            }
                         )
-                    prev_memory = memory_full.detach()
-                    step_velocities.append(v_t.detach())
-                    if recycle_mode == "full_depth" and len(step_velocities) > 1:
-                        diag = dict(diag)
-                        diag["delta_v"] = [
-                            self.relative_l2(step_velocities[-1], step_velocities[0])
-                        ]
-                    self.last_loop_diagnostics.append(
-                        {
-                            "step": int(i),
-                            "t": float(t),
-                            "r": int(inner_r),
-                            "recycle_mode": recycle_mode,
-                            "persist": persist_memory,
-                            "memory_cosine_to_prev": cosine,
-                            **diag,
-                        }
-                    )
                 m_out = (
                     None if memory_full is None else memory_full.detach().clone()
                 )
@@ -1956,6 +1980,7 @@ class Bagel(PreTrainedModel):
         memory_body_in_img: Optional[torch.Tensor] = None,
         embed_memory: Optional[torch.Tensor] = None,
         round0_gen_reads_memory: bool = False,
+        collect_round_diagnostics: bool = False,
     ):
         """Memory-loop velocity. Not @torch.no_grad.
 
@@ -2002,6 +2027,7 @@ class Bagel(PreTrainedModel):
                 memory_loop_start=memory_loop_start,
                 memory_loop_end=memory_loop_end,
                 block_gen_reads_memory=block_gen,
+                collect_round_diagnostics=bool(collect_round_diagnostics),
             )
         else:
             extra_inputs.update(
@@ -2094,6 +2120,9 @@ class Bagel(PreTrainedModel):
             cfg_renorm_min=cfg_renorm_min,
             cfg_renorm_type=cfg_renorm_type,
         )
+        if not collect_round_diagnostics:
+            return v_t, m_full, m_text, m_img, {}
+
         stats = self.memory_slot_stats(m_full)
         delta_m: List[float] = []
         delta_g: List[float] = []

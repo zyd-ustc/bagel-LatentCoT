@@ -239,6 +239,7 @@ class BagelBackbone:
         self.vit_image_size = vit_image_size
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = int(model.config.vit_max_num_patch_per_side)
+        self.initialize_loop_memory()
 
         if disable_visual_gen:
             logger.info("Loaded BAGEL in understanding-only mode (visual_gen disabled).")
@@ -253,6 +254,18 @@ class BagelBackbone:
                 parameter.requires_grad = False
 
         return self
+
+    def initialize_loop_memory(self, *, seed: int = 0) -> None:
+        """Initialize frozen m0 from BAGEL's native image boundary tokens."""
+
+        if self.bagel is None or self.token_ids is None:
+            raise RuntimeError("load the BAGEL backbone before initializing loop memory")
+        self.bagel.init_loop_memory_from_boundary_embeddings(
+            [int(self.token_ids.vision_start), int(self.token_ids.vision_end)],
+            seed=int(seed),
+        )
+        if self.bagel.loop_memory is not None:
+            self.bagel.loop_memory.requires_grad_(False)
 
     def apply_loop_trainable_policy(
         self,

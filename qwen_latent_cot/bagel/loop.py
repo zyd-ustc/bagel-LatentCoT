@@ -45,7 +45,7 @@ def loop_lora_projections(
 
 
 class LoopLoRALinear(nn.Module):
-    """A LoRA linear whose residual is active only in an explicit loop pass.
+    """A LoRA linear whose residual is active only in an allowed loop mode.
 
     The pretrained linear is retained as ``base_layer`` and is always used.
     Unlike a global PEFT adapter, this module cannot silently alter BAGEL's
@@ -62,6 +62,7 @@ class LoopLoRALinear(nn.Module):
         rank: int,
         alpha: int,
         dropout: float = 0.0,
+        read_enabled: bool = True,
     ) -> None:
         super().__init__()
         if not isinstance(base_layer, nn.Linear):
@@ -83,14 +84,29 @@ class LoopLoRALinear(nn.Module):
         self.lora_B.to(device=base_layer.weight.device, dtype=torch.float32)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
-        self.loop_enabled = False
+        self.read_enabled = bool(read_enabled)
+        self.loop_mode = "off"
+
+    @property
+    def loop_enabled(self) -> bool:
+        """Backward-compatible view used by older checkpoints and tests."""
+
+        return self.loop_mode != "off"
+
+    def set_loop_mode(self, mode: str) -> None:
+        mode = str(mode)
+        if mode not in ("off", "read", "write"):
+            raise ValueError("loop mode must be 'off', 'read', or 'write'")
+        self.loop_mode = mode
 
     def set_loop_enabled(self, enabled: bool) -> None:
-        self.loop_enabled = bool(enabled)
+        self.set_loop_mode("write" if enabled else "off")
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         output = self.base_layer(inputs)
-        if not self.loop_enabled:
+        if self.loop_mode == "off" or (
+            self.loop_mode == "read" and not self.read_enabled
+        ):
             return output
         with torch.autocast(device_type=inputs.device.type, enabled=False):
             residual = self.lora_B(self.lora_A(self.dropout(inputs.float())))
@@ -145,6 +161,9 @@ def inject_loop_lora(
                     rank=int(rank),
                     alpha=int(alpha),
                     dropout=float(dropout),
+                    # The read round learns only the UND route. Generation
+                    # projections become active once memory is allowed to write.
+                    read_enabled=projection in UND_Q_PROJECTIONS,
                 ),
             )
 

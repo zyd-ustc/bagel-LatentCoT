@@ -10,8 +10,8 @@ BAGEL-7B-MoT 上的 **步内 understanding–generation hidden loop**。
 
 | 阶段 | 状态 |
 |---|---|
-| **Phase 0** | 已实现。默认 **same-depth body loop**：prefix 一次、只在 \([s,e)\) 上把 memory slots recycle \(R\) 次、suffix 一次。`full_depth` 仍可作为对照。CFG 三条分支各自维护 memory。`K=0` 走原 `_forward_flow`。 |
-| Phase 1+ | 未做：双侧 attention LoRA、Loop-SFT / DS+LD、Flow-GRPO |
+| **Phase 0** | 已实现。默认 **same-depth body loop**：prefix 一次、只在 \([s,e)\) 上把 memory slots recycle \(R\) 次、suffix 一次。Round-0 禁止所有 non-memory query 读取 memory，关闭跨层 UND relay。CFG 三条分支各自维护 memory；`K=0` 走原 `_forward_flow`。 |
+| Phase 1+ | Q-only loop LoRA 与 Flow-GRPO replay 已接通；text-reflection → latent-loop 的 Δv distillation trainer 未实现。 |
 | **B2 FlowEdit** | 官方速度场差速积分，对照「纯 flow 编辑」 |
 | **B3 显式反思链** | `draft_prefix_loop`：decode → UND 文本 → 官方 Editing |
 
@@ -36,15 +36,16 @@ BagelConfig(
     num_loop_tokens=8,
     loop_depth=2,
     loop_recycle_mode="same_depth",  # or "full_depth"
-    loop_memory_persist=True,        # False = reset m every timestep
-    memory_loop_start_layer=20,
-    memory_loop_end_layer=28,
+    loop_memory_persist=False,
+    memory_loop_start_layer=16,
+    memory_loop_end_layer=24,
 )
-# load checkpoint 后
-model.init_loop_memory_from_boundary_embeddings(
-    [new_token_ids["start_of_image"], new_token_ids["end_of_image"]]
-)
+# BagelBackbone.load() 会用原生 SOI/EOI embedding 确定性初始化 m0。
 ```
+
+`return_loop_diagnostics=False` 是正式推理/训练默认值，此时严格只跑
+`prefix ×1 + body ×R + suffix ×1`；机制探针显式设为 `True` 才计算逐轮
+`ΔM / ΔG / Δv`。
 
 ## 安装
 

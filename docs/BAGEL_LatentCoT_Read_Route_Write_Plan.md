@@ -114,11 +114,14 @@ h_s[M]=m_r.
 Q_MK_G^\top,
 \]
 
-让 memory 读取当前 GEN state；暂时禁止：
+让 memory 读取当前 GEN state；暂时禁止所有 non-memory query 读取 memory：
 
 \[
-Q_GK_M^\top.
+Q_{\neg M}K_M^\top.
 \]
+
+这同时覆盖 GEN、SOI、EOI 等 UND boundary token，避免跨层出现
+\(M_l\rightarrow B_{l+1}\rightarrow G_{l+2}\) relay。
 
 得到：
 
@@ -146,6 +149,9 @@ G(x_t; C_{native}, m_1).
 核心原则是：
 
 > **learn how to read / route before learning new content representations.**
+
+执行时按轮门控：Round 0 只开 UND-Q LoRA；Round 1+ 再开 UND-Q 与
+GEN-Q（以及可选的 GEN-O）。
 
 ### 2.4 编辑 context：默认去掉旧生成 prompt
 

@@ -276,6 +276,7 @@ def official_edit(
         image_shapes=tuple(image_shape),
         enable_taylorseer=False,
         remove_old_prompt=bool(remove_old_prompt),
+        return_loop_diagnostics=True,
         **NOTEBOOK_EDIT_HYPER,
     )
     if old_prompt and not remove_old_prompt:
@@ -372,16 +373,11 @@ def summarize_diagnostics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def init_frozen_memory(model, inferencer, seed: int) -> Optional[str]:
+def init_frozen_memory(model) -> Optional[str]:
     if getattr(model, "loop_memory", None) is None:
         return None
-    torch.manual_seed(int(seed))
-    model.init_loop_memory_from_boundary_embeddings(
-        [
-            int(inferencer.new_token_ids["start_of_image"]),
-            int(inferencer.new_token_ids["end_of_image"]),
-        ]
-    )
+    # BagelBackbone.load() owns the deterministic boundary initialization so
+    # zero-shot, SFT, rollout, and replay all start from the same m0.
     model.loop_memory.requires_grad_(False)
     return tensor_digest(model.loop_memory)
 
@@ -598,7 +594,7 @@ def main() -> None:
     print("[model] loading frozen BAGEL with loop_memory K="
           f"{int(args.num_loop_tokens)}", flush=True)
     backbone, inferencer = load_native_bagel(args)
-    m0_hash = init_frozen_memory(backbone.bagel, inferencer, int(args.seed))
+    m0_hash = init_frozen_memory(backbone.bagel)
     print(f"[model] m0_sha256={m0_hash}", flush=True)
 
     source_path = str(args.source_image or "").strip()

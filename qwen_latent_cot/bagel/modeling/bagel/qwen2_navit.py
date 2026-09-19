@@ -58,31 +58,32 @@ def round0_blocked_slices(
     packed_vae_token_indexes: Optional[torch.Tensor],
     packed_memory_token_indexes: Optional[torch.Tensor],
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Per-sample (GEN query local, memory key local) index pairs to block.
+    """Per-sample (non-memory query, memory key) index pairs to block.
 
     Memory keys sit in the query half of the merged KV slice, after the past
-    prefix of length ``K - Q``.
+    prefix of length ``K - Q``. Blocking every current non-memory query closes
+    indirect ``memory -> UND boundary -> GEN`` relay paths across layers.
     """
 
-    if packed_vae_token_indexes is None or packed_memory_token_indexes is None:
+    if packed_memory_token_indexes is None:
         return []
-    if int(packed_vae_token_indexes.numel()) == 0 or int(
-        packed_memory_token_indexes.numel()
-    ) == 0:
+    if int(packed_memory_token_indexes.numel()) == 0:
         return []
     query_lengths = [int(length) for length in query_lens.tolist()]
     key_lengths = [int(length) for length in key_value_lens.tolist()]
-    vae = packed_vae_token_indexes.to(dtype=torch.long)
     mem = packed_memory_token_indexes.to(dtype=torch.long)
     slices: List[Tuple[torch.Tensor, torch.Tensor]] = []
     query_offset = 0
     for query_length, key_length in zip(query_lengths, key_lengths):
         past = key_length - query_length
-        gen_local = vae - query_offset
-        gen_in = gen_local[(gen_local >= 0) & (gen_local < query_length)]
         mem_local = mem - query_offset
         mem_in = mem_local[(mem_local >= 0) & (mem_local < query_length)]
-        slices.append((gen_in, past + mem_in))
+        non_mem = torch.ones(query_length, device=mem.device, dtype=torch.bool)
+        non_mem[mem_in] = False
+        non_mem_in = torch.arange(
+            query_length, device=mem.device, dtype=torch.long
+        )[non_mem]
+        slices.append((non_mem_in, past + mem_in))
         query_offset += query_length
     return slices
 
@@ -152,8 +153,8 @@ def _sdpa_varlen_inference(
             attention_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
             attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
         if blocked_slices is not None and sample_index < len(blocked_slices):
-            gen_local, mem_keys = blocked_slices[sample_index]
-            if int(gen_local.numel()) > 0 and int(mem_keys.numel()) > 0:
+            non_mem_local, mem_keys = blocked_slices[sample_index]
+            if int(non_mem_local.numel()) > 0 and int(mem_keys.numel()) > 0:
                 if attention_mask is None:
                     attention_mask = torch.ones(
                         1,
@@ -165,9 +166,11 @@ def _sdpa_varlen_inference(
                     )
                 else:
                     attention_mask = attention_mask.clone()
-                gen_idx = gen_local.to(device=query.device)
+                non_mem_idx = non_mem_local.to(device=query.device)
                 mem_idx = mem_keys.to(device=query.device)
-                attention_mask[0, 0, gen_idx[:, None], mem_idx[None, :]] = False
+                attention_mask[
+                    0, 0, non_mem_idx[:, None], mem_idx[None, :]
+                ] = False
         sample_index += 1
         sample_output = scaled_dot_product_attention(
             sample_query.transpose(0, 1).unsqueeze(0),
@@ -1538,6 +1541,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         memory_loop_end: Optional[int] = None,
         memory_body_in: Optional[torch.Tensor] = None,
         block_gen_reads_memory: bool = True,
+        collect_round_diagnostics: bool = False,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1569,7 +1573,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             hidden,
             *,
             checkpoint=False,
-            loop_adapter_enabled=False,
+            loop_adapter_mode="off",
             packed_memory_token_indexes=None,
             block_gen_reads_memory=False,
         ):
@@ -1604,19 +1608,19 @@ class Qwen2Model(Qwen2PreTrainedModel):
             )
             def _enable_loop_adapters():
                 local_states = []
-                if loop_adapter_enabled:
+                if loop_adapter_mode != "off":
                     modules_fn = getattr(actual_layer, "modules", None)
                     iterable = modules_fn() if callable(modules_fn) else ()
                     for module in iterable:
-                        setter = getattr(module, "set_loop_enabled", None)
+                        setter = getattr(module, "set_loop_mode", None)
                         if callable(setter):
                             local_states.append(
                                 (
                                     module,
-                                    bool(getattr(module, "loop_enabled", False)),
+                                    str(getattr(module, "loop_mode", "off")),
                                 )
                             )
-                            setter(True)
+                            setter(loop_adapter_mode)
                 return local_states
 
             if use_checkpoint:
@@ -1630,8 +1634,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         )
                         return layer_output
                     finally:
-                        for module, was_enabled in local_states:
-                            module.set_loop_enabled(was_enabled)
+                        for module, previous_mode in local_states:
+                            module.set_loop_mode(previous_mode)
 
                 hidden = torch.utils.checkpoint.checkpoint(
                     checkpointed_layer,
@@ -1647,8 +1651,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         **layer_kwargs,
                     )
                 finally:
-                    for module, was_enabled in local_states:
-                        module.set_loop_enabled(was_enabled)
+                    for module, previous_mode in local_states:
+                        module.set_loop_mode(previous_mode)
             return hidden, cache
 
         def normalize(hidden):
@@ -1716,9 +1720,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
             else:
                 hidden = h_base
             memory_r = hidden[indexes]
-            round_memory = []
-            round_gen = []
-            round_suffix_gen = []
+            round_memory = [] if collect_round_diagnostics else None
+            round_gen = [] if collect_round_diagnostics else None
+            round_suffix_gen = [] if collect_round_diagnostics else None
             gen_idx = packed_vae_token_indexes
             has_gen = gen_idx is not None and int(gen_idx.numel()) > 0
 
@@ -1745,15 +1749,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         layer_idx,
                         hidden,
                         checkpoint=True,
-                        loop_adapter_enabled=True,
+                        loop_adapter_mode="read" if block_this else "write",
                         packed_memory_token_indexes=indexes,
                         block_gen_reads_memory=block_this,
                     )
                 memory_r = hidden[indexes]
-                round_memory.append(memory_r)
-                if has_gen:
+                if collect_round_diagnostics:
+                    round_memory.append(memory_r)
+                if collect_round_diagnostics and has_gen:
                     round_gen.append(hidden[gen_idx])
-                if _round + 1 < mem_repeat:
+                if collect_round_diagnostics and _round + 1 < mem_repeat:
                     suffix_hidden = suffix_gen(hidden)
                     if suffix_hidden is not None:
                         round_suffix_gen.append(suffix_hidden)
@@ -1766,12 +1771,18 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 )
             packed_query_sequence = normalize(hidden)
             memory_body_out = memory_r
-            memory_round_hiddens = tuple(round_memory)
-            gen_round_hiddens = tuple(round_gen) if round_gen else None
-            if has_gen:
+            memory_round_hiddens = (
+                tuple(round_memory) if collect_round_diagnostics else None
+            )
+            gen_round_hiddens = (
+                tuple(round_gen) if collect_round_diagnostics and round_gen else None
+            )
+            if collect_round_diagnostics and has_gen:
                 round_suffix_gen.append(packed_query_sequence[gen_idx])
             gen_suffix_round_hiddens = (
-                tuple(round_suffix_gen) if round_suffix_gen else None
+                tuple(round_suffix_gen)
+                if collect_round_diagnostics and round_suffix_gen
+                else None
             )
         elif loop_repeat > 1:
             # Looped-MMDiT style: repeat a shared middle block inside one
@@ -2045,6 +2056,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         memory_loop_end: Optional[int] = None,
         memory_body_in: Optional[torch.Tensor] = None,
         block_gen_reads_memory: bool = True,
+        collect_round_diagnostics: bool = False,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2071,6 +2083,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             memory_loop_end=memory_loop_end,
             memory_body_in=memory_body_in,
             block_gen_reads_memory=block_gen_reads_memory,
+            collect_round_diagnostics=collect_round_diagnostics,
         )
 
         return outputs

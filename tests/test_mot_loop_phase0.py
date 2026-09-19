@@ -212,6 +212,7 @@ def test_r2_calls_inner_loop_twice_but_euler_once_per_timestep():
         enable_taylorseer=False,
         loop_depth=2,
         loop_recycle_mode="full_depth",
+        return_loop_diagnostics=True,
     )
     assert len(velocity_calls) == 4  # 2 timesteps * R=2
     assert len(euler_calls) == 2  # outer clock only
@@ -315,7 +316,7 @@ def test_bagel_config_defaults_match_plan():
     from qwen_latent_cot.bagel.modeling.bagel.bagel import BagelConfig
 
     cfg = BagelConfig()
-    assert cfg.num_loop_tokens == 8
+    assert cfg.num_loop_tokens == 0
     assert cfg.loop_depth == 2
     assert cfg.loop_recycle_mode == "same_depth"
     assert cfg.loop_memory_persist is False
@@ -339,6 +340,27 @@ def test_bagel_config_exposes_phase0_fields():
     assert cfg.loop_uncond_memory == "zero"
     assert cfg.loop_recycle_mode == "same_depth"
     assert cfg.loop_memory_persist is False
+
+
+def test_loop_memory_boundary_initialization_is_deterministic():
+    embed = torch.nn.Embedding(4, 3)
+    with torch.no_grad():
+        embed.weight.copy_(torch.arange(12, dtype=torch.float32).reshape(4, 3))
+    dummy = SimpleNamespace(
+        loop_memory=torch.nn.Parameter(torch.zeros(2, 3), requires_grad=False),
+        language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=embed)),
+    )
+    initialize = Bagel.init_loop_memory_from_boundary_embeddings.__get__(
+        dummy, SimpleNamespace
+    )
+    initialize([1, 2], seed=17)
+    first = dummy.loop_memory.detach().clone()
+    initialize([1, 2], seed=17)
+    assert torch.equal(dummy.loop_memory, first)
+    initialize([1, 2], seed=18)
+    assert not torch.equal(dummy.loop_memory, first)
+    expected = embed(torch.tensor([1, 2])).mean(dim=0)
+    assert torch.allclose(first.mean(dim=0), expected, atol=3e-4)
 
 
 _DIAG = {
@@ -378,6 +400,7 @@ def _generate_kwargs(**overrides):
         "return_trajectory": True,
         "sde_step_indices": (0, 1),
         "sde_noise_level": 0.0,
+        "return_loop_diagnostics": True,
     }
     kwargs.update(overrides)
     return kwargs
@@ -478,7 +501,8 @@ def test_same_depth_body_recurrence_preserves_nonmemory_and_recycles_memory():
         memory_loop_end=3,
     )
     counts = [len(layer.inputs) for layer in navit.layers]
-    assert counts == [1, 2, 2, 2]
+    # Diagnostics are off by default: prefix once + body twice + suffix once.
+    assert counts == [1, 2, 2, 1]
     h_base = navit.layers[0].outputs[0]
     round1_body_out = navit.layers[2].outputs[0]
     round2_body_in = navit.layers[1].inputs[1]
@@ -696,6 +720,23 @@ def test_persist_false_resets_next_step_but_logs_current_m_out():
         assert "delta_v" in row
 
 
+def test_k_ablation_slices_allocated_memory_slots():
+    seen = []
+
+    def forward(kwargs):
+        seen.append(tuple(kwargs["loop_memory"].shape))
+        memory = kwargs["loop_memory"]
+        return kwargs["x_t"], memory, memory, memory, dict(_DIAG)
+
+    dummy = _make_memory_dummy(
+        persist=False, recycle_mode="same_depth", forward=forward
+    )
+    dummy.generate_image(
+        **_generate_kwargs(packed_loop_token_indexes=torch.tensor([1]))
+    )
+    assert seen == [(1, 4), (1, 4)]
+
+
 class TinySdpaLayer:
     def __init__(self):
         self.blocks = []
@@ -800,6 +841,7 @@ def _run_tiny_sdpa(seq, *, block: bool, repeat: int = 1, body: bool = True, n_la
             memory_loop_repeat=repeat,
             memory_loop_start=0,
             memory_loop_end=1,
+            collect_round_diagnostics=True,
         )
     return Qwen2Model.forward_inference(navit, **kwargs), navit
 
@@ -812,11 +854,11 @@ def test_round0_blocked_slices_accounts_for_past_and_batch():
     vae = torch.tensor([2, 6], dtype=torch.long)
     mem = torch.tensor([1, 5], dtype=torch.long)
     slices = round0_blocked_slices(query_lens, key_lens, vae, mem)
-    gen0, mem0 = slices[0]
-    gen1, mem1 = slices[1]
-    assert list(gen0.tolist()) == [2]
+    non_mem0, mem0 = slices[0]
+    non_mem1, mem1 = slices[1]
+    assert list(non_mem0.tolist()) == [0, 2, 3]
     assert list(mem0.tolist()) == [3 + 1]
-    assert list(gen1.tolist()) == [2]
+    assert list(non_mem1.tolist()) == [0, 2, 3]
     assert list(mem1.tolist()) == [2 + 1]
 
 
@@ -840,7 +882,8 @@ def test_sdpa_round0_block_and_read():
     qk = hidden.unsqueeze(1)
     v = hidden.unsqueeze(1)
     blocked = round0_blocked_slices(query_lens, query_lens, gen, mem)
-    gen_local, mem_keys = blocked[0]
+    non_mem_local, mem_keys = blocked[0]
+    assert list(non_mem_local.tolist()) == [0, 2, 3]
     assert list(mem_keys.tolist()) == [1]
     v_mem = v.clone()
     v_mem[1] = torch.tensor([[0.0, -1.0]])
@@ -935,6 +978,32 @@ def test_sdpa_round0_block_and_read():
         blocked_slices=slices,
     ).squeeze(1)
     assert not torch.allclose(out_past[1], out_past_gen[1], atol=1e-4)
+
+
+def test_round0_blocks_two_layer_memory_boundary_gen_relay():
+    seq, mem, _, _ = _sdpa_layout()
+    blocked, _ = _run_tiny_sdpa(seq, block=True, body=False, n_layers=2)
+    changed = seq.clone()
+    changed[mem] = torch.tensor([[0.0, -1.0]])
+    blocked_changed, _ = _run_tiny_sdpa(
+        changed, block=True, body=False, n_layers=2
+    )
+    non_memory = torch.tensor([0, 2, 3], dtype=torch.long)
+    assert torch.allclose(
+        blocked.packed_query_sequence[non_memory],
+        blocked_changed.packed_query_sequence[non_memory],
+        atol=1e-5,
+    )
+
+    opened, _ = _run_tiny_sdpa(seq, block=False, body=False, n_layers=2)
+    opened_changed, _ = _run_tiny_sdpa(
+        changed, block=False, body=False, n_layers=2
+    )
+    assert not torch.allclose(
+        opened.packed_query_sequence[2],
+        opened_changed.packed_query_sequence[2],
+        atol=1e-4,
+    )
 
 
 def test_same_depth_round0_block_round1_write_and_read():
@@ -1065,6 +1134,7 @@ def test_diagnostics_populate_deltas_when_r_ge_2():
         memory_loop_end=3,
         embed_memory=torch.ones(1, 4),
         round0_gen_reads_memory=False,
+        collect_round_diagnostics=True,
     )
     assert diag["delta_m"]
     assert diag["delta_g"]
@@ -1181,4 +1251,3 @@ def test_filter_old_prompt_keeps_edit_instruction():
     items = ["old prompt", image, "make it blue"]
     assert filter_old_prompt(items, True) == [image, "make it blue"]
     assert filter_old_prompt(items, False) == items
-
