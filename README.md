@@ -66,26 +66,31 @@ pytest -q tests/test_mot_loop_phase0.py tests/test_bagel_flowedit.py
 
 ## 对照实验
 
-Phase 0.5 使用 paired semantic-edit evaluation harness；JSONL 每行必须包含
-`id/source_image/source_prompt/instruction/target/preserve`。仓库提供 24 条覆盖
-addition、deletion、count、relation、color、binding、material、replacement 的
-规格清单 `experiments/data/semantic_edit_phase05.jsonl`，但不包含 24 张 source
-image，也尚未接 target/preserve evaluator，因此当前不是 quantitative benchmark。
-先把固定 source image 放到 `experiments/data/semantic_edit_sources/`，再运行主矩阵：
+Phase 0.5 是 frozen BAGEL 的纯 T2I compositional mechanism benchmark。所有 arm
+共享 prompt、initial noise、1024×1024 geometry、官方 T2I CFG、50-step schedule，
+只改变 `K/R/body/persist/read-write`。16 卡主矩阵：
 
 ```bash
-bash scripts/evaluate/run_bagel_loop_zeroshot.sh /path/to/out
+bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/out
 ```
 
-K 消融与主矩阵分开运行（Z0 baseline + strict mid-body Z2 的 K）：
+K 消融与主矩阵分开运行：
 
 ```bash
-K_VALUES=1,4,8 bash scripts/evaluate/run_bagel_loop_zeroshot.sh /path/to/k_ablation
+K_VALUES=1,4,8 bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/k_ablation
 ```
 
 主矩阵固定为 Z0 vanilla、Z1 old loop、Z2 strict read→write、Z3 early、
-Z4 late、Z5 persist、C0 full-depth、C1 read-only 与 C2 keep-old-prompt。
-`K_VALUES` 非空时不得同时设置 `ARMS`。
+Z4 late、Z5 persist、C0 full-depth、C1 read-only 与 C2 immediate-write。
+生成完成后会写 `mechanism_summary.json` 及每个 arm 的 GenEval2 image map；启动
+Soft-TIFA server 后用 `score_bagel_loop_t2i_geneval2.py` 汇总 AM/GM、skill 和
+atomicity。`K_VALUES` 非空时不得同时设置 `ARMS`。
+
+原 paired-edit specification 与 runner 保留在
+`experiments/data/semantic_edit_phase05.jsonl` 和
+`scripts/evaluate/bagel_loop_edit_zeroshot.py`，留待 Phase 2 editing 使用。
+完整协议、arm 定义和评分命令见
+[`docs/BAGEL_LatentCoT_T2I_Phase05.md`](docs/BAGEL_LatentCoT_T2I_Phase05.md)。
 
 FlowEdit 4.1（文档 B2），16 卡：
 
