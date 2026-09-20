@@ -21,8 +21,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
-from qwen_latent_cot.bagel.modeling._bagel_utils import pil_img2rgb
-
 from bagel_common import (
     add_native_model_args,
     load_native_bagel,
@@ -30,6 +28,7 @@ from bagel_common import (
     pixel_mae,
     stable_noise_seed,
 )
+from qwen_latent_cot.bagel.modeling._bagel_utils import pil_img2rgb
 
 
 NOTEBOOK_EDIT_HYPER = dict(
