@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.5 paired semantic-edit evaluation harness and isolated K ablation.
+"""Archived paired semantic-edit evaluation harness and isolated K ablation.
 
 Call path is the official notebook editor:
     inferencer(image=source, text=edit, init_noise=ε, **NOTEBOOK_EDIT_HYPER)

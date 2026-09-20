@@ -10,7 +10,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
 
-from bagel_loop_zeroshot import (  # noqa: E402
+from bagel_loop_edit_zeroshot import (  # noqa: E402
     ARMS,
     NOTEBOOK_EDIT_HYPER,
     apply_loop_config,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Phase-0.5 paired semantic edits. All selected arms share ε for each case.
+# Archived paired semantic edits. All selected arms share ε for each case.
 OUTPUT_DIR=${1:-/root/outputs/bagel_loop_zeroshot_v1}
 PYTHON_BIN=${PYTHON_BIN:-/home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python}
 if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -58,7 +58,7 @@ pids=()
 for i in $(seq 0 $((NUM_SHARDS - 1))); do
   echo "[launch] shard $i -> $OUTPUT_DIR/shard_${i}.log"
   ASCEND_RT_VISIBLE_DEVICES=$i PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u \
-    scripts/evaluate/bagel_loop_zeroshot.py \
+    scripts/evaluate/bagel_loop_edit_zeroshot.py \
     --model-path "$MODEL_PATH" \
     --output-dir "$OUTPUT_DIR" \
     --device npu:0 \
@@ -82,7 +82,7 @@ for pid in "${pids[@]}"; do
   fi
 done
 
-PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u scripts/evaluate/bagel_loop_zeroshot.py \
+PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u scripts/evaluate/bagel_loop_edit_zeroshot.py \
   --merge-only \
   --model-path "$MODEL_PATH" \
   --output-dir "$OUTPUT_DIR" \
