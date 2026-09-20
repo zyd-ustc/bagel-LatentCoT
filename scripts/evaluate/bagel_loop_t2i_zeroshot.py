@@ -116,6 +116,30 @@ ARMS: List[Dict[str, Any]] = [
         "end_layer": 24,
         "round0_memory_write_enabled": False,
     },
+    {
+        "id": "C1",
+        "slug": "c1_read_only",
+        "title": "C1 strict read-only",
+        "K": 8,
+        "R": 1,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 16,
+        "end_layer": 24,
+        "round0_memory_write_enabled": False,
+    },
+    {
+        "id": "C2",
+        "slug": "c2_direct_write",
+        "title": "C2 immediate write",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 16,
+        "end_layer": 24,
+        "round0_memory_write_enabled": True,
+    },
 ]
 
 
