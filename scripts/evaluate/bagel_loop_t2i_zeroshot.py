@@ -167,6 +167,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated arm ids, e.g. Z0,Z2. Empty = all.",
     )
     parser.add_argument(
+        "--k-values",
+        default="",
+        help="Run only Z0 plus strict mid-body K ablation, e.g. 1,4,8.",
+    )
+    parser.add_argument(
         "--num-loop-tokens",
         type=int,
         default=8,
@@ -202,6 +207,47 @@ def select_arms(raw: str) -> List[Dict[str, Any]]:
     if missing:
         raise ValueError(f"unknown arms: {missing}")
     return [deepcopy(by_id[name]) for name in wanted]
+
+
+def parse_k_values(raw: str) -> List[int]:
+    values = []
+    for part in str(raw).split(","):
+        if not part.strip():
+            continue
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(f"invalid K value: {part!r}") from exc
+        if value < 1:
+            raise ValueError("K ablation values must be >= 1")
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def make_k_ablation_arms(values: Sequence[int]) -> List[Dict[str, Any]]:
+    vanilla = deepcopy(next(arm for arm in ARMS if arm["id"] == "Z0"))
+    base = next(arm for arm in ARMS if arm["id"] == "Z2")
+    arms = [vanilla]
+    for value in values:
+        arm = deepcopy(base)
+        arm.update(
+            id=f"K{int(value)}",
+            slug=f"k{int(value)}_read_write",
+            title=f"K={int(value)} strict read→write",
+            K=int(value),
+        )
+        arms.append(arm)
+    return arms
+
+
+def resolve_arms(raw_arms: str, raw_k_values: str) -> List[Dict[str, Any]]:
+    k_values = parse_k_values(raw_k_values)
+    if k_values:
+        if str(raw_arms).strip():
+            raise ValueError("--k-values and --arms are separate protocols; choose one")
+        return make_k_ablation_arms(k_values)
+    return select_arms(raw_arms)
 
 
 def shard_indices(n: int, shard_id: int, num_shards: int) -> List[int]:
@@ -358,6 +404,58 @@ def init_frozen_memory(model) -> Optional[str]:
     return tensor_digest(model.loop_memory)
 
 
+def aggregate_mechanism_rows(
+    prompt_rows: Sequence[Dict[str, Any]],
+    arms: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    def mean(values):
+        valid = [float(value) for value in values if isinstance(value, (int, float))]
+        return sum(valid) / len(valid) if valid else None
+
+    summary = []
+    for arm in arms:
+        arm_rows = []
+        mae_values = []
+        for prompt_row in prompt_rows:
+            match = next(
+                (row for row in prompt_row.get("arms", []) if row["id"] == arm["id"]),
+                None,
+            )
+            if match is not None:
+                arm_rows.append(match)
+            if arm["id"] == "Z0":
+                mae_values.append(0.0)
+            else:
+                mae_values.append(
+                    prompt_row.get("pixel_mae_vs_Z0", {}).get(arm["id"])
+                )
+        summary.append(
+            {
+                **{key: value for key, value in arm.items()},
+                "prompt_count": len(arm_rows),
+                "mean_pixel_mae_vs_Z0": mean(mae_values),
+                "mean_delta_m": mean(
+                    row.get("diagnostics", {}).get("mean_delta_m") for row in arm_rows
+                ),
+                "mean_delta_g": mean(
+                    row.get("diagnostics", {}).get("mean_delta_g") for row in arm_rows
+                ),
+                "mean_delta_v": mean(
+                    row.get("diagnostics", {}).get("mean_delta_v") for row in arm_rows
+                ),
+                "mean_effective_rank": mean(
+                    row.get("diagnostics", {}).get("mean_effective_rank")
+                    for row in arm_rows
+                ),
+            }
+        )
+    return {
+        "schema": "bagel_loop_t2i_mechanism_v1",
+        "prompt_count": len(prompt_rows),
+        "arms": summary,
+    }
+
+
 def write_prompt_gallery(
     prompt_dir: Path,
     prompt: str,
@@ -432,6 +530,11 @@ def merge_gallery(output_dir: Path, arms: Sequence[Dict[str, Any]]) -> None:
             encoding="utf-8",
         )
     if prompt_rows:
+        mechanism = aggregate_mechanism_rows(prompt_rows, arms)
+        (output_dir / "mechanism_summary.json").write_text(
+            json.dumps(mechanism, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
         root_manifest = {
             "schema": "bagel_loop_t2i_phase05_v1",
             "prompts": [row["prompt"] for row in prompt_rows],
@@ -441,6 +544,11 @@ def merge_gallery(output_dir: Path, arms: Sequence[Dict[str, Any]]) -> None:
             "arms": [
                 {key: value for key, value in arm.items()} for arm in arms
             ],
+            "mechanism_summary": "mechanism_summary.json",
+            "geneval2_image_maps": {
+                arm["id"]: f"geneval2/{arm['slug']}_image_paths.json"
+                for arm in arms
+            },
         }
         (output_dir / "run_manifest.json").write_text(
             json.dumps(root_manifest, indent=2, ensure_ascii=False) + "\n",
@@ -550,7 +658,7 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    arms = select_arms(args.arms)
+    arms = resolve_arms(args.arms, args.k_values)
     required_k = max(int(arm["K"]) for arm in arms)
     if required_k > int(args.num_loop_tokens):
         raise ValueError(

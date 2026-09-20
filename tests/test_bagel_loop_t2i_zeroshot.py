@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
@@ -12,9 +13,13 @@ sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
 from bagel_loop_t2i_zeroshot import (  # noqa: E402
     ARMS,
     T2I_HYPER,
+    aggregate_mechanism_rows,
     apply_loop_config,
     load_prompts,
+    make_k_ablation_arms,
     official_t2i,
+    parse_k_values,
+    resolve_arms,
     select_arms,
     shard_indices,
     summarize_diagnostics,
@@ -120,6 +125,65 @@ def test_prompt_loading_and_sharding(tmp_path):
     path.write_text("one\n# comment\ntwo\nthree\n", encoding="utf-8")
     assert load_prompts(str(path), 2) == ["one", "two"]
     assert shard_indices(5, 1, 2) == [1, 3]
+
+
+def test_k_ablation_is_z0_plus_strict_mid_body_scaling():
+    assert parse_k_values("1,4,8,4") == [1, 4, 8]
+    arms = make_k_ablation_arms([1, 4, 8])
+    assert [arm["id"] for arm in arms] == ["Z0", "K1", "K4", "K8"]
+    assert [arm["K"] for arm in arms] == [0, 1, 4, 8]
+    assert all(arm["R"] in (1, 2) for arm in arms)
+    assert all(arm["start_layer"] == 16 for arm in arms)
+    assert all(arm["end_layer"] == 24 for arm in arms)
+    assert all(arm["round0_memory_write_enabled"] is False for arm in arms)
+    assert [arm["id"] for arm in resolve_arms("", "1,4,8")] == [
+        "Z0",
+        "K1",
+        "K4",
+        "K8",
+    ]
+
+
+def test_mechanism_aggregation_keeps_deltas_separate_from_mae():
+    arms = select_arms("Z0,Z2")
+    rows = [
+        {
+            "pixel_mae_vs_Z0": {"Z2": 12.0},
+            "arms": [
+                {"id": "Z0", "diagnostics": {}},
+                {
+                    "id": "Z2",
+                    "diagnostics": {
+                        "mean_delta_m": 0.2,
+                        "mean_delta_g": 0.1,
+                        "mean_delta_v": 0.05,
+                        "mean_effective_rank": 3.0,
+                    },
+                },
+            ],
+        },
+        {
+            "pixel_mae_vs_Z0": {"Z2": 16.0},
+            "arms": [
+                {"id": "Z0", "diagnostics": {}},
+                {
+                    "id": "Z2",
+                    "diagnostics": {
+                        "mean_delta_m": 0.4,
+                        "mean_delta_g": 0.2,
+                        "mean_delta_v": 0.15,
+                        "mean_effective_rank": 5.0,
+                    },
+                },
+            ],
+        },
+    ]
+    summary = aggregate_mechanism_rows(rows, arms)
+    by_id = {row["id"]: row for row in summary["arms"]}
+    assert by_id["Z0"]["mean_pixel_mae_vs_Z0"] == 0.0
+    assert by_id["Z2"]["mean_pixel_mae_vs_Z0"] == 14.0
+    assert by_id["Z2"]["mean_delta_m"] == pytest.approx(0.3)
+    assert by_id["Z2"]["mean_delta_v"] == pytest.approx(0.1)
 
 
 def test_empty_t2i_diagnostics_are_explicit():

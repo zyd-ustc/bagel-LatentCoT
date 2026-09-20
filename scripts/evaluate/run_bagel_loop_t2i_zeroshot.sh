@@ -10,6 +10,7 @@ HEIGHT=${HEIGHT:-1024}
 WIDTH=${WIDTH:-1024}
 SEED=${SEED:-42}
 ARMS=${ARMS:-}
+K_VALUES=${K_VALUES:-}
 MAX_PROMPTS=${MAX_PROMPTS:-0}
 
 mkdir -p "$OUTPUT_DIR"
@@ -39,7 +40,7 @@ if [[ "$n_prompts" -lt "$NUM_SHARDS" ]]; then
 fi
 
 echo "[launch] T2I prompts=$n_prompts shards=$NUM_SHARDS geometry=${HEIGHT}x${WIDTH}"
-echo "[launch] model=$MODEL_PATH out=$OUTPUT_DIR arms=${ARMS:-all}"
+echo "[launch] model=$MODEL_PATH out=$OUTPUT_DIR arms=${ARMS:-all} k_values=${K_VALUES:-none}"
 
 pids=()
 for i in $(seq 0 $((NUM_SHARDS - 1))); do
@@ -59,6 +60,7 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
       --num-shards "$NUM_SHARDS" \
       --max-prompts "$MAX_PROMPTS" \
       --arms "$ARMS" \
+      --k-values "$K_VALUES" \
       > "$OUTPUT_DIR/shard_${i}.log" 2>&1 &
   pids+=($!)
 done
@@ -76,7 +78,8 @@ PYTHONPATH="${PYTHONPATH:-}:$(pwd)" "$PYTHON_BIN" -u \
     --model-path "$MODEL_PATH" \
     --output-dir "$OUTPUT_DIR" \
     --device npu:0 \
-    --arms "$ARMS"
+    --arms "$ARMS" \
+    --k-values "$K_VALUES"
 
 echo "[launch] done fail=$fail gallery=$OUTPUT_DIR/index.html"
 exit "$fail"
