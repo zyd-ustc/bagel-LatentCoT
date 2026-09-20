@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
@@ -16,11 +17,22 @@ from bagel_loop_zeroshot import (  # noqa: E402
     load_edit_cases,
     make_k_ablation_arms,
     parse_k_values,
+    prepare_source_image,
     resolve_arms,
     select_arms,
     shard_indices,
     summarize_diagnostics,
 )
+from bagel_common import _native_num_loop_tokens  # noqa: E402
+
+
+def test_shared_native_loaders_default_to_vanilla_k0():
+    from qwen_latent_cot.bagel.backbone import _configured_num_loop_tokens
+
+    assert _native_num_loop_tokens(SimpleNamespace()) == 0
+    assert _native_num_loop_tokens(SimpleNamespace(num_loop_tokens=8)) == 8
+    assert _configured_num_loop_tokens({}) == 0
+    assert _configured_num_loop_tokens({"num_loop_tokens": 8}) == 8
 
 
 def test_arm_table_matches_read_route_write_protocol():
@@ -32,6 +44,8 @@ def test_arm_table_matches_read_route_write_protocol():
         "Z4": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=20, end_layer=28, remove_old_prompt=True, round0_memory_write_enabled=False),
         "Z5": dict(K=8, R=2, recycle_mode="same_depth", persist=True, start_layer=16, end_layer=24, remove_old_prompt=True, round0_memory_write_enabled=False),
         "C0": dict(K=8, R=2, recycle_mode="full_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_memory_write_enabled=False),
+        "C1": dict(K=8, R=1, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=True, round0_memory_write_enabled=False),
+        "C2": dict(K=8, R=2, recycle_mode="same_depth", persist=False, start_layer=16, end_layer=24, remove_old_prompt=False, round0_memory_write_enabled=False),
     }
     by_id = {arm["id"]: arm for arm in ARMS}
     assert list(by_id) == list(expected)
@@ -84,6 +98,31 @@ def test_apply_loop_config_writes_bagelconfig_fields():
     assert model.config.num_write_rounds == 2
     apply_loop_config(model, select_arms("C0")[0])
     assert model.config.loop_recycle_mode == "full_depth"
+    apply_loop_config(model, select_arms("C1")[0])
+    assert model.config.num_read_rounds == 1
+    assert model.config.num_write_rounds == 0
+    apply_loop_config(model, select_arms("C2")[0])
+    assert model.config.loop_memory_persist is False
+
+
+def test_c1_and_c2_are_single_variable_controls_for_z2():
+    z2 = select_arms("Z2")[0]
+    c1 = select_arms("C1")[0]
+    c2 = select_arms("C2")[0]
+    protocol_fields = (
+        "K",
+        "R",
+        "recycle_mode",
+        "persist",
+        "start_layer",
+        "end_layer",
+        "remove_old_prompt",
+        "round0_memory_write_enabled",
+    )
+    assert {key for key in protocol_fields if z2[key] != c1[key]} == {"R"}
+    assert {key for key in protocol_fields if z2[key] != c2[key]} == {
+        "remove_old_prompt"
+    }
 
 
 def test_one_prompt_per_shard_round_robin():
@@ -95,18 +134,39 @@ def test_one_prompt_per_shard_round_robin():
 def test_k_ablation_is_separate_and_uses_strict_mid_body():
     assert parse_k_values("1,4,8,4") == [1, 4, 8]
     arms = make_k_ablation_arms([1, 4, 8])
-    assert [arm["id"] for arm in arms] == ["K1", "K4", "K8"]
-    assert [arm["K"] for arm in arms] == [1, 4, 8]
+    assert [arm["id"] for arm in arms] == ["Z0", "K1", "K4", "K8"]
+    assert [arm["K"] for arm in arms] == [0, 1, 4, 8]
     assert all(arm["start_layer"] == 16 for arm in arms)
     assert all(arm["end_layer"] == 24 for arm in arms)
     assert all(arm["round0_memory_write_enabled"] is False for arm in arms)
-    assert [arm["id"] for arm in resolve_arms("", "1,4,8")] == ["K1", "K4", "K8"]
+    assert [arm["id"] for arm in resolve_arms("", "1,4,8")] == [
+        "Z0",
+        "K1",
+        "K4",
+        "K8",
+    ]
     try:
         resolve_arms("Z2", "1")
     except ValueError as exc:
         assert "separate protocols" in str(exc)
     else:
         raise AssertionError("mixed main arms and K ablation must fail")
+
+
+def test_source_geometry_follows_native_aspect_ratio_resize():
+    class ResizeTransform:
+        def __call__(self, image):
+            assert image.mode == "RGB"
+            return image.resize((640, 480))
+
+    inferencer = SimpleNamespace(
+        vae_transform=SimpleNamespace(resize_transform=ResizeTransform())
+    )
+    source = Image.new("RGBA", (1200, 800))
+    prepared, image_shape = prepare_source_image(inferencer, source)
+    assert prepared.mode == "RGB"
+    assert prepared.size == (640, 480)
+    assert image_shape == (480, 640)
 
 
 def test_load_paired_edit_cases_resolves_images_and_validates_schema(tmp_path):

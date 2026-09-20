@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.5 paired zero-shot editing and isolated K ablation.
+"""Phase 0.5 paired semantic-edit evaluation harness and isolated K ablation.
 
 Call path is the official notebook editor:
     inferencer(image=source, text=edit, init_noise=ε, **NOTEBOOK_EDIT_HYPER)
@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
+
+from qwen_latent_cot.bagel.modeling._bagel_utils import pil_img2rgb
 
 from bagel_common import (
     add_native_model_args,
@@ -132,6 +134,32 @@ ARMS: List[Dict[str, Any]] = [
         "remove_old_prompt": True,
         "round0_memory_write_enabled": False,
     },
+    {
+        "id": "C1",
+        "slug": "c1_read_only",
+        "title": "C1 strict read-only",
+        "K": 8,
+        "R": 1,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 16,
+        "end_layer": 24,
+        "remove_old_prompt": True,
+        "round0_memory_write_enabled": False,
+    },
+    {
+        "id": "C2",
+        "slug": "c2_keep_old_prompt",
+        "title": "C2 strict read→write + old prompt",
+        "K": 8,
+        "R": 2,
+        "recycle_mode": "same_depth",
+        "persist": False,
+        "start_layer": 16,
+        "end_layer": 24,
+        "remove_old_prompt": False,
+        "round0_memory_write_enabled": False,
+    },
 ]
 
 PAIRED_EDIT_FIELDS = (
@@ -157,7 +185,12 @@ def parse_args() -> argparse.Namespace:
         help="Paired-edit JSONL. When set, source image/prompt are read per case.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--image-size", type=int, default=1024)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=1024,
+        help="Deprecated compatibility option; geometry follows the resized source.",
+    )
     parser.add_argument("--shard-id", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--max-prompts", type=int, default=0)
@@ -267,7 +300,8 @@ def parse_k_values(raw: str) -> List[int]:
 
 def make_k_ablation_arms(values: Sequence[int]) -> List[Dict[str, Any]]:
     base = next(arm for arm in ARMS if arm["id"] == "Z2")
-    arms = []
+    vanilla = deepcopy(next(arm for arm in ARMS if arm["id"] == "Z0"))
+    arms = [vanilla]
     for value in values:
         arm = deepcopy(base)
         arm.update(
@@ -278,6 +312,13 @@ def make_k_ablation_arms(values: Sequence[int]) -> List[Dict[str, Any]]:
         )
         arms.append(arm)
     return arms
+
+
+def prepare_source_image(inferencer, source_image):
+    """Match BAGEL's native aspect-ratio-preserving edit geometry."""
+
+    prepared = inferencer.vae_transform.resize_transform(pil_img2rgb(source_image))
+    return prepared, prepared.size[::-1]
 
 
 def resolve_arms(raw_arms: str, raw_k_values: str) -> List[Dict[str, Any]]:
@@ -543,7 +584,7 @@ def merge_gallery(output_dir: Path, arms: Sequence[Dict[str, Any]]) -> None:
             )
         rows.append("<tr>" + "".join(cells) + "</tr>")
     page = f"""<!doctype html><meta charset='utf-8'>
-<title>BAGEL Read–Write loop zero-shot Z0–C0</title>
+<title>BAGEL Read–Write loop Phase-0.5 controls</title>
 <style>
 body{{font:13px system-ui;background:#111;color:#eee;margin:20px}}
 table{{border-collapse:collapse}}
@@ -577,7 +618,7 @@ def run_prompt(
 ) -> None:
     prompt_dir.mkdir(parents=True, exist_ok=True)
     model = inferencer.model
-    image_shape = (int(args.image_size), int(args.image_size))
+    source_image, image_shape = prepare_source_image(inferencer, source_image)
     prompt = str(case["instruction"])
     old_prompt = str(case["source_prompt"])
     noise_seed = stable_noise_seed(int(args.seed), f"{case['id']}\n{prompt}")

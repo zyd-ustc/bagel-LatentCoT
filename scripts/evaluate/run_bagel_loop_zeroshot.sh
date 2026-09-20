@@ -12,7 +12,6 @@ EDIT_FILE=${EDIT_FILE:-experiments/data/semantic_edit_phase05.jsonl}
 SOURCE_IMAGE=${SOURCE_IMAGE:-}
 SOURCE_PROMPT=${SOURCE_PROMPT:-}
 NUM_SHARDS=${NUM_SHARDS:-16}
-IMAGE_SIZE=${IMAGE_SIZE:-1024}
 SEED=${SEED:-42}
 ARMS=${ARMS:-}
 K_VALUES=${K_VALUES:-}
@@ -53,7 +52,7 @@ fi
 
 echo "[launch] prompts=$n_prompts shards=$NUM_SHARDS python=$PYTHON_BIN"
 echo "[launch] model=$MODEL_PATH"
-echo "[launch] out=$OUTPUT_DIR image_size=$IMAGE_SIZE seed=$SEED arms=${ARMS:-all} k_values=${K_VALUES:-none}"
+echo "[launch] out=$OUTPUT_DIR source_geometry=native seed=$SEED arms=${ARMS:-all} k_values=${K_VALUES:-none}"
 
 pids=()
 for i in $(seq 0 $((NUM_SHARDS - 1))); do
@@ -64,7 +63,6 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
     --output-dir "$OUTPUT_DIR" \
     --device npu:0 \
     "${case_args[@]}" \
-    --image-size "$IMAGE_SIZE" \
     --seed "$SEED" \
     --cfg-interval-min 0.0 \
     --cfg-interval-max 1.0 \

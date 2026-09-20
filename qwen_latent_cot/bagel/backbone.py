@@ -35,6 +35,12 @@ from .loop import (
 logger = logging.getLogger(__name__)
 
 
+def _configured_num_loop_tokens(cfg: Dict[str, object]) -> int:
+    """Vanilla loaders must opt into memory tokens explicitly."""
+
+    return int(cfg.get("num_loop_tokens", 0) or 0)
+
+
 @dataclass
 class BagelBackbone:
     """BAGEL model, tokenizer, image encoder, and native VAE bundle.
@@ -173,7 +179,7 @@ class BagelBackbone:
             connector_act="gelu_pytorch_tanh",
             latent_patch_size=2,
             max_latent_size=64,
-            num_loop_tokens=int(self.cfg.get("num_loop_tokens", 8) or 0),
+            num_loop_tokens=_configured_num_loop_tokens(self.cfg),
             loop_depth=int(self.cfg.get("loop_depth", 2) or 1),
             loop_recycle_mode=str(self.cfg.get("loop_recycle_mode", "same_depth")),
             loop_memory_persist=bool(self.cfg.get("loop_memory_persist", False)),

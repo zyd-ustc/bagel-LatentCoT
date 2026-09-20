@@ -91,6 +91,12 @@ def add_native_model_args(parser) -> None:
     parser.add_argument("--vit-image-stride", type=int, default=14)
 
 
+def _native_num_loop_tokens(args) -> int:
+    """Keep shared native baselines vanilla unless a loop script opts in."""
+
+    return int(getattr(args, "num_loop_tokens", 0) or 0)
+
+
 def load_native_bagel(args):
     from qwen_latent_cot.bagel.backbone import BagelBackbone
     from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
@@ -107,7 +113,7 @@ def load_native_bagel(args):
             "disable_gen_expert": False,
             "disable_visual_gen": False,
             "num_image_tokens": patches * patches,
-            "num_loop_tokens": int(getattr(args, "num_loop_tokens", 8) or 0),
+            "num_loop_tokens": _native_num_loop_tokens(args),
             "loop_depth": int(getattr(args, "loop_depth", 2) or 1),
             "loop_recycle_mode": str(
                 getattr(args, "loop_recycle_mode", "same_depth")
