@@ -2,12 +2,37 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
 
 from score_bagel_loop_t2i_geneval2 import load_generation_inputs  # noqa: E402
+
+
+def test_geneval2_hard_128_is_balanced_and_prompt_file_matches():
+    benchmark_path = ROOT / "experiments" / "data" / "geneval2_hard_128.jsonl"
+    prompt_path = ROOT / "experiments" / "data" / "geneval2_hard_128.txt"
+    rows = [
+        json.loads(line)
+        for line in benchmark_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    prompts = [
+        line.strip()
+        for line in prompt_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == len(prompts) == 128
+    assert len(set(prompts)) == 128
+    assert prompts == [row["prompt"] for row in rows]
+    assert Counter(int(row["atom_count"]) for row in rows) == {
+        7: 32,
+        8: 32,
+        9: 32,
+        10: 32,
+    }
 
 
 def test_geneval2_loader_aligns_benchmark_and_arm_maps(tmp_path):

@@ -38,45 +38,32 @@ def test_t2i_hyper_matches_official_native_generation():
     }
 
 
-def test_t2i_arm_matrix_has_strict_read_and_direct_write_controls():
+def test_t2i_arm_matrix_pairs_each_body_window_with_persistence():
     assert [arm["id"] for arm in ARMS] == [
         "Z0",
-        "Z1",
         "Z2",
         "Z3",
         "Z4",
         "Z5",
-        "C0",
-        "C1",
-        "C2",
+        "Z6",
+        "Z7",
     ]
     assert all("remove_old_prompt" not in arm for arm in ARMS)
     assert all("source_image" not in arm for arm in ARMS)
-    c1 = select_arms("C1")[0]
-    assert c1["R"] == 1
-    assert c1["round0_memory_write_enabled"] is False
-    c2 = select_arms("C2")[0]
-    assert c2["R"] == 2
-    assert c2["round0_memory_write_enabled"] is True
-
-
-def test_c1_and_c2_each_change_one_z2_read_write_variable():
-    z2 = select_arms("Z2")[0]
-    c1 = select_arms("C1")[0]
-    c2 = select_arms("C2")[0]
-    fields = (
-        "K",
-        "R",
-        "recycle_mode",
-        "persist",
-        "start_layer",
-        "end_layer",
-        "round0_memory_write_enabled",
-    )
-    assert {key for key in fields if z2[key] != c1[key]} == {"R"}
-    assert {key for key in fields if z2[key] != c2[key]} == {
-        "round0_memory_write_enabled"
-    }
+    pairs = (("Z2", "Z5"), ("Z3", "Z6"), ("Z4", "Z7"))
+    for fresh_id, persist_id in pairs:
+        fresh = select_arms(fresh_id)[0]
+        persist = select_arms(persist_id)[0]
+        assert fresh["persist"] is False
+        assert persist["persist"] is True
+        assert {
+            key
+            for key in fresh
+            if key not in {"id", "slug", "title"} and fresh[key] != persist[key]
+        } == {"persist"}
+        assert fresh["R"] == persist["R"] == 2
+        assert fresh["round0_memory_write_enabled"] is False
+        assert persist["round0_memory_write_enabled"] is False
 
 
 def test_official_t2i_uses_prompt_only_and_fixed_noise():
@@ -112,12 +99,10 @@ def test_apply_t2i_loop_config_and_vanilla_path():
     apply_loop_config(model, select_arms("Z0")[0])
     assert model.num_loop_tokens == 0
     assert model.loop_depth == 1
-    apply_loop_config(model, select_arms("C1")[0])
+    apply_loop_config(model, select_arms("Z5")[0])
     assert model.num_read_rounds == 1
-    assert model.num_write_rounds == 0
-    apply_loop_config(model, select_arms("C2")[0])
-    assert model.num_read_rounds == 0
-    assert model.num_write_rounds == 2
+    assert model.num_write_rounds == 1
+    assert model.loop_memory_persist is True
 
 
 def test_prompt_loading_and_sharding(tmp_path):
