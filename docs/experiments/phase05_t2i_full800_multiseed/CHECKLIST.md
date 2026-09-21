@@ -6,7 +6,7 @@
 - [x] Add a deterministic three-run orchestration script.
 - [x] Add a Z0 seed-variability summary.
 - [x] Run local unit and shell-syntax tests (117 passed).
-- [ ] Push the implementation to `bagel/main`.
-- [ ] Run a bounded remote smoke test.
-- [ ] Start the full remote experiment and verify live progress.
+- [x] Push the implementation to `bagel/main` (`19f11b9`).
+- [x] Run a bounded remote smoke test (1 prompt, Z0/Z3/Z6, 3/3 images).
+- [x] Start the full remote experiment and verify all 16 workers are live.
 - [ ] Inspect the final summaries after completion.
