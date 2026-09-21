@@ -1,0 +1,52 @@
+# Phase 1.2 matched arm: identical to fresh except detached temporal memory.
+model_path: /data/model/BAGEL-7B-MoT
+data_path: experiments/data/phase1_train.jsonl
+output_dir: /data/outputs/bagel_loop_delta_v_early_persist
+device: auto
+
+seed: 42
+num_image_tokens: 4900
+num_steps: 30
+timestep_shift: 3.0
+cfg_text_scale: 4.0
+cfg_img_scale: 2.0
+cfg_interval: [0.0, 1.0]
+cfg_renorm_min: 0.0
+cfg_renorm_type: text_channel
+
+num_loop_tokens: 8
+loop_depth: 2
+loop_recycle_mode: same_depth
+loop_memory_persist: true
+loop_uncond_memory: m0
+memory_loop_start_layer: 12
+memory_loop_end_layer: 20
+round0_memory_write_enabled: false
+
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.0
+gen_attention_o_lora: false
+k_v_lora: false
+
+replay_states_per_sample: 3
+normalization_floor: 1.0e-4
+direction_active_threshold: 1.0e-3
+lambda_delta_v: 1.0
+lambda_dir: 0.1
+lambda_over: 0.05
+lambda_noop: 1.0
+overshoot_gamma: 1.5
+
+learning_rate: 5.0e-6
+betas: [0.9, 0.95]
+weight_decay: 0.0
+max_grad_norm: 1.0
+warmup_ratio: 0.03
+max_steps: 1
+logging_steps: 1
+save_steps: 100
+
+vit_max_image_size: 980
+vit_min_image_size: 224
+vit_image_stride: 14

@@ -1402,6 +1402,7 @@ class Bagel(PreTrainedModel):
         sde_noise_level: float = 0.0,
         sde_seed: int = 0,
         return_trajectory: bool = False,
+        capture_step_indices: Optional[Tuple[int, ...]] = None,
         packed_loop_token_indexes: Optional[torch.LongTensor] = None,
         loop_depth: Optional[int] = None,
         loop_uncond_memory: Optional[str] = None,
@@ -1435,6 +1436,9 @@ class Bagel(PreTrainedModel):
             num_timesteps, timestep_shift, x_t.device
         )
         selected_sde_steps = {int(index) for index in (sde_step_indices or ())}
+        selected_capture_steps = {
+            int(index) for index in (capture_step_indices or ())
+        }
         invalid_sde_steps = sorted(
             index for index in selected_sde_steps if not 0 <= index < len(timesteps)
         )
@@ -1442,6 +1446,26 @@ class Bagel(PreTrainedModel):
             raise ValueError(
                 f"SDE step indexes must be in [0, {len(timesteps) - 1}], "
                 f"got {invalid_sde_steps}"
+            )
+        invalid_capture_steps = sorted(
+            index
+            for index in selected_capture_steps
+            if not 0 <= index < len(timesteps)
+        )
+        if invalid_capture_steps:
+            raise ValueError(
+                f"capture step indexes must be in [0, {len(timesteps) - 1}], "
+                f"got {invalid_capture_steps}"
+            )
+        if selected_capture_steps and not return_trajectory:
+            raise ValueError(
+                "capture_step_indices requires return_trajectory=True"
+            )
+        overlapping_steps = sorted(selected_sde_steps & selected_capture_steps)
+        if overlapping_steps:
+            raise ValueError(
+                "SDE and velocity-state capture steps must be disjoint, got "
+                f"{overlapping_steps}"
             )
         trajectory = []
         if packed_loop_token_indexes is None:
@@ -1718,6 +1742,24 @@ class Bagel(PreTrainedModel):
                 )
             if not memory_loop_enabled:
                 v_t = result
+
+            if i in selected_capture_steps:
+                trajectory.append(
+                    {
+                        "kind": "velocity_state",
+                        "step_index": int(i),
+                        "sample": x_t.detach().clone(),
+                        "timestep": t.detach().clone(),
+                        "m_in": None if m_in is None else m_in.detach().clone(),
+                        "m_in_text": (
+                            None if m_in_text is None else m_in_text.detach().clone()
+                        ),
+                        "m_in_img": (
+                            None if m_in_img is None else m_in_img.detach().clone()
+                        ),
+                        "m_out": None if m_out is None else m_out.detach().clone(),
+                    }
+                )
 
             if i in selected_sde_steps:
                 next_t = timesteps[i + 1] if i + 1 < len(timesteps) else t.new_zeros(())

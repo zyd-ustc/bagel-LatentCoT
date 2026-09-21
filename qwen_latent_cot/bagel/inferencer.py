@@ -225,7 +225,7 @@ class InterleaveInferencer:
         )
 
     @torch.no_grad()
-    def prepare_image_condition_bundle(
+    def prepare_velocity_bundle(
         self,
         *,
         name: str,
@@ -234,7 +234,12 @@ class InterleaveInferencer:
         init_noise: Optional[torch.Tensor] = None,
         num_loop_tokens: Optional[int] = 0,
     ) -> ImageConditionBundle:
-        """Materialize BAGEL's native GEN/dual-CFG layouts for one cache set."""
+        """Materialize one native BAGEL GEN/dual-CFG velocity layout.
+
+        ``num_loop_tokens`` is a per-call property of the current query.  The
+        cached source/text context is unchanged, so Base/Teacher can use K=0
+        while Student uses K>0 on the same loaded model instance.
+        """
 
         required = {"full", "text_removed", "image_removed"}
         missing = required.difference(contexts)
@@ -287,6 +292,94 @@ class InterleaveInferencer:
         )
 
     @torch.no_grad()
+    def prepare_image_condition_bundle(self, **kwargs) -> ImageConditionBundle:
+        """Backward-compatible alias for ``prepare_velocity_bundle``."""
+
+        return self.prepare_velocity_bundle(**kwargs)
+
+    def build_image_velocity_kwargs(
+        self,
+        *,
+        x_t: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        condition: ImageConditionBundle,
+        cfg_text_scale: float = 4.0,
+        cfg_img_scale: float = 1.5,
+        cfg_interval: Tuple[float, float] = (0.4, 1.0),
+        cfg_renorm_min: float = 0.0,
+        cfg_renorm_type: str = "global",
+        within_step_loop_start: Optional[int] = None,
+        within_step_loop_end: Optional[int] = None,
+        within_step_loop_repeat: int = 1,
+        within_step_loop_damping: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Build native BAGEL flow kwargs without choosing K=0 or loop forward."""
+
+        raw_timestep = torch.as_tensor(
+            timestep, device=x_t.device, dtype=x_t.dtype
+        ).reshape(-1)
+        if int(raw_timestep.numel()) != 1:
+            raise ValueError("velocity replay requires one shared timestep")
+        value = float(raw_timestep.detach().float()[0])
+        in_cfg_interval = float(cfg_interval[0]) < value <= float(cfg_interval[1])
+        text_scale = float(cfg_text_scale) if in_cfg_interval else 1.0
+        image_scale = (
+            float(cfg_img_scale)
+            if in_cfg_interval and condition.has_visual_condition
+            else 1.0
+        )
+        timestep_tensor = torch.full(
+            (int(x_t.shape[0]),),
+            value,
+            dtype=x_t.dtype,
+            device=x_t.device,
+        )
+        flow = condition.flow_input
+        cfg_text = condition.cfg_text_input
+        cfg_img = condition.cfg_img_input
+        return dict(
+            x_t=x_t,
+            timestep=timestep_tensor,
+            packed_vae_token_indexes=flow["packed_vae_token_indexes"],
+            packed_vae_position_ids=flow["packed_vae_position_ids"],
+            packed_text_ids=flow["packed_text_ids"],
+            packed_text_indexes=flow["packed_text_indexes"],
+            packed_position_ids=flow["packed_position_ids"],
+            packed_indexes=flow["packed_indexes"],
+            packed_seqlens=flow["packed_seqlens"],
+            key_values_lens=flow["key_values_lens"],
+            past_key_values=condition.full_context["past_key_values"],
+            packed_key_value_indexes=flow["packed_key_value_indexes"],
+            cfg_renorm_min=float(cfg_renorm_min),
+            cfg_renorm_type=str(cfg_renorm_type),
+            cfg_text_scale=text_scale,
+            cfg_text_packed_position_ids=cfg_text["cfg_packed_position_ids"],
+            cfg_text_packed_query_indexes=cfg_text["cfg_packed_query_indexes"],
+            cfg_text_key_values_lens=cfg_text["cfg_key_values_lens"],
+            cfg_text_past_key_values=condition.text_removed_context[
+                "past_key_values"
+            ],
+            cfg_text_packed_key_value_indexes=cfg_text[
+                "cfg_packed_key_value_indexes"
+            ],
+            cfg_img_scale=image_scale,
+            cfg_img_packed_position_ids=cfg_img["cfg_packed_position_ids"],
+            cfg_img_packed_query_indexes=cfg_img["cfg_packed_query_indexes"],
+            cfg_img_key_values_lens=cfg_img["cfg_key_values_lens"],
+            cfg_img_past_key_values=condition.image_removed_context[
+                "past_key_values"
+            ],
+            cfg_img_packed_key_value_indexes=cfg_img[
+                "cfg_packed_key_value_indexes"
+            ],
+            within_step_loop_start=within_step_loop_start,
+            within_step_loop_end=within_step_loop_end,
+            within_step_loop_repeat=int(within_step_loop_repeat),
+            within_step_loop_damping=float(within_step_loop_damping),
+            packed_boundary_token_indexes=flow["packed_boundary_token_indexes"],
+        )
+
+    @torch.no_grad()
     def predict_image_velocity(
         self,
         *,
@@ -306,56 +399,21 @@ class InterleaveInferencer:
         """Evaluate one native BAGEL guided velocity without advancing ``x_t``."""
 
         self.model.language_model.model.enable_taylorseer = False
-        value = float(timestep)
-        in_cfg_interval = float(cfg_interval[0]) < value <= float(cfg_interval[1])
-        text_scale = float(cfg_text_scale) if in_cfg_interval else 1.0
-        image_scale = (
-            float(cfg_img_scale)
-            if in_cfg_interval and condition.has_visual_condition
-            else 1.0
-        )
-        timestep_tensor = torch.full(
-            (int(x_t.shape[0]),),
-            value,
-            dtype=x_t.dtype,
-            device=x_t.device,
-        )
-        flow = condition.flow_input
-        cfg_text = condition.cfg_text_input
-        cfg_img = condition.cfg_img_input
-        return self.model.predict_image_velocity(
+        kwargs = self.build_image_velocity_kwargs(
             x_t=x_t,
-            timestep=timestep_tensor,
-            packed_vae_token_indexes=flow["packed_vae_token_indexes"],
-            packed_vae_position_ids=flow["packed_vae_position_ids"],
-            packed_text_ids=flow["packed_text_ids"],
-            packed_text_indexes=flow["packed_text_indexes"],
-            packed_position_ids=flow["packed_position_ids"],
-            packed_indexes=flow["packed_indexes"],
-            packed_seqlens=flow["packed_seqlens"],
-            key_values_lens=flow["key_values_lens"],
-            past_key_values=condition.full_context["past_key_values"],
-            packed_key_value_indexes=flow["packed_key_value_indexes"],
-            cfg_renorm_min=float(cfg_renorm_min),
-            cfg_renorm_type=str(cfg_renorm_type),
-            cfg_text_scale=text_scale,
-            cfg_text_packed_position_ids=cfg_text["cfg_packed_position_ids"],
-            cfg_text_packed_query_indexes=cfg_text["cfg_packed_query_indexes"],
-            cfg_text_key_values_lens=cfg_text["cfg_key_values_lens"],
-            cfg_text_past_key_values=condition.text_removed_context["past_key_values"],
-            cfg_text_packed_key_value_indexes=cfg_text["cfg_packed_key_value_indexes"],
-            cfg_img_scale=image_scale,
-            cfg_img_packed_position_ids=cfg_img["cfg_packed_position_ids"],
-            cfg_img_packed_query_indexes=cfg_img["cfg_packed_query_indexes"],
-            cfg_img_key_values_lens=cfg_img["cfg_key_values_lens"],
-            cfg_img_past_key_values=condition.image_removed_context["past_key_values"],
-            cfg_img_packed_key_value_indexes=cfg_img["cfg_packed_key_value_indexes"],
+            timestep=timestep,
+            condition=condition,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_min=cfg_renorm_min,
+            cfg_renorm_type=cfg_renorm_type,
             within_step_loop_start=within_step_loop_start,
             within_step_loop_end=within_step_loop_end,
             within_step_loop_repeat=within_step_loop_repeat,
             within_step_loop_damping=within_step_loop_damping,
-            packed_boundary_token_indexes=flow["packed_boundary_token_indexes"],
         )
+        return self.model.predict_image_velocity(**kwargs)
 
     @torch.no_grad()
     def gen_image(
@@ -379,6 +437,16 @@ class InterleaveInferencer:
         sde_seed: int = 0,
         return_trajectory: bool = False,
         return_loop_diagnostics: bool = False,
+        num_loop_tokens: Optional[int] = None,
+        capture_step_indices: Optional[tuple[int, ...]] = None,
+        decode_output: bool = True,
+        loop_depth: Optional[int] = None,
+        loop_uncond_memory: Optional[str] = None,
+        loop_recycle_mode: Optional[str] = None,
+        loop_memory_persist: Optional[bool] = None,
+        memory_loop_start: Optional[int] = None,
+        memory_loop_end: Optional[int] = None,
+        round0_memory_write_enabled: Optional[bool] = None,
     ):
         # print(cfg_renorm_type)
         past_key_values = gen_context["past_key_values"]
@@ -389,6 +457,7 @@ class InterleaveInferencer:
             curr_rope=ropes,
             image_sizes=[image_shape],
             new_token_ids=self.new_token_ids,
+            num_loop_tokens=num_loop_tokens,
         )
         generation_input = _move_to_device(generation_input, self.device)
         if init_noise is not None:
@@ -416,6 +485,7 @@ class InterleaveInferencer:
             curr_kvlens=kv_lens_cfg,
             curr_rope=ropes_cfg,
             image_sizes=[image_shape],
+            num_loop_tokens=num_loop_tokens,
         )
         generation_input_cfg_text = _move_to_device(
             generation_input_cfg_text, self.device
@@ -429,6 +499,7 @@ class InterleaveInferencer:
             curr_kvlens=kv_lens_cfg,
             curr_rope=ropes_cfg,
             image_sizes=[image_shape],
+            num_loop_tokens=num_loop_tokens,
         )
         generation_input_cfg_img = _move_to_device(
             generation_input_cfg_img, self.device
@@ -472,6 +543,14 @@ class InterleaveInferencer:
             sde_seed=sde_seed,
             return_trajectory=return_trajectory,
             return_loop_diagnostics=bool(return_loop_diagnostics),
+            capture_step_indices=capture_step_indices,
+            loop_depth=loop_depth,
+            loop_uncond_memory=loop_uncond_memory,
+            loop_recycle_mode=loop_recycle_mode,
+            loop_memory_persist=loop_memory_persist,
+            memory_loop_start=memory_loop_start,
+            memory_loop_end=memory_loop_end,
+            round0_memory_write_enabled=round0_memory_write_enabled,
         )
 
         if return_trajectory:
@@ -481,7 +560,7 @@ class InterleaveInferencer:
             trajectory = None
 
         latent = unpacked_latent[0]
-        image = self.decode_image(latent, image_shape)
+        image = self.decode_image(latent, image_shape) if decode_output else None
         if return_trajectory:
             replay_context = {
                 "packed_vae_token_indexes": generation_input[
@@ -536,25 +615,49 @@ class InterleaveInferencer:
                     "packed_loop_token_indexes"
                 ),
                 "recycle_mode": str(
-                    getattr(self.model.config, "loop_recycle_mode", "same_depth")
+                    loop_recycle_mode
+                    if loop_recycle_mode is not None
+                    else getattr(self.model.config, "loop_recycle_mode", "same_depth")
                 ),
-                "memory_loop_repeat": int(getattr(self.model.config, "loop_depth", 2)),
+                "memory_loop_repeat": int(
+                    loop_depth
+                    if loop_depth is not None
+                    else getattr(self.model.config, "loop_depth", 2)
+                ),
                 "memory_loop_start": int(
-                    getattr(self.model.config, "memory_loop_start_layer", 16)
+                    memory_loop_start
+                    if memory_loop_start is not None
+                    else getattr(self.model.config, "memory_loop_start_layer", 16)
                 ),
                 "memory_loop_end": int(
-                    getattr(self.model.config, "memory_loop_end_layer", 24)
+                    memory_loop_end
+                    if memory_loop_end is not None
+                    else getattr(self.model.config, "memory_loop_end_layer", 24)
                 ),
                 "round0_memory_write_enabled": bool(
-                    getattr(
+                    round0_memory_write_enabled
+                    if round0_memory_write_enabled is not None
+                    else getattr(
                         self.model.config,
                         "round0_memory_write_enabled",
-                        getattr(
-                            self.model.config, "round0_gen_reads_memory", False
-                        ),
+                        getattr(self.model.config, "round0_gen_reads_memory", False),
                     )
                 ),
+                "loop_memory_persist": bool(
+                    loop_memory_persist
+                    if loop_memory_persist is not None
+                    else getattr(self.model.config, "loop_memory_persist", False)
+                ),
+                "loop_uncond_memory": str(
+                    loop_uncond_memory
+                    if loop_uncond_memory is not None
+                    else getattr(self.model.config, "loop_uncond_memory", "m0")
+                ),
                 "embed_memory": getattr(self.model, "loop_memory", None),
+                "num_loop_tokens": int(
+                    generation_input["packed_loop_token_indexes"].numel()
+                )
+                // max(1, int(generation_input["packed_vae_seqlens"].numel())),
             }
             return {
                 "image": image,
