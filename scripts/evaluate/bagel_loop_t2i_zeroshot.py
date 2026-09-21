@@ -81,18 +81,6 @@ ARMS: List[Dict[str, Any]] = [
         "round0_memory_write_enabled": False,
     },
     {
-        "id": "Z5",
-        "slug": "z5_mid_persist",
-        "title": "Z5 mid body + persist",
-        "K": 8,
-        "R": 2,
-        "recycle_mode": "same_depth",
-        "persist": True,
-        "start_layer": 16,
-        "end_layer": 24,
-        "round0_memory_write_enabled": False,
-    },
-    {
         "id": "Z6",
         "slug": "z6_early_persist",
         "title": "Z6 early body + persist",
@@ -102,18 +90,6 @@ ARMS: List[Dict[str, Any]] = [
         "persist": True,
         "start_layer": 12,
         "end_layer": 20,
-        "round0_memory_write_enabled": False,
-    },
-    {
-        "id": "Z7",
-        "slug": "z7_late_persist",
-        "title": "Z7 late body + persist",
-        "K": 8,
-        "R": 2,
-        "recycle_mode": "same_depth",
-        "persist": True,
-        "start_layer": 20,
-        "end_layer": 28,
         "round0_memory_write_enabled": False,
     },
 ]
@@ -129,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vit-image-stride", type=int, default=14)
     parser.add_argument(
         "--prompt-file",
-        default="experiments/data/geneval2_hard_128.txt",
+        default="experiments/data/geneval2_all_800.txt",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--height", type=int, default=1024)

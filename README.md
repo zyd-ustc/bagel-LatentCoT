@@ -68,8 +68,8 @@ pytest -q tests/test_mot_loop_phase0.py tests/test_bagel_flowedit.py
 
 Phase 0.5 是 frozen BAGEL 的纯 T2I compositional mechanism benchmark。所有 arm
 共享 prompt、initial noise、1024×1024 geometry、官方 T2I CFG、50-step schedule，
-只改变 loop body 与跨 timestep persistence。默认使用 128 条 GenEval2 hard
-held-out prompts（atomicity 7–10 各 32 条）。16 卡主矩阵：
+只改变 loop body 与跨 timestep persistence。默认使用官方 GenEval2 全量 800
+prompts（atomicity 3–10 各 100 条）。16 卡主矩阵：
 
 ```bash
 bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/out
@@ -82,11 +82,22 @@ K_VALUES=1,4,8 bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/k_a
 ```
 
 主矩阵固定为 Z0 vanilla；Z2/Z3/Z4 分别使用 mid/early/late body 且不跨 timestep
-保留 memory；Z5/Z6/Z7 使用完全对应的三个 body window 并开启 persistence。
+保留 memory；Z6 是 early body 的 persistence 对照。Z5/Z7 已从当前主实验移除。
 生成完成后会写 `mechanism_summary.json` 及每个 arm 的 GenEval2 image map；如果
 Soft-TIFA server 已运行或 `VLM_PATH` 可用，launcher 会自动汇总 AM/GM、skill 和
 atomicity。设置 `SCORE=1` 可强制要求评分成功；`K_VALUES` 非空时不得同时设置
 `ARMS`。
+
+全量 800 prompts 与 Z0 三 seed 随机性对照一键运行：
+
+```bash
+nohup bash scripts/evaluate/run_bagel_loop_t2i_full800_multiseed.sh \
+  /data/outputs/bagel_loop_t2i_full800_multiseed \
+  > /data/outputs/bagel_loop_t2i_full800_multiseed.log 2>&1 &
+```
+
+该协议在 seed 42 比较 `Z0,Z2,Z3,Z4,Z6`，并额外运行 seed 43/44 的 Z0。
+额外 seed 只衡量 baseline 随机波动，不等价于所有 loop arm 的多 seed 复现。
 
 原 paired-edit specification 与 runner 保留在
 `experiments/data/semantic_edit_phase05.jsonl` 和

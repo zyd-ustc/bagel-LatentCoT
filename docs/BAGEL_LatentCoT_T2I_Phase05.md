@@ -42,13 +42,12 @@ may change. Noise seeds use schema `bagel-loop-t2i-v1`.
 | Z2 | 8 | 2 | `[16,24)` | off | read | mid body, fresh memory |
 | Z3 | 8 | 2 | `[12,20)` | off | read | early body |
 | Z4 | 8 | 2 | `[20,28)` | off | read | late body |
-| Z5 | 8 | 2 | `[16,24)` | on | read | mid body, persistent memory |
 | Z6 | 8 | 2 | `[12,20)` | on | read | early body, persistent memory |
-| Z7 | 8 | 2 | `[20,28)` | on | read | late body, persistent memory |
 
-The matched persistence comparisons are `Z2↔Z5`, `Z3↔Z6`, and `Z4↔Z7`.
-Each pair differs only in whether the final memory state is carried into the next
-denoising timestep. All six loop arms use strict `1R+1W` and `K=8`.
+`Z3↔Z6` is the retained matched persistence comparison. It differs only in whether
+the final memory state is carried into the next denoising timestep. Z5 and Z7 were
+removed after the 128-prompt pilot did not support retaining their persistence
+windows. All loop arms use strict `1R+1W` and `K=8`.
 
 ## 4. K-scaling matrix
 
@@ -62,12 +61,23 @@ K_VALUES=1,4,8 \
   bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /data/outputs/t2i_k
 ```
 
-The launcher defaults to 16 NPU shards, 1024×1024, seed 42, and a deterministic
-128-prompt held-out subset of official GenEval2. Atomicities 7–10 each contribute
-32 prompts; seed 42 preserves all 80 prompts from the previous held-out split.
-The source is official GenEval2 commit `a6e82d2289e8d418f27f0adee77908b07060eea3`.
+The launcher defaults to 16 NPU shards, 1024×1024, seed 42, and all 800 official
+GenEval2 prompts. Atomicities 3–10 each contribute 100 prompts. The source is
+official GenEval2 commit `a6e82d2289e8d418f27f0adee77908b07060eea3`.
 Override with `NUM_SHARDS`, `HEIGHT`, `WIDTH`, `SEED`, `MODEL_PATH`, or
 `PROMPT_FILE`.
+
+The multi-seed protocol runs the five-arm main matrix at seed 42, then Z0-only at
+seeds 43 and 44:
+
+```bash
+bash scripts/evaluate/run_bagel_loop_t2i_full800_multiseed.sh \
+  /data/outputs/bagel_loop_t2i_full800_multiseed
+```
+
+The root-level `multiseed_summary.{json,md}` reports Z0 mean, sample standard
+deviation, and range. Loop deltas remain same-seed comparisons against seed-42 Z0;
+the extra Z0 seeds do not make the loop arms multi-seed evaluations.
 
 ## 5. Outputs and scoring
 
@@ -90,7 +100,7 @@ to make a missing evaluator a hard error:
 SCORE=1 \
 VLM_PATH=/data/bagel-LatentCoT/models/Qwen3-VL-8B-Instruct \
 bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh \
-  /data/outputs/bagel_loop_t2i_phase05_128
+  /data/outputs/bagel_loop_t2i_phase05_full800
 ```
 
 The scorer writes aggregate AM/GM, per-skill, per-atomicity, CSV, JSON, and a
@@ -100,5 +110,5 @@ Markdown summary using Z0 as the baseline.
 
 Select a body/persistence configuration only if diagnostics establish
 `memory → GEN → velocity` and the arm improves GenEval2 AM/GM over Z0 without
-unacceptable visual degradation. Persistence must be judged through the three
-matched pairs, not only the mid-body pair.
+unacceptable visual degradation. Treat a loop gain smaller than ordinary Z0 seed
+variation as inconclusive until that loop arm is repeated across multiple seeds.

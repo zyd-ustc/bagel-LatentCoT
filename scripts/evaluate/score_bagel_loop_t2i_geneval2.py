@@ -98,7 +98,7 @@ def main() -> None:
     parser.add_argument(
         "--benchmark-data",
         type=Path,
-        default=Path("experiments/data/geneval2_hard_128.jsonl"),
+        default=Path("experiments/data/geneval2_all_800.jsonl"),
     )
     parser.add_argument("--server-url", default="http://127.0.0.1:18086")
     parser.add_argument("--timeout-seconds", type=float, default=600.0)

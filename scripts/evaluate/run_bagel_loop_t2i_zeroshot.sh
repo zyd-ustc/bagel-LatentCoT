@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OUTPUT_DIR=${1:-/data/outputs/bagel_loop_t2i_phase05_128}
+OUTPUT_DIR=${1:-/data/outputs/bagel_loop_t2i_phase05_full800}
 PYTHON_BIN=${PYTHON_BIN:-/home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python}
+DEFAULT_SCORE_PYTHON=/data/bagel-LatentCoT/envs/geneval2-soft-tifa/bin/python
+if [[ ! -x "$DEFAULT_SCORE_PYTHON" ]]; then
+  DEFAULT_SCORE_PYTHON=$PYTHON_BIN
+fi
+SCORE_PYTHON_BIN=${SCORE_PYTHON_BIN:-$DEFAULT_SCORE_PYTHON}
 MODEL_PATH=${MODEL_PATH:-/data/bagel-LatentCoT/models/Bagel-7B-MoT}
-PROMPT_FILE=${PROMPT_FILE:-experiments/data/geneval2_hard_128.txt}
-BENCHMARK_DATA=${BENCHMARK_DATA:-experiments/data/geneval2_hard_128.jsonl}
+PROMPT_FILE=${PROMPT_FILE:-experiments/data/geneval2_all_800.txt}
+BENCHMARK_DATA=${BENCHMARK_DATA:-experiments/data/geneval2_all_800.jsonl}
 NUM_SHARDS=${NUM_SHARDS:-16}
 HEIGHT=${HEIGHT:-1024}
 WIDTH=${WIDTH:-1024}
@@ -17,12 +22,16 @@ SCORE=${SCORE:-auto}
 SCORE_SERVER_URL=${SCORE_SERVER_URL:-http://127.0.0.1:18086}
 SCORE_PORT=${SCORE_PORT:-18086}
 SCORE_BATCH_SIZE=${SCORE_BATCH_SIZE:-4}
-VLM_PATH=${VLM_PATH:-/data/bagel-LatentCoT/models/Qwen3-VL-8B-Instruct}
+VLM_PATH=${VLM_PATH:-/data/model/Qwen3-VL-8B-Instruct}
 SCORE_DEVICE=${SCORE_DEVICE:-npu:0}
 
 mkdir -p "$OUTPUT_DIR"
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "python not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+if [[ ! -x "$SCORE_PYTHON_BIN" ]]; then
+  echo "score python not found: $SCORE_PYTHON_BIN" >&2
   exit 1
 fi
 if [[ ! -f "$MODEL_PATH/ema.safetensors" ]]; then
@@ -119,7 +128,7 @@ if [[ "$fail" == "0" && "$SCORE" != "0" ]]; then
   elif [[ -f "$VLM_PATH/config.json" ]] && \
        [[ "$SCORE_SERVER_URL" == "http://127.0.0.1:${SCORE_PORT}" ]]; then
     echo "[score] starting GenEval2 Soft-TIFA on $SCORE_DEVICE"
-    ASCEND_RT_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u \
+    ASCEND_RT_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 "$SCORE_PYTHON_BIN" -u \
       scripts/evaluate/serve_geneval2_soft_tifa.py \
       --model-path "$VLM_PATH" \
       --device "$SCORE_DEVICE" \
@@ -138,7 +147,7 @@ if [[ "$fail" == "0" && "$SCORE" != "0" ]]; then
 
   if [[ "$score_ready" == "1" ]]; then
     echo "[score] evaluating all arms on $n_prompts GenEval2 prompts"
-    PYTHONPATH="${PYTHONPATH:-}:$(pwd)" "$PYTHON_BIN" -u \
+    PYTHONPATH="${PYTHONPATH:-}:$(pwd)" "$SCORE_PYTHON_BIN" -u \
       scripts/evaluate/score_bagel_loop_t2i_geneval2.py \
       --output-dir "$OUTPUT_DIR" \
       --benchmark-data "$BENCHMARK_DATA" \

@@ -35,6 +35,27 @@ def test_geneval2_hard_128_is_balanced_and_prompt_file_matches():
     }
 
 
+def test_geneval2_full_800_is_official_balanced_set_and_prompt_file_matches():
+    benchmark_path = ROOT / "experiments" / "data" / "geneval2_all_800.jsonl"
+    prompt_path = ROOT / "experiments" / "data" / "geneval2_all_800.txt"
+    rows = [
+        json.loads(line)
+        for line in benchmark_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    prompts = [
+        line.strip()
+        for line in prompt_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == len(prompts) == 800
+    assert len(set(prompts)) == 800
+    assert prompts == [row["prompt"] for row in rows]
+    assert Counter(int(row["atom_count"]) for row in rows) == {
+        atomicity: 100 for atomicity in range(3, 11)
+    }
+
+
 def test_geneval2_loader_aligns_benchmark_and_arm_maps(tmp_path):
     output_dir = tmp_path / "run"
     map_dir = output_dir / "geneval2"

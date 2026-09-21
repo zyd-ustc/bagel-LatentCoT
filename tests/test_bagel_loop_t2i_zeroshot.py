@@ -38,32 +38,25 @@ def test_t2i_hyper_matches_official_native_generation():
     }
 
 
-def test_t2i_arm_matrix_pairs_each_body_window_with_persistence():
+def test_t2i_arm_matrix_keeps_selected_body_and_persistence_ablations():
     assert [arm["id"] for arm in ARMS] == [
         "Z0",
         "Z2",
         "Z3",
         "Z4",
-        "Z5",
         "Z6",
-        "Z7",
     ]
     assert all("remove_old_prompt" not in arm for arm in ARMS)
     assert all("source_image" not in arm for arm in ARMS)
-    pairs = (("Z2", "Z5"), ("Z3", "Z6"), ("Z4", "Z7"))
-    for fresh_id, persist_id in pairs:
-        fresh = select_arms(fresh_id)[0]
-        persist = select_arms(persist_id)[0]
-        assert fresh["persist"] is False
-        assert persist["persist"] is True
-        assert {
-            key
-            for key in fresh
-            if key not in {"id", "slug", "title"} and fresh[key] != persist[key]
-        } == {"persist"}
-        assert fresh["R"] == persist["R"] == 2
-        assert fresh["round0_memory_write_enabled"] is False
-        assert persist["round0_memory_write_enabled"] is False
+    assert all(select_arms(arm_id)[0]["persist"] is False for arm_id in ("Z2", "Z3", "Z4"))
+    z3 = select_arms("Z3")[0]
+    z6 = select_arms("Z6")[0]
+    assert z6["persist"] is True
+    assert {
+        key
+        for key in z3
+        if key not in {"id", "slug", "title"} and z3[key] != z6[key]
+    } == {"persist"}
 
 
 def test_official_t2i_uses_prompt_only_and_fixed_noise():
@@ -99,7 +92,7 @@ def test_apply_t2i_loop_config_and_vanilla_path():
     apply_loop_config(model, select_arms("Z0")[0])
     assert model.num_loop_tokens == 0
     assert model.loop_depth == 1
-    apply_loop_config(model, select_arms("Z5")[0])
+    apply_loop_config(model, select_arms("Z6")[0])
     assert model.num_read_rounds == 1
     assert model.num_write_rounds == 1
     assert model.loop_memory_persist is True
