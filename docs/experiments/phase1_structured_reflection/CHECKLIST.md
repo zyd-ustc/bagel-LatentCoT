@@ -24,9 +24,21 @@
 - [x] unrelated changes avoided or justified
 - [x] risky logic guarded or sanity-checked
 
+## Reliability Fixes
+
+- [x] direction activation uses teacher correction RMS
+- [x] replay states backward sequentially to release each BAGEL graph
+- [x] training data requires a valid teacher score contract
+- [x] noop/non-noop semantic constraints are validated
+- [x] Base/Teacher/Student CFG shape and K contracts are tested
+- [x] Q-only trainable/gradient allowlist is tested
+- [x] strict Read/Write adapter gates are tested
+- [x] Phase-2 GRPO explicitly uses Base K=0 and Loop K=8
+- [x] Phase-2 GRPO accepts the Phase-1 v8 adapter contract
+
 ## Pilot / Smoke
 
-- [x] unit tests pass (128 passed locally)
+- [x] unit tests pass (140 passed locally)
 - [ ] one-update model smoke executed
 - [ ] outputs and gradients look valid
 - [ ] comparability still holds

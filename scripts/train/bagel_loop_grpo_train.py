@@ -42,6 +42,14 @@ def _round0_memory_write_enabled(config: Mapping[str, Any]) -> bool:
     return bool(value)
 
 
+def _rollout_num_loop_tokens(
+    config: Mapping[str, Any], *, base: bool
+) -> int:
+    """Keep the GRPO baseline vanilla while the policy rollout uses K>0."""
+
+    return 0 if bool(base) else int(config.get("num_loop_tokens", 8))
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/training/loop_grpo.yaml")
@@ -136,9 +144,10 @@ def _validate_adapter_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         "bagel_native_loop_grpo_adapter_v6",
         "bagel_semantic_state_flow_adapter_v7",
         "bagel_semantic_state_grpo_adapter_v7",
+        "bagel_loop_delta_velocity_adapter_v8",
     }:
         raise RuntimeError(
-            "GRPO requires a compatible v6 initializer or v7 semantic-state adapter; "
+            "GRPO requires a compatible v6/v7 adapter or Phase-1 v8 adapter; "
             f"got schema={metadata.get('schema')!r}"
         )
     start_layer = int(config.get("memory_loop_start_layer", 16))
@@ -161,6 +170,29 @@ def _validate_adapter_contract(config: Mapping[str, Any]) -> dict[str, Any]:
             int(config.get("lora_alpha", 16)),
         ),
     }
+    if metadata.get("schema") == "bagel_loop_delta_velocity_adapter_v8":
+        checks.update(
+            num_loop_tokens=(
+                metadata.get("num_loop_tokens"),
+                int(config.get("num_loop_tokens", 8)),
+            ),
+            loop_depth=(
+                metadata.get("loop_depth"),
+                int(config.get("loop_depth", 2)),
+            ),
+            round0_memory_write_enabled=(
+                metadata.get("round0_memory_write_enabled"),
+                _round0_memory_write_enabled(config),
+            ),
+            gen_attention_o_lora=(
+                metadata.get("gen_attention_o_lora"),
+                bool(config.get("gen_attention_o_lora", False)),
+            ),
+            k_v_lora=(
+                metadata.get("k_v_lora"),
+                bool(config.get("k_v_lora", False)),
+            ),
+        )
     mismatches = [
         f"{key}: adapter={got!r}, GRPO={want!r}"
         for key, (got, want) in checks.items()
@@ -170,9 +202,10 @@ def _validate_adapter_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         "depth1_velocity_format_distillation",
         "cross_step_local_flow",
         "quality_constrained_grpo",
+        "structured_reflection_delta_velocity_distillation",
     }:
         mismatches.append(
-            "objective: adapter must be a v6 format-only or GRPO adapter"
+            "objective: adapter must be a compatible v6/v7 or Phase-1 v8 adapter"
         )
     if mismatches:
         raise RuntimeError(
@@ -471,6 +504,7 @@ def main() -> None:
                     init_noise=init_noise,
                     return_latent=True,
                     sde_seed=rollout_seed,
+                    num_loop_tokens=_rollout_num_loop_tokens(config, base=True),
                     **generation_common,
                 )
             loop_context, loop_visual_only, loop_text_only = _contexts(inferencer, prompt)
@@ -483,6 +517,7 @@ def main() -> None:
                     init_noise=init_noise,
                     return_trajectory=True,
                     sde_seed=rollout_seed,
+                    num_loop_tokens=_rollout_num_loop_tokens(config, base=False),
                     **generation_common,
                 )
             base_images.append(base_image)

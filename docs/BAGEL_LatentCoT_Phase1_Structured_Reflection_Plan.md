@@ -960,9 +960,16 @@ Fresh / Persist：
     "texture"
   ],
   "is_noop": false,
-  "difficulty": 3
+  "difficulty": 3,
+  "teacher_valid": true,
+  "teacher_semantic_delta": 0.15,
+  "teacher_preserve_delta": -0.01
 }
 ```
+
+训练主集默认只保留 `teacher_valid=true`。非 no-op teacher 必须带来正的
+semantic delta，且 preservation 下降不超过配置的 epsilon；no-op 允许
+semantic delta 为 0，但同样必须通过 preservation gate。
 
 可选：
 

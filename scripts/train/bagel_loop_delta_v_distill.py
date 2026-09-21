@@ -49,6 +49,9 @@ REQUIRED_FIELDS = (
     "preserve_constraints",
     "is_noop",
     "difficulty",
+    "teacher_valid",
+    "teacher_semantic_delta",
+    "teacher_preserve_delta",
 )
 
 
@@ -108,6 +111,10 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
     replay_count = int(config.get("replay_states_per_sample", 3))
     if not 2 <= replay_count <= 4:
         raise ValueError("replay_states_per_sample must be in [2, 4]")
+    if float(config.get("teacher_preserve_epsilon", 0.02)) < 0.0:
+        raise ValueError("teacher_preserve_epsilon must be non-negative")
+    if float(config.get("direction_active_threshold", 1e-3)) < 0.0:
+        raise ValueError("direction_active_threshold must be non-negative")
     return config
 
 
@@ -134,7 +141,12 @@ def _reflection_bullet_counts(reflection: str) -> Tuple[int, int]:
 
 
 def validate_phase1_record(
-    row: Mapping[str, Any], *, source_root: Path, location: str
+    row: Mapping[str, Any],
+    *,
+    source_root: Path,
+    location: str,
+    teacher_min_semantic_delta: float = 0.0,
+    teacher_preserve_epsilon: float = 0.02,
 ) -> Dict[str, Any]:
     missing = [key for key in REQUIRED_FIELDS if key not in row]
     if missing:
@@ -164,10 +176,45 @@ def validate_phase1_record(
     for key in ("edit_type", "target_constraints", "preserve_constraints"):
         if not isinstance(normalized[key], list):
             raise ValueError(f"{location}: {key} must be a JSON list")
+    if not normalized["edit_type"]:
+        raise ValueError(f"{location}: edit_type must be non-empty")
+    if not normalized["preserve_constraints"]:
+        raise ValueError(f"{location}: preserve_constraints must be non-empty")
     if not isinstance(normalized["is_noop"], bool):
         raise ValueError(f"{location}: is_noop must be a JSON boolean")
+    if normalized["is_noop"]:
+        noop_phrases = ("no structural change", "no change required")
+        if not any(phrase in reflection.lower() for phrase in noop_phrases):
+            raise ValueError(
+                f"{location}: noop reflection must explicitly state "
+                "No structural change or No change required"
+            )
+    elif not normalized["target_constraints"]:
+        raise ValueError(
+            f"{location}: non-noop target_constraints must be non-empty"
+        )
     if not isinstance(normalized["difficulty"], (int, float)):
         raise ValueError(f"{location}: difficulty must be numeric")
+    if not isinstance(normalized["teacher_valid"], bool):
+        raise ValueError(f"{location}: teacher_valid must be a JSON boolean")
+    for key in ("teacher_semantic_delta", "teacher_preserve_delta"):
+        if not isinstance(normalized[key], (int, float)) or not math.isfinite(
+            float(normalized[key])
+        ):
+            raise ValueError(f"{location}: {key} must be a finite number")
+    semantic_delta = float(normalized["teacher_semantic_delta"])
+    semantic_valid = (
+        semantic_delta >= float(teacher_min_semantic_delta)
+        if normalized["is_noop"]
+        else semantic_delta > float(teacher_min_semantic_delta)
+    )
+    score_valid = semantic_valid and float(
+        normalized["teacher_preserve_delta"]
+    ) >= -float(teacher_preserve_epsilon)
+    if normalized["teacher_valid"] and not score_valid:
+        raise ValueError(
+            f"{location}: teacher_valid conflicts with teacher score deltas"
+        )
     source = Path(str(normalized["source_image"])).expanduser()
     if not source.is_absolute():
         source = source_root / source
@@ -177,7 +224,13 @@ def validate_phase1_record(
     return normalized
 
 
-def load_phase1_records(path: str) -> list[Dict[str, Any]]:
+def load_phase1_records(
+    path: str,
+    *,
+    teacher_valid_only: bool = True,
+    teacher_min_semantic_delta: float = 0.0,
+    teacher_preserve_epsilon: float = 0.02,
+) -> list[Dict[str, Any]]:
     data_path = Path(path).expanduser().resolve()
     rows = []
     for line_number, line in enumerate(
@@ -186,15 +239,18 @@ def load_phase1_records(path: str) -> list[Dict[str, Any]]:
         if not line.strip():
             continue
         row = json.loads(line)
-        rows.append(
-            validate_phase1_record(
-                row,
-                source_root=data_path.parent,
-                location=f"{data_path}:{line_number}",
-            )
+        normalized = validate_phase1_record(
+            row,
+            source_root=data_path.parent,
+            location=f"{data_path}:{line_number}",
+            teacher_min_semantic_delta=float(teacher_min_semantic_delta),
+            teacher_preserve_epsilon=float(teacher_preserve_epsilon),
         )
+        if not teacher_valid_only or normalized["teacher_valid"]:
+            rows.append(normalized)
     if not rows:
-        raise ValueError(f"no Phase-1 records found in {data_path}")
+        suffix = " teacher-valid" if teacher_valid_only else ""
+        raise ValueError(f"no{suffix} Phase-1 records found in {data_path}")
     return rows
 
 
@@ -273,6 +329,13 @@ def _save_adapter(model, output_dir: Path, step: int, config: Mapping[str, Any])
         "teacher": "source+instruction+structured_reflection,K=0",
         "base": "source+instruction,K=0",
         "student": "source+instruction,K=8",
+        "teacher_valid_only": bool(config.get("teacher_valid_only", True)),
+        "teacher_min_semantic_delta": float(
+            config.get("teacher_min_semantic_delta", 0.0)
+        ),
+        "teacher_preserve_epsilon": float(
+            config.get("teacher_preserve_epsilon", 0.02)
+        ),
     }
     (output_dir / f"{stem}.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -292,6 +355,19 @@ def _scalar(value: Any) -> float:
     return float(value)
 
 
+def _backward_scaled_replay_loss(
+    loss: torch.Tensor, *, state_count: int
+) -> torch.Tensor:
+    """Backward one replay state and return a graph-free metric value."""
+
+    if int(state_count) < 1:
+        raise ValueError("state_count must be positive")
+    if not bool(torch.isfinite(loss.detach())):
+        raise RuntimeError("non-finite replay-state loss")
+    (loss / int(state_count)).backward()
+    return loss.detach()
+
+
 def main() -> None:
     args = _arguments()
     config = _load_config(args)
@@ -299,7 +375,16 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    records = load_phase1_records(str(config["data_path"]))
+    records = load_phase1_records(
+        str(config["data_path"]),
+        teacher_valid_only=bool(config.get("teacher_valid_only", True)),
+        teacher_min_semantic_delta=float(
+            config.get("teacher_min_semantic_delta", 0.0)
+        ),
+        teacher_preserve_epsilon=float(
+            config.get("teacher_preserve_epsilon", 0.02)
+        ),
+    )
     if args.validate_only:
         LOGGER.info("validated %d Phase-1 records", len(records))
         return
@@ -499,7 +584,6 @@ def main() -> None:
             raise RuntimeError("rollout did not return the requested replay states")
 
         optimizer.zero_grad(set_to_none=True)
-        losses = []
         per_state = []
         replay_common = {
             "cfg_text_scale": generation["cfg_text_scale"],
@@ -541,12 +625,24 @@ def main() -> None:
                     lambda_noop=float(config.get("lambda_noop", 1.0)),
                     overshoot_gamma=float(config.get("overshoot_gamma", 1.5)),
                 )
-            losses.append(result.loss)
-            per_state.append(result)
-        loss = torch.stack(losses).mean()
-        if not bool(torch.isfinite(loss)):
-            raise RuntimeError(f"non-finite loss at step {step}")
-        loss.backward()
+            detached_loss = _backward_scaled_replay_loss(
+                result.loss, state_count=len(states)
+            )
+            per_state.append(
+                {
+                    "loss": detached_loss,
+                    "delta_v_loss": result.delta_v_loss,
+                    "direction_loss": result.direction_loss,
+                    "overshoot_loss": result.overshoot_loss,
+                    "noop_loss": result.noop_loss,
+                    "cosine": result.cosine,
+                    "relative_error": result.relative_error,
+                    "student_rms": result.student_rms,
+                    "teacher_rms": result.teacher_rms,
+                    "direction_active": result.direction_active,
+                }
+            )
+            del result, student_velocity, base_velocity, teacher_velocity
         missing_gradients = [
             name
             for name, parameter in model.named_parameters()
@@ -565,17 +661,17 @@ def main() -> None:
         scheduler.step()
 
         def mean_metric(name: str) -> float:
-            return sum(_scalar(getattr(item, name)) for item in per_state) / len(
-                per_state
-            )
+            return sum(_scalar(item[name]) for item in per_state) / len(per_state)
 
         metrics = {
             "step": step,
             "sample_id": str(record["id"]),
             "record_index": record_index,
             "is_noop": bool(record["is_noop"]),
+            "teacher_semantic_delta": float(record["teacher_semantic_delta"]),
+            "teacher_preserve_delta": float(record["teacher_preserve_delta"]),
             "selected_step_indices": list(selected_steps),
-            "loss": _scalar(loss),
+            "loss": mean_metric("loss"),
             "delta_v_loss": mean_metric("delta_v_loss"),
             "direction_loss": mean_metric("direction_loss"),
             "overshoot_loss": mean_metric("overshoot_loss"),
@@ -585,7 +681,7 @@ def main() -> None:
             "student_rms": mean_metric("student_rms"),
             "teacher_rms": mean_metric("teacher_rms"),
             "direction_active_fraction": sum(
-                float(item.direction_active) for item in per_state
+                float(item["direction_active"]) for item in per_state
             )
             / len(per_state),
             "grad_norm": _scalar(grad_norm),

@@ -30,6 +30,9 @@ gen_attention_o_lora: false
 k_v_lora: false
 
 replay_states_per_sample: 3
+teacher_valid_only: true
+teacher_min_semantic_delta: 0.0
+teacher_preserve_epsilon: 0.02
 normalization_floor: 1.0e-4
 direction_active_threshold: 1.0e-3
 lambda_delta_v: 1.0

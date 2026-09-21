@@ -219,7 +219,6 @@ def delta_velocity_distillation_loss(
     student_delta = (student_velocity - base).float()
     teacher_rms = teacher_delta.square().mean().sqrt()
     student_rms = student_delta.square().mean().sqrt()
-    teacher_norm = teacher_delta.norm()
     denominator = teacher_delta.square().mean().clamp_min(
         float(normalization_floor)
     ).sqrt()
@@ -229,7 +228,7 @@ def delta_velocity_distillation_loss(
         student_delta / denominator,
         teacher_delta / denominator,
     )
-    active = bool(teacher_norm.detach() > float(direction_active_threshold))
+    active = bool(teacher_rms.detach() > float(direction_active_threshold))
     if active:
         direction_loss = 1.0 - F.cosine_similarity(
             student_delta.reshape(1, -1),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -11,6 +12,55 @@ from qwen_latent_cot.bagel.loop_grpo import (
     replay_transition,
     temporary_loop_adapter_state,
 )
+
+
+def test_grpo_rollout_uses_base_k0_and_loop_k8():
+    from scripts.train.bagel_loop_grpo_train import _rollout_num_loop_tokens
+
+    config = {"num_loop_tokens": 8}
+    assert _rollout_num_loop_tokens(config, base=True) == 0
+    assert _rollout_num_loop_tokens(config, base=False) == 8
+
+
+def test_grpo_accepts_phase1_v8_adapter_contract(tmp_path):
+    import json
+
+    from scripts.train.bagel_loop_grpo_train import _validate_adapter_contract
+
+    adapter = tmp_path / "phase1.safetensors"
+    metadata = {
+        "schema": "bagel_loop_delta_velocity_adapter_v8",
+        "objective": "structured_reflection_delta_velocity_distillation",
+        "memory_loop_start_layer": 12,
+        "memory_loop_end_layer": 20,
+        "num_loop_tokens": 8,
+        "loop_depth": 2,
+        "round0_memory_write_enabled": False,
+        "lora_rank": 8,
+        "lora_alpha": 16,
+        "gen_attention_o_lora": False,
+        "k_v_lora": False,
+    }
+    adapter.with_suffix(".json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+    config = {
+        "adapter_path": str(adapter),
+        "memory_loop_start_layer": 12,
+        "memory_loop_end_layer": 20,
+        "num_loop_tokens": 8,
+        "loop_depth": 2,
+        "round0_memory_write_enabled": False,
+        "lora_rank": 8,
+        "lora_alpha": 16,
+        "gen_attention_o_lora": False,
+        "k_v_lora": False,
+    }
+    assert _validate_adapter_contract(config) == metadata
+
+    config["num_loop_tokens"] = 4
+    with pytest.raises(RuntimeError, match="num_loop_tokens"):
+        _validate_adapter_contract(config)
 
 
 def test_truncated_final_geneval_row_is_ignored(tmp_path):

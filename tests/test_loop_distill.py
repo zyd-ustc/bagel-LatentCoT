@@ -190,6 +190,33 @@ def test_delta_velocity_loss_backpropagates_only_through_student():
     assert torch.isfinite(result.relative_error)
 
 
+def test_direction_gate_uses_teacher_rms_not_global_norm():
+    base = torch.zeros(10_000)
+    tiny_teacher = torch.full_like(base, 2.0e-5)
+    tiny_student = torch.full_like(base, 1.0e-5, requires_grad=True)
+    tiny = delta_velocity_distillation_loss(
+        student_velocity=tiny_student,
+        teacher_velocity=tiny_teacher,
+        base_velocity=base,
+        is_noop=False,
+        direction_active_threshold=1.0e-3,
+    )
+    assert tiny_teacher.norm() > 1.0e-3
+    assert tiny.teacher_rms < 1.0e-3
+    assert tiny.direction_active is False
+
+    normal_teacher = torch.full((16,), 2.0e-2)
+    normal_student = torch.full((16,), 1.0e-2, requires_grad=True)
+    normal = delta_velocity_distillation_loss(
+        student_velocity=normal_student,
+        teacher_velocity=normal_teacher,
+        base_velocity=torch.zeros_like(normal_teacher),
+        is_noop=False,
+        direction_active_threshold=1.0e-3,
+    )
+    assert normal.direction_active is True
+
+
 def test_noop_uses_only_restraint_loss():
     base = torch.zeros(2)
     teacher = torch.tensor([4.0, -3.0])
@@ -204,6 +231,16 @@ def test_noop_uses_only_restraint_loss():
     assert torch.allclose(result.loss, 2.0 * result.noop_loss)
     result.loss.backward()
     assert student.grad is not None
+
+
+def test_base_teacher_student_cfg_replay_shapes_match():
+    model = _ReplayModel()
+    state = {"sample": torch.zeros(3, 2), "timestep": torch.tensor(0.8)}
+    base = replay_velocity(model, _ReplayInferencer(), _condition(0), state)
+    teacher = replay_velocity(model, _ReplayInferencer(), _condition(0), state)
+    student = replay_velocity(model, _ReplayInferencer(), _condition(8), state)
+    assert base.velocity.shape == teacher.velocity.shape == student.velocity.shape
+    assert [call[0] for call in model.calls] == ["base", "base", "loop"]
 
 
 def test_capture_step_contract_rejects_capture_without_trajectory():

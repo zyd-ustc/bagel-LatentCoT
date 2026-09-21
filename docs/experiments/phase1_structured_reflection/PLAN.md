@@ -93,6 +93,9 @@ trainable gradients.
 
 - checklist: `docs/experiments/phase1_structured_reflection/CHECKLIST.md`
 - next unchecked item: run one optimizer-update smoke on the training machine.
+- current repair gate: complete the structured-reflection reliability checklist
+  before that optimizer-update smoke. This does not change K, R, body range,
+  teacher construction, or the delta-velocity objective.
 
 ## 8. Revision Log
 
@@ -100,3 +103,5 @@ trainable gradients.
 |---|---|---|---|
 | 2026-09-21 | Initial Step 1–2 implementation contract | User supplied new Phase 1 plan | No metric change; code-only start |
 | 2026-09-21 | Implemented K contract, selected-state replay, loss, trainer, and matched configs | Complete Phase 1.1 code path before accelerator smoke | 128 tests pass; model smoke pending |
+| 2026-09-21 | Locked reliability repair pass | Correct direction scale, replay HBM lifetime, teacher/data contracts, and Phase-2 handoff | No method change; smoke remains pending until tests pass |
+| 2026-09-21 | Completed reliability repair pass | All checklist code contracts and targeted tests implemented | 140 tests pass; accelerator HBM/model smoke remains pending |

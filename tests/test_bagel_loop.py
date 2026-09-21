@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -185,6 +187,29 @@ class _Injectable(nn.Module):
         self.other = nn.Parameter(torch.ones(()))
 
 
+class _Phase1Layer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = _Attention()
+        self.mlp = nn.Linear(2, 2, bias=False)
+        self.input_layernorm = nn.LayerNorm(2)
+
+
+class _Phase1Injectable(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(visual_gen=True)
+        self.use_moe = True
+        self.language_model = nn.Module()
+        self.language_model.model = nn.Module()
+        self.language_model.model.layers = nn.ModuleList(
+            [_Phase1Layer() for _ in range(24)]
+        )
+        self.loop_memory = nn.Parameter(torch.ones(8, 2))
+        self.prefix = nn.Linear(2, 2, bias=False)
+        self.suffix = nn.Linear(2, 2, bias=False)
+
+
 def test_injection_and_allowlist_are_restricted_to_body_layers():
     model = _Injectable()
     for parameter in model.parameters():
@@ -254,6 +279,90 @@ def test_optional_gen_o_and_kv_lora_are_explicit():
     assert any(".v_proj." in name for name in kv_names)
     assert any(".k_proj_moe_gen." in name for name in kv_names)
     assert not any(".o_proj_moe_gen." in name for name in kv_names)
+
+
+def test_phase1_student_backward_is_q_only_in_layers_12_to_20():
+    from qwen_latent_cot.bagel.backbone import BagelBackbone
+
+    model = _Phase1Injectable()
+    backbone = SimpleNamespace(bagel=model)
+    names = BagelBackbone.apply_loop_trainable_policy(
+        backbone,
+        start_layer=12,
+        end_layer=20,
+        rank=2,
+        alpha=4,
+        gen_attention_o_lora=False,
+        k_v_lora=False,
+    )
+    assert names
+    assert all(
+        (".q_proj." in name or ".q_proj_moe_gen." in name)
+        and any(f".layers.{index}." in name for index in range(12, 20))
+        for name in names
+    )
+
+    inputs = torch.tensor([[1.0, 0.5], [0.25, -0.5]])
+    memory_rows = torch.tensor([True, False])
+    loss = torch.zeros(())
+    for index in range(12, 20):
+        attention = model.language_model.model.layers[index].self_attn
+        und_q = attention.q_proj
+        gen_q = attention.q_proj_moe_gen
+        with torch.no_grad():
+            und_q.lora_B.weight.fill_(0.25)
+            gen_q.lora_B.weight.fill_(0.25)
+        und_q.set_loop_mode("read")
+        gen_q.set_loop_mode("read")
+        loss = loss + und_q.forward_rows(inputs, memory_rows).sum()
+        loss = loss + gen_q(inputs).sum()
+        und_q.set_loop_mode("write")
+        gen_q.set_loop_mode("write")
+        loss = loss + und_q.forward_rows(inputs, memory_rows).sum()
+        loss = loss + gen_q(inputs).sum()
+        und_q.set_loop_mode("off")
+        gen_q.set_loop_mode("off")
+    loss.backward()
+
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            assert name in names
+            assert parameter.grad is not None
+            assert parameter.grad.abs().sum() > 0
+        else:
+            assert parameter.grad is None, name
+    assert model.loop_memory.grad is None
+    assert model.prefix.weight.grad is None
+    assert model.suffix.weight.grad is None
+
+
+def test_phase1_read_write_gate_contract():
+    und_q = LoopLoRALinear(_linear(2.0), rank=1, alpha=1, read_enabled=True)
+    gen_q = LoopLoRALinear(_linear(2.0), rank=1, alpha=1, read_enabled=False)
+    for module in (und_q, gen_q):
+        with torch.no_grad():
+            module.lora_A.weight.fill_(1.0)
+            module.lora_B.weight.fill_(1.0)
+    inputs = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    memory_rows = torch.tensor([True, False])
+    und_base = und_q.base_layer(inputs)
+    gen_base = gen_q.base_layer(inputs)
+
+    und_q.set_loop_mode("read")
+    gen_q.set_loop_mode("read")
+    und_read = und_q.forward_rows(inputs, memory_rows)
+    gen_read = gen_q(inputs)
+    assert not torch.equal(und_read[0], und_base[0])
+    assert torch.equal(und_read[1], und_base[1])
+    assert torch.equal(gen_read, gen_base)
+
+    und_q.set_loop_mode("write")
+    gen_q.set_loop_mode("write")
+    und_write = und_q.forward_rows(inputs, memory_rows)
+    gen_write = gen_q(inputs)
+    assert not torch.equal(und_write[0], und_base[0])
+    assert torch.equal(und_write[1], und_base[1])
+    assert not torch.equal(gen_write, gen_base)
 
 
 class _TinyRotary(nn.Module):
