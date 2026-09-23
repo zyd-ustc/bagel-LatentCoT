@@ -5,6 +5,6 @@
 - [x] Route mask to conditional branch only and add eight-cell paired evaluator.
 - [x] Add targeted mask/routing tests; local syntax, Ruff F rules, and diff checks pass.
 - [ ] Run PyTorch tests on NPU checkout (local macOS PyTorch lacks `libtorch_cpu.dylib`).
-- [ ] Push code to GitHub main and verify remote SHA.
+- [x] Push code to GitHub main and verify remote SHA.
 - [ ] User runs 2-prompt pilot on NPU and checks complete manifest/gallery.
 - [ ] User runs full hard-16 comparison on NPU and records findings.
