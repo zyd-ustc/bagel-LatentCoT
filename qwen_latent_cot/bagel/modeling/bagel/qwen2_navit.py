@@ -58,25 +58,38 @@ def round0_blocked_slices(
     key_value_lens: torch.Tensor,
     packed_vae_token_indexes: Optional[torch.Tensor],
     packed_memory_token_indexes: Optional[torch.Tensor],
+    mask_prompt_kv_for_nonmemory: bool = False,
+    block_gen_reads_memory: bool = True,
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Per-sample (non-memory query, memory key) index pairs to block.
+    """Per-sample non-memory query/key pairs blocked during generation.
 
-    Memory keys sit in the query half of the merged KV slice, after the past
-    prefix of length ``K - Q``. Blocking every current non-memory query closes
-    indirect ``memory -> UND boundary -> GEN`` relay paths across layers.
+    Prompt KV keys occupy [0, K-Q); current memory keys sit after that prefix.
+    Blocking all non-memory queries also closes the UND-boundary relay path.
     """
 
-    if packed_memory_token_indexes is None:
+    if packed_memory_token_indexes is None and not mask_prompt_kv_for_nonmemory:
         return []
-    if int(packed_memory_token_indexes.numel()) == 0:
+    if (
+        packed_memory_token_indexes is not None
+        and int(packed_memory_token_indexes.numel()) == 0
+        and not mask_prompt_kv_for_nonmemory
+    ):
         return []
     query_lengths = [int(length) for length in query_lens.tolist()]
     key_lengths = [int(length) for length in key_value_lens.tolist()]
-    mem = packed_memory_token_indexes.to(dtype=torch.long)
+    if len(query_lengths) != len(key_lengths):
+        raise ValueError("query and key-value lengths must have equal batch size")
+    mem = (
+        packed_memory_token_indexes.to(dtype=torch.long)
+        if packed_memory_token_indexes is not None
+        else torch.empty(0, device=query_lens.device, dtype=torch.long)
+    )
     slices: List[Tuple[torch.Tensor, torch.Tensor]] = []
     query_offset = 0
     for query_length, key_length in zip(query_lengths, key_lengths):
         past = key_length - query_length
+        if past < 0:
+            raise ValueError("key length must include the current query")
         mem_local = mem - query_offset
         mem_in = mem_local[(mem_local >= 0) & (mem_local < query_length)]
         non_mem = torch.ones(query_length, device=mem.device, dtype=torch.bool)
@@ -84,7 +97,11 @@ def round0_blocked_slices(
         non_mem_in = torch.arange(
             query_length, device=mem.device, dtype=torch.long
         )[non_mem]
-        slices.append((non_mem_in, past + mem_in))
+        blocked_keys = past + mem_in if block_gen_reads_memory else mem_in.new_empty((0,))
+        if mask_prompt_kv_for_nonmemory:
+            prompt_keys = torch.arange(past, device=mem.device, dtype=torch.long)
+            blocked_keys = torch.cat((prompt_keys, blocked_keys))
+        slices.append((non_mem_in, blocked_keys))
         query_offset += query_length
     return slices
 
@@ -410,6 +427,7 @@ class BaseNavitOutputWithPast(ModelOutput):
     memory_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_suffix_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
+    body_entry_hidden: Optional[torch.FloatTensor] = None
 
 
 def pad_sequence(tensor, pad_size):
@@ -844,6 +862,7 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_text_indexes=None,
         packed_memory_token_indexes=None,
         block_gen_reads_memory=False,
+        mask_prompt_kv_for_nonmemory=False,
     ):
         if mode == "und":
             packed_query_states = self.q_proj(packed_query_sequence).view(
@@ -977,12 +996,14 @@ class PackedAttentionMoT(Qwen2Attention):
         )
 
         blocked_slices = None
-        if bool(block_gen_reads_memory) and mode == "gen":
+        if (bool(block_gen_reads_memory) or bool(mask_prompt_kv_for_nonmemory)) and mode == "gen":
             blocked_slices = round0_blocked_slices(
                 query_lens,
                 key_values_lens,
                 packed_vae_token_indexes,
                 packed_memory_token_indexes,
+                mask_prompt_kv_for_nonmemory=bool(mask_prompt_kv_for_nonmemory),
+                block_gen_reads_memory=bool(block_gen_reads_memory),
             )
             if not any(
                 int(gen.numel()) > 0 and int(mem.numel()) > 0
@@ -1220,6 +1241,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         packed_text_indexes=None,
         packed_memory_token_indexes=None,
         block_gen_reads_memory=False,
+        mask_prompt_kv_for_nonmemory=False,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1262,6 +1284,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 packed_text_indexes=packed_text_indexes,
                 packed_memory_token_indexes=packed_memory_token_indexes,
                 block_gen_reads_memory=block_gen_reads_memory,
+                mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
             )
             packed_query_sequence = residual + packed_query_sequence
 
@@ -1587,6 +1610,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         memory_read_adapter_mode: str = "read",
         memory_write_source: str = "correct",
         memory_write_probe: Optional[list] = None,
+        capture_body_entry_at: Optional[int] = None,
+        prompt_body_memory_init: Optional[torch.Tensor] = None,
+        mask_prompt_kv_for_nonmemory: bool = False,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1645,6 +1671,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
             if packed_memory_token_indexes is not None:
                 layer_kwargs["packed_memory_token_indexes"] = packed_memory_token_indexes
                 layer_kwargs["block_gen_reads_memory"] = bool(block_gen_reads_memory)
+            if mask_prompt_kv_for_nonmemory:
+                layer_kwargs["mask_prompt_kv_for_nonmemory"] = True
             use_checkpoint = (
                 bool(checkpoint)
                 and bool(getattr(self, "gradient_checkpointing", False))
@@ -1720,6 +1748,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
         memory_round_hiddens = None
         gen_round_hiddens = None
         gen_suffix_round_hiddens = None
+        body_entry_hidden = None
+        if capture_body_entry_at is not None:
+            if not update_past_key_values or not 1 <= int(capture_body_entry_at) <= len(self.layers):
+                raise ValueError("body-entry capture requires prompt KV update and valid depth")
+        if prompt_body_memory_init is not None and capture_body_entry_at is not None:
+            raise ValueError("cannot capture and inject body-entry memory in one pass")
 
         loop_repeat = int(within_step_loop_repeat)
         mem_repeat = int(memory_loop_repeat)
@@ -1731,6 +1765,23 @@ class Qwen2Model(Qwen2PreTrainedModel):
             and memory_loop_end is not None
             and mem_repeat >= 1
         )
+        if prompt_body_memory_init is not None and not memory_body_active:
+            raise ValueError("prompt body memory requires an active same-depth memory body")
+        if mask_prompt_kv_for_nonmemory and (
+            not memory_body_active
+            or prompt_body_memory_init is None
+            or mode != "gen"
+            or update_past_key_values
+            or not self.use_moe
+        ):
+            raise ValueError("prompt KV mask requires prompt-aware MoT same-depth generation")
+        if mask_prompt_kv_for_nonmemory and (
+            past_key_values is None
+            or past_key_values.key_cache[0] is None
+            or key_values_lens is None
+            or not bool((key_values_lens > 0).all())
+        ):
+            raise ValueError("prompt KV mask requires a nonempty prompt cache for every sample")
         if memory_body_active:
             if update_past_key_values:
                 raise ValueError(
@@ -1759,6 +1810,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
             indexes = mem_indexes.to(
                 device=packed_query_sequence.device, dtype=torch.long
             )
+            if prompt_body_memory_init is not None:
+                if memory_body_in is not None or prompt_body_memory_init.shape != (
+                    int(indexes.numel()), int(packed_query_sequence.shape[-1])
+                ):
+                    raise ValueError("prompt body memory must match [B*K,D] and cannot be persisted")
             block_round0 = bool(block_gen_reads_memory)
             hidden = packed_query_sequence
             for layer_idx in range(0, s):
@@ -1769,7 +1825,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     block_gen_reads_memory=block_round0,
                 )
             h_base = hidden.clone()
-            if memory_body_in is not None:
+            if prompt_body_memory_init is not None:
+                hidden = h_base.clone()
+                hidden[indexes] = prompt_body_memory_init.to(
+                    dtype=hidden.dtype, device=hidden.device
+                )
+            elif memory_body_in is not None:
                 hidden = h_base.clone()
                 hidden[indexes] = memory_body_in.to(
                     dtype=hidden.dtype, device=hidden.device
@@ -1795,7 +1856,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 cloned = normalize(cloned)
                 return cloned[gen_idx] if has_gen else None
 
-            initial_memory = packed_query_sequence[indexes]
+            initial_memory = (
+                hidden[indexes].clone()
+                if prompt_body_memory_init is not None
+                else packed_query_sequence[indexes]
+            )
             for _round in range(mem_repeat):
                 if _round > 0:
                     nxt = h_base.clone()
@@ -1914,6 +1979,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     block_gen_reads_memory=bool(block_gen_reads_memory)
                     and seq_mem is not None,
                 )
+                if capture_body_entry_at == layer_idx + 1:
+                    body_entry_hidden = packed_query_sequence.detach().clone()
             packed_query_sequence = normalize(packed_query_sequence)
 
         if enable_taylorseer:
@@ -1926,6 +1993,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             memory_round_hiddens=memory_round_hiddens,
             gen_round_hiddens=gen_round_hiddens,
             gen_suffix_round_hiddens=gen_suffix_round_hiddens,
+            body_entry_hidden=body_entry_hidden,
         )
 
     def forward_kvcache(
@@ -2147,6 +2215,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         memory_read_adapter_mode: str = "read",
         memory_write_source: str = "correct",
         memory_write_probe: Optional[list] = None,
+        capture_body_entry_at: Optional[int] = None,
+        prompt_body_memory_init: Optional[torch.Tensor] = None,
+        mask_prompt_kv_for_nonmemory: bool = False,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2178,6 +2249,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             memory_read_adapter_mode=memory_read_adapter_mode,
             memory_write_source=memory_write_source,
             memory_write_probe=memory_write_probe,
+            capture_body_entry_at=capture_body_entry_at,
+            prompt_body_memory_init=prompt_body_memory_init,
+            mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
         )
 
         return outputs

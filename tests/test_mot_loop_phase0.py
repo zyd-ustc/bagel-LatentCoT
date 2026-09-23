@@ -842,6 +842,7 @@ def test_k_ablation_slices_allocated_memory_slots():
 class TinySdpaLayer:
     def __init__(self):
         self.blocks = []
+        self.prompt_masks = []
 
     def forward_inference(
         self,
@@ -859,6 +860,7 @@ class TinySdpaLayer:
         )
 
         self.blocks.append(bool(block_gen_reads_memory))
+        self.prompt_masks.append(bool(kwargs.get("mask_prompt_kv_for_nonmemory", False)))
         qkv = packed_query_sequence.unsqueeze(1)
         kv_lens = query_lens
         blocked = None
@@ -917,18 +919,25 @@ def _sdpa_layout():
     return seq, mem, gen, text
 
 
-def _run_tiny_sdpa(seq, *, block: bool, repeat: int = 1, body: bool = True, n_layers: int = 3):
-    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Model
+def _run_tiny_sdpa(
+    seq, *, block: bool, repeat: int = 1, body: bool = True,
+    n_layers: int = 3, prompt_init=None, write_source="correct", write_probe=None,
+    mask_prompt_kv=False, body_start=0,
+):
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache, Qwen2Model
 
     navit = TinySdpaNavit(n_layers)
+    cache = NaiveCache(n_layers) if mask_prompt_kv else None
+    if cache is not None:
+        cache.key_cache[0] = torch.zeros(1, 1, seq.shape[-1])
     _, mem, gen, text = _sdpa_layout()
     kwargs = dict(
         packed_query_sequence=seq.clone(),
         query_lens=torch.tensor([4], dtype=torch.int),
         packed_query_position_ids=torch.arange(4),
         packed_query_indexes=torch.arange(4),
-        past_key_values=None,
-        key_values_lens=torch.tensor([0], dtype=torch.int),
+        past_key_values=cache,
+        key_values_lens=torch.tensor([1 if mask_prompt_kv else 0], dtype=torch.int),
         packed_key_value_indexes=torch.tensor([], dtype=torch.long),
         update_past_key_values=False,
         is_causal=False,
@@ -937,15 +946,133 @@ def _run_tiny_sdpa(seq, *, block: bool, repeat: int = 1, body: bool = True, n_la
         packed_text_indexes=text,
         packed_memory_token_indexes=mem,
         block_gen_reads_memory=block,
+        prompt_body_memory_init=prompt_init,
+        memory_write_source=write_source,
+        memory_write_probe=write_probe,
+        mask_prompt_kv_for_nonmemory=mask_prompt_kv,
     )
     if body:
         kwargs.update(
             memory_loop_repeat=repeat,
-            memory_loop_start=0,
-            memory_loop_end=1,
+            memory_loop_start=body_start,
+            memory_loop_end=body_start + 1,
             collect_round_diagnostics=True,
         )
     return Qwen2Model.forward_inference(navit, **kwargs), navit
+
+
+def test_prompt_body_memory_is_the_exact_m0_write_source():
+    seq, _, _, _ = _sdpa_layout()
+    prompt_init = torch.tensor([[5.0, 0.0]])
+    probe = []
+    _run_tiny_sdpa(
+        seq, block=True, repeat=2, body=True, n_layers=2,
+        prompt_init=prompt_init, write_source="m0", write_probe=probe,
+    )
+    assert len(probe) == 1
+    assert probe[0]["m0_l2"] == pytest.approx(5.0)
+    assert probe[0]["read_write_input_cos"] == pytest.approx(probe[0]["read_m0_cos"])
+    legacy_probe = []
+    _run_tiny_sdpa(
+        seq, block=True, repeat=2, body=True, n_layers=2,
+        write_source="m0", write_probe=legacy_probe,
+    )
+    assert legacy_probe[0]["m0_l2"] == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="active same-depth"):
+        _run_tiny_sdpa(seq, block=True, body=False, prompt_init=prompt_init)
+
+
+def test_prompt_kv_mask_reaches_prefix_read_write_and_suffix():
+    seq, _, _, _ = _sdpa_layout()
+    _, navit = _run_tiny_sdpa(
+        seq, block=True, repeat=2, body=True, n_layers=3,
+        prompt_init=torch.tensor([[5.0, 0.0]]),
+        mask_prompt_kv=True, body_start=1,
+    )
+    assert [layer.prompt_masks for layer in navit.layers] == [
+        [True], [True, True], [True, True],
+    ]
+
+
+def test_prompt_kv_mask_blocks_only_nonmemory_queries_per_sample():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import round0_blocked_slices
+
+    query_lens = torch.tensor([4, 4], dtype=torch.int)
+    key_lens = torch.tensor([7, 6], dtype=torch.int)
+    memory = torch.tensor([1, 5], dtype=torch.long)
+    gen = torch.tensor([2, 6], dtype=torch.long)
+    write = round0_blocked_slices(
+        query_lens, key_lens, gen, memory,
+        mask_prompt_kv_for_nonmemory=True,
+        block_gen_reads_memory=False,
+    )
+    assert [rows.tolist() for rows, _ in write] == [[0, 2, 3], [0, 2, 3]]
+    assert [keys.tolist() for _, keys in write] == [[0, 1, 2], [0, 1]]
+    read = round0_blocked_slices(
+        query_lens, key_lens, gen, memory,
+        mask_prompt_kv_for_nonmemory=True,
+        block_gen_reads_memory=True,
+    )
+    assert [keys.tolist() for _, keys in read] == [[0, 1, 2, 4], [0, 1, 3]]
+    native = round0_blocked_slices(query_lens, key_lens, gen, memory)
+    assert [keys.tolist() for _, keys in native] == [[4], [3]]
+
+
+def test_prompt_kv_mask_preserves_memory_read_but_blocks_direct_rows():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import (
+        _sdpa_varlen_inference,
+        round0_blocked_slices,
+    )
+
+    query_lens = torch.tensor([3], dtype=torch.int)
+    key_lens = torch.tensor([5], dtype=torch.int)
+    blocked = round0_blocked_slices(
+        query_lens, key_lens,
+        torch.tensor([2]), torch.tensor([1]),
+        mask_prompt_kv_for_nonmemory=True,
+        block_gen_reads_memory=False,
+    )
+    q = torch.zeros(3, 1, 2)
+    k = torch.zeros(5, 1, 2)
+    values = torch.zeros(5, 1, 2)
+    values[:2, 0, 0] = 10.0
+    changed = values.clone()
+    changed[:2, 0, 0] = -10.0
+    def attend(v):
+        return _sdpa_varlen_inference(
+            query=q, key=k, value=v,
+            query_lens=query_lens, key_value_lens=key_lens,
+            causal=False, blocked_slices=blocked,
+        )
+    original, mutated = attend(values), attend(changed)
+    assert torch.equal(original[[0, 2]], mutated[[0, 2]])
+    assert not torch.equal(original[1], mutated[1])
+
+
+def test_prompt_hidden_capture_stops_at_requested_depth():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Model
+
+    seq, _, _, _ = _sdpa_layout()
+    navit = TinySdpaNavit(n_layers=2)
+    output = Qwen2Model.forward_inference(
+        navit,
+        packed_query_sequence=seq,
+        query_lens=torch.tensor([4], dtype=torch.int),
+        packed_query_position_ids=torch.arange(4),
+        packed_query_indexes=torch.arange(4),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        update_past_key_values=True,
+        is_causal=True,
+        mode="und",
+        capture_body_entry_at=1,
+    )
+    first, _ = navit.layers[0].forward_inference(
+        packed_query_sequence=seq,
+        query_lens=torch.tensor([4], dtype=torch.int),
+    )
+    assert torch.allclose(output.body_entry_hidden, first)
 
 
 def test_round0_blocked_slices_accounts_for_past_and_batch():

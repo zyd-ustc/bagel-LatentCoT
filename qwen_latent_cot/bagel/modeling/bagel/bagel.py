@@ -542,6 +542,7 @@ class Bagel(PreTrainedModel):
         packed_text_indexes: torch.LongTensor,
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
+        capture_body_entry_at: Optional[int] = None,
     ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
 
@@ -559,11 +560,20 @@ class Bagel(PreTrainedModel):
             key_values_lens=key_values_lens,
             update_past_key_values=True,
             is_causal=True,
+            capture_body_entry_at=capture_body_entry_at,
             **extra_inputs,
         )
         past_key_values = output.past_key_values
 
-        return past_key_values
+        if capture_body_entry_at is None:
+            return past_key_values
+        if output.body_entry_hidden is None:
+            raise RuntimeError("prompt body-entry hidden was not captured")
+        # Each prompt ends with an EOS token; in causal text mode it sees the
+        # whole prompt, unlike a pooled image-generation query hidden.
+        final_indexes = text_token_lens.long().cumsum(dim=0) - 1
+        prompt_body_entry = output.body_entry_hidden[final_indexes]
+        return past_key_values, prompt_body_entry
 
     def prepare_vit_images(
         self, curr_kvlens, curr_rope, images, transforms, new_token_ids
@@ -1416,6 +1426,8 @@ class Bagel(PreTrainedModel):
         return_loop_diagnostics: bool = False,
         memory_write_source: str = "correct",
         memory_write_probe: Optional[list] = None,
+        prompt_body_memory_init: Optional[torch.Tensor] = None,
+        mask_prompt_kv_for_nonmemory: bool = False,
         enable_taylorseer=False,
     ):
         if enable_taylorseer:
@@ -1529,6 +1541,16 @@ class Bagel(PreTrainedModel):
                 "Write sensitivity requires K>0, same_depth, strict Read + "
                 "one Write, and persist=False"
             )
+        if prompt_body_memory_init is not None and (
+            not memory_loop_enabled
+            or recycle_mode != "same_depth"
+            or inner_depth != 2
+            or round0_write
+            or persist_memory
+        ):
+            raise ValueError("prompt body memory requires fresh same-depth strict Read + Write")
+        if mask_prompt_kv_for_nonmemory and prompt_body_memory_init is None:
+            raise ValueError("prompt KV mask requires prompt-aware memory initialization")
         body_start = (
             memory_loop_start
             if memory_loop_start is not None
@@ -1667,6 +1689,8 @@ class Bagel(PreTrainedModel):
                             collect_round_diagnostics=bool(return_loop_diagnostics),
                             memory_write_source=memory_write_source,
                             memory_write_probe=memory_write_probe,
+                            prompt_body_memory_init=prompt_body_memory_init,
+                            mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
                             packed_vae_seqlens=packed_vae_seqlens,
                         )
                     )
@@ -2224,6 +2248,8 @@ class Bagel(PreTrainedModel):
         collect_round_diagnostics: bool = False,
         memory_write_source: str = "correct",
         memory_write_probe: Optional[list] = None,
+        prompt_body_memory_init: Optional[torch.Tensor] = None,
+        mask_prompt_kv_for_nonmemory: bool = False,
         packed_vae_seqlens: Optional[torch.IntTensor] = None,
     ):
         """Memory-loop velocity. Not @torch.no_grad.
@@ -2289,13 +2315,16 @@ class Bagel(PreTrainedModel):
 
         def run_branch(
             sequence, kv, pos_ids, query_indexes, kv_lens, kv_indexes,
-            body_in, *, write_probe=None,
+            body_in, *, write_probe=None, prompt_init=None,
+            write_source="correct", mask_prompt_kv=False,
         ):
             kwargs = dict(extra_inputs)
             if same_depth:
                 kwargs["memory_body_in"] = body_in
-                kwargs["memory_write_source"] = memory_write_source
+                kwargs["memory_write_source"] = write_source
                 kwargs["memory_write_probe"] = write_probe
+                kwargs["prompt_body_memory_init"] = prompt_init
+                kwargs["mask_prompt_kv_for_nonmemory"] = mask_prompt_kv
             output = self.language_model.forward_inference(
                 packed_query_sequence=sequence,
                 query_lens=packed_seqlens,
@@ -2328,6 +2357,9 @@ class Bagel(PreTrainedModel):
             packed_key_value_indexes,
             memory_body_in,
             write_probe=memory_write_probe,
+            prompt_init=prompt_body_memory_init,
+            write_source=memory_write_source,
+            mask_prompt_kv=mask_prompt_kv_for_nonmemory,
         )
         m_text = m_full
         m_img = m_full

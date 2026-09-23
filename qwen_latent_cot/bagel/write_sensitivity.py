@@ -10,6 +10,39 @@ import torch.nn.functional as F
 
 
 WRITE_MEMORY_SOURCES = ("correct", "shuffle", "m0", "zero")
+PROMPT_MEMORY_SLOT_BETA = 0.05
+
+
+def prompt_memory_init(
+    prompt_body_entry: torch.Tensor,
+    *,
+    slots: int,
+    beta: float = PROMPT_MEMORY_SLOT_BETA,
+) -> torch.Tensor:
+    """Nonparametric [B*K,D] memory at the same depth as the loop body.
+
+    Each row of ``prompt_body_entry`` is the causal final prompt token after
+    prefix layers [0,s).  The centered sinusoidal offsets distinguish slots
+    without adding trainable parameters or changing the prompt KV cache.
+    """
+
+    if prompt_body_entry.ndim != 2 or slots < 1 or not math.isfinite(beta) or beta < 0:
+        raise ValueError("expected prompt body entry [B,D], K>0 and finite beta>=0")
+    batch, width = prompt_body_entry.shape
+    if batch < 1 or width < 1:
+        raise ValueError("prompt body entry must be nonempty")
+    anchor = prompt_body_entry.float()
+    if not bool(torch.isfinite(anchor).all()):
+        raise ValueError("prompt body entry must be finite")
+    slot_ids = torch.arange(1, slots + 1, device=anchor.device, dtype=torch.float32)[:, None]
+    features = torch.arange(1, width + 1, device=anchor.device, dtype=torch.float32)[None, :]
+    offsets = torch.sin(slot_ids * features * 0.013) + torch.cos(slot_ids * features * 0.017)
+    offsets = offsets - offsets.mean(dim=0, keepdim=True)
+    offsets = offsets / offsets.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1e-6)
+    if bool((anchor.square().sum(dim=1) == 0).any()):
+        raise ValueError("prompt body entry must be nonzero")
+    memory = anchor[:, None, :] + beta * offsets[None, :, :]
+    return memory.to(dtype=prompt_body_entry.dtype).reshape(batch * slots, width)
 
 
 def select_write_memory(

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Paired-batch hard-16 T2I probe of the Read-to-Write memory channel.
+"""Prompt-as-memory hard-16 T2I: Write source × prompt-KV visibility.
 
-All four arms use the same batch of two prompts and initial noises.  Only the
-memory supplied to the Write round changes.  This script does not score image
-quality or claim that any arm is semantically superior.
+The eight cells reuse one packed pair of prompts, prompt cache, and noises.
+Masking changes only non-memory generation queries' access to cached prompt
+keys; memory queries retain access. This does not score semantic image quality.
 """
 
 from __future__ import annotations
@@ -20,8 +20,6 @@ from typing import Any
 
 import torch
 import yaml
-from safetensors.torch import load_file
-
 from bagel_common import autocast_for, load_native_bagel, make_noise, pixel_mae, stable_noise_seed
 from bagel_hard16_checkpoint import (
     load_benchmark,
@@ -29,11 +27,14 @@ from bagel_hard16_checkpoint import (
     set_adapter,
     set_loop,
     sha256,
-    validate_adapter_state,
 )
 
 from qwen_latent_cot.bagel import accelerator
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache
+from qwen_latent_cot.bagel.write_sensitivity import (
+    PROMPT_MEMORY_SLOT_BETA,
+    prompt_memory_init,
+)
 
 
 ARM_SOURCES = {
@@ -42,6 +43,7 @@ ARM_SOURCES = {
     "m0": "m0",
     "zero_M": "zero",
 }
+KV_POLICIES = {"keep": False, "mask_nonmemory": True}
 PAIR_SIZE = 2
 NOISE_SCHEMA = "bagel-write-sensitivity-t2i-v1"
 
@@ -49,7 +51,6 @@ NOISE_SCHEMA = "bagel-write-sensitivity-t2i-v1"
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--training-config", required=True, type=Path)
-    parser.add_argument("--adapter", type=Path, help="Optional checkpoint; omitted = frozen/training-free loop")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--model-path", default="", help="Override model_path in the training YAML")
     parser.add_argument("--benchmark-data", type=Path, default=Path("experiments/data/geneval2_hard_16.jsonl"))
@@ -84,7 +85,7 @@ def validate_protocol(contract: dict, args) -> None:
     if args.height <= 0 or args.width <= 0 or args.num_steps < 2 or args.timestep_shift <= 0:
         raise ValueError("image size, num-steps, and timestep-shift must be positive")
     if args.cfg_text_scale != 4.0 or args.cfg_img_scale != 1.0:
-        raise ValueError("this v1 experiment fixes CFG text/image scales to 4/1")
+        raise ValueError("this experiment fixes CFG text/image scales to 4/1")
 
 
 def paired_rows(rows: list[dict]) -> list[list[dict]]:
@@ -128,7 +129,15 @@ def prepare_pair(inferencer, rows: list[dict], noises: list[torch.Tensor], shape
         tokenizer=inferencer.tokenizer,
         new_token_ids=inferencer.new_token_ids,
     )
-    full_cache = model.forward_cache_update_text(full_cache, **move_tensors(prompt_input, device))
+    full_cache, prompt_body_entry = model.forward_cache_update_text(
+        full_cache,
+        capture_body_entry_at=int(model.config.memory_loop_start_layer),
+        **move_tensors(prompt_input, device),
+    )
+    memory_init = prompt_memory_init(
+        prompt_body_entry,
+        slots=int(model.config.num_loop_tokens),
+    )
     image_shapes = [shape] * count
     generation = model.prepare_vae_latent(
         curr_kvlens=full_lens,
@@ -171,10 +180,14 @@ def prepare_pair(inferencer, rows: list[dict], noises: list[torch.Tensor], shape
         "cfg_img_packed_query_indexes": cfg_img["cfg_packed_query_indexes"],
         "cfg_img_key_values_lens": cfg_img["cfg_key_values_lens"],
         "cfg_img_packed_key_value_indexes": cfg_img["cfg_packed_key_value_indexes"],
+        "prompt_body_memory_init": memory_init,
     }
 
 
-def generate_pair(inferencer, bundle: dict, args, source: str, probe: list[dict]) -> list:
+def generate_pair(
+    inferencer, bundle: dict, args, source: str, probe: list[dict],
+    *, mask_prompt_kv: bool = False,
+) -> list:
     with torch.inference_mode(), autocast_for(inferencer.device):
         latents = inferencer.model.generate_image(
             **bundle,
@@ -189,6 +202,7 @@ def generate_pair(inferencer, bundle: dict, args, source: str, probe: list[dict]
             return_loop_diagnostics=False,
             memory_write_source=source,
             memory_write_probe=probe,
+            mask_prompt_kv_for_nonmemory=mask_prompt_kv,
         )
         if len(latents) != PAIR_SIZE:
             raise RuntimeError(f"BAGEL returned {len(latents)} images, expected {PAIR_SIZE}")
@@ -209,27 +223,30 @@ def summarize_probe(rows: list[dict], sample: int, expected_steps: int) -> dict[
 
 
 def write_gallery(output_dir: Path, rows: list[dict], image_maps: dict[str, dict[str, str]]) -> None:
-    header = "".join(f"<th>{html.escape(arm)}</th>" for arm in ARM_SOURCES)
+    header = "".join(
+        f"<th>{html.escape(policy)}<br>{html.escape(arm)}</th>"
+        for policy in KV_POLICIES for arm in ARM_SOURCES
+    )
     body = []
     for index, row in enumerate(rows):
         prompt = str(row["prompt"])
         cells = "".join(
-            f"<td><img src='p{index:03d}/{arm}.png'><br>{html.escape(arm)}</td>"
-            for arm in ARM_SOURCES
+            f"<td><img src='p{index:03d}/{policy}/{arm}.png'><br>{html.escape(policy)} / {html.escape(arm)}</td>"
+            for policy in KV_POLICIES for arm in ARM_SOURCES
         )
         body.append(f"<tr><td>{index:02d}</td><td>{html.escape(prompt)}</td>{cells}</tr>")
     (output_dir / "index.html").write_text(
-        "<!doctype html><meta charset='utf-8'><title>BAGEL Write Sensitivity</title>"
+        "<!doctype html><meta charset='utf-8'><title>BAGEL Prompt KV × Write</title>"
         "<style>body{font:14px system-ui;background:#151515;color:#eee;padding:20px}"
         "table{border-collapse:collapse}td,th{border:1px solid #555;padding:8px;vertical-align:top}"
         "img{width:240px}td:nth-child(2){max-width:260px}</style>"
-        f"<h1>BAGEL Write Sensitivity: paired hard prompts</h1><table><tr><th>#</th><th>Prompt</th>{header}</tr>"
+        f"<h1>BAGEL Prompt KV visibility × Write source: paired hard prompts</h1><table><tr><th>#</th><th>Prompt</th>{header}</tr>"
         + "".join(body) + "</table>", encoding="utf-8",
     )
     maps_dir = output_dir / "geneval2"
     maps_dir.mkdir()
-    for arm, image_map in image_maps.items():
-        (maps_dir / f"{arm}_image_paths.json").write_text(
+    for cell, image_map in image_maps.items():
+        (maps_dir / f"{cell}_image_paths.json").write_text(
             json.dumps(image_map, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
 
@@ -240,10 +257,7 @@ def main() -> None:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
         raise ValueError("training YAML must be a mapping")
-    adapter_path = args.adapter.expanduser().resolve() if args.adapter else None
-    metadata_path = adapter_path.with_suffix(".json") if adapter_path else None
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path and metadata_path.is_file() else {}
-    contract = resolve_contract(config, metadata)
+    contract = resolve_contract(config, {})
     validate_protocol(contract, args)
     benchmark_path = args.benchmark_data.expanduser().resolve()
     rows = load_benchmark(benchmark_path, args.max_prompts)
@@ -251,10 +265,8 @@ def main() -> None:
     model_path = Path(args.model_path or config["model_path"]).expanduser().resolve()
     if not model_path.is_dir():
         raise FileNotFoundError(model_path)
-    if adapter_path and not adapter_path.is_file():
-        raise FileNotFoundError(adapter_path)
     if args.dry_run:
-        print(json.dumps({"contract": contract, "pairs": len(pairs), "adapter": str(adapter_path) if adapter_path else None}, indent=2))
+        print(json.dumps({"contract": contract, "pairs": len(pairs), "memory_init": "prompt_body_entry_eos"}, indent=2))
         return
 
     output_dir = args.output_dir.expanduser().resolve()
@@ -277,6 +289,8 @@ def main() -> None:
     backbone, inferencer = load_native_bagel(native_args)
     model = backbone.bagel
     assert model is not None
+    if model.config.llm_config.layer_module != "Qwen2MoTDecoderLayer":
+        raise ValueError("prompt KV masking requires the BAGEL MoT decoder")
     backbone.apply_loop_trainable_policy(
         start_layer=contract["memory_loop_start_layer"],
         end_layer=contract["memory_loop_end_layer"],
@@ -287,31 +301,33 @@ def main() -> None:
     )
     model.eval().requires_grad_(False)
     set_loop(model, contract, True)
-    if adapter_path:
-        state = load_file(str(adapter_path), device="cpu")
-        missing = validate_adapter_state(state, model, metadata)
-        if missing and metadata.get("schema") != "bagel_pair_grounded_memory_adapter_v1":
-            raise RuntimeError("partial adapter needs its Phase 1.1 sidecar")
-        set_adapter(model, state)
-    else:
-        set_adapter(model, None)
+    set_adapter(model, None)
     if args.height % int(model.latent_downsample) or args.width % int(model.latent_downsample):
         raise ValueError(f"height/width must be divisible by {model.latent_downsample}")
 
     manifest: dict[str, Any] = {
-        "schema": "bagel_write_sensitivity_t2i_hard16_v1",
+        "schema": "bagel_prompt_memory_kv_visibility_write_hard16_v3",
         "complete": False,
         "code_commit": code_commit(),
         "training_config": str(config_path),
         "training_config_sha256": sha256(config_path),
-        "adapter": str(adapter_path) if adapter_path else None,
-        "adapter_sha256": sha256(adapter_path) if adapter_path else None,
-        "adapter_metadata": metadata,
+        "adapter": None,
+        "memory_init": {
+            "source": "causal_final_prompt_token_at_body_entry",
+            "body_entry_layer": contract["memory_loop_start_layer"],
+            "slot_offset": "centered_sin_cos_rms_normalized_v1",
+            "slot_offset_beta": PROMPT_MEMORY_SLOT_BETA,
+            "cfg_unconditioned_memory": "boundary_embedding_m0",
+        },
         "model_path": str(model_path),
         "benchmark_data": str(benchmark_path),
         "benchmark_sha256": sha256(benchmark_path),
         "contract": contract,
         "arm_sources": ARM_SOURCES,
+        "prompt_kv_policies": {
+            "keep": "all generation queries see cached prompt KV",
+            "mask_nonmemory": "only memory queries see cached prompt KV, at every generation layer",
+        },
         "pair_size": PAIR_SIZE,
         "pairing": "adjacent_file_order; shuffle=roll(samples,+1)",
         "prompts": [str(row["prompt"]) for row in rows],
@@ -324,14 +340,19 @@ def main() -> None:
                   "cfg_interval": [0.4, 1.0], "cfg_renorm_min": 0.0,
                   "cfg_renorm_type": "sample_global", "return_loop_diagnostics": False},
         "pairs": [],
-        "geneval2_image_maps": {arm: f"geneval2/{arm}_image_paths.json" for arm in ARM_SOURCES},
+        "geneval2_image_maps": {
+            f"{policy}__{arm}": f"geneval2/{policy}__{arm}_image_paths.json"
+            for policy in KV_POLICIES for arm in ARM_SOURCES
+        },
     }
     manifest_path = output_dir / "run_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (output_dir / "benchmark_hard.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
     )
-    image_maps: dict[str, dict[str, str]] = {arm: {} for arm in ARM_SOURCES}
+    image_maps: dict[str, dict[str, str]] = {
+        f"{policy}__{arm}": {} for policy in KV_POLICIES for arm in ARM_SOURCES
+    }
     image_shape = (args.height, args.width)
     for pair_index, pair in enumerate(pairs):
         global_indexes = [pair_index * PAIR_SIZE + position for position in range(PAIR_SIZE)]
@@ -341,48 +362,67 @@ def main() -> None:
         ]
         with torch.inference_mode(), autocast_for(accelerator.resolve_device(args.device)):
             bundle = prepare_pair(inferencer, pair, noises, image_shape)
+        memory_init = bundle["prompt_body_memory_init"].detach().float().cpu()
         pair_result: dict[str, Any] = {
             "pair_index": pair_index,
             "prompt_indexes": global_indexes,
             "donor_indexes": list(reversed(global_indexes)),
             "noise_seed": [stable_noise_seed(args.seed, str(row["prompt"]), schema=NOISE_SCHEMA) for row in pair],
             "noise_sha256": [hashlib.sha256(noise.contiguous().numpy().tobytes()).hexdigest() for noise in noises],
-            "arms": {},
+            "prompt_memory_init_sha256": [
+                hashlib.sha256(memory.contiguous().numpy().tobytes()).hexdigest()
+                for memory in memory_init.reshape(PAIR_SIZE, contract["num_loop_tokens"], -1)
+            ],
+            "policies": {},
         }
-        images: dict[str, list] = {}
+        images: dict[str, dict[str, list]] = {}
         pair_dir = output_dir / f"pair_{pair_index:02d}"
         pair_dir.mkdir()
-        for arm, source in ARM_SOURCES.items():
-            probe: list[dict] = []
-            images[arm] = generate_pair(inferencer, bundle, args, source, probe)
-            if len(probe) != (args.num_steps - 1) * PAIR_SIZE:
-                raise RuntimeError(f"{arm}: incomplete Read→Write probe: {len(probe)} rows")
-            for step in range(args.num_steps - 1):
-                for position in range(PAIR_SIZE):
-                    probe[step * PAIR_SIZE + position]["step"] = step
-            probe_path = pair_dir / f"{arm}_memory_probe.json"
-            probe_path.write_text(json.dumps(probe, indent=2) + "\n", encoding="utf-8")
-            arm_rows = []
-            for position, (global_index, row, image) in enumerate(zip(global_indexes, pair, images[arm])):
-                prompt_dir = output_dir / f"p{global_index:03d}"
-                prompt_dir.mkdir(exist_ok=True)
-                (prompt_dir / "prompt.txt").write_text(str(row["prompt"]) + "\n", encoding="utf-8")
-                image_path = prompt_dir / f"{arm}.png"
-                image.save(image_path)
-                image_maps[arm][str(row["prompt"])] = str(image_path.resolve())
-                arm_rows.append({
-                    "prompt_index": global_index,
-                    "image": str(image_path.resolve()),
-                    "write_source": source,
-                    "memory_probe": str(probe_path.resolve()),
-                    "probe_mean": summarize_probe(probe, position, args.num_steps - 1),
-                })
-                print(f"[{global_index + 1}/{len(rows)}] {arm}: {image_path}", flush=True)
-            pair_result["arms"][arm] = arm_rows
+        for policy, mask_prompt_kv in KV_POLICIES.items():
+            images[policy] = {}
+            pair_result["policies"][policy] = {}
+            for arm, source in ARM_SOURCES.items():
+                probe: list[dict] = []
+                images[policy][arm] = generate_pair(
+                    inferencer, bundle, args, source, probe,
+                    mask_prompt_kv=mask_prompt_kv,
+                )
+                if len(probe) != (args.num_steps - 1) * PAIR_SIZE:
+                    raise RuntimeError(f"{policy}/{arm}: incomplete Read→Write probe: {len(probe)} rows")
+                for step in range(args.num_steps - 1):
+                    for position in range(PAIR_SIZE):
+                        probe[step * PAIR_SIZE + position]["step"] = step
+                probe_path = pair_dir / f"{policy}__{arm}_memory_probe.json"
+                probe_path.write_text(json.dumps(probe, indent=2) + "\n", encoding="utf-8")
+                arm_rows = []
+                for position, (global_index, row, image) in enumerate(zip(global_indexes, pair, images[policy][arm])):
+                    prompt_dir = output_dir / f"p{global_index:03d}"
+                    prompt_dir.mkdir(exist_ok=True)
+                    (prompt_dir / "prompt.txt").write_text(str(row["prompt"]) + "\n", encoding="utf-8")
+                    policy_dir = prompt_dir / policy
+                    policy_dir.mkdir(exist_ok=True)
+                    image_path = policy_dir / f"{arm}.png"
+                    image.save(image_path)
+                    image_maps[f"{policy}__{arm}"][str(row["prompt"])] = str(image_path.resolve())
+                    arm_rows.append({
+                        "prompt_index": global_index,
+                        "image": str(image_path.resolve()),
+                        "write_source": source,
+                        "mask_prompt_kv_for_nonmemory": mask_prompt_kv,
+                        "memory_probe": str(probe_path.resolve()),
+                        "probe_mean": summarize_probe(probe, position, args.num_steps - 1),
+                    })
+                    print(f"[{global_index + 1}/{len(rows)}] {policy}/{arm}: {image_path}", flush=True)
+                pair_result["policies"][policy][arm] = arm_rows
         for position, global_index in enumerate(global_indexes):
+            for policy in KV_POLICIES:
+                for arm in ARM_SOURCES:
+                    pair_result["policies"][policy][arm][position]["pixel_mae_vs_correct_M"] = (
+                        0.0 if arm == "correct_M" else pixel_mae(images[policy][arm][position], images[policy]["correct_M"][position])
+                    )
             for arm in ARM_SOURCES:
-                pair_result["arms"][arm][position]["pixel_mae_vs_correct_M"] = (
-                    0.0 if arm == "correct_M" else pixel_mae(images[arm][position], images["correct_M"][position])
+                pair_result["policies"]["mask_nonmemory"][arm][position]["pixel_mae_vs_keep_same_arm"] = pixel_mae(
+                    images["mask_nonmemory"][arm][position], images["keep"][arm][position]
                 )
         manifest["pairs"].append(pair_result)
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
 
 from bagel_write_sensitivity_t2i import (  # noqa: E402
     ARM_SOURCES,
+    KV_POLICIES,
     paired_rows,
     prepare_pair,
     summarize_probe,
@@ -19,6 +20,7 @@ from bagel_write_sensitivity_t2i import (  # noqa: E402
 )
 from qwen_latent_cot.bagel.write_sensitivity import (  # noqa: E402
     append_write_probe,
+    prompt_memory_init,
     select_write_memory,
 )
 from qwen_latent_cot.bagel.modeling.bagel.bagel import Bagel  # noqa: E402
@@ -50,6 +52,7 @@ def test_protocol_fixes_architecture_and_real_pairs():
         [{"prompt": "2"}, {"prompt": "3"}],
     ]
     assert list(ARM_SOURCES.values()) == ["correct", "shuffle", "m0", "zero"]
+    assert KV_POLICIES == {"keep": False, "mask_nonmemory": True}
     bad = contract()
     bad["loop_depth"] = 1
     with pytest.raises(ValueError, match="strict Read"):
@@ -100,6 +103,46 @@ def test_probe_records_read_m0_and_used_memory_without_svd():
         summarize_probe(rows, 0, 2)
 
 
+def test_prompt_memory_init_is_prompt_specific_centered_and_deterministic():
+    anchors = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
+    memory = prompt_memory_init(anchors, slots=8).reshape(2, 8, 4)
+    assert torch.equal(memory, prompt_memory_init(anchors, slots=8).reshape(2, 8, 4))
+    assert torch.allclose(memory.mean(dim=1), anchors, atol=1e-5)
+    assert torch.allclose(memory[0] - anchors[0], memory[1] - anchors[1], atol=1e-6)
+    assert not torch.allclose(memory[0], memory[1])
+    assert not torch.allclose(memory[0, 0], memory[0, 1])
+    with pytest.raises(ValueError, match="prompt body entry"):
+        prompt_memory_init(anchors[0], slots=8)
+    with pytest.raises(ValueError, match="finite"):
+        prompt_memory_init(torch.tensor([[float("nan"), 1.0]]), slots=8)
+
+
+def test_prompt_cache_returns_causal_eos_at_requested_depth():
+    class FakeLanguageModel:
+        model = SimpleNamespace(embed_tokens=lambda ids: ids.float().unsqueeze(-1))
+
+        def forward_inference(self, **kwargs):
+            assert kwargs["capture_body_entry_at"] == 12
+            assert kwargs["is_causal"] is True
+            return SimpleNamespace(
+                past_key_values="cached",
+                body_entry_hidden=torch.arange(6.0).unsqueeze(-1),
+            )
+
+    fake = SimpleNamespace(language_model=FakeLanguageModel(), use_moe=False)
+    cache, anchors = Bagel.forward_cache_update_text(
+        fake, "empty", packed_text_ids=torch.arange(6),
+        packed_text_position_ids=torch.arange(6),
+        text_token_lens=torch.tensor([2, 4]),
+        packed_text_indexes=torch.arange(6),
+        packed_key_value_indexes=torch.empty(0, dtype=torch.long),
+        key_values_lens=torch.zeros(2, dtype=torch.int),
+        capture_body_entry_at=12,
+    )
+    assert cache == "cached"
+    assert torch.equal(anchors.flatten(), torch.tensor([1.0, 5.0]))
+
+
 def test_sample_global_cfg_keeps_other_sample_out_of_norm():
     reference = torch.tensor([[1.0], [1.0]])
     text_branch = torch.tensor([[0.0], [2.0]])
@@ -125,6 +168,7 @@ def test_prepare_pair_uses_native_two_sample_packing():
     class FakeModel:
         config = SimpleNamespace(
             llm_config=SimpleNamespace(num_hidden_layers=1), num_loop_tokens=8,
+            memory_loop_start_layer=12,
         )
 
         def prepare_prompts(self, **kwargs):
@@ -132,7 +176,8 @@ def test_prepare_pair_uses_native_two_sample_packing():
             return {"input": torch.tensor(1)}, [3, 5], [3, 5]
 
         def forward_cache_update_text(self, cache, **kwargs):
-            return cache
+            assert kwargs["capture_body_entry_at"] == 12
+            return cache, torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
 
         def prepare_vae_latent(self, **kwargs):
             calls.append(("images", kwargs["image_sizes"]))
@@ -162,3 +207,4 @@ def test_prepare_pair_uses_native_two_sample_packing():
     ]
     assert torch.equal(bundle["packed_init_noises"][:2], torch.ones(2, 3))
     assert torch.equal(bundle["packed_init_noises"][2:], torch.full((2, 3), 2.0))
+    assert bundle["prompt_body_memory_init"].shape == (16, 3)

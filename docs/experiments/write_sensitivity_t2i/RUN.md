@@ -1,13 +1,18 @@
-# NPU run commands — Write Sensitivity T2I
+# NPU run commands — Prompt-as-Memory Write Sensitivity T2I (v2)
+
+> Superseded before its NPU run. The current evaluator now emits a **v3
+> keep-vs-mask prompt-KV × four-Write-arm** comparison. Do not use the v2
+> output/count expectations below with current main; use
+> `docs/experiments/prompt_kv_mask/RUN.md` instead.
 
 Run from the repository's NPU checkout. This experiment is **not yet run**;
-its four-arm outcomes are unknown. The default is a frozen/training-free loop,
-matching the first-round scope of the supplied plan. The existing early-body
-training YAML supplies K=8, R=2, `[12,20)`, LoRA shape, and strict Read policy.
-All LoRA B residuals are zero in the default run. The optional `--adapter`
-loads a matching checkpoint without changing the four-arm protocol.
+its four-arm outcomes are unknown. This script is **training-free only**;
+`--adapter` was removed because a Phase 1.1 checkpoint was trained with the old
+boundary initialization. The early-body training YAML supplies K=8, R=2,
+`[12,20)`, LoRA shape, and strict Read policy. All LoRA B residuals are zero.
+`m0` now means prompt-aware body-entry initialization; do not pool v1/v2 results.
 
-## 1. Update the calibrated checkout
+## 1. Update the calibrated checkout after code is published
 
 The other NPU checkouts have local edits; use this separate checkout and do
 not delete prior outputs.
@@ -27,7 +32,7 @@ PYTHONPATH="$PWD" /home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python -m pytes
 PYTHONPATH="$PWD" /home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python -u \
   scripts/evaluate/bagel_write_sensitivity_t2i.py \
   --training-config configs/training/loop_pair_memory_early.yaml \
-  --output-dir /data/outputs/bagel_write_sensitivity_hard16_pair2_smoke \
+  --output-dir /data/outputs/bagel_prompt_memory_write_hard16_v2_smoke \
   --device npu:0 --max-prompts 2 --num-steps 2
 ```
 
@@ -40,7 +45,7 @@ The smoke must produce 8 PNGs, 4 pair probe files, and
 PYTHONPATH="$PWD" /home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python -u \
   scripts/evaluate/bagel_write_sensitivity_t2i.py \
   --training-config configs/training/loop_pair_memory_early.yaml \
-  --output-dir /data/outputs/bagel_write_sensitivity_hard16_pair2 \
+  --output-dir /data/outputs/bagel_prompt_memory_write_hard16_v2 \
   --device npu:0
 ```
 
@@ -49,20 +54,19 @@ batch, 50 generation schedule points, 512×512, CFG text/image 4/1. The shuffle
 is a deterministic swap **within each pair**, with no identity mapping. It
 does not alter prompt/noise/CFG/schedule/K/R/body. The intervention is made
 after strict Read and before the sole Write round in each denoising step.
-The same source rule is applied to conditional and CFG branches, while only
-conditional Read memory is probed. `sample_global` applies the native global
+The conditional branch uses the causal prompt EOS hidden captured at body-entry
+depth while building normal prompt KV: `M_init=A_s(P)+0.05*b_k`, with fixed
+centered, RMS-normalized deterministic slot offsets shared by all prompts.
+This same initializer is reinjected after the prefix each denoising step.
+Unconditional CFG retains its old boundary initialization and always uses
+`correct` Read→Write, while only conditional Write input is intervened/probed.
+Prompt KV remains. `sample_global` applies the native global
 CFG norm formula separately to each sample (equal to `global` for batch size
 1), avoiding a second cross-sample path. This is a new paired-batch protocol;
 do not compare absolute pixels to the earlier single-sample hard-16 run.
 
-To repeat with Phase 1.1 UND-Q weights, use a **new output directory** and add:
-
-```text
---adapter /data/outputs/bagel_pair_memory_calibrated_f783989/pair_memory_adapter_step_0001000.safetensors
-```
-
 Open `index.html` for the four-column gallery. `run_manifest.json` records
-pair/donor indexes, noise hashes, checkpoint/config/benchmark hashes, probe
+pair/donor indexes, noise and prompt-memory hashes, config/benchmark hashes, probe
 summaries, and per-prompt pixel MAE versus `correct_M`. Raw per-step memory
 probes are under `pair_*/`. GenEval2 image maps are under `geneval2/` for
 optional later scoring. Pixel MAE measures difference, not quality.
