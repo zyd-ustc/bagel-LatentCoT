@@ -30,6 +30,8 @@ recorded in `run_manifest.json`; hold them fixed when comparing phases.
 Training-free sets LoRA B weights to zero; trained loads the checkpoint.
 Both arms use the same per-prompt initial noise. Phase 1.1 only trained UND-Q
 Read; its missing GEN-Q Write residual remains zero in the trained arm.
+The image-only protocol disables unused loop diagnostics: their effective-rank
+SVD can require the Ascend TBE compiler and does not affect generated pixels.
 Its sidecar `R=1` is the number of Read rounds, while the training YAML's
 `loop_depth=2` controls image generation. A future checkpoint with missing
 routes is rejected unless it carries that Phase 1.1 schema.

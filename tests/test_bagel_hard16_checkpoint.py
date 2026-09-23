@@ -11,6 +11,7 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "evaluate"))
 
 from bagel_hard16_checkpoint import (  # noqa: E402
+    generate,
     load_benchmark,
     resolve_contract,
     selected_arms,
@@ -89,3 +90,21 @@ def test_hard16_is_fixed_and_arms_are_unambiguous():
     assert len(load_benchmark(path, 1)) == 1
     with pytest.raises(ValueError, match="subset"):
         selected_arms("base,base")
+
+
+def test_generation_avoids_unused_npu_svd_diagnostics():
+    calls = []
+
+    def inferencer(**kwargs):
+        calls.append(kwargs)
+        return {"image": "image"}
+
+    args = SimpleNamespace(
+        cfg_text_scale=4.0, cfg_img_scale=1.0,
+        num_steps=50, timestep_shift=3.0,
+    )
+    noise = torch.ones(2, 3)
+    assert generate(inferencer, "prompt", noise, (512, 512), args) == "image"
+    assert calls[0]["return_loop_diagnostics"] is False
+    assert calls[0]["init_noise"] is not noise
+    assert torch.equal(calls[0]["init_noise"], noise)

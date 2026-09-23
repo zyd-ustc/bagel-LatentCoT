@@ -192,7 +192,10 @@ def set_adapter(model, state: dict | None) -> None:
 def generate(inferencer, prompt: str, noise: torch.Tensor, image_shape: tuple[int, int], args):
     return inferencer(
         image=None, text=prompt, image_shapes=image_shape, init_noise=noise.clone(),
-        enable_taylorseer=False, return_loop_diagnostics=True,
+        # This image-only protocol does not consume loop diagnostics.  On
+        # Ascend, their SVD/effective-rank path may require the optional TBE
+        # compiler even though the denoising path itself runs without it.
+        enable_taylorseer=False, return_loop_diagnostics=False,
         cfg_text_scale=args.cfg_text_scale, cfg_img_scale=args.cfg_img_scale,
         cfg_interval=[0.4, 1.0], cfg_renorm_min=0.0, cfg_renorm_type="global",
         num_timesteps=args.num_steps, timestep_shift=args.timestep_shift,
@@ -272,7 +275,8 @@ def main() -> None:
         "hyper": {"num_timesteps": args.num_steps, "timestep_shift": args.timestep_shift,
                   "cfg_text_scale": args.cfg_text_scale, "cfg_img_scale": args.cfg_img_scale,
                   "cfg_interval": [0.4, 1.0], "cfg_renorm_min": 0.0,
-                  "cfg_renorm_type": "global", "enable_taylorseer": False},
+                  "cfg_renorm_type": "global", "enable_taylorseer": False,
+                  "return_loop_diagnostics": False},
         "geneval2_image_maps": {arm: f"geneval2/{arm}_image_paths.json" for arm in arms},
     }
     (output_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
