@@ -64,3 +64,10 @@ ratio was `0.425` with no clipping. A 32-step Phase 1.2A pilot loaded the
 step-64 Read adapter and saved a combined checkpoint. All pilot losses and
 gradient norms were finite. The pilots verify numerical training paths, not
 held-out editing quality or the Phase 1.1 Go condition.
+
+## 2026-09-23 calibrated Phase 1.1 full run
+
+The 1000-step NPU run completed at
+`/data/outputs/bagel_pair_memory_calibrated_f783989`. Its configuration,
+grouped training metrics, final checkpoint hash, and pending quality gates are
+recorded in `RESULT_1000_2026-09-23.md`.
