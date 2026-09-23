@@ -7,6 +7,6 @@
 - [x] Add unit tests for derangement, paired packing, probes, and per-sample CFG.
 - [x] Run local syntax/whitespace checks.
 - [ ] Run PyTorch unit tests (local PyTorch install lacks `libtorch_cpu.dylib`; defer to user-run NPU checkout, without launching evaluation here).
-- [ ] Push implementation to GitHub `main` and verify remote SHA.
+- [x] Push implementation to GitHub `main` and verify remote SHA (`2e3ff70`).
 - [ ] User runs the unit-test command and one-pair smoke on NPU.
 - [ ] User runs full 16-prompt NPU experiment and records results.
