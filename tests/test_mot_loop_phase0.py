@@ -557,6 +557,88 @@ def test_same_depth_body_recurrence_preserves_nonmemory_and_recycles_memory():
     assert out2.memory_body_out is not None
 
 
+def test_memory_read_only_stops_before_suffix():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Model
+
+    class FakeLayer:
+        def __init__(self, idx):
+            self.idx = idx
+            self.calls = 0
+
+        def forward_inference(self, packed_query_sequence, **kwargs):
+            self.calls += 1
+            return packed_query_sequence + float(self.idx + 1), kwargs.get(
+                "past_key_values"
+            )
+
+    class FakeNavit:
+        def __init__(self):
+            self.layers = [FakeLayer(index) for index in range(4)]
+            self.use_moe = False
+            self.norm = lambda hidden: (_ for _ in ()).throw(
+                AssertionError("Read-only path must not normalize")
+            )
+            self.gradient_checkpointing = False
+            self.training = False
+            self.enable_taylorseer = False
+
+        def rotary_emb(self, seq, pos):
+            return torch.ones(1, seq.shape[0], seq.shape[1]), torch.zeros(
+                1, seq.shape[0], seq.shape[1]
+            )
+
+    navit = FakeNavit()
+    output = Qwen2Model.forward_inference(
+        navit,
+        packed_query_sequence=torch.zeros(4, 2),
+        query_lens=torch.tensor([4], dtype=torch.int),
+        packed_query_position_ids=torch.arange(4),
+        packed_query_indexes=torch.arange(4),
+        past_key_values=None,
+        key_values_lens=torch.tensor([0], dtype=torch.int),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        update_past_key_values=False,
+        is_causal=False,
+        packed_memory_token_indexes=torch.tensor([1]),
+        memory_loop_repeat=1,
+        memory_loop_start=1,
+        memory_loop_end=3,
+        memory_read_only=True,
+        memory_read_adapter_mode="off",
+    )
+    assert [layer.calls for layer in navit.layers] == [1, 1, 1, 0]
+    assert output.memory_body_out is not None
+
+
+def test_causal_lm_wrapper_forwards_read_only_controls():
+    from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import (
+        BaseNavitOutputWithPast,
+        Qwen2ForCausalLM,
+    )
+
+    captured = {}
+
+    class Inner:
+        def forward_inference(self, **kwargs):
+            captured.update(kwargs)
+            return BaseNavitOutputWithPast(
+                packed_query_sequence=kwargs["packed_query_sequence"]
+            )
+
+    wrapper = SimpleNamespace(model=Inner())
+    Qwen2ForCausalLM.forward_inference(
+        wrapper,
+        packed_query_sequence=torch.zeros(1, 2),
+        query_lens=torch.tensor([1]),
+        packed_query_position_ids=torch.tensor([0]),
+        packed_query_indexes=torch.tensor([0]),
+        memory_read_only=True,
+        memory_read_adapter_mode="off",
+    )
+    assert captured["memory_read_only"] is True
+    assert captured["memory_read_adapter_mode"] == "off"
+
+
 def test_cfg_branches_keep_independent_recurrent_memory():
     from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import BaseNavitOutputWithPast
 

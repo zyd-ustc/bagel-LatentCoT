@@ -34,6 +34,15 @@ class ImageConditionBundle:
     has_visual_condition: bool = False
 
 
+@dataclass
+class MemoryReadConditionBundle:
+    """Minimal conditional state for prefix -> strict Read -> STOP."""
+
+    name: str
+    context: Dict[str, Any]
+    flow_input: Dict[str, Any]
+
+
 def _move_to_device(generation_input, device):
     """Mirror of BAGEL eval/gen/gen_images_mp.py:22 -- move every tensor in
     a `prepare_*` output dict onto `device`. Needed when the model is loaded
@@ -290,6 +299,74 @@ class InterleaveInferencer:
             cfg_img_input=_move_to_device(cfg_img_input, self.device),
             has_visual_condition=bool(contexts.get("has_visual_condition", False)),
         )
+
+    @torch.no_grad()
+    def prepare_memory_read_bundle(
+        self,
+        *,
+        name: str,
+        context: Dict[str, Any],
+        image_shape: Tuple[int, int],
+        num_loop_tokens: int = 8,
+    ) -> MemoryReadConditionBundle:
+        """Materialize only the conditional query needed by Phase 1.1."""
+
+        loop_k = int(num_loop_tokens)
+        if loop_k <= 0:
+            raise ValueError("memory Read requires num_loop_tokens > 0")
+        flow_input = self.model.prepare_vae_latent(
+            curr_kvlens=context["kv_lens"],
+            curr_rope=context["ropes"],
+            image_sizes=[tuple(image_shape)],
+            new_token_ids=self.new_token_ids,
+            num_loop_tokens=loop_k,
+        )
+        return MemoryReadConditionBundle(
+            name=str(name),
+            context=context,
+            flow_input=_move_to_device(flow_input, self.device),
+        )
+
+    def build_memory_read_kwargs(
+        self,
+        *,
+        x_t: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        condition: MemoryReadConditionBundle,
+        memory_loop_start: int = 12,
+        memory_loop_end: int = 20,
+    ) -> Dict[str, Any]:
+        raw_timestep = torch.as_tensor(
+            timestep, device=x_t.device, dtype=x_t.dtype
+        ).reshape(-1)
+        if int(raw_timestep.numel()) != 1:
+            raise ValueError("memory Read requires one shared timestep")
+        flow = condition.flow_input
+        return {
+            "x_t": x_t,
+            "timestep": torch.full(
+                (int(x_t.shape[0]),),
+                float(raw_timestep.detach().float()[0]),
+                dtype=x_t.dtype,
+                device=x_t.device,
+            ),
+            "packed_vae_token_indexes": flow["packed_vae_token_indexes"],
+            "packed_vae_position_ids": flow["packed_vae_position_ids"],
+            "packed_text_ids": flow["packed_text_ids"],
+            "packed_text_indexes": flow["packed_text_indexes"],
+            "packed_indexes": flow["packed_indexes"],
+            "packed_position_ids": flow["packed_position_ids"],
+            "packed_seqlens": flow["packed_seqlens"],
+            "key_values_lens": flow["key_values_lens"],
+            "past_key_values": condition.context["past_key_values"],
+            "packed_key_value_indexes": flow["packed_key_value_indexes"],
+            "packed_loop_token_indexes": flow["packed_loop_token_indexes"],
+            "packed_boundary_token_indexes": flow[
+                "packed_boundary_token_indexes"
+            ],
+            "memory_loop_start": int(memory_loop_start),
+            "memory_loop_end": int(memory_loop_end),
+        }
 
     @torch.no_grad()
     def prepare_image_condition_bundle(self, **kwargs) -> ImageConditionBundle:

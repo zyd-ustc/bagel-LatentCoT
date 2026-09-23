@@ -1582,6 +1582,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         memory_body_in: Optional[torch.Tensor] = None,
         block_gen_reads_memory: bool = True,
         collect_round_diagnostics: bool = False,
+        memory_read_only: bool = False,
+        memory_read_adapter_mode: str = "read",
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1734,6 +1736,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 )
             s = int(memory_loop_start)
             e = int(memory_loop_end)
+            if memory_read_only and mem_repeat != 1:
+                raise ValueError("memory_read_only requires memory_loop_repeat=1")
+            if memory_read_adapter_mode not in ("off", "read"):
+                raise ValueError(
+                    "memory_read_adapter_mode must be 'off' or 'read'"
+                )
             if not 0 <= s < e <= len(self.layers):
                 raise ValueError(
                     f"memory loop range [{s}, {e}) is invalid for "
@@ -1789,7 +1797,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         layer_idx,
                         hidden,
                         checkpoint=True,
-                        loop_adapter_mode="read" if block_this else "write",
+                        loop_adapter_mode=(
+                            memory_read_adapter_mode
+                            if block_this
+                            else "write"
+                        ),
                         packed_memory_token_indexes=indexes,
                         block_gen_reads_memory=block_this,
                     )
@@ -1802,6 +1814,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     suffix_hidden = suffix_gen(hidden)
                     if suffix_hidden is not None:
                         round_suffix_gen.append(suffix_hidden)
+            if memory_read_only:
+                # Phase 1 pair-grounding must stop at the end of the strict
+                # Read body.  In particular, do not normalize, execute the
+                # suffix, or expose this memory to GEN/context rows.
+                return BaseNavitOutputWithPast(
+                    packed_query_sequence=hidden,
+                    past_key_values=past_key_values,
+                    memory_body_out=memory_r,
+                    memory_round_hiddens=(memory_r,),
+                )
             for layer_idx in range(e, len(self.layers)):
                 hidden, past_key_values = run_layer(
                     layer_idx,
@@ -2097,6 +2119,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         memory_body_in: Optional[torch.Tensor] = None,
         block_gen_reads_memory: bool = True,
         collect_round_diagnostics: bool = False,
+        memory_read_only: bool = False,
+        memory_read_adapter_mode: str = "read",
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2124,6 +2148,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             memory_body_in=memory_body_in,
             block_gen_reads_memory=block_gen_reads_memory,
             collect_round_diagnostics=collect_round_diagnostics,
+            memory_read_only=memory_read_only,
+            memory_read_adapter_mode=memory_read_adapter_mode,
         )
 
         return outputs

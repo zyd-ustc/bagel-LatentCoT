@@ -1,0 +1,47 @@
+# Phase 1.1: pair-grounded strict-Read memory training.
+model_path: /data/bagel-LatentCoT/models/Bagel-7B-MoT
+data_path: /data/bagel-LatentCoT/datasets/phase1_structured/full_seed42_v2/train_candidates.jsonl
+output_dir: /data/outputs/bagel_loop_pair_memory_early
+device: auto
+
+seed: 42
+num_image_tokens: 4900
+stage_a_only: true
+noop_fraction: 0.20
+
+num_loop_tokens: 8
+loop_depth: 2
+loop_recycle_mode: same_depth
+loop_memory_persist: false
+memory_loop_start_layer: 12
+memory_loop_end_layer: 20
+round0_memory_write_enabled: false
+
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.0
+gen_attention_o_lora: false
+k_v_lora: false
+
+lambda_mem_dir: 1.0
+lambda_mem_mag: 0.1
+lambda_mem_reg: 0.25
+# A 64-step NPU pilot at 4e-4 measured median no-op/edit gradient norms
+# 0.000676/0.007919.  Raise the no-op weight 5x for a second pilot;
+# the first pilot's largest no-op norm would remain below the clip limit.
+lambda_noop_mem: 2.0e-3
+normalization_floor: 1.0e-4
+timestep_bucket_weights: [0.5, 0.3, 0.2]
+
+learning_rate: 5.0e-6
+betas: [0.9, 0.95]
+weight_decay: 0.0
+max_grad_norm: 1.0
+warmup_ratio: 0.03
+max_steps: 1000
+logging_steps: 1
+save_steps: 100
+
+vit_max_image_size: 980
+vit_min_image_size: 224
+vit_image_stride: 14

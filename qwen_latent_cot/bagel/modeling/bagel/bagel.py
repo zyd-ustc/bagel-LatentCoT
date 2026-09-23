@@ -46,6 +46,7 @@ from .qwen2_navit import NaiveCache
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from ..cache_utils.taylorseer import cache_init
 from ...flow_grpo import sde_step_with_logprob
+from ...loop_pair_ground import MemoryReadOutput
 
 from tqdm import tqdm
 
@@ -1994,6 +1995,111 @@ class Bagel(PreTrainedModel):
             pass
 
         return v_t
+
+    def forward_memory_read(
+        self,
+        *,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        packed_vae_token_indexes: torch.LongTensor,
+        packed_vae_position_ids: torch.LongTensor,
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        packed_indexes: torch.LongTensor,
+        packed_position_ids: torch.LongTensor,
+        packed_seqlens: torch.IntTensor,
+        key_values_lens: torch.IntTensor,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        packed_loop_token_indexes: torch.LongTensor,
+        packed_boundary_token_indexes: Optional[torch.LongTensor] = None,
+        memory_loop_start: int = 12,
+        memory_loop_end: int = 20,
+        memory_body_in: Optional[torch.Tensor] = None,
+        embed_memory: Optional[torch.Tensor] = None,
+        adapter_mode: str = "read",
+    ) -> MemoryReadOutput:
+        """Execute prefix -> one strict Read body -> STOP.
+
+        This API intentionally does not execute a Write round, suffix, output
+        normalization, or velocity projection.  It is the only Phase-1.1 path
+        used for frozen visual references and the instruction-conditioned
+        student memory.
+        """
+
+        if adapter_mode not in ("off", "read"):
+            raise ValueError("adapter_mode must be 'off' or 'read'")
+        if int(packed_loop_token_indexes.numel()) == 0:
+            raise ValueError("forward_memory_read requires memory tokens")
+        if timestep.unique().shape[0] != 1:
+            raise ValueError("forward_memory_read requires one shared timestep")
+
+        packed_text_embedding = self.language_model.model.embed_tokens(
+            packed_text_ids
+        )
+        packed_sequence = packed_text_embedding.new_zeros(
+            (sum(packed_seqlens), self.hidden_size)
+        )
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        samples = int(packed_seqlens.numel())
+        total_slots = int(packed_loop_token_indexes.numel())
+        if samples < 1 or total_slots % samples:
+            raise ValueError("memory tokens must tile equally across samples")
+        slots = total_slots // samples
+        initial_memory = embed_memory
+        if initial_memory is None:
+            if self.loop_memory is None or slots > int(self.loop_memory.shape[0]):
+                raise ValueError("requested memory K exceeds initialized loop_memory")
+            initial_memory = self.loop_memory[:slots].repeat(samples, 1)
+        if tuple(initial_memory.shape) != (total_slots, self.hidden_size):
+            raise ValueError(
+                "embed_memory shape must be [total_memory_tokens, hidden_size]"
+            )
+        packed_sequence[packed_loop_token_indexes] = initial_memory.to(
+            device=packed_sequence.device, dtype=packed_sequence.dtype
+        )
+
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+        packed_timestep_embeds = self.time_embedder(timestep)
+        vae_hidden = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        packed_sequence[packed_vae_token_indexes] = vae_hidden.to(
+            packed_sequence.dtype
+        )
+        und_indexes = self.mot_und_route_indexes(
+            packed_text_indexes, packed_loop_token_indexes
+        )
+        extra_inputs: Dict[str, Any] = {}
+        if self.use_moe:
+            extra_inputs.update(
+                mode="gen",
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                packed_text_indexes=und_indexes,
+            )
+        output = self.language_model.forward_inference(
+            packed_query_sequence=packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            packed_boundary_token_indexes=packed_boundary_token_indexes,
+            packed_memory_token_indexes=packed_loop_token_indexes,
+            memory_loop_repeat=1,
+            memory_loop_start=int(memory_loop_start),
+            memory_loop_end=int(memory_loop_end),
+            memory_body_in=memory_body_in,
+            block_gen_reads_memory=True,
+            memory_read_only=True,
+            memory_read_adapter_mode=adapter_mode,
+            **extra_inputs,
+        )
+        if output.memory_body_out is None:
+            raise RuntimeError("strict Read path returned no memory state")
+        return MemoryReadOutput(memory_read=output.memory_body_out)
 
     def _combine_cfg_velocities(
         self,

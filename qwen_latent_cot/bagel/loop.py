@@ -247,6 +247,58 @@ def loop_adapter_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     return state
 
 
+def configure_loop_trainable_routes(
+    model: nn.Module,
+    projections: Sequence[str],
+) -> List[str]:
+    """Freeze the model and enable only selected, already-injected LoRA routes."""
+
+    selected = tuple(str(name) for name in projections)
+    known = set(
+        UND_Q_PROJECTIONS
+        + GEN_Q_PROJECTIONS
+        + GEN_O_PROJECTIONS
+        + K_V_PROJECTIONS
+    )
+    unknown = sorted(set(selected) - known)
+    if unknown:
+        raise ValueError(f"unknown loop LoRA projections: {unknown}")
+    if not selected:
+        raise ValueError("at least one loop LoRA projection must be trainable")
+    names: List[str] = []
+    for name, parameter in model.named_parameters():
+        is_lora = ".lora_A." in name or ".lora_B." in name
+        enabled = is_lora and any(
+            f".{projection}." in name for projection in selected
+        )
+        parameter.requires_grad = bool(enabled)
+        if enabled:
+            names.append(name)
+    if not names:
+        raise RuntimeError(
+            "selected loop LoRA routes were not injected: " + ",".join(selected)
+        )
+    return names
+
+
+def loop_adapter_route_state_dict(
+    model: nn.Module,
+    projections: Sequence[str],
+) -> Dict[str, torch.Tensor]:
+    """Serialize only the requested LoRA routes."""
+
+    selected = tuple(str(name) for name in projections)
+    state = {
+        name: parameter.detach().cpu().contiguous()
+        for name, parameter in model.named_parameters()
+        if (".lora_A." in name or ".lora_B." in name)
+        and any(f".{projection}." in name for projection in selected)
+    }
+    if not state:
+        raise RuntimeError("model contains no matching loop LoRA tensors")
+    return state
+
+
 def load_loop_adapter_state_dict(
     model: nn.Module,
     state: Dict[str, torch.Tensor],
@@ -308,8 +360,10 @@ __all__ = [
     "TEXT_ATTENTION_PROJECTIONS",
     "UND_Q_PROJECTIONS",
     "inject_loop_lora",
+    "configure_loop_trainable_routes",
     "load_loop_adapter_state_dict",
     "loop_adapter_state_dict",
+    "loop_adapter_route_state_dict",
     "loop_lora_projections",
     "loop_trainable_names",
     "move_batch_to_device",

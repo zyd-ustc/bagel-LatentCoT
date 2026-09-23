@@ -14,7 +14,9 @@ expert，和当前 VAE/gen token 做原生 joint attention，只用最后一轮�
 | 阶段 | 状态 |
 |---|---|
 | **Phase 0** | 已实现。默认 **same-depth body loop**：prefix 一次、只在 \([s,e)\) 上把 memory slots recycle \(R\) 次、suffix 一次。Round-0 禁止所有 non-memory query 读取 memory，关闭跨层 UND relay。CFG 三条分支各自维护 memory；`K=0` 走原 `_forward_flow`。 |
-| Phase 1+ | Q-only loop LoRA 与 Flow-GRPO replay 已接通；text-reflection → latent-loop 的 Δv distillation trainer 未实现。 |
+| **Phase 1.1** | 已实现 Pair-Grounded Memory Read：同一 target-noised state 上用 source/target frozen visual reference 构造 memory delta，只训练 `[12,20)` UND-Q LoRA。 |
+| **Phase 1.2A** | 已实现 Target Flow SFT：加载并冻结 Phase 1.1 UND-Q，只训练 GEN-Q，直接拟合 `epsilon - x1`；structured reflection 降级为 ablation。 |
+| Phase 1.3+ | 等 1.1/1.2 go gate 后再做 joint relaxation、memory swap、persist 与 RL。 |
 | **B2 FlowEdit** | 官方速度场差速积分，对照「纯 flow 编辑」 |
 | **B3 显式反思链** | `draft_prefix_loop`：decode → UND 文本 → 官方 Editing |
 
@@ -25,11 +27,28 @@ qwen_latent_cot/bagel/           # 官方 BAGEL + Phase-0 loop
   modeling/bagel/bagel.py        # prepare_vae_latent / _forward_flow / _forward_flow_loop
   inferencer.py                  # InterleaveInferencer + gen_image_flowedit
 scripts/evaluate/                # B2 / B3 / GenEval2
-scripts/train/                   # 后续 GRPO / semantic-state（非 Phase-0 主线）
+scripts/train/                   # Phase 1 paired memory/flow + 后续 GRPO
 experiments/data/                # GenEval2-hard 16
 docs/                            # 主设计 + FlowEdit / 外循环说明
 tests/test_mot_loop_phase0.py
 ```
+
+Phase 1 新主线入口：
+
+```bash
+# 1.1: prefix -> strict Read -> STOP; UND-Q only
+python scripts/train/bagel_loop_pair_memory.py \
+  --config configs/training/loop_pair_memory_early.yaml
+
+# 1.2A: Read -> Write -> suffix; frozen UND-Q + trainable GEN-Q
+python scripts/train/bagel_loop_pair_flow_sft.py \
+  --config configs/training/loop_pair_flow_early_fresh.yaml \
+  --read-adapter /path/to/pair_memory_adapter.safetensors
+```
+
+完整协议见
+[`docs/BAGEL_LatentCoT_Phase1_Pair_Grounded_Memory_Plan.md`](docs/BAGEL_LatentCoT_Phase1_Pair_Grounded_Memory_Plan.md)。
+旧 `bagel_loop_delta_v_distill.py` 仅保留作 structured-reflection ablation。
 
 启用 Phase-0 memory（默认 `K=0`，不改官方路径）：
 
