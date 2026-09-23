@@ -43,6 +43,7 @@ from ..cache_utils.taylorseer import (
     taylor_formula,
 )
 from ...accelerator import enable_dynamo_flex_attention as _enable_dynamo_flex_attention
+from ...write_sensitivity import append_write_probe, select_write_memory
 
 
 torch._dynamo.config.cache_size_limit = 512
@@ -1584,6 +1585,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         collect_round_diagnostics: bool = False,
         memory_read_only: bool = False,
         memory_read_adapter_mode: str = "read",
+        memory_write_source: str = "correct",
+        memory_write_probe: Optional[list] = None,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1742,6 +1745,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 raise ValueError(
                     "memory_read_adapter_mode must be 'off' or 'read'"
                 )
+            if memory_write_source != "correct" and (
+                mem_repeat != 2 or not bool(block_gen_reads_memory) or memory_read_only
+            ):
+                raise ValueError(
+                    "Write sensitivity requires strict Read plus exactly one Write"
+                )
             if not 0 <= s < e <= len(self.layers):
                 raise ValueError(
                     f"memory loop range [{s}, {e}) is invalid for "
@@ -1786,10 +1795,25 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 cloned = normalize(cloned)
                 return cloned[gen_idx] if has_gen else None
 
+            initial_memory = packed_query_sequence[indexes]
             for _round in range(mem_repeat):
                 if _round > 0:
                     nxt = h_base.clone()
-                    nxt[indexes] = memory_r
+                    write_memory = select_write_memory(
+                        memory_r,
+                        initial_memory,
+                        source=memory_write_source,
+                        batch_size=int(query_lens.numel()),
+                    )
+                    if memory_write_probe is not None:
+                        append_write_probe(
+                            memory_write_probe,
+                            memory_r,
+                            initial_memory,
+                            write_memory,
+                            batch_size=int(query_lens.numel()),
+                        )
+                    nxt[indexes] = write_memory
                     hidden = nxt
                 block_this = block_round0 and _round == 0
                 for layer_idx in range(s, e):
@@ -2121,6 +2145,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         collect_round_diagnostics: bool = False,
         memory_read_only: bool = False,
         memory_read_adapter_mode: str = "read",
+        memory_write_source: str = "correct",
+        memory_write_probe: Optional[list] = None,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2150,6 +2176,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             collect_round_diagnostics=collect_round_diagnostics,
             memory_read_only=memory_read_only,
             memory_read_adapter_mode=memory_read_adapter_mode,
+            memory_write_source=memory_write_source,
+            memory_write_probe=memory_write_probe,
         )
 
         return outputs

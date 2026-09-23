@@ -1414,6 +1414,8 @@ class Bagel(PreTrainedModel):
         round0_memory_write_enabled: Optional[bool] = None,
         round0_gen_reads_memory: Optional[bool] = None,
         return_loop_diagnostics: bool = False,
+        memory_write_source: str = "correct",
+        memory_write_probe: Optional[list] = None,
         enable_taylorseer=False,
     ):
         if enable_taylorseer:
@@ -1516,6 +1518,17 @@ class Bagel(PreTrainedModel):
             ),
         )
         read_rounds, write_rounds = loop_round_counts(inner_depth, round0_write)
+        if memory_write_source != "correct" and (
+            not memory_loop_enabled
+            or recycle_mode != "same_depth"
+            or inner_depth != 2
+            or round0_write
+            or persist_memory
+        ):
+            raise ValueError(
+                "Write sensitivity requires K>0, same_depth, strict Read + "
+                "one Write, and persist=False"
+            )
         body_start = (
             memory_loop_start
             if memory_loop_start is not None
@@ -1652,6 +1665,9 @@ class Bagel(PreTrainedModel):
                                 else round0_write
                             ),
                             collect_round_diagnostics=bool(return_loop_diagnostics),
+                            memory_write_source=memory_write_source,
+                            memory_write_probe=memory_write_probe,
+                            packed_vae_seqlens=packed_vae_seqlens,
                         )
                     )
                     if return_loop_diagnostics:
@@ -1718,6 +1734,7 @@ class Bagel(PreTrainedModel):
                     packed_key_value_indexes=packed_key_value_indexes,
                     cfg_renorm_min=cfg_renorm_min,
                     cfg_renorm_type=cfg_renorm_type,
+                    vae_seqlens=packed_vae_seqlens,
                     # cfg_text
                     cfg_text_scale=cfg_text_scale_,
                     cfg_text_packed_position_ids=cfg_text_packed_position_ids,
@@ -2111,6 +2128,7 @@ class Bagel(PreTrainedModel):
         cfg_img_scale,
         cfg_renorm_min,
         cfg_renorm_type,
+        vae_seqlens=None,
     ):
         if cfg_text_scale <= 1.0:
             return v_t
@@ -2130,6 +2148,24 @@ class Bagel(PreTrainedModel):
             v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
         else:
             v_t_ = v_t_text_
+        if cfg_renorm_type == "sample_global":
+            if vae_seqlens is None:
+                raise ValueError("sample_global CFG requires per-sample VAE token lengths")
+            lengths = [int(length) for length in vae_seqlens]
+            if sum(lengths) != int(v_t.shape[0]) or any(length < 1 for length in lengths):
+                raise ValueError("VAE token lengths do not match packed velocity rows")
+            reference_chunks = v_t.split(lengths, dim=0)
+            candidate_chunks = v_t_.split(lengths, dim=0)
+            return torch.cat(
+                [
+                    candidate * (
+                        torch.norm(reference)
+                        / (torch.norm(candidate) + 1e-8)
+                    ).clamp(min=cfg_renorm_min, max=1.0)
+                    for reference, candidate in zip(reference_chunks, candidate_chunks)
+                ],
+                dim=0,
+            )
         if cfg_renorm_type == "global":
             norm_v_t = torch.norm(v_t)
             norm_v_t_ = torch.norm(v_t_)
@@ -2186,6 +2222,9 @@ class Bagel(PreTrainedModel):
         round0_memory_write_enabled: Optional[bool] = None,
         round0_gen_reads_memory: Optional[bool] = None,
         collect_round_diagnostics: bool = False,
+        memory_write_source: str = "correct",
+        memory_write_probe: Optional[list] = None,
+        packed_vae_seqlens: Optional[torch.IntTensor] = None,
     ):
         """Memory-loop velocity. Not @torch.no_grad.
 
@@ -2248,10 +2287,15 @@ class Bagel(PreTrainedModel):
                 block_gen_reads_memory=block_gen,
             )
 
-        def run_branch(sequence, kv, pos_ids, query_indexes, kv_lens, kv_indexes, body_in):
+        def run_branch(
+            sequence, kv, pos_ids, query_indexes, kv_lens, kv_indexes,
+            body_in, *, write_probe=None,
+        ):
             kwargs = dict(extra_inputs)
             if same_depth:
                 kwargs["memory_body_in"] = body_in
+                kwargs["memory_write_source"] = memory_write_source
+                kwargs["memory_write_probe"] = write_probe
             output = self.language_model.forward_inference(
                 packed_query_sequence=sequence,
                 query_lens=packed_seqlens,
@@ -2283,6 +2327,7 @@ class Bagel(PreTrainedModel):
             key_values_lens,
             packed_key_value_indexes,
             memory_body_in,
+            write_probe=memory_write_probe,
         )
         m_text = m_full
         m_img = m_full
@@ -2332,6 +2377,7 @@ class Bagel(PreTrainedModel):
             cfg_img_scale=cfg_img_scale,
             cfg_renorm_min=cfg_renorm_min,
             cfg_renorm_type=cfg_renorm_type,
+            vae_seqlens=packed_vae_seqlens,
         )
         if not collect_round_diagnostics:
             return v_t, m_full, m_text, m_img, {}
