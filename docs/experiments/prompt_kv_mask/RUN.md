@@ -31,6 +31,7 @@ do not reset the existing tree.
 ## 2. Two-prompt pilot
 
 ```bash
+set -euo pipefail
 PYTHONPATH="$PWD" /home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python -m pytest -q \
   tests/test_bagel_write_sensitivity_t2i.py tests/test_mot_loop_phase0.py
 
@@ -51,6 +52,7 @@ Gate: `run_manifest.json` has `complete=true`, both `keep` and
 Only after the pilot passes, use a new output path:
 
 ```bash
+set -euo pipefail
 PYTHONPATH="$PWD" /home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python -u \
   scripts/evaluate/bagel_write_sensitivity_t2i.py \
   --training-config configs/training/loop_pair_memory_early.yaml \
