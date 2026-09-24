@@ -406,6 +406,12 @@ class NaiveCache:
     def __init__(self, num_layers):
         self.key_cache = {k: None for k in range(num_layers)}
         self.value_cache = {k: None for k in range(num_layers)}
+        # Phase 0.5 keeps pretrained prompt KV as an immutable anchor.
+        self.hidden_cache = {k: None for k in range(num_layers)}
+        self.prompt_mask = None
+        self.position_ids = None
+        self.capture_layer_inputs = False
+        self.dynamic_prompt_eligible = True
 
     @property
     def num_layers(self):
@@ -418,6 +424,123 @@ class NaiveCache:
         else:
             return 0
 
+    @staticmethod
+    def _merge_rows(current, new_rows, query_indexes, cached_indexes):
+        if current is None:
+            return new_rows
+        total = int(query_indexes.numel()) + int(cached_indexes.numel())
+        merged = new_rows.new_empty((total, *new_rows.shape[1:]))
+        merged[query_indexes] = new_rows
+        merged[cached_indexes] = current.to(
+            device=new_rows.device, dtype=new_rows.dtype
+        )
+        return merged
+
+    def record_layer_input(
+        self,
+        layer_idx: int,
+        hidden: torch.Tensor,
+        query_indexes: torch.Tensor,
+        cached_indexes: torch.Tensor,
+    ) -> None:
+        self.hidden_cache[int(layer_idx)] = self._merge_rows(
+            self.hidden_cache[int(layer_idx)],
+            hidden.detach(),
+            query_indexes,
+            cached_indexes,
+        )
+
+    def record_segment(
+        self,
+        position_ids: torch.Tensor,
+        query_indexes: torch.Tensor,
+        cached_indexes: torch.Tensor,
+        *,
+        is_prompt: bool,
+    ) -> None:
+        old_mask = self.prompt_mask
+        old_positions = self.position_ids
+        if old_mask is None:
+            if int(cached_indexes.numel()) != 0:
+                raise ValueError("cache metadata was not recorded for an earlier segment")
+            self.prompt_mask = torch.full_like(
+                position_ids, bool(is_prompt), dtype=torch.bool
+            )
+            self.position_ids = position_ids.detach().to(dtype=torch.long).clone()
+            return
+        if int(old_mask.numel()) != int(cached_indexes.numel()):
+            raise ValueError("cache metadata is not aligned with cached KV rows")
+        total = int(query_indexes.numel()) + int(cached_indexes.numel())
+        mask = torch.zeros(total, device=position_ids.device, dtype=torch.bool)
+        positions = torch.zeros(total, device=position_ids.device, dtype=torch.long)
+        mask[query_indexes] = bool(is_prompt)
+        mask[cached_indexes] = old_mask.to(mask.device)
+        positions[query_indexes] = position_ids.to(dtype=torch.long)
+        positions[cached_indexes] = old_positions.to(positions.device)
+        self.prompt_mask = mask
+        self.position_ids = positions
+
+    def record_prompt_segment(
+        self,
+        position_ids: torch.Tensor,
+        query_indexes: torch.Tensor,
+        cached_indexes: torch.Tensor,
+    ) -> None:
+        self.record_segment(
+            position_ids,
+            query_indexes,
+            cached_indexes,
+            is_prompt=True,
+        )
+
+    def record_non_prompt_segment(
+        self,
+        position_ids: torch.Tensor,
+        query_indexes: torch.Tensor,
+        cached_indexes: torch.Tensor,
+    ) -> None:
+        self.record_segment(
+            position_ids,
+            query_indexes,
+            cached_indexes,
+            is_prompt=False,
+        )
+        self.dynamic_prompt_eligible = False
+        self.hidden_cache = {k: None for k in range(self.num_layers)}
+
+    def with_value_residuals(
+        self,
+        *,
+        start_layer: int,
+        prompt_indexes: torch.Tensor,
+        residuals: Tuple[torch.Tensor, ...],
+        alpha: float,
+    ) -> "NaiveCache":
+        """Shallow-fork the anchor cache and modify selected prompt V rows."""
+
+        fork = NaiveCache(self.num_layers)
+        fork.key_cache = dict(self.key_cache)
+        fork.value_cache = dict(self.value_cache)
+        fork.hidden_cache = dict(self.hidden_cache)
+        fork.prompt_mask = self.prompt_mask
+        fork.position_ids = self.position_ids
+        fork.capture_layer_inputs = False
+        fork.dynamic_prompt_eligible = self.dynamic_prompt_eligible
+        indexes = prompt_indexes.to(dtype=torch.long)
+        for offset, residual in enumerate(residuals):
+            layer_idx = int(start_layer) + offset
+            base = self.value_cache[layer_idx]
+            if base is None:
+                raise ValueError(f"missing anchor value cache at layer {layer_idx}")
+            local_indexes = indexes.to(base.device)
+            updated = base.clone()
+            updated[local_indexes] = (
+                base[local_indexes]
+                + float(alpha) * residual.to(device=base.device, dtype=base.dtype)
+            )
+            fork.value_cache[layer_idx] = updated
+        return fork
+
 
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):
@@ -428,6 +551,7 @@ class BaseNavitOutputWithPast(ModelOutput):
     gen_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_suffix_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     body_entry_hidden: Optional[torch.FloatTensor] = None
+    prompt_value_residuals: Optional[Tuple[torch.Tensor, ...]] = None
 
 
 def pad_sequence(tensor, pad_size):
@@ -1613,6 +1737,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         capture_body_entry_at: Optional[int] = None,
         prompt_body_memory_init: Optional[torch.Tensor] = None,
         mask_prompt_kv_for_nonmemory: bool = False,
+        collect_prompt_value_residuals: bool = False,
+        prompt_cache_indexes: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1657,6 +1783,17 @@ class Qwen2Model(Qwen2PreTrainedModel):
             actual_layer = getattr(
                 decoder_layer, "_checkpoint_wrapped_module", decoder_layer
             )
+            if (
+                update_past_key_values
+                and past_key_values is not None
+                and bool(past_key_values.capture_layer_inputs)
+            ):
+                past_key_values.record_layer_input(
+                    layer_idx,
+                    hidden,
+                    packed_query_indexes,
+                    packed_key_value_indexes,
+                )
             layer_kwargs = dict(
                 query_lens=query_lens,
                 packed_query_position_embeddings=packed_query_position_embeddings,
@@ -1815,6 +1952,19 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     int(indexes.numel()), int(packed_query_sequence.shape[-1])
                 ):
                     raise ValueError("prompt body memory must match [B*K,D] and cannot be persisted")
+            if collect_prompt_value_residuals:
+                if not memory_read_only:
+                    raise ValueError(
+                        "prompt V residual collection requires memory_read_only=True"
+                    )
+                if prompt_cache_indexes is None:
+                    raise ValueError(
+                        "prompt V residual collection requires prompt_cache_indexes"
+                    )
+                if int(prompt_cache_indexes.numel()) != int(indexes.numel()):
+                    raise ValueError(
+                        "active prompt rows and anchor prompt rows must align"
+                    )
             block_round0 = bool(block_gen_reads_memory)
             hidden = packed_query_sequence
             for layer_idx in range(0, s):
@@ -1841,6 +1991,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             round_memory = [] if collect_round_diagnostics else None
             round_gen = [] if collect_round_diagnostics else None
             round_suffix_gen = [] if collect_round_diagnostics else None
+            prompt_value_residuals = [] if collect_prompt_value_residuals else None
             gen_idx = packed_vae_token_indexes
             has_gen = gen_idx is not None and int(gen_idx.numel()) > 0
 
@@ -1882,6 +2033,30 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     hidden = nxt
                 block_this = block_round0 and _round == 0
                 for layer_idx in range(s, e):
+                    if collect_prompt_value_residuals:
+                        decoder_layer = self.layers[layer_idx]
+                        actual_layer = getattr(
+                            decoder_layer,
+                            "_checkpoint_wrapped_module",
+                            decoder_layer,
+                        )
+                        prompt_hidden = actual_layer.input_layernorm(hidden[indexes])
+                        dynamic_value = actual_layer.self_attn.v_proj(
+                            prompt_hidden
+                        ).view(
+                            -1,
+                            actual_layer.self_attn.num_key_value_heads,
+                            actual_layer.self_attn.head_dim,
+                        )
+                        anchor_indexes = prompt_cache_indexes.to(
+                            device=dynamic_value.device, dtype=torch.long
+                        )
+                        anchor_value = past_key_values.value_cache[layer_idx][
+                            anchor_indexes
+                        ]
+                        prompt_value_residuals.append(
+                            dynamic_value.to(anchor_value.dtype) - anchor_value
+                        )
                     hidden, past_key_values = run_layer(
                         layer_idx,
                         hidden,
@@ -1912,6 +2087,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     past_key_values=past_key_values,
                     memory_body_out=memory_r,
                     memory_round_hiddens=(memory_r,),
+                    prompt_value_residuals=(
+                        tuple(prompt_value_residuals)
+                        if collect_prompt_value_residuals
+                        else None
+                    ),
                 )
             for layer_idx in range(e, len(self.layers)):
                 hidden, past_key_values = run_layer(
@@ -2218,6 +2398,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         capture_body_entry_at: Optional[int] = None,
         prompt_body_memory_init: Optional[torch.Tensor] = None,
         mask_prompt_kv_for_nonmemory: bool = False,
+        collect_prompt_value_residuals: bool = False,
+        prompt_cache_indexes: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2252,6 +2434,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             capture_body_entry_at=capture_body_entry_at,
             prompt_body_memory_init=prompt_body_memory_init,
             mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
+            collect_prompt_value_residuals=collect_prompt_value_residuals,
+            prompt_cache_indexes=prompt_cache_indexes,
         )
 
         return outputs

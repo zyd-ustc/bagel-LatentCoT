@@ -1,11 +1,9 @@
 # bagel-LatentCoT
 
-BAGEL-7B-MoT 上的 **步内 understanding–generation hidden loop**。
-
-主方案不是外循环编辑 agent，也不是 FlowEdit。每个去噪步里固定跑
-`1 read + (loop_depth - 1) write`：\(K\) 个 memory token 走 understanding
-expert，和当前 VAE/gen token 做原生 joint attention，只用最后一轮速度推进
-\(x_t\)。当前方法称为 **Read–Write Loop with implicit context rerouting**。
+BAGEL-7B-MoT 上的 latent-condition research code。Phase 0.5 当前主线是
+**Anchored Dynamic Prompt Memory**：原生 prompt KV 始终作为 anchor，active
+prompt-copy 在固定 \(x_t\) 上做 Read，随后只把同层 \(\Delta V_P\) 残差写回
+GEN 的原生 prompt attention route。不再把 K=8 side memory 当成 semantic carrier。
 
 设计文档：[docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx](docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx)
 
@@ -14,6 +12,7 @@ expert，和当前 VAE/gen token 做原生 joint attention，只用最后一轮�
 | 阶段 | 状态 |
 |---|---|
 | **Phase 0** | 已实现。默认 **same-depth body loop**：prefix 一次、只在 \([s,e)\) 上把 memory slots recycle \(R\) 次、suffix 一次。Round-0 禁止所有 non-memory query 读取 memory，关闭跨层 UND relay。CFG 三条分支各自维护 memory；`K=0` 走原 `_forward_flow`。 |
+| **Phase 0.5** | 已重构。保留 full-length native prompt anchor；`[12,20)` Read 产生同层 `ΔV`，Write 仅注入 `V₀ + αΔV`；默认只开 early 35% denoising steps。 |
 | **Phase 1.1** | 已实现 Pair-Grounded Memory Read：同一 target-noised state 上用 source/target frozen visual reference 构造 memory delta，只训练 `[12,20)` UND-Q LoRA。 |
 | **Phase 1.2A** | 已实现 Target Flow SFT：加载并冻结 Phase 1.1 UND-Q，只训练 GEN-Q，直接拟合 `epsilon - x1`；structured reflection 降级为 ablation。 |
 | Phase 1.3+ | 等 1.1/1.2 go gate 后再做 joint relaxation、memory swap、persist 与 RL。 |
@@ -85,38 +84,31 @@ pytest -q tests/test_mot_loop_phase0.py tests/test_bagel_flowedit.py
 
 ## 对照实验
 
-Phase 0.5 是 frozen BAGEL 的纯 T2I compositional mechanism benchmark。所有 arm
-共享 prompt、initial noise、1024×1024 geometry、官方 T2I CFG、50-step schedule，
-只改变 loop body 与跨 timestep persistence。默认使用官方 GenEval2 全量 800
-prompts（atomicity 3–10 各 100 条）。16 卡主矩阵：
+Phase 0.5 先做固定 \(x_t\) 数值验证，再跑端到端 trajectory。两种模式都共享
+prompt、initial noise、geometry、CFG 与 schedule；`alpha=0` 直接走原生
+`_forward_flow`，用于 exact native parity。
 
 ```bash
-bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/out
+python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
+  --mode probe --model-path /path/to/BAGEL-7B-MoT \
+  --output-dir /data/outputs/dynamic_prompt_probe \
+  --alphas 0,0.1,-0.1,0.2 --max-prompts 16
 ```
 
-K 消融与主矩阵分开运行：
+端到端 hard16：
 
 ```bash
-K_VALUES=1,4,8 bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/k_ablation
+python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
+  --mode generate --model-path /path/to/BAGEL-7B-MoT \
+  --output-dir /data/outputs/dynamic_prompt_hard16 \
+  --alphas 0,0.1,-0.1,0.2 --body-start 12 --body-end 20 \
+  --step-fraction 0.35 --max-prompts 16
 ```
 
-主矩阵固定为 Z0 vanilla；Z2/Z3/Z4 分别使用 mid/early/late body 且不跨 timestep
-保留 memory；Z6 是 early body 的 persistence 对照。Z5/Z7 已从当前主实验移除。
-生成完成后会写 `mechanism_summary.json` 及每个 arm 的 GenEval2 image map；如果
-Soft-TIFA server 已运行或 `VLM_PATH` 可用，launcher 会自动汇总 AM/GM、skill 和
-atomicity。设置 `SCORE=1` 可强制要求评分成功；`K_VALUES` 非空时不得同时设置
-`ARMS`。
-
-全量 800 prompts 与 Z0 三 seed 随机性对照一键运行：
-
-```bash
-nohup bash scripts/evaluate/run_bagel_loop_t2i_full800_multiseed.sh \
-  /data/outputs/bagel_loop_t2i_full800_multiseed \
-  > /data/outputs/bagel_loop_t2i_full800_multiseed.log 2>&1 &
-```
-
-该协议在 seed 42 比较 `Z0,Z2,Z3,Z4,Z6`，并额外运行 seed 43/44 的 Z0。
-额外 seed 只衡量 baseline 随机波动，不等价于所有 loop arm 的多 seed 复现。
+probe 的 `manifest.json` 记录 `relative_l2`、
+`cos(Δv(+a), -Δv(-a))`、`2a/a` scaling 与逐层 `ΔV` norm；generate 模式保存
+每个 alpha 的图和逐 step 诊断。当前不做 prompt compression、persistent memory、
+K residual 或 learnable gate。
 
 原 paired-edit specification 与 runner 保留在
 `experiments/data/semantic_edit_phase05.jsonl` 和
