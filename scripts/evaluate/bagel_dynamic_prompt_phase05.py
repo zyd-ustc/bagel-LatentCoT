@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--body-end", type=int, default=20)
     parser.add_argument("--step-fraction", type=float, default=0.35)
     parser.add_argument("--probe-timestep", type=float, default=0.8)
+    parser.add_argument("--shard-id", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--merge-only", action="store_true")
     return parser.parse_args()
 
 
@@ -200,42 +203,96 @@ def generate_prompt(inferencer, model, args, prompt: str, alphas: List[float], o
     return {"prompt": prompt, "arms": rows}
 
 
+def merge_manifests(output_dir: Path) -> Path:
+    paths = sorted(output_dir.glob("manifest_shard_*.json"))
+    if not paths:
+        raise FileNotFoundError(f"no shard manifests under {output_dir}")
+    manifests = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    first = manifests[0]
+    for manifest in manifests[1:]:
+        for key in ("schema", "mode", "alphas", "body", "step_fraction"):
+            if manifest.get(key) != first.get(key):
+                raise ValueError(f"shard manifest mismatch for {key}")
+    rows = [row for manifest in manifests for row in manifest.get("rows", [])]
+    rows.sort(key=lambda row: int(row["prompt_index"]))
+    merged = {
+        key: first[key]
+        for key in ("schema", "mode", "alphas", "body", "step_fraction")
+    }
+    merged.update(
+        num_shards=len(paths),
+        prompt_count=len(rows),
+        rows=rows,
+    )
+    path = output_dir / "manifest.json"
+    path.write_text(
+        json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def main() -> None:
     args = parse_args()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.merge_only:
+        print(merge_manifests(output_dir), flush=True)
+        return
     alphas = parse_csv_floats(args.alphas)
     if not alphas:
         raise ValueError("--alphas cannot be empty")
     prompts = load_prompts(args.prompt_file, args.max_prompts)
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if int(args.num_shards) < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if not 0 <= int(args.shard_id) < int(args.num_shards):
+        raise ValueError("--shard-id must be in [0, num-shards)")
+    assigned = [
+        index
+        for index in range(len(prompts))
+        if index % int(args.num_shards) == int(args.shard_id)
+    ]
+    print(
+        f"[shard {args.shard_id}/{args.num_shards}] prompts={assigned}",
+        flush=True,
+    )
+    if not assigned:
+        raise ValueError("this shard has no prompts; reduce --num-shards")
     _, inferencer = load_native_bagel(args)
     model = inferencer.model
     rows = []
-    for index, prompt in enumerate(prompts):
+    for index in assigned:
+        prompt = prompts[index]
         print(f"[{index + 1}/{len(prompts)}] {prompt}", flush=True)
         if args.mode == "probe":
-            rows.append(probe_prompt(inferencer, model, args, prompt, alphas))
+            row = probe_prompt(inferencer, model, args, prompt, alphas)
         else:
             prompt_dir = output_dir / f"p{index:03d}"
             prompt_dir.mkdir(parents=True, exist_ok=True)
-            rows.append(
-                generate_prompt(
-                    inferencer, model, args, prompt, alphas, prompt_dir
-                )
+            row = generate_prompt(
+                inferencer, model, args, prompt, alphas, prompt_dir
             )
+        rows.append({"prompt_index": int(index), **row})
     manifest = {
         "schema": "bagel_dynamic_prompt_phase05_v1",
         "mode": args.mode,
         "alphas": alphas,
         "body": [int(args.body_start), int(args.body_end)],
         "step_fraction": float(args.step_fraction),
+        "shard_id": int(args.shard_id),
+        "num_shards": int(args.num_shards),
         "rows": rows,
     }
-    (output_dir / "manifest.json").write_text(
+    manifest_path = (
+        output_dir / "manifest.json"
+        if int(args.num_shards) == 1
+        else output_dir / f"manifest_shard_{int(args.shard_id):02d}.json"
+    )
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    print(output_dir / "manifest.json", flush=True)
+    print(manifest_path, flush=True)
 
 
 if __name__ == "__main__":
