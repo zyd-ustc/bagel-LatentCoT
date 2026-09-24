@@ -1,114 +1,92 @@
-# Phase 0.5: Frozen BAGEL T2I Read→Write Validation
+# Phase 0.5: Anchored Dynamic Prompt Memory
 
-## 1. Research question
+## Contract
 
-Phase 0.5 tests one mechanism only:
+Phase 0.5 no longer adds K=8/16 memory tokens. Prompt prefill records:
 
-> Given the same prompt and initial noise, does one latent Read→Write cycle improve
-> complex composition without damaging BAGEL's native T2I prior?
+- native per-layer prompt `K₀/V₀`;
+- every prompt token's layer-entry hidden state `H_P^{l,0}`;
+- original prompt positions and packed sample ownership.
 
-Paired semantic editing is intentionally excluded. The archived edit runner and
-`experiments/data/semantic_edit_phase05.jsonl` remain available for Phase 2.
+For each enabled denoising step, fixed `(P, x_t, t)` receives two body passes over
+`[s,e)`:
 
-## 2. Fixed T2I path
+1. **Read**: active prompt-copy rows restart from `H_P^{s,0}` and may attend to
+   native prompt cache plus current GEN rows. All non-prompt-copy queries are
+   masked from prompt-copy keys.
+2. **Write**: GEN restarts from the native query. Native prompt K is unchanged;
+   only prompt V rows become `V₀ + α(V_dyn - V₀)` at the matching layer.
 
-Every arm calls the native prompt-only path:
+The anchor cache is never mutated. `alpha=0` bypasses Read and calls native
+`_forward_flow`, so V0 compares the exact original path rather than a nominally
+equivalent reconstruction.
 
-```python
-inferencer(
-    image=None,
-    text=prompt,
-    image_shapes=(height, width),
-    init_noise=init_noise,
-    cfg_text_scale=4.0,
-    cfg_img_scale=1.0,
-    cfg_interval=[0.4, 1.0],
-    timestep_shift=3.0,
-    num_timesteps=50,
-    cfg_renorm_min=0.0,
-    cfg_renorm_type="global",
-)
+Default prototype:
+
+```text
+body                 [12,20)
+enabled trajectory   early 35%
+alpha sweep          0, +0.1, -0.1, +0.2
+prompt length        native full length
+K intervention       none
+cross-step state     none (fresh Read at each enabled t)
 ```
 
-For one prompt, every arm shares prompt, seed, initial noise, geometry, CFG, NFE,
-and timestep schedule. Only `K`, `R`, loop body, persistence, and read/write timing
-may change. Noise seeds use schema `bagel-loop-t2i-v1`.
+## Validation order
 
-## 3. Main arm matrix
+1. V0: `alpha=0` native parity.
+2. V1/V2: fixed-`x_t` sensitivity, approximate magnitude scaling, and
+   `cos(Δv(+a), -Δv(-a))`.
+3. V3/V4: zero/shuffled residual controls and Read usefulness.
+4. V5: early/mid/late body and early/late/all step localization.
+5. V6: paired-seed hard prompts, then full/easy prior regression.
 
-| Arm | K | R | Body | Persist | Round 0 | Purpose |
-|---|---:|---:|---|---|---|---|
-| Z0 | 0 | 1 | — | off | — | native BAGEL T2I |
-| Z2 | 8 | 2 | `[16,24)` | off | read | mid body, fresh memory |
-| Z3 | 8 | 2 | `[12,20)` | off | read | early body |
-| Z4 | 8 | 2 | `[20,28)` | off | read | late body |
-| Z6 | 8 | 2 | `[12,20)` | on | read | early body, persistent memory |
+Only V0–V2 and end-to-end alpha arms are automated in the first runner. Shuffled
+delta is implemented in the model API and intentionally requires a packed batch
+with at least two equal-length prompts.
 
-`Z3↔Z6` is the retained matched persistence comparison. It differs only in whether
-the final memory state is carried into the next denoising timestep. Z5 and Z7 were
-removed after the 128-prompt pilot did not support retaining their persistence
-windows. All loop arms use strict `1R+1W` and `K=8`.
+## Commands
 
-## 4. K-scaling matrix
-
-Run `Z0`, `K1`, `K4`, and `K8` separately from the main matrix. Every K arm uses
-`R=2`, strict Round-0 read, body `[16,24)`, and `persist=False`.
+Fixed-state numerical probe:
 
 ```bash
-bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /data/outputs/t2i_main
-
-K_VALUES=1,4,8 \
-  bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /data/outputs/t2i_k
+python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
+  --mode probe \
+  --model-path /data/models/BAGEL-7B-MoT \
+  --output-dir /data/outputs/phase05_dynamic_prompt_probe \
+  --prompt-file experiments/data/geneval2_hard_16.txt \
+  --alphas 0,0.1,-0.1,0.2 \
+  --probe-timestep 0.8 \
+  --body-start 12 --body-end 20 \
+  --max-prompts 16
 ```
 
-The launcher defaults to 16 NPU shards, 1024×1024, seed 42, and all 800 official
-GenEval2 prompts. Atomicities 3–10 each contribute 100 prompts. The source is
-official GenEval2 commit `a6e82d2289e8d418f27f0adee77908b07060eea3`.
-Override with `NUM_SHARDS`, `HEIGHT`, `WIDTH`, `SEED`, `MODEL_PATH`, or
-`PROMPT_FILE`.
-
-The multi-seed protocol runs the five-arm main matrix at seed 42, then Z0-only at
-seeds 43 and 44:
+End-to-end hard16:
 
 ```bash
-bash scripts/evaluate/run_bagel_loop_t2i_full800_multiseed.sh \
-  /data/outputs/bagel_loop_t2i_full800_multiseed
+python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
+  --mode generate \
+  --model-path /data/models/BAGEL-7B-MoT \
+  --output-dir /data/outputs/phase05_dynamic_prompt_hard16 \
+  --prompt-file experiments/data/geneval2_hard_16.txt \
+  --alphas 0,0.1,-0.1,0.2 \
+  --body-start 12 --body-end 20 \
+  --step-fraction 0.35 \
+  --max-prompts 16
 ```
 
-The root-level `multiseed_summary.{json,md}` reports Z0 mean, sample standard
-deviation, and range. Loop deltas remain same-seed comparisons against seed-42 Z0;
-the extra Z0 seeds do not make the loop arms multi-seed evaluations.
-
-## 5. Outputs and scoring
-
-The merge step writes:
-
-- `index.html`: visual arm comparison;
-- `run_manifest.json`: run metadata and per-arm GenEval image maps;
-- `mechanism_summary.json`: aggregated `ΔM`, `ΔG`, and `Δv`;
-- `geneval2_image_maps/*.json`: prompt-to-image maps for semantic scoring.
-
-Pixel MAE versus Z0 is behavioral distance, not a quality score. Semantic quality
-comes from GenEval2 Soft-TIFA, especially count, spatial relation, attribute
-binding, and multi-object composition.
-
-The launcher uses `SCORE=auto`: it scores when a Soft-TIFA server is already live,
-or starts one after generation when `VLM_PATH` contains Qwen3-VL. Use `SCORE=1`
-to make a missing evaluator a hard error:
+Numerical tests (not run during the refactor):
 
 ```bash
-SCORE=1 \
-VLM_PATH=/data/bagel-LatentCoT/models/Qwen3-VL-8B-Instruct \
-bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh \
-  /data/outputs/bagel_loop_t2i_phase05_full800
+pytest -q tests/test_dynamic_prompt_numeric.py
 ```
 
-The scorer writes aggregate AM/GM, per-skill, per-atomicity, CSV, JSON, and a
-Markdown summary using Z0 as the baseline.
+Outputs are written to `manifest.json`. Probe mode contains relative velocity
+change, direction cosine, scale ratio, and layerwise residual norms. Generate
+mode stores one image per alpha plus per-step diagnostics.
 
-## 6. Decision rule
+## Explicit exclusions
 
-Select a body/persistence configuration only if diagnostics establish
-`memory → GEN → velocity` and the arm improves GenEval2 AM/GM over Z0 without
-unacceptable visual degradation. Treat a loop gain smaller than ordinary Z0 seed
-variation as inconclusive until that loop arm is repeated across multiple seeds.
+No prompt compression, learnable encoder, LoRA, K rewrite, prompt-KV removal,
+persistent cross-timestep memory, full-layer rewrite, or Phase 1 supervision is
+part of this implementation.
