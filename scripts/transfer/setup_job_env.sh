@@ -5,7 +5,7 @@ set -uo pipefail
 
 ROOT=${ROOT:-/cache/bagel-LatentCoT}
 MODEL=${MODEL:-/cache/models/Bagel-7B-MoT}
-DATA=${DATA:-/data/bagel-LatentCoT/datasets/qwen_latent_cot_v3_adapted_20260816}
+DATA=${DATA:-/data/zyd_workspace/bagel-LatentCoT/datasets/qwen_latent_cot_v3_adapted_20260816}
 PY=${PY:-/home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python}
 
 mkdir -p "$ROOT" "$(dirname "$MODEL")" "$(dirname "$DATA")"

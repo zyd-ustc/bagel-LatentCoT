@@ -1,7 +1,7 @@
 # Phase 1.2 matched arm: identical to fresh except detached temporal memory.
-model_path: /data/model/BAGEL-7B-MoT
+model_path: /data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT
 data_path: experiments/data/phase1_train.jsonl
-output_dir: /data/outputs/bagel_loop_delta_v_early_persist
+output_dir: /data/zyd_workspace/outputs/bagel_loop_delta_v_early_persist
 device: auto
 
 seed: 42

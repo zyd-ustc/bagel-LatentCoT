@@ -52,8 +52,8 @@ Fixed-state numerical probe:
 ```bash
 python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
   --mode probe \
-  --model-path /data/models/BAGEL-7B-MoT \
-  --output-dir /data/outputs/phase05_dynamic_prompt_probe \
+  --model-path /data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT \
+  --output-dir /data/zyd_workspace/outputs/phase05_dynamic_prompt_probe \
   --prompt-file experiments/data/geneval2_hard_16.txt \
   --alphas 0,0.1,-0.1,0.2 \
   --probe-timestep 0.8 \
@@ -66,8 +66,8 @@ End-to-end hard16:
 ```bash
 python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
   --mode generate \
-  --model-path /data/models/BAGEL-7B-MoT \
-  --output-dir /data/outputs/phase05_dynamic_prompt_hard16 \
+  --model-path /data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT \
+  --output-dir /data/zyd_workspace/outputs/phase05_dynamic_prompt_hard16 \
   --prompt-file experiments/data/geneval2_hard_16.txt \
   --alphas 0,0.1,-0.1,0.2 \
   --body-start 12 --body-end 20 \
