@@ -1,8 +1,8 @@
 # Phase 1.2A: frozen UND-Q Read + fresh, trainable GEN-Q Write.
-model_path: /data/bagel-LatentCoT/models/Bagel-7B-MoT
-data_path: /data/bagel-LatentCoT/datasets/phase1_structured/full_seed42_v2/train_candidates.jsonl
-read_adapter: /data/outputs/bagel_loop_pair_memory_early/pair_memory_adapter_step_0001000.safetensors
-output_dir: /data/outputs/bagel_loop_pair_flow_early_fresh
+model_path: /data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT
+data_path: /data/zyd_workspace/bagel-LatentCoT/datasets/phase1_structured/full_seed42_v2/train_candidates.jsonl
+read_adapter: /data/zyd_workspace/outputs/bagel_loop_pair_memory_early/pair_memory_adapter_step_0001000.safetensors
+output_dir: /data/zyd_workspace/outputs/bagel_loop_pair_flow_early_fresh
 device: auto
 
 seed: 42

@@ -6,7 +6,7 @@ PYTHON_BIN=${PYTHON_BIN:-/home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python}
 if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN=${PYTHON_BIN_FALLBACK:-/home/ma-user/anaconda3/envs/PyTorch-2.6.0/bin/python}
 fi
-MODEL_PATH=${MODEL_PATH:-/data/bagel-LatentCoT/models/Bagel-7B-MoT}
+MODEL_PATH=${MODEL_PATH:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}
 PROMPT_FILE=${PROMPT_FILE:-experiments/data/geneval2_hard_16.txt}
 EDIT_FILE=${EDIT_FILE:-experiments/data/semantic_edit_phase05.jsonl}
 SOURCE_IMAGE=${SOURCE_IMAGE:-}

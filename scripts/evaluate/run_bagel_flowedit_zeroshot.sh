@@ -6,7 +6,7 @@ PYTHON_BIN=${PYTHON_BIN:-/home/ma-user/anaconda3/envs/PyTorch-2.7.1/bin/python}
 if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN=${PYTHON_BIN_FALLBACK:-/home/ma-user/anaconda3/envs/PyTorch-2.6.0/bin/python}
 fi
-MODEL_PATH=${MODEL_PATH:-/data/bagel-LatentCoT/models/Bagel-7B-MoT}
+MODEL_PATH=${MODEL_PATH:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}
 PAIRS_FILE=${PAIRS_FILE:-experiments/data/geneval2_hard_16_flowedit.jsonl}
 PREFIX_MODE=${PREFIX_MODE:-text}
 NUM_SHARDS=${NUM_SHARDS:-16}

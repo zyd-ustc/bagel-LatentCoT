@@ -1,7 +1,7 @@
 # Phase 1.1: structured reflection -> fresh early-body latent correction.
-model_path: /data/model/BAGEL-7B-MoT
+model_path: /data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT
 data_path: experiments/data/phase1_train.jsonl
-output_dir: /data/outputs/bagel_loop_delta_v_early_fresh
+output_dir: /data/zyd_workspace/outputs/bagel_loop_delta_v_early_fresh
 device: auto
 
 seed: 42

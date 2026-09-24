@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # One independent frozen-BAGEL process per NPU; prompts are round-robin sharded.
-OUTPUT_DIR=${1:-/data/outputs/phase05_dynamic_prompt_hard16}
+OUTPUT_DIR=${1:-/data/zyd_workspace/outputs/phase05_dynamic_prompt_hard16}
 PYTHON_BIN=${PYTHON_BIN:-python}
-MODEL_PATH=${MODEL_PATH:-/data/bagel-LatentCoT/models/Bagel-7B-MoT}
+MODEL_PATH=${MODEL_PATH:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}
 PROMPT_FILE=${PROMPT_FILE:-experiments/data/geneval2_hard_16.txt}
 MODE=${MODE:-probe}
 NUM_SHARDS=${NUM_SHARDS:-16}

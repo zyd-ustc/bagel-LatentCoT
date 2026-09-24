@@ -91,7 +91,7 @@ prompt、initial noise、geometry、CFG 与 schedule；`alpha=0` 直接走原生
 ```bash
 python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
   --mode probe --model-path /path/to/BAGEL-7B-MoT \
-  --output-dir /data/outputs/dynamic_prompt_probe \
+  --output-dir /data/zyd_workspace/outputs/dynamic_prompt_probe \
   --alphas 0,0.1,-0.1,0.2 --max-prompts 16
 ```
 
@@ -100,7 +100,7 @@ python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
 ```bash
 python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
   --mode generate --model-path /path/to/BAGEL-7B-MoT \
-  --output-dir /data/outputs/dynamic_prompt_hard16 \
+  --output-dir /data/zyd_workspace/outputs/dynamic_prompt_hard16 \
   --alphas 0,0.1,-0.1,0.2 --body-start 12 --body-end 20 \
   --step-fraction 0.35 --max-prompts 16
 ```
