@@ -109,6 +109,8 @@ def test_prompt_memory_init_is_prompt_specific_centered_and_deterministic():
     assert torch.equal(memory, prompt_memory_init(anchors, slots=8).reshape(2, 8, 4))
     assert torch.allclose(memory.mean(dim=1), anchors, atol=1e-5)
     assert torch.allclose(memory[0] - anchors[0], memory[1] - anchors[1], atol=1e-6)
+    offsets = (memory[0] - anchors[0]) / 0.05
+    assert torch.allclose(offsets.square().mean(), torch.tensor(1.0), atol=1e-5)
     assert not torch.allclose(memory[0], memory[1])
     assert not torch.allclose(memory[0, 0], memory[0, 1])
     with pytest.raises(ValueError, match="prompt body entry"):

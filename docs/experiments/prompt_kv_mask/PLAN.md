@@ -50,3 +50,4 @@
 |---|---|---|
 | 2026-09-23 | Mask cached prompt keys to all non-memory generation queries, not just VAE GEN rows | closes the boundary-token relay confound |
 | 2026-09-23 | Keep prompt cache and memory-query access intact | isolates direct prompt-to-nonmemory routing; does not test removal of prompt information from memory |
+| 2026-09-24 | Use one global RMS for centered slot offsets | per-slot RMS after centering broke the `mean_k M_init(P)=A_s(P)` invariant; fix is code-only, no NPU results existed yet |

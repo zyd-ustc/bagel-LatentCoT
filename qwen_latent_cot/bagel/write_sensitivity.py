@@ -38,7 +38,9 @@ def prompt_memory_init(
     features = torch.arange(1, width + 1, device=anchor.device, dtype=torch.float32)[None, :]
     offsets = torch.sin(slot_ids * features * 0.013) + torch.cos(slot_ids * features * 0.017)
     offsets = offsets - offsets.mean(dim=0, keepdim=True)
-    offsets = offsets / offsets.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1e-6)
+    # One shared scale preserves the zero-mean-across-slots invariant. A
+    # separate RMS for each slot would undo the centering above.
+    offsets = offsets / offsets.square().mean().sqrt().clamp_min(1e-6)
     if bool((anchor.square().sum(dim=1) == 0).any()):
         raise ValueError("prompt body entry must be nonzero")
     memory = anchor[:, None, :] + beta * offsets[None, :, :]

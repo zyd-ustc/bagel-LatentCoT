@@ -315,7 +315,7 @@ def main() -> None:
         "memory_init": {
             "source": "causal_final_prompt_token_at_body_entry",
             "body_entry_layer": contract["memory_loop_start_layer"],
-            "slot_offset": "centered_sin_cos_rms_normalized_v1",
+            "slot_offset": "centered_sin_cos_global_rms_v2",
             "slot_offset_beta": PROMPT_MEMORY_SLOT_BETA,
             "cfg_unconditioned_memory": "boundary_embedding_m0",
         },
