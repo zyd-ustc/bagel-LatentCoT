@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Prompt-as-memory hard-16 T2I: Write source × prompt-KV visibility.
+"""Prompt-as-memory hard-16 T2I: Write source × extra-loop prompt-KV visibility.
 
 The eight cells reuse one packed pair of prompts, prompt cache, and noises.
-Masking changes only non-memory generation queries' access to cached prompt
-keys; memory queries retain access. This does not score semantic image quality.
+The main mask changes only non-memory queries in the extra Write body pass;
+memory queries and the native prefix/Read/suffix retain prompt access.
+This does not score semantic image quality.
 """
 
 from __future__ import annotations
@@ -40,10 +41,11 @@ from qwen_latent_cot.bagel.write_sensitivity import (
 ARM_SOURCES = {
     "correct_M": "correct",
     "shuffled_across_sample_M": "shuffle",
-    "m0": "m0",
+    "prompt_init_M": "m0",
     "zero_M": "zero",
 }
-KV_POLICIES = {"keep": False, "mask_nonmemory": True}
+KV_POLICIES = {"keep": "none", "mask_loop_only": "extra_loop"}
+LEGACY_KV_POLICY = {"mask_all_generation": "all_generation"}
 PAIR_SIZE = 2
 NOISE_SCHEMA = "bagel-write-sensitivity-t2i-v1"
 
@@ -63,6 +65,7 @@ def parse_args():
     parser.add_argument("--cfg-text-scale", type=float, default=4.0)
     parser.add_argument("--cfg-img-scale", type=float, default=1.0)
     parser.add_argument("--max-prompts", type=int, default=16, help="Even number in [2,16]; use 2 for smoke")
+    parser.add_argument("--include-all-generation-control", action="store_true", help="Add the legacy destructive all-layer mask as a third policy")
     parser.add_argument("--dry-run", action="store_true", help="Validate contract without loading BAGEL")
     return parser.parse_args()
 
@@ -186,7 +189,7 @@ def prepare_pair(inferencer, rows: list[dict], noises: list[torch.Tensor], shape
 
 def generate_pair(
     inferencer, bundle: dict, args, source: str, probe: list[dict],
-    *, mask_prompt_kv: bool = False,
+    *, prompt_kv_mask_scope: str = "none",
 ) -> list:
     with torch.inference_mode(), autocast_for(inferencer.device):
         latents = inferencer.model.generate_image(
@@ -202,7 +205,7 @@ def generate_pair(
             return_loop_diagnostics=False,
             memory_write_source=source,
             memory_write_probe=probe,
-            mask_prompt_kv_for_nonmemory=mask_prompt_kv,
+            prompt_kv_mask_scope=prompt_kv_mask_scope,
         )
         if len(latents) != PAIR_SIZE:
             raise RuntimeError(f"BAGEL returned {len(latents)} images, expected {PAIR_SIZE}")
@@ -222,17 +225,17 @@ def summarize_probe(rows: list[dict], sample: int, expected_steps: int) -> dict[
     return result
 
 
-def write_gallery(output_dir: Path, rows: list[dict], image_maps: dict[str, dict[str, str]]) -> None:
+def write_gallery(output_dir: Path, rows: list[dict], image_maps: dict[str, dict[str, str]], policies: dict[str, str]) -> None:
     header = "".join(
         f"<th>{html.escape(policy)}<br>{html.escape(arm)}</th>"
-        for policy in KV_POLICIES for arm in ARM_SOURCES
+        for policy in policies for arm in ARM_SOURCES
     )
     body = []
     for index, row in enumerate(rows):
         prompt = str(row["prompt"])
         cells = "".join(
             f"<td><img src='p{index:03d}/{policy}/{arm}.png'><br>{html.escape(policy)} / {html.escape(arm)}</td>"
-            for policy in KV_POLICIES for arm in ARM_SOURCES
+            for policy in policies for arm in ARM_SOURCES
         )
         body.append(f"<tr><td>{index:02d}</td><td>{html.escape(prompt)}</td>{cells}</tr>")
     (output_dir / "index.html").write_text(
@@ -259,6 +262,9 @@ def main() -> None:
         raise ValueError("training YAML must be a mapping")
     contract = resolve_contract(config, {})
     validate_protocol(contract, args)
+    policies = dict(KV_POLICIES)
+    if args.include_all_generation_control:
+        policies.update(LEGACY_KV_POLICY)
     benchmark_path = args.benchmark_data.expanduser().resolve()
     rows = load_benchmark(benchmark_path, args.max_prompts)
     pairs = paired_rows(rows)
@@ -266,7 +272,8 @@ def main() -> None:
     if not model_path.is_dir():
         raise FileNotFoundError(model_path)
     if args.dry_run:
-        print(json.dumps({"contract": contract, "pairs": len(pairs), "memory_init": "prompt_body_entry_eos"}, indent=2))
+        print(json.dumps({"contract": contract, "pairs": len(pairs),
+                          "policies": policies, "memory_init": "prompt_body_entry_eos"}, indent=2))
         return
 
     output_dir = args.output_dir.expanduser().resolve()
@@ -306,7 +313,7 @@ def main() -> None:
         raise ValueError(f"height/width must be divisible by {model.latent_downsample}")
 
     manifest: dict[str, Any] = {
-        "schema": "bagel_prompt_memory_kv_visibility_write_hard16_v3",
+        "schema": "bagel_prompt_memory_extra_loop_kv_write_hard16_v4",
         "complete": False,
         "code_commit": code_commit(),
         "training_config": str(config_path),
@@ -324,9 +331,11 @@ def main() -> None:
         "benchmark_sha256": sha256(benchmark_path),
         "contract": contract,
         "arm_sources": ARM_SOURCES,
-        "prompt_kv_policies": {
-            "keep": "all generation queries see cached prompt KV",
-            "mask_nonmemory": "only memory queries see cached prompt KV, at every generation layer",
+        "prompt_kv_policies": policies,
+        "prompt_kv_mask_semantics": {
+            "none": "all generation queries see cached prompt KV",
+            "extra_loop": "only extra Write body pass blocks non-memory queries from cached prompt KV",
+            "all_generation": "legacy destructive control; every generation layer blocks non-memory prompt-KV reads",
         },
         "pair_size": PAIR_SIZE,
         "pairing": "adjacent_file_order; shuffle=roll(samples,+1)",
@@ -342,7 +351,7 @@ def main() -> None:
         "pairs": [],
         "geneval2_image_maps": {
             f"{policy}__{arm}": f"geneval2/{policy}__{arm}_image_paths.json"
-            for policy in KV_POLICIES for arm in ARM_SOURCES
+            for policy in policies for arm in ARM_SOURCES
         },
     }
     manifest_path = output_dir / "run_manifest.json"
@@ -351,7 +360,7 @@ def main() -> None:
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
     )
     image_maps: dict[str, dict[str, str]] = {
-        f"{policy}__{arm}": {} for policy in KV_POLICIES for arm in ARM_SOURCES
+        f"{policy}__{arm}": {} for policy in policies for arm in ARM_SOURCES
     }
     image_shape = (args.height, args.width)
     for pair_index, pair in enumerate(pairs):
@@ -378,14 +387,14 @@ def main() -> None:
         images: dict[str, dict[str, list]] = {}
         pair_dir = output_dir / f"pair_{pair_index:02d}"
         pair_dir.mkdir()
-        for policy, mask_prompt_kv in KV_POLICIES.items():
+        for policy, prompt_kv_mask_scope in policies.items():
             images[policy] = {}
             pair_result["policies"][policy] = {}
             for arm, source in ARM_SOURCES.items():
                 probe: list[dict] = []
                 images[policy][arm] = generate_pair(
                     inferencer, bundle, args, source, probe,
-                    mask_prompt_kv=mask_prompt_kv,
+                    prompt_kv_mask_scope=prompt_kv_mask_scope,
                 )
                 if len(probe) != (args.num_steps - 1) * PAIR_SIZE:
                     raise RuntimeError(f"{policy}/{arm}: incomplete Read→Write probe: {len(probe)} rows")
@@ -408,29 +417,31 @@ def main() -> None:
                         "prompt_index": global_index,
                         "image": str(image_path.resolve()),
                         "write_source": source,
-                        "mask_prompt_kv_for_nonmemory": mask_prompt_kv,
+                        "prompt_kv_mask_scope": prompt_kv_mask_scope,
                         "memory_probe": str(probe_path.resolve()),
                         "probe_mean": summarize_probe(probe, position, args.num_steps - 1),
                     })
                     print(f"[{global_index + 1}/{len(rows)}] {policy}/{arm}: {image_path}", flush=True)
                 pair_result["policies"][policy][arm] = arm_rows
         for position, global_index in enumerate(global_indexes):
-            for policy in KV_POLICIES:
+            for policy in policies:
                 for arm in ARM_SOURCES:
                     pair_result["policies"][policy][arm][position]["pixel_mae_vs_correct_M"] = (
                         0.0 if arm == "correct_M" else pixel_mae(images[policy][arm][position], images[policy]["correct_M"][position])
                     )
             for arm in ARM_SOURCES:
-                pair_result["policies"]["mask_nonmemory"][arm][position]["pixel_mae_vs_keep_same_arm"] = pixel_mae(
-                    images["mask_nonmemory"][arm][position], images["keep"][arm][position]
-                )
+                for policy in policies:
+                    if policy != "keep":
+                        pair_result["policies"][policy][arm][position]["pixel_mae_vs_keep_same_arm"] = pixel_mae(
+                            images[policy][arm][position], images["keep"][arm][position]
+                        )
         manifest["pairs"].append(pair_result)
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    write_gallery(output_dir, rows, image_maps)
+    write_gallery(output_dir, rows, image_maps, policies)
     manifest["complete"] = True
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"[done] {output_dir / 'index.html'}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit("Retired prompt-memory/mask protocol. Use scripts/evaluate/bagel_memory_mechanism.py; prompt KV stays visible.")

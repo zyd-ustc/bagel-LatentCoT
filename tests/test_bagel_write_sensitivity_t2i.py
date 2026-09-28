@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "evaluate"))
 from bagel_write_sensitivity_t2i import (  # noqa: E402
     ARM_SOURCES,
     KV_POLICIES,
+    LEGACY_KV_POLICY,
     paired_rows,
     prepare_pair,
     summarize_probe,
@@ -52,7 +53,9 @@ def test_protocol_fixes_architecture_and_real_pairs():
         [{"prompt": "2"}, {"prompt": "3"}],
     ]
     assert list(ARM_SOURCES.values()) == ["correct", "shuffle", "m0", "zero"]
-    assert KV_POLICIES == {"keep": False, "mask_nonmemory": True}
+    assert list(ARM_SOURCES) == ["correct_M", "shuffled_across_sample_M", "prompt_init_M", "zero_M"]
+    assert KV_POLICIES == {"keep": "none", "mask_loop_only": "extra_loop"}
+    assert LEGACY_KV_POLICY == {"mask_all_generation": "all_generation"}
     bad = contract()
     bad["loop_depth"] = 1
     with pytest.raises(ValueError, match="strict Read"):

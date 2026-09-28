@@ -25,8 +25,8 @@ DST_HOST="${DST_HOST:-root@dev.modelarts.cnszaismartcity01.api-ai.smartcitysz.co
 DST_PORT="${DST_PORT:-32692}"
 DST_KEY="${DST_KEY:-$HOME/Downloads/KeyPair-zyd.pem}"
 DST_ROOT="${DST_ROOT:-/cache/bagel-LatentCoT}"
-DST_MODEL="${DST_MODEL:-/data/bagel-LatentCoT/models/Bagel-7B-MoT}"
-DST_DATA="${DST_DATA:-/data/bagel-LatentCoT/datasets/qwen_latent_cot_v3_adapted_20260816}"
+DST_MODEL="${DST_MODEL:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}"
+DST_DATA="${DST_DATA:-/data/zyd_workspace/bagel-LatentCoT/datasets/qwen_latent_cot_v3_adapted_20260816}"
 
 STATE_DIR="${STATE_DIR:-$HOME/.cache/port_h200_to_job}"
 LOG="$STATE_DIR/transfer.log"

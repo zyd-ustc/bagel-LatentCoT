@@ -112,7 +112,7 @@ class InterleaveInferencer:
         return gen_context
 
     @torch.no_grad()
-    def update_context_text(self, text, gen_context):
+    def update_context_text(self, text, gen_context, *, capture_prompt_hidden_at=None):
         # used for interleave data, currently only support 1 data inference,
 
         past_key_values = gen_context["past_key_values"]
@@ -127,9 +127,25 @@ class InterleaveInferencer:
         )
         generation_input = _move_to_device(generation_input, self.device)
 
-        past_key_values = self.model.forward_cache_update_text(
-            past_key_values, **generation_input
+        result = self.model.forward_cache_update_text(
+            past_key_values, **generation_input,
+            **({"capture_body_entry_at": int(capture_prompt_hidden_at),
+                "return_full_body_entry": True}
+               if capture_prompt_hidden_at is not None else {})
         )
+        if capture_prompt_hidden_at is not None:
+            from .memory_init import prompt_content_mask
+            past_key_values, hidden = result
+            ids = generation_input["packed_text_ids"].tolist()
+            content = prompt_content_mask(ids, self.tokenizer, special_ids=(
+                self.new_token_ids["bos_token_id"], self.new_token_ids["eos_token_id"]))
+            gen_context["prompt_hidden"] = {int(capture_prompt_hidden_at): hidden.detach()}
+            gen_context["prompt_mask"] = torch.ones((1, len(ids)), dtype=torch.bool,
+                                                    device=hidden.device)
+            gen_context["content_mask"] = torch.tensor(content, dtype=torch.bool,
+                                                       device=hidden.device).unsqueeze(0)
+        else:
+            past_key_values = result
         gen_context["kv_lens"] = kv_lens
         gen_context["ropes"] = ropes
         gen_context["past_key_values"] = past_key_values
@@ -493,46 +509,6 @@ class InterleaveInferencer:
         return self.model.predict_image_velocity(**kwargs)
 
     @torch.no_grad()
-    def predict_dynamic_prompt_velocity(
-        self,
-        *,
-        x_t: torch.Tensor,
-        timestep: float,
-        condition: ImageConditionBundle,
-        alpha: float,
-        body_start: int = 12,
-        body_end: int = 20,
-        delta_mode: str = "dynamic",
-        cfg_text_scale: float = 4.0,
-        cfg_img_scale: float = 1.0,
-        cfg_interval: Tuple[float, float] = (0.4, 1.0),
-        cfg_renorm_min: float = 0.0,
-        cfg_renorm_type: str = "global",
-        return_diagnostics: bool = False,
-    ):
-        """Evaluate one fixed-x_t anchored prompt Read/Write counterfactual."""
-
-        self.model.language_model.model.enable_taylorseer = False
-        kwargs = self.build_image_velocity_kwargs(
-            x_t=x_t,
-            timestep=timestep,
-            condition=condition,
-            cfg_text_scale=cfg_text_scale,
-            cfg_img_scale=cfg_img_scale,
-            cfg_interval=cfg_interval,
-            cfg_renorm_min=cfg_renorm_min,
-            cfg_renorm_type=cfg_renorm_type,
-        )
-        return self.model._forward_dynamic_prompt(
-            **kwargs,
-            prompt_body_start=int(body_start),
-            prompt_body_end=int(body_end),
-            prompt_alpha=float(alpha),
-            prompt_delta_mode=str(delta_mode),
-            return_diagnostics=bool(return_diagnostics),
-        )
-
-    @torch.no_grad()
     def gen_image(
         self,
         image_shape,
@@ -564,11 +540,8 @@ class InterleaveInferencer:
         memory_loop_start: Optional[int] = None,
         memory_loop_end: Optional[int] = None,
         round0_memory_write_enabled: Optional[bool] = None,
-        dynamic_prompt_alpha: Optional[float] = None,
-        dynamic_prompt_body_start: int = 12,
-        dynamic_prompt_body_end: int = 20,
-        dynamic_prompt_step_fraction: float = 0.35,
-        dynamic_prompt_delta_mode: str = "dynamic",
+        single_pass_memory_update_end: Optional[int] = None,
+        single_pass_mask_prompt_kv: bool = False,
     ):
         # print(cfg_renorm_type)
         past_key_values = gen_context["past_key_values"]
@@ -673,11 +646,8 @@ class InterleaveInferencer:
             memory_loop_start=memory_loop_start,
             memory_loop_end=memory_loop_end,
             round0_memory_write_enabled=round0_memory_write_enabled,
-            dynamic_prompt_alpha=dynamic_prompt_alpha,
-            dynamic_prompt_body_start=int(dynamic_prompt_body_start),
-            dynamic_prompt_body_end=int(dynamic_prompt_body_end),
-            dynamic_prompt_step_fraction=float(dynamic_prompt_step_fraction),
-            dynamic_prompt_delta_mode=str(dynamic_prompt_delta_mode),
+            single_pass_memory_update_end=single_pass_memory_update_end,
+            single_pass_mask_prompt_kv=single_pass_mask_prompt_kv,
         )
 
         if return_trajectory:
@@ -1120,11 +1090,8 @@ class InterleaveInferencer:
         return_latent: bool = False,
         remove_old_prompt: Optional[bool] = None,
         return_loop_diagnostics: bool = False,
-        dynamic_prompt_alpha: Optional[float] = None,
-        dynamic_prompt_body_start: int = 12,
-        dynamic_prompt_body_end: int = 20,
-        dynamic_prompt_step_fraction: float = 0.35,
-        dynamic_prompt_delta_mode: str = "dynamic",
+        single_pass_memory_update_end: Optional[int] = None,
+        single_pass_mask_prompt_kv: bool = False,
     ) -> List[Union[str, Image.Image]]:
         """Official interleaved entry point.
 
@@ -1210,13 +1177,8 @@ class InterleaveInferencer:
                     init_noise=init_noise,
                     return_latent=bool(return_latent),
                     return_loop_diagnostics=bool(return_loop_diagnostics),
-                    dynamic_prompt_alpha=dynamic_prompt_alpha,
-                    dynamic_prompt_body_start=int(dynamic_prompt_body_start),
-                    dynamic_prompt_body_end=int(dynamic_prompt_body_end),
-                    dynamic_prompt_step_fraction=float(
-                        dynamic_prompt_step_fraction
-                    ),
-                    dynamic_prompt_delta_mode=str(dynamic_prompt_delta_mode),
+                    single_pass_memory_update_end=single_pass_memory_update_end,
+                    single_pass_mask_prompt_kv=single_pass_mask_prompt_kv,
                 )
                 if return_latent:
                     img, self.last_latent = gen_result

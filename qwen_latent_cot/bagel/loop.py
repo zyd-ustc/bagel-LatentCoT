@@ -85,6 +85,7 @@ class LoopLoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
         self.read_enabled = bool(read_enabled)
+        self.write_enabled = True
         self.loop_mode = "off"
 
     @property
@@ -113,6 +114,8 @@ class LoopLoRALinear(nn.Module):
     ) -> torch.Tensor:
         output = self.base_layer(inputs)
         if self.loop_mode == "off":
+            return output
+        if self.loop_mode == "write" and not self.write_enabled:
             return output
         if self.loop_mode == "read" and (not self.read_enabled or row_mask is None):
             return output

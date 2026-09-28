@@ -839,10 +839,40 @@ def test_k_ablation_slices_allocated_memory_slots():
     assert seen == [(1, 4), (1, 4)]
 
 
+def test_single_pass_routes_one_forward_per_step_and_training_mask_range():
+    seen = []
+
+    def forward(kwargs):
+        seen.append(kwargs)
+        memory = kwargs["loop_memory"]
+        return kwargs["x_t"], memory, memory, memory, {}
+
+    dummy = _make_memory_dummy(
+        persist=False, recycle_mode="same_depth", forward=forward
+    )
+    dummy.generate_image(
+        **_generate_kwargs(
+            memory_loop_start=1, memory_loop_end=3,
+            single_pass_memory_update_end=2,
+            single_pass_mask_prompt_kv=True,
+            return_loop_diagnostics=False,
+        )
+    )
+    assert len(seen) == 2  # One forward at each of two timesteps.
+    assert all(call["memory_loop_repeat"] == 1 for call in seen)
+    assert all(call["single_pass_memory_update_end"] == 2 for call in seen)
+    assert all(call["single_pass_prompt_mask_start"] == 1 for call in seen)
+    assert all(call["single_pass_prompt_mask_end"] == 3 for call in seen)
+    assert all(call["round0_memory_write_enabled"] is True for call in seen)
+    assert all(call["memory_body_in"] is None for call in seen)
+
+
 class TinySdpaLayer:
     def __init__(self):
         self.blocks = []
         self.prompt_masks = []
+        self.inputs = []
+        self.outputs = []
 
     def forward_inference(
         self,
@@ -861,25 +891,35 @@ class TinySdpaLayer:
 
         self.blocks.append(bool(block_gen_reads_memory))
         self.prompt_masks.append(bool(kwargs.get("mask_prompt_kv_for_nonmemory", False)))
+        self.inputs.append(packed_query_sequence.detach().clone())
         qkv = packed_query_sequence.unsqueeze(1)
-        kv_lens = query_lens
+        prompt = (
+            past_key_values.key_cache[0]
+            if past_key_values is not None and past_key_values.key_cache[0] is not None
+            else None
+        )
+        keys = torch.cat((prompt, qkv), dim=0) if prompt is not None else qkv
+        kv_lens = query_lens + (int(prompt.shape[0]) if prompt is not None else 0)
         blocked = None
-        if bool(block_gen_reads_memory):
+        if bool(block_gen_reads_memory) or self.prompt_masks[-1]:
             blocked = round0_blocked_slices(
                 query_lens,
                 kv_lens,
                 packed_vae_token_indexes,
                 packed_memory_token_indexes,
+                mask_prompt_kv_for_nonmemory=self.prompt_masks[-1],
+                block_gen_reads_memory=bool(block_gen_reads_memory),
             )
         attn = _sdpa_varlen_inference(
             query=qkv,
-            key=qkv,
-            value=qkv,
+            key=keys,
+            value=keys,
             query_lens=query_lens,
             key_value_lens=kv_lens,
             causal=False,
             blocked_slices=blocked,
         )
+        self.outputs.append(attn.squeeze(1).detach().clone())
         return attn.squeeze(1), past_key_values
 
 
@@ -922,12 +962,14 @@ def _sdpa_layout():
 def _run_tiny_sdpa(
     seq, *, block: bool, repeat: int = 1, body: bool = True,
     n_layers: int = 3, prompt_init=None, write_source="correct", write_probe=None,
-    mask_prompt_kv=False, body_start=0,
+    prompt_kv_mask_scope="none", prompt_cache=False, body_start=0,
+    single_pass_memory_update_end=None, single_pass_prompt_mask_start=None,
+    single_pass_prompt_mask_end=None,
 ):
     from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache, Qwen2Model
 
     navit = TinySdpaNavit(n_layers)
-    cache = NaiveCache(n_layers) if mask_prompt_kv else None
+    cache = NaiveCache(n_layers) if prompt_cache or prompt_kv_mask_scope != "none" else None
     if cache is not None:
         cache.key_cache[0] = torch.zeros(1, 1, seq.shape[-1])
     _, mem, gen, text = _sdpa_layout()
@@ -937,7 +979,7 @@ def _run_tiny_sdpa(
         packed_query_position_ids=torch.arange(4),
         packed_query_indexes=torch.arange(4),
         past_key_values=cache,
-        key_values_lens=torch.tensor([1 if mask_prompt_kv else 0], dtype=torch.int),
+        key_values_lens=torch.tensor([1 if cache is not None else 0], dtype=torch.int),
         packed_key_value_indexes=torch.tensor([], dtype=torch.long),
         update_past_key_values=False,
         is_causal=False,
@@ -949,7 +991,10 @@ def _run_tiny_sdpa(
         prompt_body_memory_init=prompt_init,
         memory_write_source=write_source,
         memory_write_probe=write_probe,
-        mask_prompt_kv_for_nonmemory=mask_prompt_kv,
+        prompt_kv_mask_scope=prompt_kv_mask_scope,
+        single_pass_memory_update_end=single_pass_memory_update_end,
+        single_pass_prompt_mask_start=single_pass_prompt_mask_start,
+        single_pass_prompt_mask_end=single_pass_prompt_mask_end,
     )
     if body:
         kwargs.update(
@@ -982,16 +1027,54 @@ def test_prompt_body_memory_is_the_exact_m0_write_source():
         _run_tiny_sdpa(seq, block=True, body=False, prompt_init=prompt_init)
 
 
-def test_prompt_kv_mask_reaches_prefix_read_write_and_suffix():
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        ("none", [[False], [False, False], [False, False]]),
+        ("extra_loop", [[False], [False, True], [False, False]]),
+        ("all_generation", [[True], [True, True], [True, True]]),
+    ],
+)
+def test_prompt_kv_mask_scope_traces_only_selected_round(scope, expected):
     seq, _, _, _ = _sdpa_layout()
     _, navit = _run_tiny_sdpa(
         seq, block=True, repeat=2, body=True, n_layers=3,
         prompt_init=torch.tensor([[5.0, 0.0]]),
-        mask_prompt_kv=True, body_start=1,
+        prompt_kv_mask_scope=scope, prompt_cache=True, body_start=1,
     )
-    assert [layer.prompt_masks for layer in navit.layers] == [
-        [True], [True, True], [True, True],
-    ]
+    assert [layer.prompt_masks for layer in navit.layers] == expected
+
+
+def test_extra_loop_keeps_prefix_and_read_numerically_identical():
+    seq, mem, _, _ = _sdpa_layout()
+    prompt_init = torch.tensor([[5.0, 0.0]])
+    keep, keep_navit = _run_tiny_sdpa(
+        seq, block=True, repeat=2, body=True, n_layers=3,
+        prompt_init=prompt_init, prompt_cache=True, body_start=1,
+    )
+    masked, masked_navit = _run_tiny_sdpa(
+        seq, block=True, repeat=2, body=True, n_layers=3,
+        prompt_init=prompt_init, prompt_cache=True,
+        prompt_kv_mask_scope="extra_loop", body_start=1,
+    )
+    assert torch.equal(keep_navit.layers[0].outputs[0], masked_navit.layers[0].outputs[0])
+    assert torch.equal(keep_navit.layers[1].inputs[0], masked_navit.layers[1].inputs[0])
+    assert torch.equal(keep_navit.layers[1].outputs[0][mem], masked_navit.layers[1].outputs[0][mem])
+    assert torch.equal(keep.memory_round_hiddens[0], masked.memory_round_hiddens[0])
+
+
+def test_extra_loop_rejects_non_strict_or_missing_write():
+    seq, _, _, _ = _sdpa_layout()
+    prompt_init = torch.tensor([[5.0, 0.0]])
+    with pytest.raises(ValueError, match="strict Read"):
+        _run_tiny_sdpa(seq, block=False, repeat=2, prompt_init=prompt_init,
+                       prompt_kv_mask_scope="extra_loop")
+    with pytest.raises(ValueError, match="exactly one Write"):
+        _run_tiny_sdpa(seq, block=True, repeat=1, prompt_init=prompt_init,
+                       prompt_kv_mask_scope="extra_loop")
+    with pytest.raises(ValueError, match="invalid prompt KV mask scope"):
+        _run_tiny_sdpa(seq, block=True, repeat=2, prompt_init=prompt_init,
+                       prompt_kv_mask_scope="typo")
 
 
 def test_prompt_kv_mask_blocks_only_nonmemory_queries_per_sample():
@@ -1047,6 +1130,45 @@ def test_prompt_kv_mask_preserves_memory_read_but_blocks_direct_rows():
     original, mutated = attend(values), attend(changed)
     assert torch.equal(original[[0, 2]], mutated[[0, 2]])
     assert not torch.equal(original[1], mutated[1])
+
+
+def test_single_pass_updates_memory_then_freezes_it_and_masks_configured_layers():
+    seq, mem, gen, _ = _sdpa_layout()
+    keep, keep_navit = _run_tiny_sdpa(
+        seq, block=False, body=False, n_layers=4, prompt_cache=True,
+        single_pass_memory_update_end=2,
+    )
+    masked, masked_navit = _run_tiny_sdpa(
+        seq, block=False, body=False, n_layers=4, prompt_cache=True,
+        single_pass_memory_update_end=2,
+        single_pass_prompt_mask_start=1, single_pass_prompt_mask_end=3,
+    )
+    assert [layer.prompt_masks for layer in masked_navit.layers] == [
+        [False], [True], [True], [False],
+    ]
+    assert all(layer.blocks == [False] for layer in masked_navit.layers)
+    assert torch.equal(keep_navit.layers[0].outputs[0], masked_navit.layers[0].outputs[0])
+    assert torch.equal(keep_navit.layers[1].inputs[0], masked_navit.layers[1].inputs[0])
+    assert torch.equal(keep_navit.layers[1].outputs[0][mem], masked_navit.layers[1].outputs[0][mem])
+    assert torch.equal(masked.memory_body_out, masked_navit.layers[1].outputs[0][mem])
+    assert torch.equal(masked_navit.layers[3].inputs[0][mem], masked.memory_body_out)
+    assert torch.equal(masked.packed_query_sequence[mem], masked.memory_body_out)
+    assert not torch.equal(keep.packed_query_sequence[gen], masked.packed_query_sequence[gen])
+
+
+def test_single_pass_rejects_missing_prompt_cache_and_second_body():
+    seq, _, _, _ = _sdpa_layout()
+    with pytest.raises(ValueError, match="nonempty prompt cache"):
+        _run_tiny_sdpa(
+            seq, block=False, body=False, n_layers=4,
+            single_pass_memory_update_end=2,
+            single_pass_prompt_mask_start=1, single_pass_prompt_mask_end=3,
+        )
+    with pytest.raises(ValueError, match="without a loop"):
+        _run_tiny_sdpa(
+            seq, block=False, body=True, n_layers=4, prompt_cache=True,
+            single_pass_memory_update_end=2,
+        )
 
 
 def test_prompt_hidden_capture_stops_at_requested_depth():
@@ -1296,6 +1418,8 @@ def test_full_depth_block_flag_uses_sequential_path():
 def test_diagnostics_populate_deltas_when_r_ge_2():
     from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import BaseNavitOutputWithPast
 
+    seen_scopes = []
+
     class Dummy(Bagel):
         def __init__(self):
             self.hidden_size = 4
@@ -1306,6 +1430,7 @@ def test_diagnostics_populate_deltas_when_r_ge_2():
                 return torch.ones(int(ids.numel()), 4)
 
             def forward_inference(**kwargs):
+                seen_scopes.append(kwargs["prompt_kv_mask_scope"])
                 seq = kwargs["packed_query_sequence"].clone()
                 loop_idx = kwargs["packed_memory_token_indexes"]
                 gen_idx = kwargs["packed_vae_token_indexes"]
@@ -1355,6 +1480,12 @@ def test_diagnostics_populate_deltas_when_r_ge_2():
         key_values_lens=torch.tensor([0], dtype=torch.int),
         past_key_values=object(),
         packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        cfg_text_scale=4.0,
+        cfg_text_packed_position_ids=torch.zeros(4, dtype=torch.long),
+        cfg_text_packed_query_indexes=torch.arange(4),
+        cfg_text_key_values_lens=torch.tensor([0], dtype=torch.int),
+        cfg_text_past_key_values=object(),
+        cfg_text_packed_key_value_indexes=torch.tensor([], dtype=torch.long),
         packed_loop_token_indexes=torch.tensor([1]),
         loop_memory=torch.ones(1, 4),
         recycle_mode="same_depth",
@@ -1364,7 +1495,9 @@ def test_diagnostics_populate_deltas_when_r_ge_2():
         embed_memory=torch.ones(1, 4),
         round0_gen_reads_memory=False,
         collect_round_diagnostics=True,
+        prompt_kv_mask_scope="extra_loop",
     )
+    assert seen_scopes == ["extra_loop", "none"]
     assert diag["delta_m"]
     assert diag["delta_g"]
     assert diag["delta_v"]

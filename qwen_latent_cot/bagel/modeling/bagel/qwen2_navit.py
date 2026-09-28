@@ -44,6 +44,7 @@ from ..cache_utils.taylorseer import (
 )
 from ...accelerator import enable_dynamo_flex_attention as _enable_dynamo_flex_attention
 from ...write_sensitivity import append_write_probe, select_write_memory
+from ...memory_mechanism import run_decoder, zero_memory_qkv, append_attention_stats
 
 
 torch._dynamo.config.cache_size_limit = 512
@@ -406,12 +407,6 @@ class NaiveCache:
     def __init__(self, num_layers):
         self.key_cache = {k: None for k in range(num_layers)}
         self.value_cache = {k: None for k in range(num_layers)}
-        # Phase 0.5 keeps pretrained prompt KV as an immutable anchor.
-        self.hidden_cache = {k: None for k in range(num_layers)}
-        self.prompt_mask = None
-        self.position_ids = None
-        self.capture_layer_inputs = False
-        self.dynamic_prompt_eligible = True
 
     @property
     def num_layers(self):
@@ -424,123 +419,6 @@ class NaiveCache:
         else:
             return 0
 
-    @staticmethod
-    def _merge_rows(current, new_rows, query_indexes, cached_indexes):
-        if current is None:
-            return new_rows
-        total = int(query_indexes.numel()) + int(cached_indexes.numel())
-        merged = new_rows.new_empty((total, *new_rows.shape[1:]))
-        merged[query_indexes] = new_rows
-        merged[cached_indexes] = current.to(
-            device=new_rows.device, dtype=new_rows.dtype
-        )
-        return merged
-
-    def record_layer_input(
-        self,
-        layer_idx: int,
-        hidden: torch.Tensor,
-        query_indexes: torch.Tensor,
-        cached_indexes: torch.Tensor,
-    ) -> None:
-        self.hidden_cache[int(layer_idx)] = self._merge_rows(
-            self.hidden_cache[int(layer_idx)],
-            hidden.detach(),
-            query_indexes,
-            cached_indexes,
-        )
-
-    def record_segment(
-        self,
-        position_ids: torch.Tensor,
-        query_indexes: torch.Tensor,
-        cached_indexes: torch.Tensor,
-        *,
-        is_prompt: bool,
-    ) -> None:
-        old_mask = self.prompt_mask
-        old_positions = self.position_ids
-        if old_mask is None:
-            if int(cached_indexes.numel()) != 0:
-                raise ValueError("cache metadata was not recorded for an earlier segment")
-            self.prompt_mask = torch.full_like(
-                position_ids, bool(is_prompt), dtype=torch.bool
-            )
-            self.position_ids = position_ids.detach().to(dtype=torch.long).clone()
-            return
-        if int(old_mask.numel()) != int(cached_indexes.numel()):
-            raise ValueError("cache metadata is not aligned with cached KV rows")
-        total = int(query_indexes.numel()) + int(cached_indexes.numel())
-        mask = torch.zeros(total, device=position_ids.device, dtype=torch.bool)
-        positions = torch.zeros(total, device=position_ids.device, dtype=torch.long)
-        mask[query_indexes] = bool(is_prompt)
-        mask[cached_indexes] = old_mask.to(mask.device)
-        positions[query_indexes] = position_ids.to(dtype=torch.long)
-        positions[cached_indexes] = old_positions.to(positions.device)
-        self.prompt_mask = mask
-        self.position_ids = positions
-
-    def record_prompt_segment(
-        self,
-        position_ids: torch.Tensor,
-        query_indexes: torch.Tensor,
-        cached_indexes: torch.Tensor,
-    ) -> None:
-        self.record_segment(
-            position_ids,
-            query_indexes,
-            cached_indexes,
-            is_prompt=True,
-        )
-
-    def record_non_prompt_segment(
-        self,
-        position_ids: torch.Tensor,
-        query_indexes: torch.Tensor,
-        cached_indexes: torch.Tensor,
-    ) -> None:
-        self.record_segment(
-            position_ids,
-            query_indexes,
-            cached_indexes,
-            is_prompt=False,
-        )
-        self.dynamic_prompt_eligible = False
-        self.hidden_cache = {k: None for k in range(self.num_layers)}
-
-    def with_value_residuals(
-        self,
-        *,
-        start_layer: int,
-        prompt_indexes: torch.Tensor,
-        residuals: Tuple[torch.Tensor, ...],
-        alpha: float,
-    ) -> "NaiveCache":
-        """Shallow-fork the anchor cache and modify selected prompt V rows."""
-
-        fork = NaiveCache(self.num_layers)
-        fork.key_cache = dict(self.key_cache)
-        fork.value_cache = dict(self.value_cache)
-        fork.hidden_cache = dict(self.hidden_cache)
-        fork.prompt_mask = self.prompt_mask
-        fork.position_ids = self.position_ids
-        fork.capture_layer_inputs = False
-        fork.dynamic_prompt_eligible = self.dynamic_prompt_eligible
-        indexes = prompt_indexes.to(dtype=torch.long)
-        for offset, residual in enumerate(residuals):
-            layer_idx = int(start_layer) + offset
-            base = self.value_cache[layer_idx]
-            if base is None:
-                raise ValueError(f"missing anchor value cache at layer {layer_idx}")
-            local_indexes = indexes.to(base.device)
-            updated = base.clone()
-            updated[local_indexes] = (
-                base[local_indexes]
-                + float(alpha) * residual.to(device=base.device, dtype=base.dtype)
-            )
-            fork.value_cache[layer_idx] = updated
-        return fork
-
 
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):
@@ -550,8 +428,9 @@ class BaseNavitOutputWithPast(ModelOutput):
     memory_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_suffix_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
+    write_round_suffix_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
+    write_round_memories: Optional[Tuple[torch.Tensor, ...]] = None
     body_entry_hidden: Optional[torch.FloatTensor] = None
-    prompt_value_residuals: Optional[Tuple[torch.Tensor, ...]] = None
 
 
 def pad_sequence(tensor, pad_size):
@@ -744,7 +623,7 @@ class PackedAttention(Qwen2Attention):
             torch.cumsum(key_values_lens, dim=0), (1, 0)
         )
 
-        if flash_attn_varlen_func is None:
+        if flash_attn_varlen_func is None or packed_query_states.device.type != "cuda":
             packed_attn_output = _sdpa_varlen_inference(
                 query=packed_query_states,
                 key=merged_key_states,
@@ -987,6 +866,9 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_memory_token_indexes=None,
         block_gen_reads_memory=False,
         mask_prompt_kv_for_nonmemory=False,
+        force_memory_qkv_zero=False,
+        mechanism_attention_trace=None,
+        mechanism_stage=None,
     ):
         if mode == "und":
             packed_query_states = self.q_proj(packed_query_sequence).view(
@@ -1090,6 +972,12 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
+        if force_memory_qkv_zero:
+            packed_query_states, packed_key_states, packed_value_states = zero_memory_qkv(
+                packed_query_states, packed_key_states, packed_value_states,
+                packed_memory_token_indexes,
+            )
+
         if (
             past_key_values is not None
             and past_key_values.key_cache[self.layer_idx] is not None
@@ -1135,7 +1023,15 @@ class PackedAttentionMoT(Qwen2Attention):
             ):
                 blocked_slices = None
 
-        if flash_attn_varlen_func is None or blocked_slices is not None:
+        append_attention_stats(
+            mechanism_attention_trace, query=packed_query_states,
+            key=merged_key_states, query_lens=query_lens, key_lens=key_values_lens,
+            memory_indexes=packed_memory_token_indexes,
+            gen_indexes=packed_vae_token_indexes, blocked_slices=blocked_slices,
+            layer=self.layer_idx, stage=mechanism_stage,
+        )
+        if (flash_attn_varlen_func is None or packed_query_states.device.type != "cuda"
+                or blocked_slices is not None):
             packed_attn_output = _sdpa_varlen_inference(
                 query=packed_query_states,
                 key=merged_key_states,
@@ -1366,6 +1262,10 @@ class Qwen2MoTDecoderLayer(nn.Module):
         packed_memory_token_indexes=None,
         block_gen_reads_memory=False,
         mask_prompt_kv_for_nonmemory=False,
+        force_memory_qkv_zero=False,
+        mechanism_attention_trace=None,
+        mechanism_stage=None,
+        opd_memory_hidden=None,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1393,6 +1293,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 packed_query_sequence = packed_query_sequence_
 
             # Self Attention
+            native_attn_input = packed_query_sequence
             packed_query_sequence, past_key_values = self.self_attn.forward_inference(
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
@@ -1409,7 +1310,20 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 packed_memory_token_indexes=packed_memory_token_indexes,
                 block_gen_reads_memory=block_gen_reads_memory,
                 mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
+                force_memory_qkv_zero=force_memory_qkv_zero,
+                mechanism_attention_trace=mechanism_attention_trace,
+                mechanism_stage=mechanism_stage,
             )
+            if opd_memory_hidden is not None:
+                if mode != "gen" or packed_vae_token_indexes is None or not hasattr(self, "memory_reader"):
+                    raise ValueError("OPD reader requires installed MoT GEN layer")
+                native_gen_rms = (packed_query_sequence[packed_vae_token_indexes].detach()
+                    .float().square().mean().sqrt()) if torch.is_grad_enabled() else None
+                packed_query_sequence = packed_query_sequence.clone()
+                packed_query_sequence[packed_vae_token_indexes] += self.memory_reader(
+                    native_attn_input[packed_vae_token_indexes], opd_memory_hidden)
+                if native_gen_rms is not None:
+                    self.memory_reader.last_native_attn_rms = float(native_gen_rms)
             packed_query_sequence = residual + packed_query_sequence
 
             # Fully Connected
@@ -1736,9 +1650,22 @@ class Qwen2Model(Qwen2PreTrainedModel):
         memory_write_probe: Optional[list] = None,
         capture_body_entry_at: Optional[int] = None,
         prompt_body_memory_init: Optional[torch.Tensor] = None,
-        mask_prompt_kv_for_nonmemory: bool = False,
-        collect_prompt_value_residuals: bool = False,
-        prompt_cache_indexes: Optional[torch.Tensor] = None,
+        prompt_kv_mask_scope: str = "none",
+        single_pass_memory_update_end: Optional[int] = None,
+        single_pass_prompt_mask_start: Optional[int] = None,
+        single_pass_prompt_mask_end: Optional[int] = None,
+        memory_control_mode: Optional[str] = None,
+        memory_control_rounds: int = 2,
+        mechanism_diagnostics: Optional[dict] = None,
+        write_memory_override: Optional[torch.Tensor] = None,
+        write_memory_update: bool = True,
+        mask_prompt_kv_during_write: bool = False,
+        collect_write_round_outputs: bool = False,
+        attention_mass_sink: Optional[list] = None,
+        attention_mass_layers: Tuple[int, ...] = (12, 15, 19),
+        opd_memory_hidden: Optional[torch.Tensor] = None,
+        opd_reader_start: Optional[int] = None,
+        opd_reader_end: Optional[int] = None,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1753,6 +1680,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
         cos = cos.squeeze(0)
         sin = sin.squeeze(0)
         packed_query_position_embeddings = (cos, sin)
+
+        if opd_memory_hidden is not None:
+            if (not self.use_moe or mode != "gen" or update_past_key_values or is_causal
+                    or packed_memory_token_indexes is not None or memory_loop_repeat != 1
+                    or within_step_loop_repeat != 1 or memory_read_only
+                    or opd_reader_start is None or opd_reader_end is None
+                    or not 0 <= opd_reader_start < opd_reader_end <= len(self.layers)):
+                raise ValueError("OPD requires native K=0 GEN forward and explicit reader body")
+            if opd_memory_hidden.ndim != 2 or opd_memory_hidden.shape[-1] != self.config.hidden_size:
+                raise ValueError("OPD memory must be [K, hidden_size]")
 
         extra_inputs = {}
         if self.use_moe:
@@ -1773,6 +1710,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
             loop_adapter_mode="off",
             packed_memory_token_indexes=None,
             block_gen_reads_memory=False,
+            mask_prompt_kv_for_nonmemory=False,
+            force_memory_qkv_zero=False,
+            mechanism_attention_trace=None,
+            mechanism_stage=None,
         ):
             decoder_layer = self.layers[layer_idx]
             if enable_taylorseer:
@@ -1783,17 +1724,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
             actual_layer = getattr(
                 decoder_layer, "_checkpoint_wrapped_module", decoder_layer
             )
-            if (
-                update_past_key_values
-                and past_key_values is not None
-                and bool(past_key_values.capture_layer_inputs)
-            ):
-                past_key_values.record_layer_input(
-                    layer_idx,
-                    hidden,
-                    packed_query_indexes,
-                    packed_key_value_indexes,
-                )
+            if attention_mass_sink is not None and layer_idx in attention_mass_layers:
+                mechanism_attention_trace = attention_mass_sink
+                mechanism_stage = loop_adapter_mode
             layer_kwargs = dict(
                 query_lens=query_lens,
                 packed_query_position_embeddings=packed_query_position_embeddings,
@@ -1805,32 +1738,34 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 is_causal=is_causal,
                 **extra_inputs,
             )
+            if opd_memory_hidden is not None and opd_reader_start <= layer_idx < opd_reader_end:
+                layer_kwargs["opd_memory_hidden"] = opd_memory_hidden
             if packed_memory_token_indexes is not None:
                 layer_kwargs["packed_memory_token_indexes"] = packed_memory_token_indexes
                 layer_kwargs["block_gen_reads_memory"] = bool(block_gen_reads_memory)
             if mask_prompt_kv_for_nonmemory:
                 layer_kwargs["mask_prompt_kv_for_nonmemory"] = True
+            if force_memory_qkv_zero:
+                layer_kwargs["force_memory_qkv_zero"] = True
+            if mechanism_attention_trace is not None:
+                layer_kwargs["mechanism_attention_trace"] = mechanism_attention_trace
+                layer_kwargs["mechanism_stage"] = mechanism_stage
             use_checkpoint = (
                 bool(checkpoint)
                 and bool(getattr(self, "gradient_checkpointing", False))
-                and self.training
+                and (self.training or opd_memory_hidden is not None)
                 and torch.is_grad_enabled()
             )
             def _enable_loop_adapters():
+                # Explicitly disable adapters for native/prefix/suffix too.
                 local_states = []
-                if loop_adapter_mode != "off":
-                    modules_fn = getattr(actual_layer, "modules", None)
-                    iterable = modules_fn() if callable(modules_fn) else ()
-                    for module in iterable:
-                        setter = getattr(module, "set_loop_mode", None)
-                        if callable(setter):
-                            local_states.append(
-                                (
-                                    module,
-                                    str(getattr(module, "loop_mode", "off")),
-                                )
-                            )
-                            setter(loop_adapter_mode)
+                modules_fn = getattr(actual_layer, "modules", None)
+                iterable = modules_fn() if callable(modules_fn) else ()
+                for module in iterable:
+                    setter = getattr(module, "set_loop_mode", None)
+                    if callable(setter):
+                        local_states.append((module, str(getattr(module, "loop_mode", "off"))))
+                        setter(loop_adapter_mode)
                 return local_states
 
             if use_checkpoint:
@@ -1881,10 +1816,46 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 raise ValueError(f"unsupported MoT mode: {mode}")
             return self.norm(hidden)
 
+        if memory_control_mode is not None:
+            if (
+                self.training or torch.is_grad_enabled() or not self.use_moe
+                or mode != "gen" or update_past_key_values or is_causal
+                or enable_taylorseer or within_step_loop_repeat != 1
+                or memory_body_in is not None or prompt_body_memory_init is not None
+                or single_pass_memory_update_end is not None
+                or single_pass_prompt_mask_start is not None
+                or single_pass_prompt_mask_end is not None
+                or prompt_kv_mask_scope != "none" or memory_write_source != "correct"
+                or memory_write_probe is not None or memory_read_only
+                or capture_body_entry_at is not None or collect_round_diagnostics
+                or write_memory_override is not None or not write_memory_update
+                or mask_prompt_kv_during_write or collect_write_round_outputs
+                or attention_mass_sink is not None
+            ):
+                raise ValueError("memory mechanism requires frozen inference without legacy interventions")
+            if memory_loop_start is None or memory_loop_end is None:
+                raise ValueError("memory mechanism requires explicit body bounds")
+            result = run_decoder(
+                packed_query_sequence, mode=memory_control_mode,
+                indexes=packed_memory_token_indexes, gen_indexes=packed_vae_token_indexes,
+                query_lens=query_lens, body_start=memory_loop_start,
+                body_end=memory_loop_end, num_layers=len(self.layers),
+                run_layer=run_layer, normalize=normalize,
+                diagnostics=mechanism_diagnostics,
+                rounds=memory_control_rounds,
+            )
+            return BaseNavitOutputWithPast(
+                packed_query_sequence=result, past_key_values=past_key_values,
+            )
+        if mechanism_diagnostics is not None:
+            raise ValueError("mechanism diagnostics require memory_control_mode")
+
         memory_body_out = None
         memory_round_hiddens = None
         gen_round_hiddens = None
         gen_suffix_round_hiddens = None
+        write_round_suffix_hiddens = None
+        write_round_memories = None
         body_entry_hidden = None
         if capture_body_entry_at is not None:
             if not update_past_key_values or not 1 <= int(capture_body_entry_at) <= len(self.layers):
@@ -1902,9 +1873,62 @@ class Qwen2Model(Qwen2PreTrainedModel):
             and memory_loop_end is not None
             and mem_repeat >= 1
         )
+        single_pass_active = single_pass_memory_update_end is not None
+        v2_active = (write_memory_override is not None or not write_memory_update
+                     or mask_prompt_kv_during_write or collect_write_round_outputs)
+        if v2_active and (
+            not memory_body_active or memory_read_only or mem_repeat < 2
+            or not block_gen_reads_memory or mode != "gen" or not self.use_moe
+            or is_causal or single_pass_active or loop_repeat != 1
+            or memory_body_in is not None or prompt_body_memory_init is not None
+            or prompt_kv_mask_scope != "none" or memory_write_source != "correct"
+            or enable_taylorseer
+        ):
+            raise ValueError("v2 Write controls require fresh strict Read + Write same-depth MoT")
+        if mask_prompt_kv_during_write and (
+            past_key_values is None or past_key_values.key_cache[0] is None
+            or key_values_lens is None or not bool((key_values_lens > 0).all())
+        ):
+            raise ValueError("Write prompt mask requires a nonempty prompt cache")
+        if single_pass_active:
+            if (
+                memory_body_active
+                or mem_indexes is None
+                or int(mem_indexes.numel()) == 0
+                or mode != "gen"
+                or not self.use_moe
+                or update_past_key_values
+                or loop_repeat != 1
+                or mem_repeat != 1
+                or memory_body_in is not None
+                or prompt_body_memory_init is not None
+                or prompt_kv_mask_scope != "none"
+            ):
+                raise ValueError("single-pass memory requires fresh MoT generation without a loop or memory replacement")
+            memory_update_end = int(single_pass_memory_update_end)
+            if not 1 <= memory_update_end <= len(self.layers):
+                raise ValueError("single-pass memory update end is outside model depth")
+            if (single_pass_prompt_mask_start is None) != (single_pass_prompt_mask_end is None):
+                raise ValueError("single-pass prompt mask requires both layer bounds")
+            if single_pass_prompt_mask_start is not None:
+                mask_start = int(single_pass_prompt_mask_start)
+                mask_end = int(single_pass_prompt_mask_end)
+                if not 0 <= mask_start < mask_end <= len(self.layers):
+                    raise ValueError("single-pass prompt mask range is outside model depth")
+                if (
+                    past_key_values is None
+                    or past_key_values.key_cache[0] is None
+                    or key_values_lens is None
+                    or not bool((key_values_lens > 0).all())
+                ):
+                    raise ValueError("single-pass prompt mask requires a nonempty prompt cache")
+        elif single_pass_prompt_mask_start is not None or single_pass_prompt_mask_end is not None:
+            raise ValueError("single-pass prompt mask requires single-pass memory")
         if prompt_body_memory_init is not None and not memory_body_active:
             raise ValueError("prompt body memory requires an active same-depth memory body")
-        if mask_prompt_kv_for_nonmemory and (
+        if prompt_kv_mask_scope not in ("none", "extra_loop", "all_generation"):
+            raise ValueError(f"invalid prompt KV mask scope: {prompt_kv_mask_scope}")
+        if prompt_kv_mask_scope != "none" and (
             not memory_body_active
             or prompt_body_memory_init is None
             or mode != "gen"
@@ -1912,14 +1936,39 @@ class Qwen2Model(Qwen2PreTrainedModel):
             or not self.use_moe
         ):
             raise ValueError("prompt KV mask requires prompt-aware MoT same-depth generation")
-        if mask_prompt_kv_for_nonmemory and (
+        if prompt_kv_mask_scope != "none" and (
             past_key_values is None
             or past_key_values.key_cache[0] is None
             or key_values_lens is None
             or not bool((key_values_lens > 0).all())
         ):
             raise ValueError("prompt KV mask requires a nonempty prompt cache for every sample")
-        if memory_body_active:
+        if single_pass_active:
+            indexes = mem_indexes.to(device=packed_query_sequence.device, dtype=torch.long)
+            hidden = packed_query_sequence
+            frozen_memory = None
+            for layer_idx in range(len(self.layers)):
+                if layer_idx == memory_update_end:
+                    frozen_memory = hidden[indexes].clone()
+                mask_this_layer = (
+                    single_pass_prompt_mask_start is not None
+                    and mask_start <= layer_idx < mask_end
+                )
+                hidden, past_key_values = run_layer(
+                    layer_idx,
+                    hidden,
+                    packed_memory_token_indexes=indexes,
+                    block_gen_reads_memory=False,
+                    mask_prompt_kv_for_nonmemory=mask_this_layer,
+                )
+                if frozen_memory is not None:
+                    hidden = hidden.clone()
+                    hidden[indexes] = frozen_memory
+            memory_body_out = (
+                frozen_memory if frozen_memory is not None else hidden[indexes]
+            )
+            packed_query_sequence = normalize(hidden)
+        elif memory_body_active:
             if update_past_key_values:
                 raise ValueError(
                     "memory body loop cannot mutate the prompt KV cache; "
@@ -1929,6 +1978,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
             e = int(memory_loop_end)
             if memory_read_only and mem_repeat != 1:
                 raise ValueError("memory_read_only requires memory_loop_repeat=1")
+            if prompt_kv_mask_scope == "extra_loop" and (
+                mem_repeat != 2 or memory_read_only or not bool(block_gen_reads_memory)
+            ):
+                raise ValueError("extra-loop prompt KV mask requires strict Read plus exactly one Write")
             if memory_read_adapter_mode not in ("off", "read"):
                 raise ValueError(
                     "memory_read_adapter_mode must be 'off' or 'read'"
@@ -1947,24 +2000,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
             indexes = mem_indexes.to(
                 device=packed_query_sequence.device, dtype=torch.long
             )
+            if write_memory_override is not None and write_memory_override.shape != (
+                int(indexes.numel()), int(packed_query_sequence.shape[-1])
+            ):
+                raise ValueError("write_memory_override must match [B*K,D]")
             if prompt_body_memory_init is not None:
                 if memory_body_in is not None or prompt_body_memory_init.shape != (
                     int(indexes.numel()), int(packed_query_sequence.shape[-1])
                 ):
                     raise ValueError("prompt body memory must match [B*K,D] and cannot be persisted")
-            if collect_prompt_value_residuals:
-                if not memory_read_only:
-                    raise ValueError(
-                        "prompt V residual collection requires memory_read_only=True"
-                    )
-                if prompt_cache_indexes is None:
-                    raise ValueError(
-                        "prompt V residual collection requires prompt_cache_indexes"
-                    )
-                if int(prompt_cache_indexes.numel()) != int(indexes.numel()):
-                    raise ValueError(
-                        "active prompt rows and anchor prompt rows must align"
-                    )
             block_round0 = bool(block_gen_reads_memory)
             hidden = packed_query_sequence
             for layer_idx in range(0, s):
@@ -1973,6 +2017,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     hidden,
                     packed_memory_token_indexes=indexes,
                     block_gen_reads_memory=block_round0,
+                    mask_prompt_kv_for_nonmemory=prompt_kv_mask_scope == "all_generation",
                 )
             h_base = hidden.clone()
             if prompt_body_memory_init is not None:
@@ -1991,7 +2036,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
             round_memory = [] if collect_round_diagnostics else None
             round_gen = [] if collect_round_diagnostics else None
             round_suffix_gen = [] if collect_round_diagnostics else None
-            prompt_value_residuals = [] if collect_prompt_value_residuals else None
+            write_suffix = []
+            write_memories = []
             gen_idx = packed_vae_token_indexes
             has_gen = gen_idx is not None and int(gen_idx.numel()) > 0
 
@@ -2003,6 +2049,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         cloned,
                         packed_memory_token_indexes=indexes,
                         block_gen_reads_memory=False,
+                        mask_prompt_kv_for_nonmemory=prompt_kv_mask_scope == "all_generation",
                     )
                 cloned = normalize(cloned)
                 return cloned[gen_idx] if has_gen else None
@@ -2021,6 +2068,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         source=memory_write_source,
                         batch_size=int(query_lens.numel()),
                     )
+                    if _round == 1 and write_memory_override is not None:
+                        write_memory = write_memory_override.to(hidden)
                     if memory_write_probe is not None:
                         append_write_probe(
                             memory_write_probe,
@@ -2032,31 +2081,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     nxt[indexes] = write_memory
                     hidden = nxt
                 block_this = block_round0 and _round == 0
+                mask_prompt_this_round = prompt_kv_mask_scope == "all_generation" or (
+                    prompt_kv_mask_scope == "extra_loop" and _round > 0
+                ) or (mask_prompt_kv_during_write and _round > 0)
+                frozen_write_memory = hidden[indexes].clone()
                 for layer_idx in range(s, e):
-                    if collect_prompt_value_residuals:
-                        decoder_layer = self.layers[layer_idx]
-                        actual_layer = getattr(
-                            decoder_layer,
-                            "_checkpoint_wrapped_module",
-                            decoder_layer,
-                        )
-                        prompt_hidden = actual_layer.input_layernorm(hidden[indexes])
-                        dynamic_value = actual_layer.self_attn.v_proj(
-                            prompt_hidden
-                        ).view(
-                            -1,
-                            actual_layer.self_attn.num_key_value_heads,
-                            actual_layer.self_attn.head_dim,
-                        )
-                        anchor_indexes = prompt_cache_indexes.to(
-                            device=dynamic_value.device, dtype=torch.long
-                        )
-                        anchor_value = past_key_values.value_cache[layer_idx][
-                            anchor_indexes
-                        ]
-                        prompt_value_residuals.append(
-                            dynamic_value.to(anchor_value.dtype) - anchor_value
-                        )
                     hidden, past_key_values = run_layer(
                         layer_idx,
                         hidden,
@@ -2068,8 +2097,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         ),
                         packed_memory_token_indexes=indexes,
                         block_gen_reads_memory=block_this,
+                        mask_prompt_kv_for_nonmemory=mask_prompt_this_round,
                     )
+                    if _round > 0 and not write_memory_update:
+                        hidden = hidden.clone()
+                        hidden[indexes] = frozen_write_memory
                 memory_r = hidden[indexes]
+                if collect_write_round_outputs and _round > 0:
+                    write_memories.append(memory_r)
+                    if _round + 1 < mem_repeat:
+                        write_suffix.append(suffix_gen(hidden))
                 if collect_round_diagnostics:
                     round_memory.append(memory_r)
                 if collect_round_diagnostics and has_gen:
@@ -2087,11 +2124,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     past_key_values=past_key_values,
                     memory_body_out=memory_r,
                     memory_round_hiddens=(memory_r,),
-                    prompt_value_residuals=(
-                        tuple(prompt_value_residuals)
-                        if collect_prompt_value_residuals
-                        else None
-                    ),
                 )
             for layer_idx in range(e, len(self.layers)):
                 hidden, past_key_values = run_layer(
@@ -2099,8 +2131,13 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     hidden,
                     packed_memory_token_indexes=indexes,
                     block_gen_reads_memory=False,
+                    mask_prompt_kv_for_nonmemory=prompt_kv_mask_scope == "all_generation",
                 )
             packed_query_sequence = normalize(hidden)
+            if collect_write_round_outputs:
+                write_suffix.append(packed_query_sequence[gen_idx])
+                write_round_suffix_hiddens = tuple(write_suffix)
+                write_round_memories = tuple(write_memories)
             memory_body_out = memory_r
             memory_round_hiddens = (
                 tuple(round_memory) if collect_round_diagnostics else None
@@ -2155,6 +2192,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 packed_query_sequence, past_key_values = run_layer(
                     layer_idx,
                     packed_query_sequence,
+                    checkpoint=opd_memory_hidden is not None and layer_idx >= opd_reader_start,
                     packed_memory_token_indexes=seq_mem,
                     block_gen_reads_memory=bool(block_gen_reads_memory)
                     and seq_mem is not None,
@@ -2173,6 +2211,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
             memory_round_hiddens=memory_round_hiddens,
             gen_round_hiddens=gen_round_hiddens,
             gen_suffix_round_hiddens=gen_suffix_round_hiddens,
+            write_round_suffix_hiddens=write_round_suffix_hiddens,
+            write_round_memories=write_round_memories,
             body_entry_hidden=body_entry_hidden,
         )
 
@@ -2397,9 +2437,22 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         memory_write_probe: Optional[list] = None,
         capture_body_entry_at: Optional[int] = None,
         prompt_body_memory_init: Optional[torch.Tensor] = None,
-        mask_prompt_kv_for_nonmemory: bool = False,
-        collect_prompt_value_residuals: bool = False,
-        prompt_cache_indexes: Optional[torch.Tensor] = None,
+        prompt_kv_mask_scope: str = "none",
+        single_pass_memory_update_end: Optional[int] = None,
+        single_pass_prompt_mask_start: Optional[int] = None,
+        single_pass_prompt_mask_end: Optional[int] = None,
+        memory_control_mode: Optional[str] = None,
+        memory_control_rounds: int = 2,
+        mechanism_diagnostics: Optional[dict] = None,
+        write_memory_override: Optional[torch.Tensor] = None,
+        write_memory_update: bool = True,
+        mask_prompt_kv_during_write: bool = False,
+        collect_write_round_outputs: bool = False,
+        attention_mass_sink: Optional[list] = None,
+        attention_mass_layers: Tuple[int, ...] = (12, 15, 19),
+        opd_memory_hidden: Optional[torch.Tensor] = None,
+        opd_reader_start: Optional[int] = None,
+        opd_reader_end: Optional[int] = None,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2433,9 +2486,22 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             memory_write_probe=memory_write_probe,
             capture_body_entry_at=capture_body_entry_at,
             prompt_body_memory_init=prompt_body_memory_init,
-            mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
-            collect_prompt_value_residuals=collect_prompt_value_residuals,
-            prompt_cache_indexes=prompt_cache_indexes,
+            prompt_kv_mask_scope=prompt_kv_mask_scope,
+            single_pass_memory_update_end=single_pass_memory_update_end,
+            single_pass_prompt_mask_start=single_pass_prompt_mask_start,
+            single_pass_prompt_mask_end=single_pass_prompt_mask_end,
+            memory_control_mode=memory_control_mode,
+            memory_control_rounds=memory_control_rounds,
+            mechanism_diagnostics=mechanism_diagnostics,
+            write_memory_override=write_memory_override,
+            write_memory_update=write_memory_update,
+            mask_prompt_kv_during_write=mask_prompt_kv_during_write,
+            collect_write_round_outputs=collect_write_round_outputs,
+            attention_mass_sink=attention_mass_sink,
+            attention_mass_layers=attention_mass_layers,
+            opd_memory_hidden=opd_memory_hidden,
+            opd_reader_start=opd_reader_start,
+            opd_reader_end=opd_reader_end,
         )
 
         return outputs

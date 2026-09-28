@@ -1,0 +1,17 @@
+model_path: ""
+data_path: experiments/data/geneval2_hard_heldout.jsonl
+output_dir: ""
+adapter_path: ""
+device: auto
+seed: 42
+batch_size: 2
+max_prompts: 16
+height: 512
+width: 512
+num_steps: 50
+states_per_prompt: 3
+timestep_shift: 3.0
+cfg_text_scale: 1.0
+cfg_img_scale: 1.0
+num_write_rounds: 1
+trainable_routes: []

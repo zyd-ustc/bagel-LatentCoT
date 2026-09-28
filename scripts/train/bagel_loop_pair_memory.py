@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+# Legacy hidden-space grounding ablation. The v2 mainline starts with
+# bagel_gen_memory_grounding.py and does not require this checkpoint.
+
 import argparse
 import json
 import logging

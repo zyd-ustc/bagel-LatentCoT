@@ -1,5 +1,8 @@
 # NPU commands: 16 prompts × keep/mask prompt KV × four Write arms
 
+Historical v3 commands; the current runner defaults to the v4 extra-loop-only
+comparison. Use `docs/experiments/extra_loop_prompt_kv/README.md` for new runs.
+
 The user runs these commands after the code is on GitHub main. This experiment
 has **not** been run yet. It is frozen/training-free, K=8, R=2, same-depth body
 from `configs/training/loop_pair_memory_early.yaml`, 50 steps at 512×512 by

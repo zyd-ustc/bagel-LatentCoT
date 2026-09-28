@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-import math
 from typing import List, Tuple, Optional, Dict, Any, Union
 
 import torch
@@ -48,6 +47,7 @@ from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from ..cache_utils.taylorseer import cache_init
 from ...flow_grpo import sde_step_with_logprob
 from ...loop_pair_ground import MemoryReadOutput
+from ...loop_supervision import LoopSupervisionOutput
 
 from tqdm import tqdm
 
@@ -544,6 +544,7 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
         capture_body_entry_at: Optional[int] = None,
+        return_full_body_entry: bool = False,
     ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
 
@@ -551,31 +552,20 @@ class Bagel(PreTrainedModel):
         if self.use_moe:
             extra_inputs = {"mode": "und"}
 
-        past_key_values.capture_layer_inputs = bool(
-            past_key_values.dynamic_prompt_eligible
+        output = self.language_model.forward_inference(
+            packed_query_sequence=packed_text_embedding,
+            query_lens=text_token_lens,
+            packed_query_position_ids=packed_text_position_ids,
+            packed_query_indexes=packed_text_indexes,
+            past_key_values=past_key_values,
+            packed_key_value_indexes=packed_key_value_indexes,
+            key_values_lens=key_values_lens,
+            update_past_key_values=True,
+            is_causal=True,
+            capture_body_entry_at=capture_body_entry_at,
+            **extra_inputs,
         )
-        try:
-            output = self.language_model.forward_inference(
-                packed_query_sequence=packed_text_embedding,
-                query_lens=text_token_lens,
-                packed_query_position_ids=packed_text_position_ids,
-                packed_query_indexes=packed_text_indexes,
-                past_key_values=past_key_values,
-                packed_key_value_indexes=packed_key_value_indexes,
-                key_values_lens=key_values_lens,
-                update_past_key_values=True,
-                is_causal=True,
-                capture_body_entry_at=capture_body_entry_at,
-                **extra_inputs,
-            )
-        finally:
-            past_key_values.capture_layer_inputs = False
         past_key_values = output.past_key_values
-        past_key_values.record_prompt_segment(
-            packed_text_position_ids,
-            packed_text_indexes,
-            packed_key_value_indexes,
-        )
 
         if capture_body_entry_at is None:
             return past_key_values
@@ -584,7 +574,8 @@ class Bagel(PreTrainedModel):
         # Each prompt ends with an EOS token; in causal text mode it sees the
         # whole prompt, unlike a pooled image-generation query hidden.
         final_indexes = text_token_lens.long().cumsum(dim=0) - 1
-        prompt_body_entry = output.body_entry_hidden[final_indexes]
+        prompt_body_entry = (output.body_entry_hidden if return_full_body_entry
+                             else output.body_entry_hidden[final_indexes])
         return past_key_values, prompt_body_entry
 
     def prepare_vit_images(
@@ -822,11 +813,6 @@ class Bagel(PreTrainedModel):
             is_causal=False,
             **extra_inputs,
         )
-        output.past_key_values.record_non_prompt_segment(
-            packed_position_ids,
-            packed_indexes,
-            packed_key_value_indexes,
-        )
         return output.past_key_values
 
     @torch.no_grad
@@ -886,11 +872,6 @@ class Bagel(PreTrainedModel):
             **extra_inputs,
         )
         past_key_values = output.past_key_values
-        past_key_values.record_non_prompt_segment(
-            packed_position_ids,
-            packed_indexes,
-            packed_key_value_indexes,
-        )
 
         return past_key_values
 
@@ -1043,11 +1024,6 @@ class Bagel(PreTrainedModel):
             **extra_inputs,
         )
         past_key_values = output.past_key_values
-        past_key_values.record_non_prompt_segment(
-            packed_position_ids,
-            packed_indexes,
-            packed_key_value_indexes,
-        )
 
         return past_key_values
 
@@ -1194,11 +1170,6 @@ class Bagel(PreTrainedModel):
             update_past_key_values=True,
             is_causal=False,
             **extra_inputs,
-        )
-        output.past_key_values.record_non_prompt_segment(
-            packed_position_ids,
-            packed_indexes,
-            packed_key_value_indexes,
         )
         return output.past_key_values
 
@@ -1459,12 +1430,9 @@ class Bagel(PreTrainedModel):
         memory_write_source: str = "correct",
         memory_write_probe: Optional[list] = None,
         prompt_body_memory_init: Optional[torch.Tensor] = None,
-        mask_prompt_kv_for_nonmemory: bool = False,
-        dynamic_prompt_alpha: Optional[float] = None,
-        dynamic_prompt_body_start: int = 12,
-        dynamic_prompt_body_end: int = 20,
-        dynamic_prompt_step_fraction: float = 0.35,
-        dynamic_prompt_delta_mode: str = "dynamic",
+        prompt_kv_mask_scope: str = "none",
+        single_pass_memory_update_end: Optional[int] = None,
+        single_pass_mask_prompt_kv: bool = False,
         enable_taylorseer=False,
     ):
         if enable_taylorseer:
@@ -1525,15 +1493,6 @@ class Bagel(PreTrainedModel):
                 (0,), dtype=torch.long
             )
         memory_loop_enabled = int(packed_loop_token_indexes.numel()) > 0
-        dynamic_prompt_enabled = dynamic_prompt_alpha is not None
-        if memory_loop_enabled and dynamic_prompt_enabled:
-            raise ValueError(
-                "dynamic prompt and legacy loop memory are mutually exclusive"
-            )
-        if not 0.0 <= float(dynamic_prompt_step_fraction) <= 1.0:
-            raise ValueError("dynamic_prompt_step_fraction must be in [0, 1]")
-        if dynamic_prompt_enabled and enable_taylorseer:
-            raise ValueError("TaylorSeer is disabled for dynamic prompt memory")
         inner_depth = int(
             loop_depth
             if loop_depth is not None
@@ -1541,6 +1500,11 @@ class Bagel(PreTrainedModel):
         )
         if inner_depth < 1:
             raise ValueError("loop_depth must be >= 1")
+        single_pass_active = single_pass_memory_update_end is not None
+        if single_pass_active:
+            inner_depth = 1
+        elif single_pass_mask_prompt_kv:
+            raise ValueError("single-pass prompt mask requires single-pass memory")
         uncond_mode = str(
             loop_uncond_memory
             or getattr(self.config, "loop_uncond_memory", "m0")
@@ -1552,7 +1516,6 @@ class Bagel(PreTrainedModel):
         if memory_loop_enabled and self.loop_memory is None:
             raise ValueError("packed_loop_token_indexes is set but loop_memory is None")
         self.last_loop_diagnostics = []
-        self.last_dynamic_prompt_diagnostics = []
         recycle_mode = str(
             loop_recycle_mode
             if loop_recycle_mode is not None
@@ -1576,7 +1539,18 @@ class Bagel(PreTrainedModel):
                 )
             ),
         )
+        if single_pass_active:
+            round0_write = True  # GEN can read memory in the sole forward pass.
         read_rounds, write_rounds = loop_round_counts(inner_depth, round0_write)
+        if single_pass_active and (
+            not memory_loop_enabled
+            or recycle_mode != "same_depth"
+            or persist_memory
+            or prompt_body_memory_init is not None
+            or memory_write_source != "correct"
+            or memory_write_probe is not None
+        ):
+            raise ValueError("single-pass memory requires K>0, fresh same-depth generation, and no M replacement")
         if memory_write_source != "correct" and (
             not memory_loop_enabled
             or recycle_mode != "same_depth"
@@ -1596,7 +1570,7 @@ class Bagel(PreTrainedModel):
             or persist_memory
         ):
             raise ValueError("prompt body memory requires fresh same-depth strict Read + Write")
-        if mask_prompt_kv_for_nonmemory and prompt_body_memory_init is None:
+        if prompt_kv_mask_scope != "none" and prompt_body_memory_init is None:
             raise ValueError("prompt KV mask requires prompt-aware memory initialization")
         body_start = (
             memory_loop_start
@@ -1737,7 +1711,14 @@ class Bagel(PreTrainedModel):
                             memory_write_source=memory_write_source,
                             memory_write_probe=memory_write_probe,
                             prompt_body_memory_init=prompt_body_memory_init,
-                            mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
+                            prompt_kv_mask_scope=prompt_kv_mask_scope,
+                            single_pass_memory_update_end=single_pass_memory_update_end,
+                            single_pass_prompt_mask_start=(
+                                body_start if single_pass_mask_prompt_kv else None
+                            ),
+                            single_pass_prompt_mask_end=(
+                                body_end if single_pass_mask_prompt_kv else None
+                            ),
                             packed_vae_seqlens=packed_vae_seqlens,
                         )
                     )
@@ -1790,7 +1771,7 @@ class Bagel(PreTrainedModel):
                 m_in_text = None
                 m_in_img = None
                 m_out = None
-                velocity_kwargs = dict(
+                result = self.predict_image_velocity(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1813,6 +1794,7 @@ class Bagel(PreTrainedModel):
                     cfg_text_key_values_lens=cfg_text_key_values_lens,
                     cfg_text_past_key_values=cfg_text_past_key_values,
                     cfg_text_packed_key_value_indexes=cfg_text_packed_key_value_indexes,
+                    # cfg_img
                     cfg_img_scale=cfg_img_scale_,
                     cfg_img_packed_position_ids=cfg_img_packed_position_ids,
                     cfg_img_packed_query_indexes=cfg_img_packed_query_indexes,
@@ -1821,47 +1803,13 @@ class Bagel(PreTrainedModel):
                     cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
                     cfg_type=cfg_type,
                     packed_boundary_token_indexes=packed_boundary_token_indexes,
+                    model_pred_cache_dic=model_pred_cache_dic,
+                    model_pred_current=model_pred_current,
+                    model_pred_text_cache_dic=model_pred_text_cache_dic,
+                    model_pred_text_current=model_pred_text_current,
+                    model_pred_img_cache_dic=model_pred_img_cache_dic,
+                    model_pred_img_current=model_pred_img_current,
                 )
-                if dynamic_prompt_enabled:
-                    active_steps = int(
-                        math.ceil(
-                            len(timesteps) * float(dynamic_prompt_step_fraction)
-                        )
-                    )
-                    step_alpha = (
-                        float(dynamic_prompt_alpha) if i < active_steps else 0.0
-                    )
-                    result, prompt_diag = self._forward_dynamic_prompt(
-                        **velocity_kwargs,
-                        prompt_body_start=int(dynamic_prompt_body_start),
-                        prompt_body_end=int(dynamic_prompt_body_end),
-                        prompt_alpha=step_alpha,
-                        prompt_delta_mode=str(dynamic_prompt_delta_mode),
-                        return_diagnostics=True,
-                    )
-                    self.last_dynamic_prompt_diagnostics.append(
-                        {
-                            "step": int(i),
-                            "t": float(t),
-                            "alpha": step_alpha,
-                            "body": [
-                                int(dynamic_prompt_body_start),
-                                int(dynamic_prompt_body_end),
-                            ],
-                            "delta_mode": str(dynamic_prompt_delta_mode),
-                            **prompt_diag,
-                        }
-                    )
-                else:
-                    result = self.predict_image_velocity(
-                        **velocity_kwargs,
-                        model_pred_cache_dic=model_pred_cache_dic,
-                        model_pred_current=model_pred_current,
-                        model_pred_text_cache_dic=model_pred_text_cache_dic,
-                        model_pred_text_current=model_pred_text_current,
-                        model_pred_img_cache_dic=model_pred_img_cache_dic,
-                        model_pred_img_current=model_pred_img_current,
-                    )
             if not memory_loop_enabled:
                 v_t = result
 
@@ -1985,10 +1933,16 @@ class Bagel(PreTrainedModel):
         model_pred_text_current: Optional[int] = None,
         model_pred_img_cache_dic: Optional[Dict[str, Any]] = None,
         model_pred_img_current: Optional[int] = None,
+        opd_memory_hidden: Optional[torch.Tensor] = None,
+        opd_reader_start: Optional[int] = None,
+        opd_reader_end: Optional[int] = None,
     ):
         # This primitive is shared by inference and loop-adapter training.
         # Inference callers already own a no-grad context; decorating this
         # method would silently detach the SFT/RL loss from the loop LoRA.
+        if opd_memory_hidden is not None:
+            if cfg_text_scale != 1.0 or cfg_img_scale != 1.0 or within_step_loop_repeat != 1:
+                raise ValueError("OPD uses one native conditional forward, CFG=1, no loop")
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros(
             (sum(packed_seqlens), self.hidden_size)
@@ -2034,6 +1988,9 @@ class Bagel(PreTrainedModel):
             update_past_key_values=False,
             is_causal=False,
             packed_boundary_token_indexes=packed_boundary_token_indexes,
+            opd_memory_hidden=opd_memory_hidden,
+            opd_reader_start=opd_reader_start,
+            opd_reader_end=opd_reader_end,
             **extra_inputs,
         )
         v_t = self.llm2vae(output.packed_query_sequence)
@@ -2222,6 +2179,59 @@ class Bagel(PreTrainedModel):
             raise RuntimeError("strict Read path returned no memory state")
         return MemoryReadOutput(memory_read=output.memory_body_out)
 
+    def forward_memory_opd_velocity(
+        self, *, x_t, timestep, condition,
+        memory_init_strategy="prompt_hidden_uniform",
+        memory_body_start=12, memory_body_end=20,
+        return_memory=False,
+    ) -> torch.Tensor:
+        """Frozen strict Read and one GEN-only MemoryReader native T2I pass.
+
+        ``condition`` contains the inferencer's flow/read kwargs and captured
+        prompt content hidden. The caller owns the student-policy state; no
+        entire sampling trajectory is retained for backward here.
+        """
+        from ...memory_init import initialize_memory_from_prompt_hidden
+
+        if memory_init_strategy != "prompt_hidden_uniform":
+            raise ValueError("unsupported OPD memory initializer")
+        if not 0 <= memory_body_start < memory_body_end <= len(self.language_model.model.layers):
+            raise ValueError("invalid OPD body")
+        initial = initialize_memory_from_prompt_hidden(
+            hidden_cache=condition["prompt_hidden"],
+            prompt_mask=condition["prompt_mask"],
+            content_mask=condition["content_mask"],
+            layer_index=memory_body_start,
+            num_slots=condition["num_slots"],
+        )
+        read_kwargs = dict(condition["read_kwargs"])
+        flow_kwargs = dict(condition["flow_kwargs"])
+        # H_P^s is a body-entry state, not a token embedding. Prefix memory
+        # uses neutral slots and is overwritten exactly at layer s.
+        read_kwargs.update(x_t=x_t, timestep=timestep,
+                           embed_memory=torch.zeros_like(initial),
+                           memory_body_in=initial,
+                           memory_loop_start=memory_body_start,
+                           memory_loop_end=memory_body_end, adapter_mode="off")
+        with torch.no_grad():
+            memory = self.forward_memory_read(**read_kwargs).memory_read.detach()
+        if torch.is_grad_enabled():
+            initial_slots = self.memory_slot_stats(initial)
+            read_slots = self.memory_slot_stats(memory)
+            self.last_opd_memory_stats = {
+                "M0_rms": float(initial.detach().float().square().mean().sqrt()),
+                "Mread_rms": float(memory.float().square().mean().sqrt()),
+                "M0_effective_rank": initial_slots["effective_rank"],
+                "M0_slot_cosine": initial_slots["pairwise_cosine"],
+                "memory_effective_rank": read_slots["effective_rank"],
+                "Mread_slot_cosine": read_slots["pairwise_cosine"],
+            }
+        flow_kwargs.update(x_t=x_t, timestep=timestep, opd_memory_hidden=memory,
+                           opd_reader_start=memory_body_start,
+                           opd_reader_end=memory_body_end)
+        velocity = self._forward_flow(**flow_kwargs)
+        return (velocity, memory) if return_memory else velocity
+
     def _combine_cfg_velocities(
         self,
         v_t,
@@ -2281,376 +2291,24 @@ class Bagel(PreTrainedModel):
         scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
         return v_t_ * scale
 
-    @staticmethod
-    def _dynamic_prompt_read_layout(
-        *,
-        packed_sequence: torch.Tensor,
-        packed_seqlens: torch.Tensor,
-        packed_position_ids: torch.Tensor,
-        packed_text_indexes: torch.Tensor,
-        packed_vae_token_indexes: torch.Tensor,
-        key_values_lens: torch.Tensor,
-        past_key_values: NaiveCache,
-        body_start: int,
-    ) -> Optional[Dict[str, Any]]:
-        """Insert active prompt-copy rows without changing the anchor cache."""
+    def forward_loop_supervised(self, *, num_write_rounds=1,
+                                collect_write_round_outputs=True, **kwargs):
+        """One strict Read followed by W Writes, with complete suffix predictions.
 
-        prompt_mask = past_key_values.prompt_mask
-        prompt_positions = past_key_values.position_ids
-        anchor_hidden = past_key_values.hidden_cache[int(body_start)]
-        if prompt_mask is None or not bool(prompt_mask.any()):
-            return None
-        if prompt_positions is None or anchor_hidden is None:
-            raise ValueError(
-                "dynamic prompt requires prompt prefill instrumentation; "
-                "rebuild the context with forward_cache_update_text"
-            )
-        if not bool(past_key_values.dynamic_prompt_eligible):
-            raise ValueError(
-                "dynamic prompt Phase 0.5 supports prompt-only T2I caches"
-            )
-
-        query_lengths = [int(value) for value in packed_seqlens.tolist()]
-        cache_lengths = [int(value) for value in key_values_lens.tolist()]
-        if len(query_lengths) != len(cache_lengths):
-            raise ValueError("query and cache batch sizes differ")
-        if sum(query_lengths) != int(packed_sequence.shape[0]):
-            raise ValueError("packed_seqlens do not cover the generation query")
-        if sum(cache_lengths) != int(prompt_mask.numel()):
-            raise ValueError("key_values_lens do not cover the prompt cache")
-
-        sequence_parts = []
-        position_parts = []
-        active_indexes = []
-        anchor_indexes = []
-        old_to_new = torch.empty(
-            packed_sequence.shape[0],
-            device=packed_sequence.device,
-            dtype=torch.long,
-        )
-        read_query_indexes = []
-        read_cache_indexes = []
-        prompt_counts = []
-        query_cursor = 0
-        read_cursor = 0
-        cache_cursor = 0
-        merged_cursor = 0
-        for query_length, cache_length in zip(query_lengths, cache_lengths):
-            sample_cache = torch.arange(
-                cache_cursor,
-                cache_cursor + cache_length,
-                device=prompt_mask.device,
-                dtype=torch.long,
-            )
-            sample_prompt = sample_cache[prompt_mask[sample_cache]]
-            prompt_count = int(sample_prompt.numel())
-            prompt_counts.append(prompt_count)
-            anchor_indexes.append(sample_prompt.to(packed_sequence.device))
-            sequence_parts.append(
-                anchor_hidden[sample_prompt.to(anchor_hidden.device)].to(
-                    device=packed_sequence.device, dtype=packed_sequence.dtype
-                )
-            )
-            position_parts.append(
-                prompt_positions[sample_prompt].to(packed_position_ids.device)
-            )
-            active_indexes.append(
-                torch.arange(
-                    read_cursor,
-                    read_cursor + prompt_count,
-                    device=packed_sequence.device,
-                    dtype=torch.long,
-                )
-            )
-            sample_query = packed_sequence[
-                query_cursor : query_cursor + query_length
-            ]
-            sequence_parts.append(sample_query)
-            position_parts.append(
-                packed_position_ids[query_cursor : query_cursor + query_length]
-            )
-            old_to_new[query_cursor : query_cursor + query_length] = torch.arange(
-                read_cursor + prompt_count,
-                read_cursor + prompt_count + query_length,
-                device=packed_sequence.device,
-                dtype=torch.long,
-            )
-            read_cache_indexes.extend(
-                range(merged_cursor, merged_cursor + cache_length)
-            )
-            read_query_indexes.extend(
-                range(
-                    merged_cursor + cache_length,
-                    merged_cursor + cache_length + prompt_count + query_length,
-                )
-            )
-            query_cursor += query_length
-            read_cursor += prompt_count + query_length
-            cache_cursor += cache_length
-            merged_cursor += cache_length + prompt_count + query_length
-
-        active = torch.cat(active_indexes)
-        anchors = torch.cat(anchor_indexes)
-        shifted_text = old_to_new[packed_text_indexes]
-        return {
-            "packed_sequence": torch.cat(sequence_parts, dim=0),
-            "packed_position_ids": torch.cat(position_parts, dim=0),
-            "packed_seqlens": torch.tensor(
-                [q + p for q, p in zip(query_lengths, prompt_counts)],
-                device=packed_seqlens.device,
-                dtype=packed_seqlens.dtype,
-            ),
-            "packed_query_indexes": torch.tensor(
-                read_query_indexes,
-                device=packed_sequence.device,
-                dtype=torch.long,
-            ),
-            "packed_key_value_indexes": torch.tensor(
-                read_cache_indexes,
-                device=packed_sequence.device,
-                dtype=torch.long,
-            ),
-            "packed_prompt_indexes": active,
-            "prompt_cache_indexes": anchors,
-            "packed_text_indexes": torch.cat([active, shifted_text]),
-            "packed_vae_token_indexes": old_to_new[packed_vae_token_indexes],
-            "prompt_counts": tuple(prompt_counts),
-        }
-
-    @staticmethod
-    def _shuffle_prompt_residuals(
-        residuals: Tuple[torch.Tensor, ...], prompt_counts: Tuple[int, ...]
-    ) -> Tuple[torch.Tensor, ...]:
-        if len(prompt_counts) < 2:
-            raise ValueError("shuffled delta requires a batch of at least two prompts")
-        if len(set(prompt_counts)) != 1:
-            raise ValueError("shuffled delta requires equal prompt lengths")
-        chunk = int(prompt_counts[0])
-        order = list(range(1, len(prompt_counts))) + [0]
-        shuffled = []
-        for residual in residuals:
-            pieces = residual.split(chunk, dim=0)
-            shuffled.append(torch.cat([pieces[index] for index in order], dim=0))
-        return tuple(shuffled)
-
-    def _forward_dynamic_prompt(
-        self,
-        *,
-        x_t: torch.Tensor,
-        timestep: torch.Tensor,
-        packed_vae_token_indexes: torch.Tensor,
-        packed_vae_position_ids: torch.Tensor,
-        packed_text_ids: torch.Tensor,
-        packed_text_indexes: torch.Tensor,
-        packed_indexes: torch.Tensor,
-        packed_position_ids: torch.Tensor,
-        packed_seqlens: torch.Tensor,
-        key_values_lens: torch.Tensor,
-        past_key_values: NaiveCache,
-        packed_key_value_indexes: torch.Tensor,
-        cfg_text_scale: float = 1.0,
-        cfg_text_packed_position_ids: Optional[torch.Tensor] = None,
-        cfg_text_packed_query_indexes: Optional[torch.Tensor] = None,
-        cfg_text_key_values_lens: Optional[torch.Tensor] = None,
-        cfg_text_past_key_values: Optional[NaiveCache] = None,
-        cfg_text_packed_key_value_indexes: Optional[torch.Tensor] = None,
-        cfg_img_scale: float = 1.0,
-        cfg_img_packed_position_ids: Optional[torch.Tensor] = None,
-        cfg_img_packed_query_indexes: Optional[torch.Tensor] = None,
-        cfg_img_key_values_lens: Optional[torch.Tensor] = None,
-        cfg_img_past_key_values: Optional[NaiveCache] = None,
-        cfg_img_packed_key_value_indexes: Optional[torch.Tensor] = None,
-        cfg_renorm_min: float = 0.0,
-        cfg_renorm_type: str = "global",
-        prompt_body_start: int = 12,
-        prompt_body_end: int = 20,
-        prompt_alpha: float = 0.15,
-        prompt_delta_mode: str = "dynamic",
-        return_diagnostics: bool = False,
-        **unused,
-    ):
-        """Read current x_t into prompt copies, then write via prompt V only."""
-
-        alpha = float(prompt_alpha)
-        if alpha == 0.0:
-            velocity = self._forward_flow(
-                x_t=x_t,
-                timestep=timestep,
-                packed_vae_token_indexes=packed_vae_token_indexes,
-                packed_vae_position_ids=packed_vae_position_ids,
-                packed_text_ids=packed_text_ids,
-                packed_text_indexes=packed_text_indexes,
-                packed_indexes=packed_indexes,
-                packed_position_ids=packed_position_ids,
-                packed_seqlens=packed_seqlens,
-                key_values_lens=key_values_lens,
-                past_key_values=past_key_values,
-                packed_key_value_indexes=packed_key_value_indexes,
-                cfg_text_scale=cfg_text_scale,
-                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
-                cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
-                cfg_text_key_values_lens=cfg_text_key_values_lens,
-                cfg_text_past_key_values=cfg_text_past_key_values,
-                cfg_text_packed_key_value_indexes=cfg_text_packed_key_value_indexes,
-                cfg_img_scale=cfg_img_scale,
-                cfg_img_packed_position_ids=cfg_img_packed_position_ids,
-                cfg_img_packed_query_indexes=cfg_img_packed_query_indexes,
-                cfg_img_key_values_lens=cfg_img_key_values_lens,
-                cfg_img_past_key_values=cfg_img_past_key_values,
-                cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
-                cfg_renorm_min=cfg_renorm_min,
-                cfg_renorm_type=cfg_renorm_type,
-            )
-            return (velocity, {}) if return_diagnostics else velocity
-        if prompt_delta_mode not in ("dynamic", "zero", "shuffled"):
-            raise ValueError("prompt_delta_mode must be dynamic, zero, or shuffled")
-        start, end = int(prompt_body_start), int(prompt_body_end)
-        if not 0 <= start < end <= len(self.language_model.model.layers):
-            raise ValueError(f"invalid dynamic prompt body [{start}, {end})")
-
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-        packed_sequence = packed_text_embedding.new_zeros(
-            (sum(packed_seqlens), self.hidden_size)
-        )
-        packed_sequence[packed_text_indexes] = packed_text_embedding
-        pos_embed = self.latent_pos_embed(packed_vae_position_ids)
-        time_embed = self.time_embedder(timestep)
-        gen_hidden = self.vae2llm(x_t) + time_embed + pos_embed
-        packed_sequence[packed_vae_token_indexes] = gen_hidden.to(packed_sequence.dtype)
-
-        diagnostics = {}
-
-        def run_branch(cache, positions, query_indexes, cache_lens, cache_indexes):
-            layout = self._dynamic_prompt_read_layout(
-                packed_sequence=packed_sequence,
-                packed_seqlens=packed_seqlens,
-                packed_position_ids=positions,
-                packed_text_indexes=packed_text_indexes,
-                packed_vae_token_indexes=packed_vae_token_indexes,
-                key_values_lens=cache_lens,
-                past_key_values=cache,
-                body_start=start,
-            )
-            if layout is None:
-                output = self.language_model.forward_inference(
-                    packed_query_sequence=packed_sequence,
-                    query_lens=packed_seqlens,
-                    packed_query_position_ids=positions,
-                    packed_query_indexes=query_indexes,
-                    past_key_values=cache,
-                    key_values_lens=cache_lens,
-                    packed_key_value_indexes=cache_indexes,
-                    update_past_key_values=False,
-                    is_causal=False,
-                    mode="gen",
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_text_indexes=packed_text_indexes,
-                )
-                return self.llm2vae(output.packed_query_sequence)[
-                    packed_vae_token_indexes
-                ], None
-
-            prompt_anchor = cache.hidden_cache[start][
-                layout["prompt_cache_indexes"].to(cache.hidden_cache[start].device)
-            ]
-            read = self.language_model.forward_inference(
-                packed_query_sequence=layout["packed_sequence"],
-                query_lens=layout["packed_seqlens"],
-                packed_query_position_ids=layout["packed_position_ids"],
-                packed_query_indexes=layout["packed_query_indexes"],
-                past_key_values=cache,
-                key_values_lens=cache_lens,
-                packed_key_value_indexes=layout["packed_key_value_indexes"],
-                update_past_key_values=False,
-                is_causal=False,
-                mode="gen",
-                packed_vae_token_indexes=layout["packed_vae_token_indexes"],
-                packed_text_indexes=layout["packed_text_indexes"],
-                packed_memory_token_indexes=layout["packed_prompt_indexes"],
-                memory_loop_repeat=1,
-                memory_loop_start=start,
-                memory_loop_end=end,
-                memory_body_in=prompt_anchor,
-                block_gen_reads_memory=True,
-                memory_read_only=True,
-                memory_read_adapter_mode="off",
-                collect_prompt_value_residuals=True,
-                prompt_cache_indexes=layout["prompt_cache_indexes"],
-            )
-            residuals = read.prompt_value_residuals
-            if residuals is None or len(residuals) != end - start:
-                raise RuntimeError("dynamic prompt Read did not return one delta per layer")
-            if prompt_delta_mode == "zero":
-                residuals = tuple(torch.zeros_like(value) for value in residuals)
-            elif prompt_delta_mode == "shuffled":
-                residuals = self._shuffle_prompt_residuals(
-                    residuals, layout["prompt_counts"]
-                )
-            write_cache = cache.with_value_residuals(
-                start_layer=start,
-                prompt_indexes=layout["prompt_cache_indexes"],
-                residuals=residuals,
-                alpha=alpha,
-            )
-            output = self.language_model.forward_inference(
-                packed_query_sequence=packed_sequence,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=positions,
-                packed_query_indexes=query_indexes,
-                past_key_values=write_cache,
-                key_values_lens=cache_lens,
-                packed_key_value_indexes=cache_indexes,
-                update_past_key_values=False,
-                is_causal=False,
-                mode="gen",
-                packed_vae_token_indexes=packed_vae_token_indexes,
-                packed_text_indexes=packed_text_indexes,
-            )
-            norms = torch.stack(
-                [value.detach().float().norm() for value in residuals]
-            )
-            return self.llm2vae(output.packed_query_sequence)[
-                packed_vae_token_indexes
-            ], {
-                "prompt_tokens": int(layout["prompt_cache_indexes"].numel()),
-                "delta_v_norms": [float(value) for value in norms],
-            }
-
-        v_t, diagnostics["conditional"] = run_branch(
-            past_key_values,
-            packed_position_ids,
-            packed_indexes,
-            key_values_lens,
-            packed_key_value_indexes,
-        )
-        cfg_text_v_t = None
-        cfg_img_v_t = None
-        if cfg_text_scale > 1.0:
-            cfg_text_v_t, diagnostics["text_removed"] = run_branch(
-                cfg_text_past_key_values,
-                cfg_text_packed_position_ids,
-                cfg_text_packed_query_indexes,
-                cfg_text_key_values_lens,
-                cfg_text_packed_key_value_indexes,
-            )
-        if cfg_img_scale > 1.0:
-            cfg_img_v_t, diagnostics["image_removed"] = run_branch(
-                cfg_img_past_key_values,
-                cfg_img_packed_position_ids,
-                cfg_img_packed_query_indexes,
-                cfg_img_key_values_lens,
-                cfg_img_packed_key_value_indexes,
-            )
-        velocity = self._combine_cfg_velocities(
-            v_t,
-            cfg_text_v_t,
-            cfg_img_v_t,
-            cfg_text_scale=cfg_text_scale,
-            cfg_img_scale=cfg_img_scale,
-            cfg_renorm_min=cfg_renorm_min,
-            cfg_renorm_type=cfg_renorm_type,
-        )
-        return (velocity, diagnostics) if return_diagnostics else velocity
+        Nonmemory rows reset to body entry at each Write. Only memory recurs.
+        This training API intentionally uses conditional velocity (CFG disabled).
+        """
+        if isinstance(num_write_rounds, bool) or not isinstance(num_write_rounds, int) or num_write_rounds < 1:
+            raise ValueError("num_write_rounds must be a positive integer")
+        if not collect_write_round_outputs:
+            raise ValueError("supervised output requires collect_write_round_outputs=True")
+        locked = dict(recycle_mode="same_depth", memory_loop_repeat=1 + num_write_rounds,
+                      round0_memory_write_enabled=False, collect_write_round_outputs=True)
+        for name, expected in locked.items():
+            if name in kwargs and kwargs[name] != expected:
+                raise ValueError(f"supervised loop requires {name}={expected}")
+        kwargs.update(locked)
+        return self._forward_flow_loop(**kwargs)
 
     def _forward_flow_loop(
         self,
@@ -2700,8 +2358,16 @@ class Bagel(PreTrainedModel):
         memory_write_source: str = "correct",
         memory_write_probe: Optional[list] = None,
         prompt_body_memory_init: Optional[torch.Tensor] = None,
-        mask_prompt_kv_for_nonmemory: bool = False,
+        prompt_kv_mask_scope: str = "none",
+        single_pass_memory_update_end: Optional[int] = None,
+        single_pass_prompt_mask_start: Optional[int] = None,
+        single_pass_prompt_mask_end: Optional[int] = None,
         packed_vae_seqlens: Optional[torch.IntTensor] = None,
+        write_memory_override: Optional[torch.Tensor] = None,
+        write_memory_update: bool = True,
+        mask_prompt_kv_during_write: bool = False,
+        collect_write_round_outputs: bool = False,
+        attention_mass_sink: Optional[list] = None,
     ):
         """Memory-loop velocity. Not @torch.no_grad.
 
@@ -2711,6 +2377,12 @@ class Bagel(PreTrainedModel):
 
         if int(packed_loop_token_indexes.numel()) == 0:
             raise ValueError("_forward_flow_loop requires packed_loop_token_indexes")
+        if (write_memory_override is not None or mask_prompt_kv_during_write
+                or collect_write_round_outputs or not write_memory_update):
+            if recycle_mode != "same_depth" or single_pass_memory_update_end is not None:
+                raise ValueError("v2 controls require same-depth memory")
+            if cfg_text_scale != 1.0 or cfg_img_scale != 1.0:
+                raise ValueError("v2 training controls require conditional velocity, CFG=1")
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros(
             (sum(packed_seqlens), self.hidden_size)
@@ -2749,7 +2421,13 @@ class Bagel(PreTrainedModel):
         read_rounds, write_rounds = loop_round_counts(
             int(memory_loop_repeat), round0_write
         )
-        if same_depth:
+        single_pass_active = single_pass_memory_update_end is not None
+        if single_pass_active:
+            extra_inputs.update(
+                packed_memory_token_indexes=packed_loop_token_indexes,
+                single_pass_memory_update_end=int(single_pass_memory_update_end),
+            )
+        elif same_depth:
             extra_inputs.update(
                 packed_memory_token_indexes=packed_loop_token_indexes,
                 memory_loop_repeat=int(memory_loop_repeat),
@@ -2757,6 +2435,11 @@ class Bagel(PreTrainedModel):
                 memory_loop_end=memory_loop_end,
                 block_gen_reads_memory=block_gen,
                 collect_round_diagnostics=bool(collect_round_diagnostics),
+                write_memory_override=write_memory_override,
+                write_memory_update=write_memory_update,
+                mask_prompt_kv_during_write=mask_prompt_kv_during_write,
+                collect_write_round_outputs=collect_write_round_outputs,
+                attention_mass_sink=attention_mass_sink,
             )
         else:
             extra_inputs.update(
@@ -2767,15 +2450,19 @@ class Bagel(PreTrainedModel):
         def run_branch(
             sequence, kv, pos_ids, query_indexes, kv_lens, kv_indexes,
             body_in, *, write_probe=None, prompt_init=None,
-            write_source="correct", mask_prompt_kv=False,
+            write_source="correct", prompt_mask_scope="none",
+            prompt_mask_start=None, prompt_mask_end=None,
         ):
             kwargs = dict(extra_inputs)
-            if same_depth:
+            if single_pass_active:
+                kwargs["single_pass_prompt_mask_start"] = prompt_mask_start
+                kwargs["single_pass_prompt_mask_end"] = prompt_mask_end
+            elif same_depth:
                 kwargs["memory_body_in"] = body_in
                 kwargs["memory_write_source"] = write_source
                 kwargs["memory_write_probe"] = write_probe
                 kwargs["prompt_body_memory_init"] = prompt_init
-                kwargs["mask_prompt_kv_for_nonmemory"] = mask_prompt_kv
+                kwargs["prompt_kv_mask_scope"] = prompt_mask_scope
             output = self.language_model.forward_inference(
                 packed_query_sequence=sequence,
                 query_lens=packed_seqlens,
@@ -2792,7 +2479,7 @@ class Bagel(PreTrainedModel):
             velocity = self.llm2vae(output.packed_query_sequence)[
                 packed_vae_token_indexes
             ]
-            if same_depth and output.memory_body_out is not None:
+            if (same_depth or single_pass_active) and output.memory_body_out is not None:
                 memory_next = output.memory_body_out
             else:
                 memory_next = output.packed_query_sequence[packed_loop_token_indexes]
@@ -2810,7 +2497,9 @@ class Bagel(PreTrainedModel):
             write_probe=memory_write_probe,
             prompt_init=prompt_body_memory_init,
             write_source=memory_write_source,
-            mask_prompt_kv=mask_prompt_kv_for_nonmemory,
+            prompt_mask_scope=prompt_kv_mask_scope,
+            prompt_mask_start=single_pass_prompt_mask_start,
+            prompt_mask_end=single_pass_prompt_mask_end,
         )
         m_text = m_full
         m_img = m_full
@@ -2862,6 +2551,14 @@ class Bagel(PreTrainedModel):
             cfg_renorm_type=cfg_renorm_type,
             vae_seqlens=packed_vae_seqlens,
         )
+        if collect_write_round_outputs:
+            hiddens = cond_out.write_round_suffix_hiddens or ()
+            memories = cond_out.write_round_memories or ()
+            if len(hiddens) != write_rounds or len(memories) != write_rounds:
+                raise RuntimeError("decoder did not return every complete Write output")
+            # GEN-only hiddens: do NOT apply packed VAE indexes a second time.
+            velocities = tuple(self.llm2vae(h) for h in hiddens[:-1]) + (v_t,)
+            return LoopSupervisionOutput(v_t, velocities, tuple(memories))
         if not collect_round_diagnostics:
             return v_t, m_full, m_text, m_img, {}
 

@@ -1,5 +1,10 @@
 # Prompt-KV visibility — hard-16 paired experiment
 
+Historical v3 all-generation intervention. For the new main comparison that
+masks only the extra Write body pass, see
+`docs/experiments/extra_loop_prompt_kv/README.md`. The v3 policy names and
+commands below are retained as a record, not as the current runner interface.
+
 ## 1. Objective
 
 - Run ID: `prompt_memory_kv_visibility_hard16_v3`.
