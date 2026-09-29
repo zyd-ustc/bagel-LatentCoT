@@ -1,4 +1,4 @@
-"""Memory-only GEN residual: pretrained Q/K/V geometry, trainable zero-effect O."""
+"""Position-free memory cross-attention with native Q/K/V projections."""
 
 import math
 import torch
@@ -29,7 +29,7 @@ class GenMemoryReader(nn.Module):
     """
     def __init__(self, *, native_gen_q_proj, native_und_k_proj,
                  native_und_v_proj, num_heads, num_kv_heads, head_dim,
-                 q_norm=None, k_norm=None, o_rank=8, o_alpha=16,
+                 input_layernorm=None, q_norm=None, k_norm=None, o_rank=8, o_alpha=16,
                  train_q_lora=False):
         super().__init__()
         if train_q_lora:
@@ -42,6 +42,7 @@ class GenMemoryReader(nn.Module):
         for key, value in (("native_gen_q_proj", native_gen_q_proj),
                            ("native_und_k_proj", native_und_k_proj),
                            ("native_und_v_proj", native_und_v_proj),
+                           ("input_layernorm", input_layernorm or nn.Identity()),
                            ("q_norm", q_norm or nn.Identity()),
                            ("k_norm", k_norm or nn.Identity())):
             object.__setattr__(self, key, value)
@@ -57,9 +58,10 @@ class GenMemoryReader(nn.Module):
             raise ValueError("GEN/memory hidden widths differ")
         q = self.q_norm(self.native_gen_q_proj(gen_hidden).reshape(-1, self.num_heads,
                                                                   self.head_dim))
-        k = self.k_norm(self.native_und_k_proj(memory_hidden).reshape(-1, self.num_kv_heads,
+        memory_input = self.input_layernorm(memory_hidden)
+        k = self.k_norm(self.native_und_k_proj(memory_input).reshape(-1, self.num_kv_heads,
                                                                        self.head_dim))
-        v = self.native_und_v_proj(memory_hidden).reshape(-1, self.num_kv_heads,
+        v = self.native_und_v_proj(memory_input).reshape(-1, self.num_kv_heads,
                                                         self.head_dim)
         repeats = self.num_heads // self.num_kv_heads
         k = k.repeat_interleave(repeats, dim=1).float()
@@ -92,6 +94,7 @@ def install_memory_readers(model, *, start=12, end=20, rank=8, alpha=16):
             native_gen_q_proj=attention.q_proj_moe_gen,
             native_und_k_proj=attention.k_proj,
             native_und_v_proj=attention.v_proj,
+            input_layernorm=layer.input_layernorm,
             q_norm=attention.q_norm_moe_gen,
             k_norm=attention.k_norm,
             num_heads=attention.num_heads, num_kv_heads=attention.num_key_value_heads,

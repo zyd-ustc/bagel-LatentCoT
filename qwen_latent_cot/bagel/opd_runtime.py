@@ -128,8 +128,10 @@ class OPDRuntime:
     def student_velocity(self, state, *, return_memory=False, memory_override=None):
         with self.autocast():
             if memory_override is not None:
+                if not isinstance(memory_override, (tuple, list)):
+                    raise ValueError("OPD override must contain one memory tensor per reader layer")
                 return self.model._forward_flow(**self._flow_kwargs(state),
-                    opd_memory_hidden=memory_override.detach(),
+                    opd_memory_hidden=tuple(memory.detach() for memory in memory_override),
                     opd_reader_start=self.body_start, opd_reader_end=self.body_end)
             ctx = state.condition.prompt_context
             return self.model.forward_memory_opd_velocity(

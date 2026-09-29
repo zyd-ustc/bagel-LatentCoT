@@ -30,6 +30,11 @@ def test_teacher_cache_schema_and_contradictory_count():
     row["reasoning_text"]=row["reasoning_text"].replace("three red cubes", "four red cubes")
     with pytest.raises(ValueError,match="contradicts"):
         validate_teacher_record(row)
+    row=_row(prompt="One cube and three spheres")
+    row["reasoning_text"]=row["reasoning_text"].replace(
+        "three red cubes and one blue sphere", "three spheres")
+    with pytest.raises(ValueError, match="omits"):
+        validate_teacher_record(row)
 
 
 def test_opd_rejects_pair_ranking_and_mismatched_teacher_gate(tmp_path):
@@ -50,7 +55,38 @@ def test_opd_rejects_pair_ranking_and_mismatched_teacher_gate(tmp_path):
         teacher_cache_sha256=sha256_file(cache),model_path=str(model.resolve()),
         num_steps=50,cfg=1.0,prompt_ids=[str(i) for i in range(8)],
         field_rms_by_seed={"42":.02,"43":.03})))
-    assert check_teacher_baseline({**config,"teacher_baseline_json":str(gate)})
+    with pytest.raises(ValueError, match="held-out semantic_evidence"):
+        check_teacher_baseline({**config,"teacher_baseline_json":str(gate)})
+    debug=validate_opd_config({**base,"max_steps":10,"allow_field_only_debug":True})
+    assert check_teacher_baseline({**debug,"teacher_baseline_json":str(gate)})[
+        "training_gate"] == "field_only_debug_not_semantic_improvement"
+    with pytest.raises(ValueError, match="at most 10 steps"):
+        validate_opd_config({**base,"max_steps":11,"allow_field_only_debug":True})
+    heldout=tmp_path/"heldout.jsonl"
+    heldout.write_text("".join(json.dumps({"prompt":f"held-out semantic prompt {i}"})+"\n"
+                               for i in range(8)))
+    report=tmp_path/"scores.json"
+    report.write_text(json.dumps({"note":"independent semantic scoring report"}))
+    evidence=dict(heldout_prompt_data=str(heldout),heldout_prompt_sha256=sha256_file(heldout),
+        score_report=str(report),score_report_sha256=sha256_file(report),scorer="human",
+        model_path=str(model.resolve()),num_steps=50,cfg=1.0,prompt_count=8,
+        native_score=.50,teacher_score=.60)
+    baseline=json.loads(gate.read_text())
+    baseline["semantic_evidence"]=evidence
+    gate.write_text(json.dumps(baseline))
+    assert check_teacher_baseline({**config,"teacher_baseline_json":str(gate)})[
+        "semantic_teacher_minus_native"] == pytest.approx(.10)
+    baseline["semantic_evidence"]["teacher_score"] = .49
+    gate.write_text(json.dumps(baseline))
+    with pytest.raises(ValueError,match="must exceed native"):
+        check_teacher_baseline({**config,"teacher_baseline_json":str(gate)})
+    baseline["semantic_evidence"]["teacher_score"] = .60
+    heldout.write_text(heldout.read_text()+json.dumps({"prompt":_row()["prompt"]})+"\n")
+    baseline["semantic_evidence"]["heldout_prompt_sha256"] = sha256_file(heldout)
+    baseline["semantic_evidence"]["prompt_count"] = 9
+    gate.write_text(json.dumps(baseline))
+    with pytest.raises(ValueError,match="distinct held-out"):
+        check_teacher_baseline({**config,"teacher_baseline_json":str(gate)})
     cache.write_text(cache.read_text()+"\n")
     with pytest.raises(ValueError,match="does not match"):
         check_teacher_baseline({**config,"teacher_baseline_json":str(gate)})
@@ -64,10 +100,10 @@ def test_evaluation_controls_use_same_state_and_never_enter_loss():
             return [SimpleNamespace(condition=condition, sample=torch.tensor([1.]),
                                     timestep=.5, step_index=3)]
         def student_velocity(self, state, *, return_memory=False, memory_override=None):
-            memory=torch.tensor([1. if state.condition.record["prompt_id"]=="a" else 2.])
+            memory=(torch.tensor([1. if state.condition.record["prompt_id"]=="a" else 2.]),)
             if return_memory:
-                return state.sample+memory, memory
-            return state.sample+(memory if memory_override is None else memory_override)
+                return state.sample+memory[0], memory
+            return state.sample+(memory if memory_override is None else memory_override)[0]
         def teacher_velocity(self, state):
             return state.sample+1
         def native_velocity(self, state):

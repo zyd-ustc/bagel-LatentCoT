@@ -425,6 +425,7 @@ class BaseNavitOutputWithPast(ModelOutput):
     packed_query_sequence: torch.FloatTensor = None
     past_key_values: Optional[NaiveCache] = None
     memory_body_out: Optional[torch.FloatTensor] = None
+    memory_body_entries: Optional[Tuple[torch.Tensor, ...]] = None
     memory_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_suffix_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
@@ -1666,6 +1667,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         opd_memory_hidden: Optional[torch.Tensor] = None,
         opd_reader_start: Optional[int] = None,
         opd_reader_end: Optional[int] = None,
+        capture_memory_body_entries: bool = False,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1688,8 +1690,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     or opd_reader_start is None or opd_reader_end is None
                     or not 0 <= opd_reader_start < opd_reader_end <= len(self.layers)):
                 raise ValueError("OPD requires native K=0 GEN forward and explicit reader body")
-            if opd_memory_hidden.ndim != 2 or opd_memory_hidden.shape[-1] != self.config.hidden_size:
-                raise ValueError("OPD memory must be [K, hidden_size]")
+            if (not isinstance(opd_memory_hidden, (tuple, list))
+                    or len(opd_memory_hidden) != opd_reader_end - opd_reader_start
+                    or any(memory.ndim != 2 or memory.shape[-1] != self.config.hidden_size
+                           for memory in opd_memory_hidden)
+                    or len({tuple(memory.shape) for memory in opd_memory_hidden}) != 1):
+                raise ValueError("OPD memory must have one [K, hidden_size] entry per reader layer")
+        if capture_memory_body_entries and (not memory_read_only or memory_loop_repeat != 1):
+            raise ValueError("layer-entry memory capture requires one strict Read round")
 
         extra_inputs = {}
         if self.use_moe:
@@ -1739,7 +1747,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 **extra_inputs,
             )
             if opd_memory_hidden is not None and opd_reader_start <= layer_idx < opd_reader_end:
-                layer_kwargs["opd_memory_hidden"] = opd_memory_hidden
+                layer_kwargs["opd_memory_hidden"] = opd_memory_hidden[layer_idx - opd_reader_start]
             if packed_memory_token_indexes is not None:
                 layer_kwargs["packed_memory_token_indexes"] = packed_memory_token_indexes
                 layer_kwargs["block_gen_reads_memory"] = bool(block_gen_reads_memory)
@@ -2038,6 +2046,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             round_suffix_gen = [] if collect_round_diagnostics else None
             write_suffix = []
             write_memories = []
+            read_entries = [] if capture_memory_body_entries else None
             gen_idx = packed_vae_token_indexes
             has_gen = gen_idx is not None and int(gen_idx.numel()) > 0
 
@@ -2086,6 +2095,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 ) or (mask_prompt_kv_during_write and _round > 0)
                 frozen_write_memory = hidden[indexes].clone()
                 for layer_idx in range(s, e):
+                    if read_entries is not None:
+                        read_entries.append(hidden[indexes].detach().clone())
                     hidden, past_key_values = run_layer(
                         layer_idx,
                         hidden,
@@ -2123,6 +2134,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     packed_query_sequence=hidden,
                     past_key_values=past_key_values,
                     memory_body_out=memory_r,
+                    memory_body_entries=tuple(read_entries) if read_entries is not None else None,
                     memory_round_hiddens=(memory_r,),
                 )
             for layer_idx in range(e, len(self.layers)):
@@ -2453,6 +2465,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         opd_memory_hidden: Optional[torch.Tensor] = None,
         opd_reader_start: Optional[int] = None,
         opd_reader_end: Optional[int] = None,
+        capture_memory_body_entries: bool = False,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2502,6 +2515,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             opd_memory_hidden=opd_memory_hidden,
             opd_reader_start=opd_reader_start,
             opd_reader_end=opd_reader_end,
+            capture_memory_body_entries=capture_memory_body_entries,
         )
 
         return outputs

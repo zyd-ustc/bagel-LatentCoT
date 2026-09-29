@@ -64,8 +64,8 @@ def validate_teacher_record(row, *, tokenizer=None, min_tokens=80, max_tokens=16
     # semantic quality still requires the independent pre-training gate.
     source_counts = _numbers(row["prompt"])
     plan_counts = _numbers(next(line for line in lines if line.startswith("Counts:")))
-    if source_counts and not plan_counts <= source_counts:
-        raise ValueError("teacher Counts section contradicts an explicit prompt count")
+    if plan_counts != source_counts:
+        raise ValueError("teacher Counts section omits or contradicts an explicit prompt count")
     return row
 
 

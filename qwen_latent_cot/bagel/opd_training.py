@@ -1,14 +1,14 @@
 """Phase 1A T0 OPD contract, gate and single-device training loop."""
 
-import hashlib
 import json
+import math
 from pathlib import Path
 
 import torch
 import yaml
 from safetensors.torch import save_file
 
-from .cot_teacher import load_teacher_cache, sha256_file, validate_teacher_record
+from .cot_teacher import load_teacher_cache, sha256_file
 from .memory_training import append_json
 from .opd import opd_velocity_loss
 from .opd_runtime import OPDRuntime
@@ -63,6 +63,11 @@ def validate_opd_config(source):
     if float(config["learning_rate"]) <= 0 or float(config["max_grad_norm"]) <= 0:
         raise ValueError("learning rate and gradient clip must be positive")
     config.setdefault("device", "auto")
+    config.setdefault("allow_field_only_debug", False)
+    if not isinstance(config["allow_field_only_debug"], bool):
+        raise ValueError("allow_field_only_debug must be boolean")
+    if config["allow_field_only_debug"] and config["max_steps"] > 10:
+        raise ValueError("field-only debug is limited to at most 10 steps")
     return config
 
 
@@ -109,13 +114,48 @@ def check_teacher_baseline(config):
     stable_field = (isinstance(prompt_ids, list) and len(prompt_ids) >= 8
         and len(set(prompt_ids)) == len(prompt_ids)
         and isinstance(field, dict) and len(field) >= 2 and all(
-        isinstance(value, (int,float)) and value > 1e-4 for value in field.values())
+        not isinstance(value, bool) and isinstance(value, (int,float))
+        and math.isfinite(value) and value > 1e-4 for value in field.values())
         )
-    semantic = gate.get("semantic_teacher_minus_native")
-    semantic_gain = isinstance(semantic,(int,float)) and semantic > 0
-    if not (stable_field or semantic_gain):
-        raise ValueError("teacher failed the pre-training field/semantic baseline gate")
-    return gate
+    if config.get("allow_field_only_debug", False):
+        if not stable_field:
+            raise ValueError("field-only debug requires stable field difference on 8 prompts and 2 seeds")
+        return {**gate, "training_gate": "field_only_debug_not_semantic_improvement"}
+
+    evidence = gate.get("semantic_evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("formal OPD training requires held-out semantic_evidence")
+    heldout_path = Path(str(evidence.get("heldout_prompt_data", "")))
+    report_path = Path(str(evidence.get("score_report", "")))
+    if (not heldout_path.is_file() or not report_path.is_file()
+            or evidence.get("heldout_prompt_sha256") != sha256_file(heldout_path)
+            or evidence.get("score_report_sha256") != sha256_file(report_path)
+            or evidence.get("scorer") not in ("geneval2", "core", "human")
+            or evidence.get("model_path") != str(Path(config["model_path"]).resolve())
+            or evidence.get("num_steps") != config["num_steps"]
+            or evidence.get("cfg") != 1.0):
+        raise ValueError("semantic evidence provenance is missing or mismatched")
+    heldout_rows = [json.loads(line) for line in heldout_path.read_text().splitlines()
+                    if line.strip()]
+    train_rows = [json.loads(line) for line in Path(config["prompt_data"]).read_text().splitlines()
+                  if line.strip()]
+    heldout_prompts = [row.get("prompt") for row in heldout_rows]
+    train_prompts = {row.get("prompt") for row in train_rows}
+    if (len(heldout_prompts) < 8
+            or any(not isinstance(prompt, str) or not prompt.strip()
+                   for prompt in heldout_prompts)
+            or len(heldout_prompts) != len(set(heldout_prompts))
+            or any(prompt in train_prompts for prompt in heldout_prompts)
+            or evidence.get("prompt_count") != len(heldout_prompts)):
+        raise ValueError("semantic evidence needs at least 8 distinct held-out prompts")
+    native = evidence.get("native_score")
+    teacher = evidence.get("teacher_score")
+    if (any(isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) for value in (native, teacher))
+            or teacher <= native):
+        raise ValueError("teacher semantic score must exceed native on held-out prompts")
+    return {**gate, "training_gate": "heldout_semantic_gain",
+            "semantic_teacher_minus_native": teacher - native}
 
 
 def checkpoint(runtime, output, step, optimizer, config):

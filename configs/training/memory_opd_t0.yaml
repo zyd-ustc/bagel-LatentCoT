@@ -1,5 +1,7 @@
 # Phase 1A T0: offline BAGEL Text-CoT, frozen strict Read, O_mem-only OPD.
-# Supply paths on the CLI; training requires teacher_baseline_json evidence.
+# Supply paths on the CLI; formal training requires held-out semantic evidence
+# inside teacher_baseline_json. Field-only runs require --allow-field-only-debug
+# and --max-steps <= 10.
 model_path: null
 prompt_data: null
 teacher_cot_data: null

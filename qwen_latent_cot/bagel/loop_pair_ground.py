@@ -14,6 +14,7 @@ class MemoryReadOutput:
     """Memory state produced by prefix -> strict Read -> STOP."""
 
     memory_read: torch.Tensor
+    layer_memory_read: Tuple[torch.Tensor, ...] | None = None
 
 
 @dataclass(frozen=True)

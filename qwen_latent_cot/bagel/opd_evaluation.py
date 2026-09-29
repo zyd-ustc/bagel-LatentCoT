@@ -41,7 +41,7 @@ def fixed_state_metrics(runtime, records, *, seed):
         if pair[0]["prompt"] == pair[1]["prompt"]:
             raise ValueError("shuffle donor must have a different prompt")
         states = [runtime.rollout(row, seed + pair_index // 2)[0] for row in pair]
-        memories = [runtime.student_velocity(state, return_memory=True)[1].detach()
+        memories = [tuple(memory.detach() for memory in runtime.student_velocity(state, return_memory=True)[1])
                     for state in states]
         for index, state in enumerate(states):
             teacher = runtime.teacher_velocity(state).float()
@@ -49,7 +49,8 @@ def fixed_state_metrics(runtime, records, *, seed):
                 native=runtime.native_velocity(state),
                 correct=runtime.student_velocity(state, memory_override=memories[index]),
                 shuffled=runtime.student_velocity(state, memory_override=memories[1-index]),
-                zero=runtime.student_velocity(state, memory_override=torch.zeros_like(memories[index])))
+                zero=runtime.student_velocity(state, memory_override=tuple(
+                    torch.zeros_like(memory) for memory in memories[index])))
             errors = {name: float((value.float()-teacher).square().mean())
                       for name, value in predictions.items()}
             results.append(dict(prompt_id=state.condition.record["prompt_id"],
@@ -96,7 +97,7 @@ def _generate_pair_images(runtime, records, output, *, seed, pair_offset):
         for step, (t, dt) in enumerate(zip(ts, dts)):
             state = OPDState(condition, x_t, float(t), step)
             velocity, memory = runtime.student_velocity(state, return_memory=True)
-            donor_memories[index].append(memory.detach().clone())
+            donor_memories[index].append(tuple(value.detach().clone() for value in memory))
             x_t = runtime.model.image_euler_step(x_t, velocity, dt).detach()
     for index, condition in enumerate(conditions):
         folder = output / f"p{pair_offset + index:03d}"
@@ -113,7 +114,8 @@ def _generate_pair_images(runtime, records, output, *, seed, pair_offset):
                     velocity = runtime.student_velocity(state)
                 else:
                     reference = donor_memories[1-index][step]
-                    memory = reference if arm == "shuffled" else torch.zeros_like(reference)
+                    memory = reference if arm == "shuffled" else tuple(
+                        torch.zeros_like(value) for value in reference)
                     velocity = runtime.student_velocity(state, memory_override=memory)
                 x_t = runtime.model.image_euler_step(x_t, velocity, dt).detach()
             runtime.inferencer.decode_image(x_t, runtime.shape).save(folder / f"{arm}.png")

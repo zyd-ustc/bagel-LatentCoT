@@ -2096,6 +2096,7 @@ class Bagel(PreTrainedModel):
         memory_body_in: Optional[torch.Tensor] = None,
         embed_memory: Optional[torch.Tensor] = None,
         adapter_mode: str = "read",
+        capture_layer_memory: bool = False,
     ) -> MemoryReadOutput:
         """Execute prefix -> one strict Read body -> STOP.
 
@@ -2173,11 +2174,13 @@ class Bagel(PreTrainedModel):
             block_gen_reads_memory=True,
             memory_read_only=True,
             memory_read_adapter_mode=adapter_mode,
+            capture_memory_body_entries=capture_layer_memory,
             **extra_inputs,
         )
         if output.memory_body_out is None:
             raise RuntimeError("strict Read path returned no memory state")
-        return MemoryReadOutput(memory_read=output.memory_body_out)
+        return MemoryReadOutput(memory_read=output.memory_body_out,
+                                layer_memory_read=output.memory_body_entries)
 
     def forward_memory_opd_velocity(
         self, *, x_t, timestep, condition,
@@ -2212,9 +2215,15 @@ class Bagel(PreTrainedModel):
                            embed_memory=torch.zeros_like(initial),
                            memory_body_in=initial,
                            memory_loop_start=memory_body_start,
-                           memory_loop_end=memory_body_end, adapter_mode="off")
+                           memory_loop_end=memory_body_end, adapter_mode="off",
+                           capture_layer_memory=True)
         with torch.no_grad():
-            memory = self.forward_memory_read(**read_kwargs).memory_read.detach()
+            read = self.forward_memory_read(**read_kwargs)
+            memory = read.memory_read.detach()
+            layer_memories = read.layer_memory_read
+            if layer_memories is None or len(layer_memories) != memory_body_end - memory_body_start:
+                raise RuntimeError("strict Read did not capture each body-layer entry")
+            layer_memories = tuple(value.detach() for value in layer_memories)
         if torch.is_grad_enabled():
             initial_slots = self.memory_slot_stats(initial)
             read_slots = self.memory_slot_stats(memory)
@@ -2226,11 +2235,11 @@ class Bagel(PreTrainedModel):
                 "memory_effective_rank": read_slots["effective_rank"],
                 "Mread_slot_cosine": read_slots["pairwise_cosine"],
             }
-        flow_kwargs.update(x_t=x_t, timestep=timestep, opd_memory_hidden=memory,
+        flow_kwargs.update(x_t=x_t, timestep=timestep, opd_memory_hidden=layer_memories,
                            opd_reader_start=memory_body_start,
                            opd_reader_end=memory_body_end)
         velocity = self._forward_flow(**flow_kwargs)
-        return (velocity, memory) if return_memory else velocity
+        return (velocity, layer_memories) if return_memory else velocity
 
     def _combine_cfg_velocities(
         self,

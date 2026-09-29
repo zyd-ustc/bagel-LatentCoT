@@ -20,8 +20,13 @@ remain as historical baselines; OPD uses a separate checkpoint schema.
   The cache is immutable during training; teacher velocity remains online.
 - M0 samples 8 actual content-token hidden rows at the start of layer 12;
   short prompts repeat slots with deterministic 1e-5 jitter. Strict Read
-  computes M on `(P,x_t,t)` and detaches it. The native frozen GEN/UND Q/K/V
-  and backbone are never trained. An independent low-rank O_mem branch is
+  computes the raw memory **at each body-layer entry** on `(P,x_t,t)` and
+  detaches it. Student layer `l` reads only its matching `M_l`, first applying
+  that layer's frozen UND input RMSNorm before native UND K/V projections.
+  GEN Q and UND K/V projections are frozen. This is deliberately
+  **position-free memory cross-attention**: it reuses native projections but
+  does not reuse native RoPE or claim full native attention geometry.
+  An independent low-rank O_mem branch is
   installed only in layers `[12,20)`; its B matrix starts at zero. No M is
   concatenated into native K/V; no prompt mask or extra Write loop is used.
 - Student rolls out its current policy at CFG=1 with BAGEL `num_steps=50`
@@ -53,9 +58,18 @@ remain as historical baselines; OPD uses a separate checkpoint schema.
    ```
 
 3. Run the **pre-training teacher baseline** on at least 8 semantic prompts
-   and two seeds. The JSON is a field-difference gate only, not proof that
-   teacher images improve semantics. Optionally generate images for human or
-   external scorer comparison against native.
+   and two seeds. Its generated JSON records field difference only. Generate
+   teacher/native images on a **disjoint held-out prompt set**, score both
+   arms with GenEval2, CoRe, or a recorded human rubric, and append a
+   `semantic_evidence` object to `teacher_baseline.json`. Required fields:
+   `heldout_prompt_data`, `heldout_prompt_sha256`, `score_report`,
+   `score_report_sha256`, `scorer` (`geneval2`/`core`/`human`), `model_path`,
+   `num_steps`, `cfg` (`1.0`), `prompt_count` (at least 8), `native_score`,
+   `teacher_score`. Paths and SHA-256 hashes must identify the actual held-out
+   prompt JSONL and durable scoring report. The held-out prompts must not
+   overlap training prompts; `teacher_score` must be strictly greater than
+   `native_score`. The code verifies provenance fields and score ordering,
+   **not** the external scorer's scientific validity.
 
    ```bash
    PYTHONPATH="$PWD" python scripts/evaluate/bagel_memory_opd_eval.py \
@@ -66,10 +80,12 @@ remain as historical baselines; OPD uses a separate checkpoint schema.
      --output-dir /path/to/teacher_baseline
    ```
 
-4. Train only after inspecting the baseline. Pass its
-   `teacher_baseline.json`; the runner rejects a missing, mismatched or
-   nonpositive field/semantic gate. A preflight with `--validate-only` checks
-   paths, categories and cache schema without loading model weights.
+4. Train only after the held-out semantic gate passes. Pass the augmented
+   `teacher_baseline.json`; field difference alone is no longer sufficient.
+   For wiring checks only, `--allow-field-only-debug --max-steps 10` permits
+   a field-only run and labels its manifest as debug. A preflight with
+   `--validate-only` checks paths, categories and cache schema without
+   loading model weights.
 
    ```bash
    PYTHONPATH="$PWD" python scripts/train/bagel_memory_opd.py \
