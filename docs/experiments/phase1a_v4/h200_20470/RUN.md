@@ -1,5 +1,17 @@
 # Phase 1A.0 on H200 20470
 
+## Latest state — interrupted by user, fresh restart on 20474
+
+2026-09-30 11:52:40 UTC: user explicitly requested no resume implementation
+and a fresh 8-card start on 20474. Scoped old launcher/torchrun/eight workers
+were stopped; old last completed step=208, loss=4.834789142012596,
+pre-clipping gradient norm=2.331719398498535. Logs/data/metrics preserved.
+No checkpoint was loaded or transferred; no unrelated jobs were stopped.
+Old `main/status.json` remains its original running/208 snapshot; authoritative
+interruption record is root `interrupted_for_20474.json`, with verified workers gone.
+New run: [20474 RUN.md](../h200_20474/RUN.md). Earlier running snapshots below
+are historical, not the current process state.
+
 ## Preparation
 
 2026-09-30: Authorized GitHub push/upload/8-card Phase 1A.0 training. Code
