@@ -1,5 +1,24 @@
 # Phase 1A.0 fresh restart: 20474
 
+## Latest state — stopped by SIGTERM; continuation not started
+
+Read-only audit at 2026-09-30 14:23 UTC confirms rank 0 received SIGTERM at
+12:42:22 UTC; torchrun subsequently terminated remaining workers. Sender unknown:
+kernel log access denied and no journal available. No OOM/NaN traceback found;
+all 755 recorded loss/gradient values finite. Last loss=2.212814539670944,
+pre-clipping grad norm=3.422374725341797. `status.json` running/755 is stale;
+GPU-owning warm-up workers are gone.
+
+Step-750 adapter/metadata/AdamW files validated; checkpoint hashes match gate,
+all optimizer tensors finite. Latest formal heldout: correct MSE=3.728385418653488,
+shuffled=4.258072569966316, zero=2.7046388387680054, initial=7.139190256595612;
+native parity=0, all four existing operational checks true. Zero remains better
+than correct; do not infer semantic memory usefulness from the operational gate.
+Current 20474 GPUs are occupied by unrelated syncnet jobs; no unrelated job touched.
+User subsequently authorized resume implementation only, explicitly no launch.
+See [resume implementation](../resume/README.md). Earlier launch snapshots below
+are historical, not current process state.
+
 ## Research question and objective
 
 Same frozen-writer side-head reader warm-up as 20470, now on idle H200 cards.

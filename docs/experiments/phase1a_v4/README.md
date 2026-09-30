@@ -4,6 +4,11 @@
 再进入 **Phase 1A.1a gate-only Self-CoT OPD**。以下是代码协议与运行方法，
 不是 BAGEL-7B/H200 训练结果。
 
+断点续训使用训练入口的 `--resume-checkpoint`；必须写入全新输出目录，
+恢复 A/B、AdamW 和全局步数，`--max-steps` 为最终总步数。检查点、原始数据/
+配置和 global batch 不匹配时拒绝恢复。旧 step-750 检查点兼容说明与只校验命令见
+[续训说明](resume/README.md)。续训功能已准备；不代表正式续训已启动。
+
 ## 两个阶段的计算图
 
 两阶段均采用 K=8、body `[12,20)`，从 layer-12 prompt **content** hidden 均匀取

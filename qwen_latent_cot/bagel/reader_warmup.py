@@ -1,8 +1,10 @@
 """Phase 1A.0: side-head MemoryReader reconstruction before Self-CoT OPD."""
 
 import json
+import hashlib
 import math
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +23,13 @@ SCHEMA = "bagel-memory-reader-warmup-v1"
 CATEGORIES = frozenset(("count", "spatial_relation", "attribute_binding",
     "multi_object_composition", "action_relation", "rare_concept",
     "reasoning_heavy_t2i"))
+RESUME_SCHEMA = "bagel-reader-warmup-resume-v1"
+RESUME_CONFIG_KEYS = ("seed", "height", "width", "num_steps", "timestep_shift",
+    "states_per_rollout", "timestep_bucket_weights", "num_loop_tokens",
+    "memory_loop_start_layer", "memory_loop_end_layer", "o_adapter_rank",
+    "o_adapter_alpha", "learning_rate", "max_grad_norm", "eval_max_prompts",
+    "save_steps", "eval_steps", "reader", "loss", "memory_init",
+    "memory_writer_trainable", "batch_size", "cfg_text_scale", "cfg_img_scale")
 
 
 @dataclass
@@ -115,6 +124,8 @@ def validate_warmup_config(source):
         raise ValueError("invalid timestep bucket weights")
     if any(not math.isfinite(float(w)) for w in weights) or not math.isfinite(float(config["timestep_shift"])) or config["timestep_shift"] <= 0:
         raise ValueError("schedule values must be finite and timestep_shift positive")
+    if config.get("resume_checkpoint") and not Path(config["resume_checkpoint"]).is_file():
+        raise FileNotFoundError(f"resume_checkpoint: {config['resume_checkpoint']}")
     return config
 
 
@@ -240,6 +251,186 @@ def save_warmup_checkpoint(runtime, output, step, optimizer, config):
     stem.with_suffix(".json").write_text(json.dumps(meta, indent=2)+"\n")
     torch.save(dict(step=step, optimizer=optimizer.state_dict()), stem.with_suffix(".optimizer.pt"))
     return stem.with_suffix(".safetensors")
+
+
+def inspect_warmup_resume(config, *, world_size=None):
+    """CPU-only preflight; never silently fall back to weights-only recovery."""
+    path = Path(config["resume_checkpoint"])
+    if Path(config["output_dir"]).exists():
+        raise FileExistsError("resume requires a fresh output directory; parent run is read-only")
+    meta = inspect_warmup_checkpoint(path)
+    step = meta.get("step")
+    if isinstance(step, bool) or not isinstance(step, int) or not 0 < step < config["max_steps"]:
+        raise ValueError("resume step must be positive and below total max_steps")
+    expected = dict(K=config["num_loop_tokens"],
+        body=[config["memory_loop_start_layer"], config["memory_loop_end_layer"]],
+        adapter_rank=config["o_adapter_rank"], adapter_alpha=config["o_adapter_alpha"],
+        memory_init="prompt_hidden_uniform", query_source="native_gen_q",
+        memory_kv_source="frozen_read_native_kv", prompt_target="native_prompt_bank",
+        model_path=str(Path(config["model_path"]).resolve()))
+    if any(meta.get(key) != value for key, value in expected.items()):
+        raise ValueError("resume checkpoint model/reader contract mismatch")
+    source = path.parent
+    previous = json.loads((source / "resolved_config.json").read_text())
+    manifest = json.loads((source / "run_manifest.json").read_text())
+    for key in RESUME_CONFIG_KEYS:
+        left, right = previous.get(key), config.get(key)
+        if key in ("reader", "loss"):
+            defaults = (dict(query_source="native_gen_q", memory_kv_source="frozen_read_native_kv",
+                prompt_teacher_kv_source="native_prompt_cache", output_source="native_gen_o",
+                inject_into_generation=False, adapter_rank=8, adapter_alpha=16)
+                if key == "reader" else dict(type="mse", layer_weights="uniform"))
+            left, right = {**defaults, **(left or {})}, {**defaults, **(right or {})}
+        if left != right:
+            raise ValueError(f"resume config mismatch: {key}")
+    previous_world = manifest.get("world_size")
+    if (isinstance(previous_world, bool) or not isinstance(previous_world, int) or previous_world < 1
+            or manifest.get("effective_batch_size") != previous_world
+            or manifest.get("per_rank_batch_size") != 1):
+        raise ValueError("invalid resume global batch/world_size provenance")
+    if world_size is not None and previous_world != world_size:
+        raise ValueError("resume world_size/global batch must match the original run")
+    for key in ("prompt_data", "heldout_prompt_data"):
+        digest = sha256_file(config[key])
+        if meta.get(key+"_sha256") != digest or manifest.get(key+"_sha256") != digest:
+            raise ValueError(f"resume dataset hash mismatch: {key}")
+    names = json.loads((source / "trainable_routes.json").read_text())
+    if sorted(names) != meta["trainable_names"] or len(set(names)) != len(names):
+        raise ValueError("resume adapter parameter ordering provenance mismatch")
+    state = torch.load(path.with_suffix(".optimizer.pt"), map_location="cpu", weights_only=True)
+    if state.get("step") != step:
+        raise ValueError("resume optimizer/checkpoint step mismatch")
+    optimizer = state.get("optimizer", {})
+    groups = optimizer.get("param_groups", [])
+    if len(groups) != 1 or groups[0].get("params") != list(range(len(names))):
+        raise ValueError("resume optimizer parameter layout mismatch")
+    group = groups[0]
+    if (group.get("lr") != config["learning_rate"] or tuple(group.get("betas", ())) != (.9, .95)
+            or group.get("weight_decay") != 0. or group.get("eps") != 1e-8
+            or group.get("amsgrad") is not False or group.get("maximize") is not False):
+        raise ValueError("resume optimizer hyperparameters mismatch")
+    buffers = optimizer.get("state", {})
+    tensors = load_file(str(path))
+    if set(buffers) != set(range(len(names))):
+        raise ValueError("resume optimizer moments are missing")
+    for index, name in enumerate(names):
+        item = buffers[index]
+        counter = item.get("step")
+        if not torch.is_tensor(counter) or counter.numel() != 1 or float(counter) != step:
+            raise ValueError("resume AdamW update counter mismatch")
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = item.get(key)
+            if (not torch.is_tensor(value) or value.shape != tensors[name].shape
+                    or value.dtype != tensors[name].dtype or not bool(torch.isfinite(value).all())
+                    or (key == "exp_avg_sq" and bool((value < 0).any()))):
+                raise ValueError("invalid resume optimizer moments")
+    initial = None
+    for line in (source / "heldout_diagnostics.jsonl").read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("step") == 0:
+            initial = row
+            break
+    if initial is None or initial.get("native_parity_max_abs", float("inf")) > 1e-6:
+        raise ValueError("resume requires the original step-zero heldout baseline/parity")
+    ids = [row["prompt_id"] for row in initial.get("per_state", [])]
+    expected_ids = [json.loads(line)["prompt_id"] for line in Path(config["heldout_prompt_data"]).read_text().splitlines()
+                    if line.strip()][:config["eval_max_prompts"]]
+    if set(ids) != set(expected_ids):
+        raise ValueError("resume initial heldout prompt IDs mismatch")
+    warmup_gate_checks(initial, initial)  # Validate finite diagnostics, not readiness.
+    rng = None
+    marker = path.with_suffix(".resume.json")
+    if marker.exists():
+        record = json.loads(marker.read_text())
+        if (record.get("schema") != RESUME_SCHEMA or record.get("step") != step
+                or record.get("world_size") != previous_world or record.get("param_names") != names):
+            raise ValueError("resume sidecar contract mismatch")
+        for suffix in (".safetensors", ".json", ".optimizer.pt", ".resume.pt"):
+            if record.get("hashes", {}).get(suffix) != sha256_file(path.with_suffix(suffix)):
+                raise ValueError("resume sidecar hash mismatch")
+        for name in ("resolved_config.json", "run_manifest.json", "trainable_routes.json"):
+            if record.get("source_hashes", {}).get(name) != sha256_file(source / name):
+                raise ValueError("resume source provenance hash mismatch")
+        digest = hashlib.sha256(json.dumps(initial, sort_keys=True).encode()).hexdigest()
+        if record.get("initial_sha256") != digest:
+            raise ValueError("resume initial baseline hash mismatch")
+        rng = torch.load(path.with_suffix(".resume.pt"), map_location="cpu", weights_only=True)
+        if not isinstance(rng, list) or len(rng) != previous_world:
+            raise ValueError("resume per-rank RNG count mismatch")
+        for item in rng:
+            validate_warmup_rng(item)
+    elif path.with_suffix(".resume.pt").exists() or manifest.get("resume_schema") == RESUME_SCHEMA:
+        raise ValueError("incomplete resume sidecar: completion marker missing")
+    return dict(step=step, world_size=previous_world, param_names=names,
+        optimizer=optimizer, initial={key:value for key,value in initial.items() if key != "step"}, rng=rng,
+        mode="per_rank_rng" if rng is not None else "legacy_seeded_rollout",
+        checkpoint_sha256=sha256_file(path), optimizer_sha256=sha256_file(path.with_suffix(".optimizer.pt")))
+
+
+def capture_warmup_rng(device):
+    import numpy as np
+    numpy_state = np.random.get_state()
+    return dict(torch_cpu=torch.get_rng_state(), python=random.getstate(),
+        numpy=(numpy_state[0], torch.tensor(numpy_state[1].astype("int64")), *numpy_state[2:]),
+        torch_cuda=torch.cuda.get_rng_state(device) if torch.device(device).type == "cuda" else None)
+
+
+def validate_warmup_rng(state):
+    import numpy as np
+    try:
+        torch.Generator().set_state(state["torch_cpu"])
+        random.Random().setstate(state["python"])
+        name, keys, pos, gauss, cached = state["numpy"]
+        np.random.RandomState().set_state((name, keys.numpy().astype("uint32"), pos, gauss, cached))
+        cuda = state["torch_cuda"]
+        if cuda is not None and (not torch.is_tensor(cuda) or cuda.ndim != 1 or cuda.dtype != torch.uint8):
+            raise ValueError("invalid CUDA RNG tensor")
+    except (KeyError, TypeError, ValueError, RuntimeError, AttributeError) as exc:
+        raise ValueError("invalid resume RNG state") from exc
+
+
+def restore_warmup_rng(state, device):
+    import numpy as np
+    torch.set_rng_state(state["torch_cpu"])
+    random.setstate(state["python"])
+    name, keys, pos, gauss, cached = state["numpy"]
+    np.random.set_state((name, keys.numpy().astype("uint32"), pos, gauss, cached))
+    if torch.device(device).type == "cuda":
+        if state["torch_cuda"] is None:
+            raise ValueError("CUDA resume checkpoint is missing CUDA RNG state")
+        torch.cuda.set_rng_state(state["torch_cuda"], device)
+
+
+def save_warmup_resume_state(runtime, output, step):
+    """All ranks participate after eval; write the completion/hash marker last."""
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    state = capture_warmup_rng(runtime.device)
+    states = [state]
+    if world > 1:
+        states = [None] * world
+        dist.all_gather_object(states, state)
+    if rank == 0:
+        path = Path(output) / f"reader_warmup_step_{step:07d}.safetensors"
+        rng_path = path.with_suffix(".resume.pt")
+        temporary = Path(str(rng_path)+".tmp")
+        torch.save(states, temporary)
+        temporary.replace(rng_path)
+        record = dict(schema=RESUME_SCHEMA, step=step, world_size=world,
+            param_names=[name for name, param in runtime.model.named_parameters() if param.requires_grad],
+            hashes={suffix:sha256_file(path.with_suffix(suffix))
+                    for suffix in (".safetensors", ".json", ".optimizer.pt", ".resume.pt")},
+            source_hashes={name:sha256_file(Path(output)/name)
+                          for name in ("resolved_config.json", "run_manifest.json", "trainable_routes.json")})
+        initial = next(json.loads(line) for line in (Path(output)/"heldout_diagnostics.jsonl").read_text().splitlines()
+                       if line.strip() and json.loads(line).get("step") == 0)
+        record["initial_sha256"] = hashlib.sha256(json.dumps(initial, sort_keys=True).encode()).hexdigest()
+        marker = path.with_suffix(".resume.json")
+        temporary = Path(str(marker)+".tmp")
+        temporary.write_text(json.dumps(record, indent=2)+"\n")
+        temporary.replace(marker)
 
 
 class ReaderWarmupRuntime(OPDRuntime):
@@ -467,13 +658,20 @@ def train_warmup(config, train_records, heldout_records):
         if world > 1:
             dist.barrier()
     output = Path(config["output_dir"])
-    if primary and output.exists():
+    if output.exists():
         raise FileExistsError(f"refusing to overwrite warm-up output: {output}")
+    resume = inspect_warmup_resume(config, world_size=world) if config.get("resume_checkpoint") else None
+    start_step = resume["step"] if resume else 0
     barrier()
     runtime = ReaderWarmupRuntime.load_model(config)
     if not runtime.trainable_names or any("memory_reader.output_adapter." not in name
                                           for name in runtime.trainable_names):
         raise RuntimeError("warm-up must train only reader translation adapters")
+    if resume:
+        names = [name for name, param in runtime.model.named_parameters() if param.requires_grad]
+        if names != resume["param_names"]:
+            raise ValueError("resume live optimizer parameter ordering mismatch")
+        load_warmup_checkpoint(runtime, config["resume_checkpoint"])
     if primary:
         output.mkdir(parents=True, exist_ok=False)
         (output / "resolved_config.json").write_text(json.dumps(config,indent=2)+"\n")
@@ -485,25 +683,35 @@ def train_warmup(config, train_records, heldout_records):
             world_size=world,per_rank_batch_size=1,effective_batch_size=world,
             gradient_reduction="mean_before_clipping",eval_rank=0,
             code_commit=os.environ.get("BAGEL_CODE_COMMIT"),
-            torch_version=torch.__version__,generation_injection=False),indent=2)+"\n")
+            torch_version=torch.__version__,generation_injection=False,
+            resume_schema=RESUME_SCHEMA, start_step=start_step,
+            resume_checkpoint=str(Path(config["resume_checkpoint"]).resolve()) if resume else None,
+            resume_mode=resume["mode"] if resume else None,
+            resume_checkpoint_sha256=resume["checkpoint_sha256"] if resume else None,
+            resume_optimizer_sha256=resume["optimizer_sha256"] if resume else None),indent=2)+"\n")
     barrier()
     params = [p for p in runtime.model.parameters() if p.requires_grad]
     synchronize_reader_parameters(params)
     optimizer = torch.optim.AdamW(params, lr=config["learning_rate"],
         betas=(.9,.95), weight_decay=0.)
+    if resume:
+        optimizer.load_state_dict(resume["optimizer"])
     heldout = heldout_records[:max(2, int(config.get("eval_max_prompts", 8)))]
-    status = dict(status="running", step=0)
+    status = dict(status="running", step=start_step)
     if primary:
         (output / "status.json").write_text(json.dumps(status)+"\n")
     try:
         if primary:
-            initial = evaluate_warmup(runtime, heldout, seed=int(config["seed"]))
+            initial = resume["initial"] if resume else evaluate_warmup(runtime, heldout, seed=int(config["seed"]))
             append_json(output / "heldout_diagnostics.jsonl", dict(step=0, **initial))
             if initial["native_parity_max_abs"] > 1e-6:
                 raise RuntimeError("warm-up side head changed native velocity")
-            print(json.dumps(dict(event="initial_eval_complete",world_size=world)),flush=True)
+            print(json.dumps(dict(event="resume_loaded" if resume else "initial_eval_complete",
+                step=start_step, world_size=world, resume_mode=resume["mode"] if resume else None)),flush=True)
         barrier()
-        for step in range(1, config["max_steps"]+1):
+        if resume and resume["rng"] is not None:
+            restore_warmup_rng(resume["rng"][rank], runtime.device)
+        for step in range(start_step+1, config["max_steps"]+1):
             record = train_records[((step-1)*world+rank) % len(train_records)]
             states = runtime.rollout(record, int(config["seed"])+step*100003+rank)
             optimizer.zero_grad(set_to_none=True)
@@ -550,6 +758,9 @@ def train_warmup(config, train_records, heldout_records):
                 (output / "warmup_gate.json").write_text(json.dumps(report,indent=2)+"\n")
                 if evaluation["native_parity_max_abs"] > 1e-6:
                     raise RuntimeError("warm-up side head changed native velocity")
+            if (step % config["save_steps"] == 0 or step % config["eval_steps"] == 0
+                    or step == config["max_steps"]):
+                save_warmup_resume_state(runtime, output, step)
             if primary:
                 print(json.dumps(dict(step=step,loss_reader_mse=row["loss_reader_mse"],world_size=world)),flush=True)
                 (output / "status.json").write_text(json.dumps(dict(status="running",step=step))+"\n")
@@ -559,7 +770,7 @@ def train_warmup(config, train_records, heldout_records):
                 ready_for_opd=report["ready_for_opd"], checks=report["checks"],
                 warmup_gate_json=str(output / "warmup_gate.json"))
     except Exception as exc:
-        status = dict(status="failed", step=step if "step" in locals() else 0,
+        status = dict(status="failed", step=step if "step" in locals() else start_step,
             error=f"{type(exc).__name__}: {exc}")
         raise
     finally:
