@@ -8,6 +8,29 @@ from test_memory_grounding import tiny_bagel
 from test_memory_read_bank import one_sample_flow, random_bank, reader_condition
 
 
+def test_real_text_cache_capture_batches_hidden_for_memory_initializer():
+    from types import SimpleNamespace
+    from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
+    model=tiny_bagel()
+    model.config.llm_config=model.language_model.config
+    class Tokenizer:
+        def encode(self,text,add_special_tokens=False):
+            return [1,2,3,4]
+        def decode(self,ids):
+            return {1:"Two",2:"red",3:"cubes",4:"left"}.get(ids[0],".")
+    inf=InterleaveInferencer(model,None,Tokenizer(),None,None,
+        dict(bos_token_id=10,eos_token_id=11,start_of_image=12,end_of_image=13))
+    context=inf.update_context_text("Two red cubes left",inf.init_gen_context(),
+                                   capture_prompt_hidden_at=1)
+    hidden=context["prompt_hidden"][1]
+    assert hidden.shape==(1,6,8) and not hidden.requires_grad
+    assert context["prompt_mask"].shape==context["content_mask"].shape==(1,6)
+    slots=initialize_memory_from_prompt_hidden(hidden_cache=context["prompt_hidden"],
+        prompt_mask=context["prompt_mask"],content_mask=context["content_mask"],
+        layer_index=1,num_slots=2)
+    assert torch.equal(slots,hidden[0,[1,4]])
+
+
 def test_prompt_content_uniform_initializer_is_detached_and_deterministic():
     hidden = torch.arange(1*7*8,dtype=torch.float32).reshape(1,7,8).requires_grad_()
     mask = torch.ones(1,7,dtype=torch.bool)

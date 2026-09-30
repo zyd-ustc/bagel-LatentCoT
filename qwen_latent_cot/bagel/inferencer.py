@@ -139,7 +139,12 @@ class InterleaveInferencer:
             ids = generation_input["packed_text_ids"].tolist()
             content = prompt_content_mask(ids, self.tokenizer, special_ids=(
                 self.new_token_ids["bos_token_id"], self.new_token_ids["eos_token_id"]))
-            gen_context["prompt_hidden"] = {int(capture_prompt_hidden_at): hidden.detach()}
+            # Cache update returns packed [L,D]; the initializer consumes [B,L,D].
+            # This inferencer handles exactly one prompt, so add only its batch axis.
+            if hidden.ndim != 2 or hidden.shape[0] != len(ids):
+                raise RuntimeError("captured prompt hidden must match packed text rows")
+            gen_context["prompt_hidden"] = {
+                int(capture_prompt_hidden_at): hidden.detach().unsqueeze(0)}
             gen_context["prompt_mask"] = torch.ones((1, len(ids)), dtype=torch.bool,
                                                     device=hidden.device)
             gen_context["content_mask"] = torch.tensor(content, dtype=torch.bool,
