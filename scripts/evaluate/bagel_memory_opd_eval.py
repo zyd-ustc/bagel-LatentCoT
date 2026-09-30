@@ -20,6 +20,8 @@ def main():
     p.add_argument("--model-path")
     p.add_argument("--prompt-data")
     p.add_argument("--teacher-cot-data")
+    p.add_argument("--reader-warmup-checkpoint")
+    p.add_argument("--reader-warmup-eval-json")
     p.add_argument("--output-dir")
     p.add_argument("--adapter-path")
     p.add_argument("--allow-train-split-debug", action="store_true")
@@ -29,12 +31,13 @@ def main():
     p.add_argument("--validate-only", action="store_true")
     args=p.parse_args()
     config=yaml.safe_load(Path(args.config).read_text()) or {}
-    for name in ("model_path","prompt_data","teacher_cot_data","output_dir"):
+    for name in ("model_path","prompt_data","teacher_cot_data","output_dir",
+                 "reader_warmup_checkpoint","reader_warmup_eval_json"):
         value=getattr(args,name)
         if value is not None:
             config[name]=value
     config["max_prompts"]=args.max_prompts if args.max_prompts is not None else (8 if args.baseline_only else 2)
-    config=validate_opd_config(config)
+    config=validate_opd_config(config,require_warmup=not args.baseline_only)
     records=load_training_records(config)
     if args.validate_only:
         print(json.dumps(dict(records=len(records), config=config),indent=2))
@@ -42,7 +45,7 @@ def main():
     output=Path(config["output_dir"])
     if output.exists():
         raise FileExistsError(output)
-    runtime=OPDRuntime.load_model(config)
+    runtime=OPDRuntime.load_model(config,stage="base" if args.baseline_only else "opd")
     load_training_records(config, tokenizer=runtime.inferencer.tokenizer)
     if args.adapter_path:
         meta=load_reader_checkpoint(runtime,args.adapter_path)
@@ -73,7 +76,11 @@ def main():
         result=fixed_state_metrics(runtime,records,seed=int(config["seed"]))
         (output/"field_metrics.json").write_text(json.dumps(result,indent=2)+"\n")
     if args.generate_images:
-        generate_five_arm_images(runtime,records,output,seed=int(config["seed"]))
+        if args.baseline_only:
+            from qwen_latent_cot.bagel.opd_evaluation import generate_teacher_baseline_images
+            generate_teacher_baseline_images(runtime,records,output,seed=int(config["seed"]))
+        else:
+            generate_five_arm_images(runtime,records,output,seed=int(config["seed"]))
     print(json.dumps(dict(output=str(output),result=result),ensure_ascii=False),flush=True)
 
 

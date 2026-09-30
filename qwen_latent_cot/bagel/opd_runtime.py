@@ -39,7 +39,7 @@ class OPDRuntime:
         self.slots = int(config["num_loop_tokens"])
 
     @classmethod
-    def load_model(cls, config):
+    def load_model(cls, config, *, stage="opd"):
         from .backbone import BagelBackbone
         from .inferencer import InterleaveInferencer
         from .modeling._bagel_utils import ImageTransform
@@ -57,14 +57,17 @@ class OPDRuntime:
         loaded = BagelBackbone({**config, "disable_visual_gen": False,
                                 "disable_gen_expert": False, "loop_depth": 2}).load()
         model, vae = loaded.bagel, loaded.vae_model
-        names = install_memory_readers(model,
+        model.requires_grad_(False)
+        if stage not in ("base", "warmup", "opd"):
+            raise ValueError("unknown Phase 1A runtime stage")
+        names = [] if stage == "base" else install_memory_readers(model,
             start=int(config["memory_loop_start_layer"]),
             end=int(config["memory_loop_end_layer"]),
             rank=int(config.get("o_adapter_rank", 8)),
-            alpha=int(config.get("o_adapter_alpha", 16)))
+            alpha=int(config.get("o_adapter_alpha", 16)), stage=stage)
         # OPD uses inference-mode MoT routing while still backpropagating
         # through frozen downstream layers to the new reader branch.
-        model.language_model.model.gradient_checkpointing = True
+        model.language_model.model.gradient_checkpointing = stage == "opd"
         model.to(device).eval()
         vae.to(device).eval().requires_grad_(False)
         ids = loaded.token_ids
@@ -73,7 +76,12 @@ class OPDRuntime:
             vit_transform=ImageTransform(980, 224, 14), new_token_ids={
                 "bos_token_id": int(ids.im_start), "eos_token_id": int(ids.im_end),
                 "start_of_image": int(ids.vision_start), "end_of_image": int(ids.vision_end)})
-        return cls(config, model, vae, inferencer, device, names)
+        runtime = cls(config, model, vae, inferencer, device, names)
+        runtime.stage = stage
+        if stage == "opd":
+            from .reader_warmup import load_warmup_checkpoint
+            load_warmup_checkpoint(runtime, config["reader_warmup_checkpoint"])
+        return runtime
 
     def autocast(self):
         return accelerator.autocast_for(self.device)
@@ -128,10 +136,9 @@ class OPDRuntime:
     def student_velocity(self, state, *, return_memory=False, memory_override=None):
         with self.autocast():
             if memory_override is not None:
-                if not isinstance(memory_override, (tuple, list)):
-                    raise ValueError("OPD override must contain one memory tensor per reader layer")
+                memory_override.require_layers(self.body_start, self.body_end)
                 return self.model._forward_flow(**self._flow_kwargs(state),
-                    opd_memory_hidden=tuple(memory.detach() for memory in memory_override),
+                    opd_memory_hidden=memory_override,
                     opd_reader_start=self.body_start, opd_reader_end=self.body_end)
             ctx = state.condition.prompt_context
             return self.model.forward_memory_opd_velocity(
@@ -143,6 +150,17 @@ class OPDRuntime:
                                flow_kwargs=self._flow_kwargs(state)),
                 memory_body_start=self.body_start,
                 memory_body_end=self.body_end, return_memory=return_memory)
+
+    @torch.no_grad()
+    def read_bank(self, state):
+        ctx = state.condition.prompt_context
+        with self.autocast():
+            return self.model.forward_memory_read_bank(
+                x_t=state.sample, timestep=state.timestep,
+                condition=dict(prompt_hidden=ctx["prompt_hidden"],
+                    prompt_mask=ctx["prompt_mask"], content_mask=ctx["content_mask"],
+                    num_slots=self.slots, read_kwargs=self._read_kwargs(state)),
+                memory_body_start=self.body_start, memory_body_end=self.body_end)
 
     @torch.no_grad()
     def rollout(self, record, seed):
@@ -159,7 +177,7 @@ class OPDRuntime:
             state = OPDState(condition, x_t.detach(), float(t), index)
             if index in indexes:
                 states.append(OPDState(condition, x_t.detach().clone(), float(t), index))
-            velocity = self.student_velocity(state)
+            velocity = self.native_velocity(state) if getattr(self, "stage", "opd") == "base" else self.student_velocity(state)
             x_t = self.model.image_euler_step(x_t, velocity, dt).detach()
         if len(states) != int(self.config["states_per_rollout"]):
             raise RuntimeError("on-policy rollout did not capture requested states")
@@ -171,8 +189,12 @@ class OPDRuntime:
         native = [layer.memory_reader.last_native_attn_rms for layer in layers]
         entropies = [layer.memory_reader.last_attention_entropy for layer in layers]
         peaks = [layer.memory_reader.last_attention_max for layer in layers]
+        gates = [float(layer.memory_reader.injection_gate.detach()) for layer in layers]
+        injected = [abs(gate)*rms for gate,rms in zip(gates,outputs)]
         return dict(memory_reader_output_rms=sum(outputs)/len(outputs),
+                    memory_reader_injection_rms=sum(injected)/len(injected),
+                    injection_gates=gates,
                     memory_reader_native_attn_ratio=sum(
-                        o/max(n, 1e-8) for o,n in zip(outputs,native))/len(outputs),
+                        o/max(n, 1e-8) for o,n in zip(injected,native))/len(outputs),
                     gen_to_memory_attention_entropy=sum(entropies)/len(entropies),
                     gen_to_memory_attention_max=sum(peaks)/len(peaks))

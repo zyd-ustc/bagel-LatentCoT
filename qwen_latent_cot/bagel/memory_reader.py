@@ -1,9 +1,9 @@
-"""Position-free memory cross-attention with native Q/K/V projections."""
+"""Symmetric bank-only GEN readout with a zero-effect OPD injection gate."""
 
 import math
+
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 
 class ZeroEffectOutputAdapter(nn.Module):
@@ -21,85 +21,101 @@ class ZeroEffectOutputAdapter(nn.Module):
         return (self.B(self.A(value.float())) * self.scale).to(value.dtype)
 
 
-class GenMemoryReader(nn.Module):
-    """Cross-attend GEN queries only to frozen Read-memory slots.
+def bank_attention(gen_query, key, value, *, num_heads, num_kv_heads, head_dim):
+    """Native GQA head repetition, independent bank-only softmax (B=1)."""
+    if (gen_query.ndim != 3 or key.ndim != 3 or value.shape != key.shape
+            or gen_query.shape[1:] != (num_heads, head_dim)
+            or key.shape[1:] != (num_kv_heads, head_dim) or key.shape[0] < 1
+            or num_heads % num_kv_heads):
+        raise ValueError("invalid bank-only Q/K/V geometry")
+    repeats = num_heads // num_kv_heads
+    k = key.repeat_interleave(repeats, dim=1).float()
+    v = value.repeat_interleave(repeats, dim=1).float()
+    weights = (torch.einsum("qhd,khd->hqk", gen_query.float(), k)
+               / math.sqrt(head_dim)).softmax(dim=-1)
+    attended = torch.einsum("hqk,khd->qhd", weights, v)
+    return attended.reshape(gen_query.shape[0], num_heads * head_dim), weights
 
-    Native projections are referenced, not registered/copied. The returned
-    residual is added after native attention; native softmax/KV is untouched.
-    """
-    def __init__(self, *, native_gen_q_proj, native_und_k_proj,
-                 native_und_v_proj, num_heads, num_kv_heads, head_dim,
-                 input_layernorm=None, q_norm=None, k_norm=None, o_rank=8, o_alpha=16,
-                 train_q_lora=False):
+
+class GenMemoryReader(nn.Module):
+    """Translate native memory-bank readout; OPD injects through a scalar gate."""
+
+    def __init__(self, *, native_gen_o_proj, num_heads, num_kv_heads, head_dim,
+                 o_rank=8, o_alpha=16):
         super().__init__()
-        if train_q_lora:
-            raise ValueError("T0 only supports frozen native GEN-Q; Q_mem LoRA is Phase 1A.1")
-        if num_heads % num_kv_heads:
-            raise ValueError("GEN heads must be divisible by UND KV heads")
         hidden = num_heads * head_dim
         self.output_adapter = ZeroEffectOutputAdapter(hidden, rank=o_rank, alpha=o_alpha)
+        self.injection_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        object.__setattr__(self, "native_gen_o_proj", native_gen_o_proj)
         self.num_heads, self.num_kv_heads, self.head_dim = num_heads, num_kv_heads, head_dim
-        for key, value in (("native_gen_q_proj", native_gen_q_proj),
-                           ("native_und_k_proj", native_und_k_proj),
-                           ("native_und_v_proj", native_und_v_proj),
-                           ("input_layernorm", input_layernorm or nn.Identity()),
-                           ("q_norm", q_norm or nn.Identity()),
-                           ("k_norm", k_norm or nn.Identity())):
-            object.__setattr__(self, key, value)
         self.last_output_rms = 0.0
         self.last_native_attn_rms = 0.0
         self.last_attention_entropy = 0.0
         self.last_attention_max = 0.0
+        self.last_slot_effective_count = 0.0
+        self.last_slot_mass_max = 0.0
+        self.last_adapter_rms = 0.0
 
-    def forward(self, gen_hidden, memory_hidden):
-        if gen_hidden.ndim != 2 or memory_hidden.ndim != 2 or memory_hidden.shape[0] < 1:
-            raise ValueError("reader needs [GEN,D] and nonempty [K,D] memory")
-        if gen_hidden.shape[-1] != memory_hidden.shape[-1]:
-            raise ValueError("GEN/memory hidden widths differ")
-        q = self.q_norm(self.native_gen_q_proj(gen_hidden).reshape(-1, self.num_heads,
-                                                                  self.head_dim))
-        memory_input = self.input_layernorm(memory_hidden)
-        k = self.k_norm(self.native_und_k_proj(memory_input).reshape(-1, self.num_kv_heads,
-                                                                       self.head_dim))
-        v = self.native_und_v_proj(memory_input).reshape(-1, self.num_kv_heads,
-                                                        self.head_dim)
-        repeats = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(repeats, dim=1).float()
-        v = v.repeat_interleave(repeats, dim=1).float()
-        scores = torch.einsum("qhd,khd->hqk", q.float(), k) / math.sqrt(self.head_dim)
-        weights = scores.softmax(dim=-1)
-        attended = torch.einsum("hqk,khd->qhd", weights, v).reshape(-1, gen_hidden.shape[-1])
-        delta = self.output_adapter(attended).to(gen_hidden.dtype)
-        if torch.is_grad_enabled():
-            self.last_output_rms = float(delta.detach().float().square().mean().sqrt())
-            probability = weights.detach().float()
-            self.last_attention_entropy = float(-(probability * probability.clamp_min(1e-12).log()).sum(dim=-1).mean())
-            self.last_attention_max = float(probability.amax(dim=-1).mean())
-        return delta
+    def _read(self, gen_query, key, value):
+        attended, weights = bank_attention(gen_query, key, value,
+            num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim)
+        native = self.native_gen_o_proj(attended.to(value.dtype))
+        adapter = self.output_adapter(attended)
+        self.last_adapter_rms = float(adapter.detach().float().square().mean().sqrt())
+        # Preserve small translation updates in the side-head MSE. Native O
+        # retains its BF16 numerics; injection is cast to the native stream.
+        return native.float() + adapter.float(), weights
+
+    def forward(self, *, gen_query, memory_key, memory_value):
+        result, weights = self._read(gen_query, memory_key, memory_value)
+        self.last_output_rms = float(result.detach().float().square().mean().sqrt())
+        probability = weights.detach().float()
+        self.last_attention_entropy = float(-(probability * probability.clamp_min(1e-12).log()).sum(dim=-1).mean())
+        self.last_attention_max = float(probability.amax(dim=-1).mean())
+        slot_mass = probability.mean(dim=(0,1))
+        self.last_slot_effective_count = float((-(slot_mass * slot_mass.clamp_min(1e-12).log()).sum()).exp())
+        self.last_slot_mass_max = float(slot_mass.max())
+        return result
+
+    def diagnostics(self):
+        return dict(memory_readout_rms=self.last_output_rms,
+            adapter_residual_rms=self.last_adapter_rms,
+            attention_entropy=self.last_attention_entropy,
+            attention_max=self.last_attention_max,
+            slot_effective_count=self.last_slot_effective_count,
+            slot_mass_max=self.last_slot_mass_max,
+            injection_gate=float(self.injection_gate.detach()))
+
+    def prompt_target(self, *, gen_query, prompt_key, prompt_value):
+        with torch.no_grad():
+            attended, _ = bank_attention(gen_query.detach(), prompt_key.detach(),
+                prompt_value.detach(), num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads, head_dim=self.head_dim)
+            return self.native_gen_o_proj(attended.to(prompt_value.dtype)).detach()
 
 
-def install_memory_readers(model, *, start=12, end=20, rank=8, alpha=16):
-    """Install only the dedicated trainable branch on the selected MoT layers."""
+def install_memory_readers(model, *, start=12, end=20, rank=8, alpha=16,
+                           stage="warmup"):
     decoder = model.language_model.model
     if not 0 <= start < end <= len(decoder.layers):
         raise ValueError("invalid MemoryReader body range")
-    for layer_idx, layer in enumerate(decoder.layers):
-        if not start <= layer_idx < end:
-            continue
+    if stage not in ("warmup", "opd"):
+        raise ValueError("reader stage must be warmup or opd")
+    for layer_idx in range(start, end):
+        layer = decoder.layers[layer_idx]
         attention = layer.self_attn
         if not all(hasattr(attention, name) for name in
-                   ("q_proj_moe_gen", "k_proj", "v_proj")):
+                   ("q_proj_moe_gen", "o_proj_moe_gen", "k_proj", "v_proj")):
             raise ValueError(f"layer {layer_idx} is not a MoT attention layer")
         layer.memory_reader = GenMemoryReader(
-            native_gen_q_proj=attention.q_proj_moe_gen,
-            native_und_k_proj=attention.k_proj,
-            native_und_v_proj=attention.v_proj,
-            input_layernorm=layer.input_layernorm,
-            q_norm=attention.q_norm_moe_gen,
-            k_norm=attention.k_norm,
+            native_gen_o_proj=attention.o_proj_moe_gen,
             num_heads=attention.num_heads, num_kv_heads=attention.num_key_value_heads,
             head_dim=attention.head_dim, o_rank=rank, o_alpha=alpha)
     model.requires_grad_(False)
     for layer in decoder.layers[start:end]:
-        layer.memory_reader.output_adapter.requires_grad_(True)
+        if stage == "warmup":
+            layer.memory_reader.output_adapter.requires_grad_(True)
+        else:
+            layer.memory_reader.injection_gate.requires_grad_(True)
     return [name for name, parameter in model.named_parameters() if parameter.requires_grad]

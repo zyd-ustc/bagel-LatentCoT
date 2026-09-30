@@ -2,10 +2,11 @@
 
 BAGEL-7B-MoT 上的 latent memory 研究实现。
 
-当前实验实现为 **Phase 1A T0 Self-CoT OPD**：冻结 BAGEL writer/backbone，
-只训练独立 GEN MemoryReader 的零效应输出分支，在 student on-policy 状态上
-拟合 frozen BAGEL `[prompt; reasoning]` teacher 的 velocity。
-[协议、数据门槛与入口](docs/experiments/phase1a_opd/README.md)。
+当前实验实现为 **Phase 1A v4：Reader Warm-up → Self-CoT OPD**：
+先用 frozen native prompt-bank readout 监督独立 memory reader side head，
+通过 heldout readability gate 后加载并冻结 reader，在 student on-policy states 上
+只训练零初始化 injection gates，拟合 frozen BAGEL `[prompt; reasoning]` teacher velocity。
+[协议、数据门槛与入口](docs/experiments/phase1a_v4/README.md)。
 旧 [Memory Grounding v2](docs/experiments/memory_grounding_v2/README.md)
 及 pair-hidden/zero-shot 代码保留为历史对照，不作为 OPD 的训练依赖。
 
@@ -14,7 +15,7 @@ BAGEL-7B-MoT 上的 latent memory 研究实现。
 旧六组机制对照已退出当前评测入口，历史结果仍保留。
 启动器默认使用当前 Python 环境和可见 CUDA GPU，不再依赖 Ascend 路径。
 
-以下是历史 loop 路线说明，不是当前 Phase 1A T0 OPD 的计算图：它不是外循环编辑 agent，也不是 FlowEdit。每个去噪步里固定跑
+以下是历史 loop 路线说明，不是当前 Phase 1A v4 的计算图：它不是外循环编辑 agent，也不是 FlowEdit。每个去噪步里固定跑
 `1 read + (loop_depth - 1) write`：\(K\) 个 memory token 走 understanding
 expert，和当前 VAE/gen token 做原生 joint attention，只用最后一轮速度推进
 \(x_t\)。当前方法称为 **Read–Write Loop with implicit context rerouting**。

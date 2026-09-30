@@ -14,16 +14,29 @@ from .opd import opd_velocity_loss
 from .opd_runtime import OPDRuntime
 
 
-SCHEMA = "bagel-selfcot-opd-phase1a-v1"
+SCHEMA = "bagel-selfcot-opd-phase1a-v4"
 
 
-def validate_opd_config(source):
+def validate_opd_config(source, *, require_warmup=True):
     config = dict(source)
+    memory_reader=config.get("memory_reader",{})
+    reader_controls=dict(load_warmup=True,injection_gate_init=0.0,train_gate=True,
+                         train_adapter=False,train_q_lora=False)
+    if not isinstance(memory_reader,dict) or set(memory_reader)-set(reader_controls):
+        raise ValueError("unknown OPD memory_reader controls")
+    for key,value in reader_controls.items():
+        if memory_reader.get(key,value)!=value:
+            raise ValueError(f"Phase 1A.1a requires memory_reader.{key}={value}")
     required = ("model_path", "prompt_data", "teacher_cot_data", "output_dir")
+    if require_warmup:
+        required += ("reader_warmup_checkpoint", "reader_warmup_eval_json")
     for key in required:
         if not config.get(key):
             raise ValueError(f"missing {key}")
-    for key in ("model_path", "prompt_data", "teacher_cot_data"):
+    paths = ("model_path", "prompt_data", "teacher_cot_data")
+    if require_warmup:
+        paths += ("reader_warmup_checkpoint", "reader_warmup_eval_json")
+    for key in paths:
         if not Path(config[key]).exists():
             raise FileNotFoundError(f"{key}: {config[key]}")
     locked = dict(num_loop_tokens=8, memory_loop_start_layer=12,
@@ -42,6 +55,12 @@ def validate_opd_config(source):
                  "reader_o_enabled", "loop_distill", "memory_loop_repeat")
     if any(key in config for key in forbidden):
         raise ValueError("Phase 1A T0 forbids v2 pair/ranking/loop/mask controls")
+    if float(config.get("injection_gate_init", 0.0)) != 0.0:
+        raise ValueError("Phase 1A.1a requires exact zero injection gate initialization")
+    if config.get("train_reader_adapter", False) or not config.get("train_gate", True):
+        raise ValueError("Phase 1A.1a trains injection gates only")
+    if config.get("train_q_lora",False):
+        raise ValueError("Phase 1A.1a freezes native Q projections")
     for key, default in (("height",512),("width",512),("num_steps",50),
                          ("max_steps",5000),("save_steps",250),("eval_steps",250),
                          ("seed",42)):
@@ -56,11 +75,12 @@ def validate_opd_config(source):
     config.setdefault("timestep_shift", 3.0)
     config.setdefault("timestep_bucket_weights", [.5,.4,.1])
     weights = config["timestep_bucket_weights"]
-    if len(weights) != 3 or any(float(v)<0 for v in weights) or sum(weights)<=0:
+    if len(weights) != 3 or any(not math.isfinite(float(v)) or float(v)<0 for v in weights) or sum(weights)<=0:
         raise ValueError("three positive-total timestep bucket weights required")
-    config.setdefault("learning_rate", 1e-4)
+    config.setdefault("learning_rate", 1e-3)
     config.setdefault("max_grad_norm", 1.0)
-    if float(config["learning_rate"]) <= 0 or float(config["max_grad_norm"]) <= 0:
+    if any(not math.isfinite(float(config[key])) or float(config[key]) <= 0
+           for key in ("learning_rate","max_grad_norm","timestep_shift")):
         raise ValueError("learning rate and gradient clip must be positive")
     config.setdefault("device", "auto")
     config.setdefault("allow_field_only_debug", False)
@@ -68,6 +88,9 @@ def validate_opd_config(source):
         raise ValueError("allow_field_only_debug must be boolean")
     if config["allow_field_only_debug"] and config["max_steps"] > 10:
         raise ValueError("field-only debug is limited to at most 10 steps")
+    if require_warmup:
+        from .reader_warmup import check_warmup_gate
+        check_warmup_gate(config)
     return config
 
 
@@ -165,8 +188,9 @@ def checkpoint(runtime, output, step, optimizer, config):
     if set(tensors) != set(runtime.trainable_names):
         raise RuntimeError("checkpoint contains an unexpected trainable route")
     save_file(tensors, str(stem.with_suffix(".safetensors")))
-    stem.with_suffix(".json").write_text(json.dumps(dict(schema=SCHEMA, stage="T0",
+    stem.with_suffix(".json").write_text(json.dumps(dict(schema=SCHEMA, stage="Phase 1A.1a",
         step=step, body=[12,20], K=8, trainable_names=runtime.trainable_names,
+        reader_warmup_checkpoint_sha256=sha256_file(config["reader_warmup_checkpoint"]),
         teacher_cache_sha256=sha256_file(config["teacher_cot_data"]),
         prompt_data_sha256=sha256_file(config["prompt_data"]),
         config=config), indent=2) + "\n")
@@ -178,12 +202,17 @@ def train(config, records):
     output = Path(config["output_dir"])
     if output.exists():
         raise FileExistsError(f"refusing to overwrite OPD output: {output}")
+    from .reader_warmup import check_warmup_gate
+    warmup_gate = check_warmup_gate(config)
     gate = check_teacher_baseline(config)
     runtime = OPDRuntime.load_model(config)
+    if any("memory_reader.injection_gate" not in name for name in runtime.trainable_names):
+        raise RuntimeError("OPD must train injection gates only")
     load_training_records(config, tokenizer=runtime.inferencer.tokenizer)
     output.mkdir(parents=True, exist_ok=False)
     (output / "resolved_config.json").write_text(json.dumps(config, indent=2)+"\n")
     (output / "run_manifest.json").write_text(json.dumps(dict(schema=SCHEMA,
+        reader_warmup_gate=warmup_gate,
         teacher_baseline=gate, teacher_cache_sha256=sha256_file(config["teacher_cot_data"]),
         prompt_data_sha256=sha256_file(config["prompt_data"]),
         model_path=str(Path(config["model_path"]).resolve()),
@@ -195,6 +224,15 @@ def train(config, records):
     status = dict(status="running", step=0)
     (output / "status.json").write_text(json.dumps(status)+"\n")
     try:
+        # Loading a trained adapter must still produce exact native velocity
+        # before the first gate update, on the same native state and timestep.
+        parity_state = runtime.rollout(records[0],int(config["seed"]))[0]
+        with torch.no_grad():
+            difference=(runtime.student_velocity(parity_state).float()
+                        - runtime.native_velocity(parity_state).float()).abs().max()
+        if float(difference) > 1e-6:
+            raise RuntimeError("loaded warm-up reader violates OPD step-0 native parity")
+        (output / "step0_parity.json").write_text(json.dumps(dict(max_abs=float(difference)))+"\n")
         for step in range(1, config["max_steps"]+1):
             record = records[(step-1) % len(records)]
             seed = int(config["seed"]) + step*100003

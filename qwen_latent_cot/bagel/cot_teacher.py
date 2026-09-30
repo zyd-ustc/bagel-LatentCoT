@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 
-TEMPLATE_VERSION = "bagel_t0_v1"
+TEMPLATE_VERSION = "bagel_t0_v2"
 SECTIONS = ("Objects", "Counts", "Attributes", "Spatial relations",
             "Actions", "Global layout", "Critical constraints")
 REFUSALS = ("i cannot", "i can't", "i'm sorry", "as an ai", "cannot assist")

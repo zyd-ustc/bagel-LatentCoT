@@ -15,6 +15,7 @@ class MemoryReadOutput:
 
     memory_read: torch.Tensor
     layer_memory_read: Tuple[torch.Tensor, ...] | None = None
+    memory_read_bank: object | None = None
 
 
 @dataclass(frozen=True)

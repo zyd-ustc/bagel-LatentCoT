@@ -14,8 +14,9 @@ from .opd_training import SCHEMA
 def load_reader_checkpoint(runtime, path):
     path = Path(path)
     meta = json.loads(path.with_suffix(".json").read_text())
-    if (meta.get("schema") != SCHEMA or meta.get("stage") != "T0"
+    if (meta.get("schema") != SCHEMA or meta.get("stage") != "Phase 1A.1a"
             or meta.get("body") != [12,20] or meta.get("K") != 8
+            or meta.get("reader_warmup_checkpoint_sha256") != sha256_file(runtime.config["reader_warmup_checkpoint"])
             or meta.get("trainable_names") != runtime.trainable_names):
         raise ValueError("incompatible OPD reader checkpoint")
     state = load_file(str(path))
@@ -41,16 +42,16 @@ def fixed_state_metrics(runtime, records, *, seed):
         if pair[0]["prompt"] == pair[1]["prompt"]:
             raise ValueError("shuffle donor must have a different prompt")
         states = [runtime.rollout(row, seed + pair_index // 2)[0] for row in pair]
-        memories = [tuple(memory.detach() for memory in runtime.student_velocity(state, return_memory=True)[1])
-                    for state in states]
         for index, state in enumerate(states):
+            memory=runtime.read_bank(state)
+            donor_state=OPDState(states[1-index].condition,state.sample,state.timestep,state.step_index)
+            donor_memory=runtime.read_bank(donor_state)
             teacher = runtime.teacher_velocity(state).float()
             predictions = dict(
                 native=runtime.native_velocity(state),
-                correct=runtime.student_velocity(state, memory_override=memories[index]),
-                shuffled=runtime.student_velocity(state, memory_override=memories[1-index]),
-                zero=runtime.student_velocity(state, memory_override=tuple(
-                    torch.zeros_like(memory) for memory in memories[index])))
+                correct=runtime.student_velocity(state, memory_override=memory),
+                shuffled=runtime.student_velocity(state, memory_override=donor_memory),
+                zero=runtime.student_velocity(state, memory_override=memory.zero_like()))
             errors = {name: float((value.float()-teacher).square().mean())
                       for name, value in predictions.items()}
             results.append(dict(prompt_id=state.condition.record["prompt_id"],
@@ -90,15 +91,6 @@ def _generate_pair_images(runtime, records, output, *, seed, pair_offset):
     conditions = [runtime.prepare(row, seed) for row in records[:2]]
     ts, dts = runtime.model.prepare_image_schedule(int(runtime.config["num_steps"]),
         float(runtime.config["timestep_shift"]), runtime.device)
-    # Donor memory evolves on the other prompt's independent correct-M policy.
-    donor_memories = [[], []]
-    for index, condition in enumerate(conditions):
-        x_t = condition.noise.detach().clone()
-        for step, (t, dt) in enumerate(zip(ts, dts)):
-            state = OPDState(condition, x_t, float(t), step)
-            velocity, memory = runtime.student_velocity(state, return_memory=True)
-            donor_memories[index].append(tuple(value.detach().clone() for value in memory))
-            x_t = runtime.model.image_euler_step(x_t, velocity, dt).detach()
     for index, condition in enumerate(conditions):
         folder = output / f"p{pair_offset + index:03d}"
         folder.mkdir(parents=True, exist_ok=False)
@@ -113,9 +105,9 @@ def _generate_pair_images(runtime, records, output, *, seed, pair_offset):
                 elif arm == "correct":
                     velocity = runtime.student_velocity(state)
                 else:
-                    reference = donor_memories[1-index][step]
-                    memory = reference if arm == "shuffled" else tuple(
-                        torch.zeros_like(value) for value in reference)
+                    donor=conditions[1-index] if arm=="shuffled" else condition
+                    reference=runtime.read_bank(OPDState(donor,x_t,float(t),step))
+                    memory = reference if arm == "shuffled" else reference.zero_like()
                     velocity = runtime.student_velocity(state, memory_override=memory)
                 x_t = runtime.model.image_euler_step(x_t, velocity, dt).detach()
             runtime.inferencer.decode_image(x_t, runtime.shape).save(folder / f"{arm}.png")
@@ -129,3 +121,22 @@ def generate_five_arm_images(runtime, records, output, *, seed):
     for pair_index in range(0, len(records), 2):
         _generate_pair_images(runtime, records[pair_index:pair_index+2], output,
                               seed=seed+pair_index//2, pair_offset=pair_index)
+
+
+@torch.no_grad()
+def generate_teacher_baseline_images(runtime,records,output,*,seed):
+    """Native versus frozen Self-CoT teacher, without a MemoryReader."""
+    ts,dts=runtime.model.prepare_image_schedule(int(runtime.config["num_steps"]),
+        float(runtime.config["timestep_shift"]),runtime.device)
+    for index,row in enumerate(records):
+        condition=runtime.prepare(row,seed+index)
+        folder=Path(output)/f"p{index:03d}"
+        folder.mkdir(parents=True,exist_ok=False)
+        for arm in ("native","teacher"):
+            sample=condition.noise.detach().clone()
+            for step,(t,dt) in enumerate(zip(ts,dts)):
+                state=OPDState(condition,sample,float(t),step)
+                velocity=runtime.native_velocity(state) if arm=="native" else runtime.teacher_velocity(state)
+                sample=runtime.model.image_euler_step(sample,velocity,dt).detach()
+            runtime.inferencer.decode_image(sample,runtime.shape).save(folder/f"{arm}.png")
+        (folder/"prompt.txt").write_text(row["prompt"]+"\n")

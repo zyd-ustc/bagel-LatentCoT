@@ -1,5 +1,10 @@
 # Phase 1A T0 Self-CoT OPD
 
+> 历史 v1/v3 协议。当前代码已切换到
+> [v4 Reader Warm-up → gate-only OPD](../phase1a_v4/README.md)。
+> 下文 position-free reader 与 adapter-only 训练命令不适用于当前分支；
+> teacher semantic-evidence 字段仍沿用，CoT cache 版本升级为 `bagel_t0_v2`。
+
 This is the **T0 implementation**, not a completed H200 run or evidence of
 semantic gain. T1 Draft-Verify, Q_mem LoRA, recurrent Write/Deep Supervision and
 SMA are explicitly deferred until the plan's gates pass. Existing v2 entrypoints

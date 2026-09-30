@@ -1936,11 +1936,13 @@ class Bagel(PreTrainedModel):
         opd_memory_hidden: Optional[torch.Tensor] = None,
         opd_reader_start: Optional[int] = None,
         opd_reader_end: Optional[int] = None,
+        reader_warmup_bank=None,
+        reader_warmup_sink=None,
     ):
         # This primitive is shared by inference and loop-adapter training.
         # Inference callers already own a no-grad context; decorating this
         # method would silently detach the SFT/RL loss from the loop LoRA.
-        if opd_memory_hidden is not None:
+        if opd_memory_hidden is not None or reader_warmup_bank is not None:
             if cfg_text_scale != 1.0 or cfg_img_scale != 1.0 or within_step_loop_repeat != 1:
                 raise ValueError("OPD uses one native conditional forward, CFG=1, no loop")
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
@@ -1991,6 +1993,8 @@ class Bagel(PreTrainedModel):
             opd_memory_hidden=opd_memory_hidden,
             opd_reader_start=opd_reader_start,
             opd_reader_end=opd_reader_end,
+            reader_warmup_bank=reader_warmup_bank,
+            reader_warmup_sink=reader_warmup_sink,
             **extra_inputs,
         )
         v_t = self.llm2vae(output.packed_query_sequence)
@@ -2097,6 +2101,7 @@ class Bagel(PreTrainedModel):
         embed_memory: Optional[torch.Tensor] = None,
         adapter_mode: str = "read",
         capture_layer_memory: bool = False,
+        capture_layer_kv: bool = False,
     ) -> MemoryReadOutput:
         """Execute prefix -> one strict Read body -> STOP.
 
@@ -2175,25 +2180,41 @@ class Bagel(PreTrainedModel):
             memory_read_only=True,
             memory_read_adapter_mode=adapter_mode,
             capture_memory_body_entries=capture_layer_memory,
+            capture_memory_body_kv=capture_layer_kv,
             **extra_inputs,
         )
         if output.memory_body_out is None:
             raise RuntimeError("strict Read path returned no memory state")
+        bank = None
+        if capture_layer_kv:
+            from ...memory_read_bank import LayerMemoryState, MemoryReadBank
+            if (output.memory_body_entries is None or output.memory_body_kv is None
+                    or len(output.memory_body_entries) != memory_loop_end - memory_loop_start
+                    or len(output.memory_body_kv) != memory_loop_end - memory_loop_start):
+                raise RuntimeError("strict Read did not capture every native KV layer")
+            bank = MemoryReadBank({layer: LayerMemoryState(layer, hidden, key, value)
+                for layer, hidden, (key, value) in zip(
+                    range(memory_loop_start, memory_loop_end), output.memory_body_entries,
+                    output.memory_body_kv)})
         return MemoryReadOutput(memory_read=output.memory_body_out,
-                                layer_memory_read=output.memory_body_entries)
+                                layer_memory_read=output.memory_body_entries,
+                                memory_read_bank=bank)
 
-    def forward_memory_opd_velocity(
+    @staticmethod
+    def _reader_timestep(x_t, timestep):
+        values = torch.as_tensor(timestep, device=x_t.device, dtype=x_t.dtype).reshape(-1)
+        if (values.numel() == 0 or values.unique().numel() != 1
+                or not bool(torch.isfinite(values).all()) or not bool(((values>=0)&(values<=1)).all())):
+            raise ValueError("reader requires one shared timestep")
+        return values[:1].expand(x_t.shape[0])
+
+    @torch.no_grad()
+    def forward_memory_read_bank(
         self, *, x_t, timestep, condition,
         memory_init_strategy="prompt_hidden_uniform",
         memory_body_start=12, memory_body_end=20,
-        return_memory=False,
-    ) -> torch.Tensor:
-        """Frozen strict Read and one GEN-only MemoryReader native T2I pass.
-
-        ``condition`` contains the inferencer's flow/read kwargs and captured
-        prompt content hidden. The caller owns the student-policy state; no
-        entire sampling trajectory is retained for backward here.
-        """
+    ):
+        """Prompt-derived M0 -> frozen strict Read -> detached native KV bank."""
         from ...memory_init import initialize_memory_from_prompt_hidden
 
         if memory_init_strategy != "prompt_hidden_uniform":
@@ -2208,38 +2229,60 @@ class Bagel(PreTrainedModel):
             num_slots=condition["num_slots"],
         )
         read_kwargs = dict(condition["read_kwargs"])
-        flow_kwargs = dict(condition["flow_kwargs"])
         # H_P^s is a body-entry state, not a token embedding. Prefix memory
         # uses neutral slots and is overwritten exactly at layer s.
-        read_kwargs.update(x_t=x_t, timestep=timestep,
+        read_kwargs.update(x_t=x_t.detach(), timestep=self._reader_timestep(x_t, timestep),
                            embed_memory=torch.zeros_like(initial),
                            memory_body_in=initial,
                            memory_loop_start=memory_body_start,
                            memory_loop_end=memory_body_end, adapter_mode="off",
-                           capture_layer_memory=True)
-        with torch.no_grad():
-            read = self.forward_memory_read(**read_kwargs)
-            memory = read.memory_read.detach()
-            layer_memories = read.layer_memory_read
-            if layer_memories is None or len(layer_memories) != memory_body_end - memory_body_start:
-                raise RuntimeError("strict Read did not capture each body-layer entry")
-            layer_memories = tuple(value.detach() for value in layer_memories)
-        if torch.is_grad_enabled():
-            initial_slots = self.memory_slot_stats(initial)
-            read_slots = self.memory_slot_stats(memory)
-            self.last_opd_memory_stats = {
-                "M0_rms": float(initial.detach().float().square().mean().sqrt()),
-                "Mread_rms": float(memory.float().square().mean().sqrt()),
-                "M0_effective_rank": initial_slots["effective_rank"],
-                "M0_slot_cosine": initial_slots["pairwise_cosine"],
-                "memory_effective_rank": read_slots["effective_rank"],
-                "Mread_slot_cosine": read_slots["pairwise_cosine"],
-            }
-        flow_kwargs.update(x_t=x_t, timestep=timestep, opd_memory_hidden=layer_memories,
+                           capture_layer_memory=True, capture_layer_kv=True)
+        read = self.forward_memory_read(**read_kwargs)
+        memory = read.memory_read.detach()
+        memory_bank = read.memory_read_bank
+        memory_bank.require_layers(memory_body_start, memory_body_end)
+        initial_slots = self.memory_slot_stats(initial)
+        read_slots = self.memory_slot_stats(memory)
+        self.last_opd_memory_stats = {
+            "M0_rms": float(initial.float().square().mean().sqrt()),
+            "Mread_rms": float(memory.float().square().mean().sqrt()),
+            "M0_effective_rank": initial_slots["effective_rank"],
+            "M0_slot_cosine": initial_slots["pairwise_cosine"],
+            "memory_effective_rank": read_slots["effective_rank"],
+            "Mread_slot_cosine": read_slots["pairwise_cosine"],
+        }
+        return memory_bank
+
+    def forward_memory_opd_velocity(
+        self, *, x_t, timestep, condition,
+        memory_init_strategy="prompt_hidden_uniform",
+        memory_body_start=12, memory_body_end=20, return_memory=False,
+    ):
+        """One student GEN forward with a frozen bank and gated readout."""
+        memory_bank = self.forward_memory_read_bank(x_t=x_t, timestep=timestep,
+            condition=condition, memory_init_strategy=memory_init_strategy,
+            memory_body_start=memory_body_start, memory_body_end=memory_body_end)
+        flow_kwargs = dict(condition["flow_kwargs"])
+        flow_kwargs.update(x_t=x_t, timestep=self._reader_timestep(x_t, timestep),
                            opd_reader_start=memory_body_start,
-                           opd_reader_end=memory_body_end)
+                           opd_reader_end=memory_body_end, opd_memory_hidden=memory_bank)
         velocity = self._forward_flow(**flow_kwargs)
-        return (velocity, layer_memories) if return_memory else velocity
+        return (velocity, memory_bank) if return_memory else velocity
+
+    def forward_memory_reader_warmup(self, *, flow_kwargs, memory_read_bank,
+                                    memory_body_start=12, memory_body_end=20):
+        """Side-head reconstruction: readout is never written back to GEN."""
+        from ...reader_warmup import ReaderWarmupOutput, layer_reconstruction
+        sink = {}
+        flow_kwargs=dict(flow_kwargs)
+        flow_kwargs["x_t"]=flow_kwargs["x_t"].detach()
+        velocity = self._forward_flow(**flow_kwargs, reader_warmup_bank=memory_read_bank,
+            reader_warmup_sink=sink, opd_reader_start=memory_body_start,
+            opd_reader_end=memory_body_end)
+        loss, layers = layer_reconstruction(sink, memory_body_start, memory_body_end)
+        return ReaderWarmupOutput(loss, layers,
+            {layer: values[0] for layer, values in sink.items()},
+            {layer: values[1] for layer, values in sink.items()}, velocity)
 
     def _combine_cfg_velocities(
         self,

@@ -1,10 +1,12 @@
-# Phase 1A T0: offline BAGEL Text-CoT, frozen strict Read, O_mem-only OPD.
+# Phase 1A.1a v4: warmed reader, zero-initialized injection gates only.
 # Supply paths on the CLI; formal training requires held-out semantic evidence
 # inside teacher_baseline_json. Field-only runs require --allow-field-only-debug
 # and --max-steps <= 10.
 model_path: null
 prompt_data: null
 teacher_cot_data: null
+reader_warmup_checkpoint: null
+reader_warmup_eval_json: null
 teacher_baseline_json: null
 output_dir: null
 device: auto
@@ -16,6 +18,12 @@ memory_init: prompt_hidden_uniform
 memory_writer_trainable: false
 o_adapter_rank: 8
 o_adapter_alpha: 16
+memory_reader:
+  load_warmup: true
+  injection_gate_init: 0.0
+  train_gate: true
+  train_adapter: false
+  train_q_lora: false
 teacher_type: bagel_text_cot
 teacher_mode: t2i
 cfg_text_scale: 1.0
@@ -27,7 +35,7 @@ timestep_shift: 3.0
 states_per_rollout: 2
 timestep_bucket_weights: [0.5, 0.4, 0.1]
 loss_type: velocity_mse
-learning_rate: 1.0e-4
+learning_rate: 1.0e-3
 max_grad_norm: 1.0
 max_steps: 5000
 save_steps: 250

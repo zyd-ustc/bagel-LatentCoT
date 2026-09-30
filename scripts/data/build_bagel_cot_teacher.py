@@ -48,28 +48,36 @@ def main():
     runtime = OPDRuntime.load_model(dict(model_path=args.model_path, device=args.device,
                                          height=512, width=512, num_loop_tokens=8,
                                          memory_loop_start_layer=12,
-                                         memory_loop_end_layer=20))
+                                         memory_loop_end_layer=20), stage="base")
     output.parent.mkdir(parents=True, exist_ok=True)
     with partial.open("x", encoding="utf-8") as handle:
         for index, row in enumerate(source):
             prompt = row.get("prompt")
             if not isinstance(prompt, str) or not prompt.strip() or not row.get("category"):
                 raise ValueError(f"row {index} needs a semantic T2I prompt and category")
+            previous_error=None
             for attempt in range(args.max_retries + 1):
                 context = runtime.inferencer.init_gen_context()
+                instruction=teacher_instruction(prompt)
+                if previous_error is not None:
+                    instruction += f"\nCorrect this validation failure: {previous_error}. Return the seven-section plan only."
                 context = runtime.inferencer.update_context_text(
-                    teacher_instruction(prompt), context)
+                    instruction, context)
                 reasoning = runtime.inferencer.gen_text(context, max_length=160,
-                                                        do_sample=attempt > 0,
-                                                        temperature=.3 if attempt else 1.)
+                                                        do_sample=False,
+                                                        temperature=1.)
                 cached = dict(prompt_id=str(row.get("prompt_id", row.get("id", index))),
                               prompt=prompt, category=row["category"],
                               reasoning_text=reasoning.strip(),
-                              teacher_template_version=TEMPLATE_VERSION)
+                              teacher_template_version=TEMPLATE_VERSION,
+                              teacher_model_revision=Path(args.model_path).name,
+                              reasoning_generation=dict(max_tokens=160, do_sample=False,
+                                                        temperature=1.0))
                 try:
                     validate_teacher_record(cached, tokenizer=runtime.inferencer.tokenizer)
                     break
-                except ValueError:
+                except ValueError as exc:
+                    previous_error=str(exc)
                     if attempt == args.max_retries:
                         raise ValueError(f"teacher quality gate failed at source row {index}")
             handle.write(json.dumps(cached, ensure_ascii=False) + "\n")

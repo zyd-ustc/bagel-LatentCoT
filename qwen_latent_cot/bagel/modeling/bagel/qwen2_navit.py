@@ -426,6 +426,7 @@ class BaseNavitOutputWithPast(ModelOutput):
     past_key_values: Optional[NaiveCache] = None
     memory_body_out: Optional[torch.FloatTensor] = None
     memory_body_entries: Optional[Tuple[torch.Tensor, ...]] = None
+    memory_body_kv: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
     memory_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
     gen_suffix_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
@@ -870,6 +871,8 @@ class PackedAttentionMoT(Qwen2Attention):
         force_memory_qkv_zero=False,
         mechanism_attention_trace=None,
         mechanism_stage=None,
+        memory_kv_sink=None,
+        reader_query_sink=None,
     ):
         if mode == "und":
             packed_query_states = self.q_proj(packed_query_sequence).view(
@@ -978,6 +981,20 @@ class PackedAttentionMoT(Qwen2Attention):
                 packed_query_states, packed_key_states, packed_value_states,
                 packed_memory_token_indexes,
             )
+
+        # Exact tensors used by this native attention call, after RMSNorm,
+        # projections, q/k norm and RoPE. Capture before any cache merge.
+        if memory_kv_sink is not None:
+            if packed_memory_token_indexes is None or not packed_memory_token_indexes.numel():
+                raise ValueError("memory KV capture requires memory token indices")
+            memory_kv_sink.append((
+                packed_key_states[packed_memory_token_indexes].detach().clone(),
+                packed_value_states[packed_memory_token_indexes].detach().clone()))
+        if reader_query_sink is not None:
+            if packed_vae_token_indexes is None or not packed_vae_token_indexes.numel():
+                raise ValueError("reader query capture requires GEN indices")
+            # Frozen Q weights still transmit gradients to earlier OPD gates.
+            reader_query_sink.append(packed_query_states[packed_vae_token_indexes].clone())
 
         if (
             past_key_values is not None
@@ -1267,6 +1284,9 @@ class Qwen2MoTDecoderLayer(nn.Module):
         mechanism_attention_trace=None,
         mechanism_stage=None,
         opd_memory_hidden=None,
+        memory_kv_sink=None,
+        reader_warmup_bank=None,
+        reader_warmup_sink=None,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1294,7 +1314,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 packed_query_sequence = packed_query_sequence_
 
             # Self Attention
-            native_attn_input = packed_query_sequence
+            reader_query_sink = [] if (opd_memory_hidden is not None or reader_warmup_bank is not None) else None
             packed_query_sequence, past_key_values = self.self_attn.forward_inference(
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
@@ -1314,15 +1334,36 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 force_memory_qkv_zero=force_memory_qkv_zero,
                 mechanism_attention_trace=mechanism_attention_trace,
                 mechanism_stage=mechanism_stage,
+                memory_kv_sink=memory_kv_sink,
+                reader_query_sink=reader_query_sink,
             )
-            if opd_memory_hidden is not None:
+            if opd_memory_hidden is not None or reader_warmup_bank is not None:
                 if mode != "gen" or packed_vae_token_indexes is None or not hasattr(self, "memory_reader"):
                     raise ValueError("OPD reader requires installed MoT GEN layer")
+                if len(reader_query_sink) != 1:
+                    raise RuntimeError("native GEN query was not captured")
+                memory = opd_memory_hidden if opd_memory_hidden is not None else reader_warmup_bank
+                reader_query=reader_query_sink[0]
+                if reader_warmup_bank is not None:
+                    reader_query=reader_query.detach()
+                readout = self.memory_reader(gen_query=reader_query,
+                    memory_key=memory.key, memory_value=memory.value)
+            if reader_warmup_bank is not None:
+                if opd_memory_hidden is not None or reader_warmup_sink is None:
+                    raise ValueError("warm-up is side-head only and cannot inject")
+                if (past_key_values is None or past_key_values.key_cache[self.self_attn.layer_idx] is None
+                        or query_lens.numel() != 1):
+                    raise ValueError("warm-up prompt bank requires B=1 native prompt cache")
+                target = self.memory_reader.prompt_target(gen_query=reader_query,
+                    prompt_key=past_key_values.key_cache[self.self_attn.layer_idx],
+                    prompt_value=past_key_values.value_cache[self.self_attn.layer_idx])
+                reader_warmup_sink[self.self_attn.layer_idx] = (readout, target)
+            if opd_memory_hidden is not None:
                 native_gen_rms = (packed_query_sequence[packed_vae_token_indexes].detach()
                     .float().square().mean().sqrt()) if torch.is_grad_enabled() else None
                 packed_query_sequence = packed_query_sequence.clone()
-                packed_query_sequence[packed_vae_token_indexes] += self.memory_reader(
-                    native_attn_input[packed_vae_token_indexes], opd_memory_hidden)
+                packed_query_sequence[packed_vae_token_indexes] += (
+                    self.memory_reader.injection_gate.to(readout.dtype) * readout)
                 if native_gen_rms is not None:
                     self.memory_reader.last_native_attn_rms = float(native_gen_rms)
             packed_query_sequence = residual + packed_query_sequence
@@ -1668,6 +1709,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         opd_reader_start: Optional[int] = None,
         opd_reader_end: Optional[int] = None,
         capture_memory_body_entries: bool = False,
+        capture_memory_body_kv: bool = False,
+        reader_warmup_bank=None,
+        reader_warmup_sink=None,
     ) -> BaseNavitOutputWithPast:
 
         enable_taylorseer = getattr(self, "enable_taylorseer", False)
@@ -1683,21 +1727,29 @@ class Qwen2Model(Qwen2PreTrainedModel):
         sin = sin.squeeze(0)
         packed_query_position_embeddings = (cos, sin)
 
-        if opd_memory_hidden is not None:
+        reader_bank = opd_memory_hidden if opd_memory_hidden is not None else reader_warmup_bank
+        if reader_bank is not None:
+            from ...memory_read_bank import MemoryReadBank
+            if not isinstance(reader_bank, MemoryReadBank):
+                raise ValueError("reader requires a layer-matched MemoryReadBank")
             if (not self.use_moe or mode != "gen" or update_past_key_values or is_causal
                     or packed_memory_token_indexes is not None or memory_loop_repeat != 1
                     or within_step_loop_repeat != 1 or memory_read_only
                     or opd_reader_start is None or opd_reader_end is None
-                    or not 0 <= opd_reader_start < opd_reader_end <= len(self.layers)):
-                raise ValueError("OPD requires native K=0 GEN forward and explicit reader body")
-            if (not isinstance(opd_memory_hidden, (tuple, list))
-                    or len(opd_memory_hidden) != opd_reader_end - opd_reader_start
-                    or any(memory.ndim != 2 or memory.shape[-1] != self.config.hidden_size
-                           for memory in opd_memory_hidden)
-                    or len({tuple(memory.shape) for memory in opd_memory_hidden}) != 1):
-                raise ValueError("OPD memory must have one [K, hidden_size] entry per reader layer")
+                    or not 0 <= opd_reader_start < opd_reader_end <= len(self.layers)
+                    or query_lens.numel() != 1 or enable_taylorseer):
+                raise ValueError("reader requires native K=0 GEN forward and explicit body")
+            reader_bank.require_layers(opd_reader_start, opd_reader_end)
+            if opd_memory_hidden is not None and reader_warmup_bank is not None:
+                raise ValueError("OPD injection and warm-up side head are exclusive")
         if capture_memory_body_entries and (not memory_read_only or memory_loop_repeat != 1):
             raise ValueError("layer-entry memory capture requires one strict Read round")
+        if capture_memory_body_kv and (not capture_memory_body_entries or not memory_read_only):
+            raise ValueError("native KV capture requires strict Read entry capture")
+        if capture_memory_body_kv and query_lens.numel() != 1:
+            raise ValueError("Read bank capture currently supports B=1")
+        if capture_memory_body_kv and not self.use_moe:
+            raise ValueError("native Read bank capture requires MoT")
 
         extra_inputs = {}
         if self.use_moe:
@@ -1722,6 +1774,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             force_memory_qkv_zero=False,
             mechanism_attention_trace=None,
             mechanism_stage=None,
+            memory_kv_sink=None,
         ):
             decoder_layer = self.layers[layer_idx]
             if enable_taylorseer:
@@ -1746,8 +1799,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 is_causal=is_causal,
                 **extra_inputs,
             )
-            if opd_memory_hidden is not None and opd_reader_start <= layer_idx < opd_reader_end:
-                layer_kwargs["opd_memory_hidden"] = opd_memory_hidden[layer_idx - opd_reader_start]
+            if reader_bank is not None and opd_reader_start <= layer_idx < opd_reader_end:
+                if opd_memory_hidden is not None:
+                    layer_kwargs["opd_memory_hidden"] = reader_bank.states[layer_idx]
+                else:
+                    layer_kwargs["reader_warmup_bank"] = reader_bank.states[layer_idx]
+                    layer_kwargs["reader_warmup_sink"] = reader_warmup_sink
+            if memory_kv_sink is not None:
+                layer_kwargs["memory_kv_sink"] = memory_kv_sink
             if packed_memory_token_indexes is not None:
                 layer_kwargs["packed_memory_token_indexes"] = packed_memory_token_indexes
                 layer_kwargs["block_gen_reads_memory"] = bool(block_gen_reads_memory)
@@ -2047,6 +2106,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             write_suffix = []
             write_memories = []
             read_entries = [] if capture_memory_body_entries else None
+            read_kv = [] if capture_memory_body_kv else None
             gen_idx = packed_vae_token_indexes
             has_gen = gen_idx is not None and int(gen_idx.numel()) > 0
 
@@ -2109,6 +2169,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                         packed_memory_token_indexes=indexes,
                         block_gen_reads_memory=block_this,
                         mask_prompt_kv_for_nonmemory=mask_prompt_this_round,
+                        memory_kv_sink=read_kv,
                     )
                     if _round > 0 and not write_memory_update:
                         hidden = hidden.clone()
@@ -2135,6 +2196,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     past_key_values=past_key_values,
                     memory_body_out=memory_r,
                     memory_body_entries=tuple(read_entries) if read_entries is not None else None,
+                    memory_body_kv=tuple(read_kv) if read_kv is not None else None,
                     memory_round_hiddens=(memory_r,),
                 )
             for layer_idx in range(e, len(self.layers)):
@@ -2466,6 +2528,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         opd_reader_start: Optional[int] = None,
         opd_reader_end: Optional[int] = None,
         capture_memory_body_entries: bool = False,
+        capture_memory_body_kv: bool = False,
+        reader_warmup_bank=None,
+        reader_warmup_sink=None,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model.forward_inference(
@@ -2516,6 +2581,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             opd_reader_start=opd_reader_start,
             opd_reader_end=opd_reader_end,
             capture_memory_body_entries=capture_memory_body_entries,
+            capture_memory_body_kv=capture_memory_body_kv,
+            reader_warmup_bank=reader_warmup_bank,
+            reader_warmup_sink=reader_warmup_sink,
         )
 
         return outputs

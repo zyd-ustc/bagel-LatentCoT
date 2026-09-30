@@ -1,0 +1,36 @@
+# Phase 1A.0: frozen strict Read + side-head prompt-bank reconstruction.
+# This stage never injects into generation. Supply paths before running.
+model_path: null
+prompt_data: null
+heldout_prompt_data: null
+output_dir: null
+device: auto
+seed: 42
+height: 512
+width: 512
+num_steps: 50
+timestep_shift: 3.0
+num_loop_tokens: 8
+memory_loop_start_layer: 12
+memory_loop_end_layer: 20
+memory_init: prompt_hidden_uniform
+o_adapter_rank: 8
+o_adapter_alpha: 16
+reader:
+  query_source: native_gen_q
+  memory_kv_source: frozen_read_native_kv
+  prompt_teacher_kv_source: native_prompt_cache
+  output_source: native_gen_o
+  inject_into_generation: false
+states_per_rollout: 2
+timestep_bucket_weights: [0.5, 0.4, 0.1]
+loss:
+  type: mse
+  layer_weights: uniform
+optimizer:
+  learning_rate: 1.0e-4
+  max_grad_norm: 1.0
+max_steps: 5000
+save_steps: 250
+eval_steps: 250
+eval_max_prompts: 8
