@@ -107,7 +107,8 @@ class SoftTIFAScorer:
                 log_gm = sum(math.log(max(value, 1e-8)) for value in probabilities) / len(probabilities)
                 prompt_scores.append(log_gm)
                 atom_scores.append(probabilities)
-        return {"scores": prompt_scores, "atom_scores": atom_scores}
+        return {"scores": prompt_scores, "atom_scores": atom_scores,
+                "prompt_order": [row["prompt"] for row in metadata]}
 
 
 def main() -> None:

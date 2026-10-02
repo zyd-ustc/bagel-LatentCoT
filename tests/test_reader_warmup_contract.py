@@ -87,6 +87,17 @@ def test_opd_warmup_gate_rejects_failed_conditions(tmp_path,change,reason):
         check_warmup_gate(config)
 
 
+def test_operational_gate_does_not_claim_correct_beats_zero(tmp_path):
+    """Document the existing gate boundary; zero usefulness is separate analysis."""
+    model = tmp_path / "model"
+    model.mkdir()
+    config, report = warmup_evidence(tmp_path, model)
+    config.update(num_steps=50, height=512, width=512, timestep_shift=3.)
+    report["heldout_error_mse"]["zero"] = .1
+    Path(config["reader_warmup_eval_json"]).write_text(json.dumps(report))
+    assert check_warmup_gate(config)["heldout_error_mse"]["correct"] > .1
+
+
 def test_warmup_gate_rejects_changed_checkpoint_and_prompt_provenance(tmp_path):
     model=tmp_path/"model"
     model.mkdir()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -38,6 +39,8 @@ def main() -> None:
     parser.add_argument("--baseline-run", type=str, default="")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.output_dir.exists():
+        raise FileExistsError(f"refusing to overwrite report directory: {args.output_dir}")
 
     benchmark = load_benchmark(args.benchmark_data)
     summaries = []
@@ -58,15 +61,19 @@ def main() -> None:
         baseline_name=args.baseline_run or None,
     )
     result["benchmark_data"] = str(args.benchmark_data)
+    result["benchmark_sha256"] = benchmark.source_sha256
+    result["score_files_sha256"] = {str(parse_run_arg(value)[1]): hashlib.sha256(
+        parse_run_arg(value)[1].read_bytes()).hexdigest() for value in args.run}
+    result["score_units"] = "percent; deltas in percentage points"
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=False)
     summary_json = args.output_dir / "geneval2_summary.json"
     summary_csv = args.output_dir / "geneval2_summary.csv"
     skill_csv = args.output_dir / "geneval2_skills.csv"
     atomicity_csv = args.output_dir / "geneval2_atomicity.csv"
     summary_md = args.output_dir / "geneval2_summary.md"
 
-    summary_json.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    summary_json.write_text(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
     write_summary_csv(result, summary_csv)
     write_skill_csv(result, skill_csv)
     write_atomicity_csv(result, atomicity_csv)

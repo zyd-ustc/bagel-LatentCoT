@@ -7,6 +7,7 @@ BAGEL-7B-MoT 上的 latent memory 研究实现。
 通过 heldout readability gate 后加载并冻结 reader，在 student on-policy states 上
 只训练零初始化 injection gates，拟合 frozen BAGEL `[prompt; reasoning]` teacher velocity。
 [协议、数据门槛与入口](docs/experiments/phase1a_v4/README.md)。
+[已有结果离线诊断、评分测试与 64 条独立生图评测清单](docs/experiments/phase1a_v4/offline/README.md)。
 旧 [Memory Grounding v2](docs/experiments/memory_grounding_v2/README.md)
 及 pair-hidden/zero-shot 代码保留为历史对照，不作为 OPD 的训练依赖。
 

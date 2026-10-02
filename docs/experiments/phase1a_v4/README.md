@@ -163,7 +163,13 @@ checkpoint hash。OPD eval 需要同时传 `--reader-warmup-checkpoint`、
 
 旧 raw-hidden、position-free、adapter-only OPD checkpoint 不兼容。旧 `bagel_t0_v1`
 CoT cache 要重新生成，不能只改版本字符串。已有历史 loop/grounding 入口不参与 v4。
-没有实现 optimizer/data-cursor 精确 resume、DDP、Phase 1A.1b capacity relaxation、
-Q_mem LoRA、Draft-Verify 或 Phase 2 Write/loop supervision。
+Warm-up 已实现 adapter/AdamW/global-step 续训，新 checkpoint 同时保存逐 rank RNG；
+旧 step-750 没有完整 RNG，恢复模式明确标记为 `legacy_seeded_rollout`，不承诺
+H200 位级一致。多卡采用显式参数/梯度同步，不是 DDP。OPD 仍无此续训实现；
+Phase 1A.1b capacity relaxation、Q_mem LoRA、Draft-Verify 和 Phase 2 Write/loop
+supervision 未实现。
+
+CPU-only 结果诊断、生图评分测试与数据审计见 [offline/README.md](offline/README.md)。
+原有 gate 不变；离线报告单独标出 correct-vs-zero 的证据边界。
 
 本地机制与 runner 验证记录见 [VALIDATION.md](VALIDATION.md)。

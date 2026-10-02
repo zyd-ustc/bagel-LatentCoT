@@ -11,6 +11,7 @@ This module keeps the heavy VLM scoring separate from lightweight aggregation:
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ class GenEval2Prompt:
 @dataclass(frozen=True)
 class GenEval2Benchmark:
     prompts: tuple[GenEval2Prompt, ...]
+    source_sha256: Optional[str] = None
 
     @property
     def prompt_count(self) -> int:
@@ -51,41 +53,66 @@ class GenEval2Benchmark:
 
 def load_benchmark(path: str | Path) -> GenEval2Benchmark:
     prompts: list[GenEval2Prompt] = []
+    seen = set()
     with Path(path).open("r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
             record = json.loads(line)
-            prompt = str(record["prompt"])
-            atom_count = int(record["atom_count"])
-            skills = tuple(str(skill) for skill in record["skills"])
-            if not skills:
-                raise ValueError(f"line {line_no}: empty skills list")
+            prompt, atom_count = record.get("prompt"), record.get("atom_count")
+            raw_skills = record.get("skills")
+            if not isinstance(prompt, str) or not prompt.strip() or prompt in seen:
+                raise ValueError(f"line {line_no}: empty/duplicate prompt")
+            if isinstance(atom_count, bool) or not isinstance(atom_count, int) or atom_count < 1:
+                raise ValueError(f"line {line_no}: invalid atomicity")
+            if (not isinstance(raw_skills, list) or not raw_skills
+                    or any(not isinstance(skill, str) or not skill.strip() for skill in raw_skills)):
+                raise ValueError(f"line {line_no}: invalid skills list")
+            skills = tuple(raw_skills)
+            # GenEval2 atomicity is not the VQA question count; do not equate them.
+            if "vqa_list" in record and (not isinstance(record["vqa_list"], list)
+                    or len(record["vqa_list"]) != len(skills)
+                    or any(not isinstance(pair, list) or len(pair) != 2
+                           or any(not isinstance(value, str) or not value.strip() for value in pair)
+                           for pair in record["vqa_list"])):
+                raise ValueError(f"line {line_no}: VQA/skills alignment mismatch")
+            seen.add(prompt)
             prompts.append(GenEval2Prompt(prompt=prompt, atom_count=atom_count, skills=skills))
     if not prompts:
         raise ValueError(f"empty GenEval2 benchmark: {path}")
-    return GenEval2Benchmark(tuple(prompts))
+    return GenEval2Benchmark(tuple(prompts), hashlib.sha256(Path(path).read_bytes()).hexdigest())
 
 
 def _as_score_lists(payload: Any, benchmark: GenEval2Benchmark) -> list[list[float]]:
     """Accept official score-list JSON and a few report-friendly wrappers."""
     if isinstance(payload, dict):
+        if "benchmark_sha256" in payload and payload["benchmark_sha256"] != benchmark.source_sha256:
+            raise ValueError("score benchmark SHA-256 mismatch")
+        if "prompt_order" in payload and payload["prompt_order"] != [item.prompt for item in benchmark.prompts]:
+            raise ValueError("score prompt order mismatch")
         if "score_lists" in payload:
             payload = payload["score_lists"]
         elif "scores" in payload:
             payload = payload["scores"]
         else:
             prompt_map = payload
-            if all(item.prompt in prompt_map for item in benchmark.prompts):
-                return [
-                    [float(value) for value in prompt_map[item.prompt]]
-                    for item in benchmark.prompts
-                ]
+            if set(prompt_map) == {item.prompt for item in benchmark.prompts}:
+                payload = [prompt_map[item.prompt] for item in benchmark.prompts]
+                return _numeric_score_rows(payload)
             raise ValueError(
                 "score JSON dict must contain 'score_lists', 'scores', or prompt keys"
             )
     if not isinstance(payload, list):
         raise ValueError("score JSON must be a list or a supported dict wrapper")
+    return _numeric_score_rows(payload)
+
+
+def _numeric_score_rows(payload):
+    if any(not isinstance(row, list) for row in payload):
+        raise ValueError("score rows must be lists")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           for row in payload for value in row):
+        raise ValueError("score values must be numeric probabilities, not bool/string")
     return [[float(value) for value in row] for row in payload]
 
 
@@ -113,6 +140,8 @@ def validate_score_lists(
                 f"{len(item.skills)} skills"
             )
         for score in scores:
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                raise ValueError(f"{source}: score must be a numeric probability")
             if not math.isfinite(float(score)):
                 raise ValueError(f"{source}: non-finite score at prompt {idx}: {score}")
             if float(score) < 0.0 or float(score) > 1.0:
@@ -165,7 +194,7 @@ def summarize_score_lists(
             "count": skill_count.get(skill, 0),
             "soft_tifa_am": _percent(skill_sum[skill] / skill_count[skill])
             if skill_count.get(skill, 0)
-            else float("nan"),
+            else None,
         }
         for skill in sorted(skill_sum, key=lambda s: SKILL_ORDER.index(s) if s in SKILL_ORDER else 999)
     }
@@ -184,6 +213,7 @@ def summarize_score_lists(
     return {
         "name": name,
         "source": source,
+        "benchmark_sha256": benchmark.source_sha256,
         "num_prompts": benchmark.prompt_count,
         "num_atoms": benchmark.atom_count,
         "overall": {
@@ -205,6 +235,11 @@ def compare_summaries(
     *,
     baseline_name: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if not summaries or len({item["name"] for item in summaries}) != len(summaries):
+        raise ValueError("nonempty runs with unique names required")
+    if len({(item.get("benchmark_sha256"), item["num_prompts"], item["num_atoms"])
+            for item in summaries}) != 1:
+        raise ValueError("runs use different benchmark contracts")
     result = {"runs": list(summaries), "baseline": baseline_name, "deltas": {}}
     if not baseline_name:
         return result
@@ -221,8 +256,9 @@ def compare_summaries(
                 for key in ("soft_tifa_am", "soft_tifa_gm", "atom_weighted_am")
             },
             "skills": {
-                skill: float(item["skills"][skill]["soft_tifa_am"])
-                - float(base_skills[skill]["soft_tifa_am"])
+                skill: (float(item["skills"][skill]["soft_tifa_am"])
+                        - float(base_skills[skill]["soft_tifa_am"])
+                        if item["skills"][skill]["count"] and base_skills[skill]["count"] else None)
                 for skill in item["skills"]
                 if skill in base_skills
             },
