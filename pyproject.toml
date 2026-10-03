@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bagel-latent-cot"
 version = "0.2.0"
-description = "BAGEL-7B-MoT native hidden-memory loop (Phase-0) and FlowEdit / reflection-loop baselines"
+description = "BAGEL-7B-MoT memory reader warm-up and Self-CoT on-policy distillation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

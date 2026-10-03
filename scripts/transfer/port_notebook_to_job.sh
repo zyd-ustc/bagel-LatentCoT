@@ -6,10 +6,10 @@
 # avoid random-access dd reads.
 #
 # Usage:
-#   bash scripts/transfer/port_h200_to_job.sh code
-#   bash scripts/transfer/port_h200_to_job.sh model [parallel]
-#   bash scripts/transfer/port_h200_to_job.sh data  [parallel]
-#   bash scripts/transfer/port_h200_to_job.sh all   [parallel]
+#   bash scripts/transfer/port_notebook_to_job.sh code
+#   bash scripts/transfer/port_notebook_to_job.sh model [parallel]
+#   bash scripts/transfer/port_notebook_to_job.sh data  [parallel]
+#   bash scripts/transfer/port_notebook_to_job.sh all   [parallel]
 
 set -uo pipefail
 

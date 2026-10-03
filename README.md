@@ -1,153 +1,63 @@
 # bagel-LatentCoT
 
-BAGEL-7B-MoT 上的 latent memory 研究实现。
+BAGEL-7B-MoT 的 latent memory 研究实现。当前路线：
+**Phase 1A.0 Reader Warm-up → Phase 1A.1a Self-CoT OPD**。
+主分支为 `main`；历史实验与当前训练依赖分开记录。
 
-当前实验实现为 **Phase 1A v4：Reader Warm-up → Self-CoT OPD**：
-先用 frozen native prompt-bank readout 监督独立 memory reader side head，
-通过 heldout readability gate 后加载并冻结 reader，在 student on-policy states 上
-只训练零初始化 injection gates，拟合 frozen BAGEL `[prompt; reasoning]` teacher velocity。
-[协议、数据门槛与入口](docs/experiments/phase1a_v4/README.md)。
-[已有结果离线诊断、评分测试与 64 条独立生图评测清单](docs/experiments/phase1a_v4/offline/README.md)。
-旧 [Memory Grounding v2](docs/experiments/memory_grounding_v2/README.md)
-及 pair-hidden/zero-shot 代码保留为历史对照，不作为 OPD 的训练依赖。
+## 当前实现
 
-历史 zero-shot 入口为 **normal-only R=2/4/6/8，8 hard prompts**：
-[协议、环境检查与 H200 运行命令](docs/experiments/normal_r_ablation/README.md)。
-旧六组机制对照已退出当前评测入口，历史结果仍保留。
-启动器默认使用当前 Python 环境和可见 CUDA GPU，不再依赖 Ascend 路径。
+1. Reader Warm-up：冻结 BAGEL 和 memory writer，用原生 prompt-bank readout
+   监督独立 memory reader，仅训练低秩 translation A/B。此阶段不向生图主路注入。
+2. Self-CoT OPD：加载并冻结 reader，在 student states 上训练零初始化 injection
+   gates，拟合 frozen `[prompt; reasoning]` teacher velocity。
 
-以下是历史 loop 路线说明，不是当前 Phase 1A v4 的计算图：它不是外循环编辑 agent，也不是 FlowEdit。每个去噪步里固定跑
-`1 read + (loop_depth - 1) write`：\(K\) 个 memory token 走 understanding
-expert，和当前 VAE/gen token 做原生 joint attention，只用最后一轮速度推进
-\(x_t\)。当前方法称为 **Read–Write Loop with implicit context rerouting**。
+OPD 是 on-policy distillation（在 student 自己生成的状态上进行蒸馏）。
+两阶段固定 K=8、body `[12,20)`。Warm-up 支持 CUDA 多卡同步和断点续训；
+OPD 当前仍为单卡入口。运行前必须通过配置、数据和 artifact 校验。
 
-设计文档：[docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx](docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx)
+## 安装与检查
 
-## 历史实现（不是 v2 的阶段依赖）
-
-| 阶段 | 状态 |
-|---|---|
-| **Phase 0** | 已实现。默认 **same-depth body loop**：prefix 一次、只在 \([s,e)\) 上把 memory slots recycle \(R\) 次、suffix 一次。Round-0 禁止所有 non-memory query 读取 memory，关闭跨层 UND relay。CFG 三条分支各自维护 memory；`K=0` 走原 `_forward_flow`。 |
-| **Phase 1.1** | 已实现 Pair-Grounded Memory Read：同一 target-noised state 上用 source/target frozen visual reference 构造 memory delta，只训练 `[12,20)` UND-Q LoRA。 |
-| **Phase 1.2A** | 已实现 Target Flow SFT：加载并冻结 Phase 1.1 UND-Q，只训练 GEN-Q，直接拟合 `epsilon - x1`；structured reflection 降级为 ablation。 |
-| Phase 1.3+ | 等 1.1/1.2 go gate 后再做 joint relaxation、memory swap、persist 与 RL。 |
-| **B2 FlowEdit** | 官方速度场差速积分，对照「纯 flow 编辑」 |
-| **B3 显式反思链** | `draft_prefix_loop`：decode → UND 文本 → 官方 Editing |
-
-## 代码
-
-```
-qwen_latent_cot/bagel/           # 官方 BAGEL + Phase-0 loop
-  modeling/bagel/bagel.py        # prepare_vae_latent / _forward_flow / _forward_flow_loop
-  inferencer.py                  # InterleaveInferencer + gen_image_flowedit
-scripts/evaluate/                # B2 / B3 / GenEval2
-scripts/train/                   # Phase 1 paired memory/flow + 后续 GRPO
-experiments/data/                # GenEval2-hard 16
-docs/                            # 主设计 + FlowEdit / 外循环说明
-tests/test_mot_loop_phase0.py
-```
-
-旧 Phase 1 对照入口（legacy hidden-space grounding ablation）：
-
-```bash
-# 1.1: prefix -> strict Read -> STOP; UND-Q only
-python scripts/train/bagel_loop_pair_memory.py \
-  --config configs/training/loop_pair_memory_early.yaml
-
-# 1.2A: Read -> Write -> suffix; frozen UND-Q + trainable GEN-Q
-python scripts/train/bagel_loop_pair_flow_sft.py \
-  --config configs/training/loop_pair_flow_early_fresh.yaml \
-  --read-adapter /path/to/pair_memory_adapter.safetensors
-```
-
-完整协议见
-[`docs/BAGEL_LatentCoT_Phase1_Pair_Grounded_Memory_Plan.md`](docs/BAGEL_LatentCoT_Phase1_Pair_Grounded_Memory_Plan.md)。
-旧 `bagel_loop_delta_v_distill.py` 仅保留作 structured-reflection ablation。
-
-启用 Phase-0 memory（默认 `K=0`，不改官方路径）：
-
-```python
-BagelConfig(
-    ...,
-    num_loop_tokens=8,
-    loop_depth=2,
-    loop_recycle_mode="same_depth",  # or "full_depth"
-    loop_memory_persist=False,
-    memory_loop_start_layer=16,
-    memory_loop_end_layer=24,
-    round0_memory_write_enabled=False,  # strict read round
-)
-# BagelBackbone.load() 会用原生 SOI/EOI embedding 确定性初始化 m0。
-```
-
-`return_loop_diagnostics=False` 是正式推理/训练默认值，此时严格只跑
-`prefix ×1 + body ×R + suffix ×1`；机制探针显式设为 `True` 才计算逐轮
-`ΔM / ΔG / Δv`。
-
-旧配置 `round0_gen_reads_memory` 仍可读取，但已由语义准确的
-`round0_memory_write_enabled` 取代。实验 metadata 同时记录
-`num_read_rounds` / `num_write_rounds`，例如 `loop_depth=2` 表示 `1R + 1W`。
-
-## 安装
+在仓库根目录执行。完整训练需要兼容 CUDA/PyTorch 环境，以及官方
+[BAGEL-7B-MoT 权重](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT)。
 
 ```bash
 pip install -e '.[dev]'
-pytest -q tests/test_mot_loop_phase0.py tests/test_bagel_flowedit.py
+python -m pytest -q
 ```
 
-权重用官方 [BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT)（需要完整 `ema.safetensors`）。
+## 常用入口
 
-## 对照实验
+| 用途 | 入口 |
+|---|---|
+| 导出 prompt-only 训练和 heldout 数据 | `scripts/data/prepare_reader_warmup_prompts.py` |
+| Reader Warm-up、续训 | `scripts/train/bagel_memory_reader_warmup.py` |
+| 8卡新训练：数据导出、smoke、正式训练 | `scripts/train/launch_reader_warmup_8gpu.sh` |
+| 独立检查 reader checkpoint | `scripts/evaluate/bagel_memory_reader_warmup_eval.py` |
+| Self-CoT teacher 数据与 OPD | `scripts/data/build_bagel_cot_teacher.py`、`scripts/train/bagel_memory_opd.py` |
+| checkpoint 生图、评分清单与离线诊断 | `scripts/evaluate/bagel_memory_opd_eval.py`、`scripts/evaluate/prepare_phase1a_score_inputs.py`、`scripts/evaluate/analyze_reader_warmup.py` |
 
-Phase 0.5 是 frozen BAGEL 的纯 T2I compositional mechanism benchmark。所有 arm
-共享 prompt、initial noise、1024×1024 geometry、官方 T2I CFG、50-step schedule，
-只改变 loop body 与跨 timestep persistence。默认使用官方 GenEval2 全量 800
-prompts（atomicity 3–10 各 100 条）。16 卡主矩阵：
+完整参数、运行顺序和进入 OPD 的两项门槛见
+[Phase 1A 运行说明](docs/experiments/phase1a_v4/README.md)。
+续训时 `--max-steps` 是最终总步数，必须使用全新输出目录；不得覆盖旧 run。
 
-```bash
-bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/out
+## 已有结果与证据范围
+
+20474 的8卡 Reader Warm-up 已完成到 step-5000。最终8条 heldout prompt 的
+readout MSE：correct=2.5826、shuffled=3.0956、zero=2.7046；native parity=0。
+这是重建误差，不是生图质量评分。OPD 未自动启动，语义生图评测仍待执行。
+
+- [完整训练和检查点记录](docs/experiments/phase1a_v4/resume_20474_20261002/RUN.md)
+- [64条独立生图评测清单、评分校验和数据审计](docs/experiments/phase1a_v4/offline/README.md)
+- [历史实验索引](docs/history/README.md)
+
+## 项目结构
+
+```text
+qwen_latent_cot/bagel/       BAGEL、memory reader、Warm-up 与 OPD
+qwen_latent_cot/evaluation/  GenEval2、评分校验、离线诊断
+scripts/                    数据、训练与评测入口
+configs/                    训练与评测配置
+experiments/data/           固定 prompt 和评测清单
+tests/                      CPU 单元与契约测试
+docs/                       当前协议、实验记录与历史索引
 ```
-
-K 消融与主矩阵分开运行：
-
-```bash
-K_VALUES=1,4,8 bash scripts/evaluate/run_bagel_loop_t2i_zeroshot.sh /path/to/k_ablation
-```
-
-主矩阵固定为 Z0 vanilla；Z2/Z3/Z4 分别使用 mid/early/late body 且不跨 timestep
-保留 memory；Z6 是 early body 的 persistence 对照。Z5/Z7 已从当前主实验移除。
-生成完成后会写 `mechanism_summary.json` 及每个 arm 的 GenEval2 image map；如果
-Soft-TIFA server 已运行或 `VLM_PATH` 可用，launcher 会自动汇总 AM/GM、skill 和
-atomicity。设置 `SCORE=1` 可强制要求评分成功；`K_VALUES` 非空时不得同时设置
-`ARMS`。
-
-全量 800 prompts 与 Z0 三 seed 随机性对照一键运行：
-
-```bash
-nohup bash scripts/evaluate/run_bagel_loop_t2i_full800_multiseed.sh \
-  /data/outputs/bagel_loop_t2i_full800_multiseed \
-  > /data/outputs/bagel_loop_t2i_full800_multiseed.log 2>&1 &
-```
-
-该协议在 seed 42 比较 `Z0,Z2,Z3,Z4,Z6`，并额外运行 seed 43/44 的 Z0。
-额外 seed 只衡量 baseline 随机波动，不等价于所有 loop arm 的多 seed 复现。
-
-原 paired-edit specification 与 runner 保留在
-`experiments/data/semantic_edit_phase05.jsonl` 和
-`scripts/evaluate/bagel_loop_edit_zeroshot.py`，留待 Phase 2 editing 使用。
-完整协议、arm 定义和评分命令见
-[`docs/BAGEL_LatentCoT_T2I_Phase05.md`](docs/BAGEL_LatentCoT_T2I_Phase05.md)。
-
-FlowEdit 4.1（文档 B2），16 卡：
-
-```bash
-bash scripts/evaluate/run_bagel_flowedit_zeroshot.sh /path/to/out
-```
-
-Draft-prefix 外循环（文档 B3）：
-
-```bash
-bash scripts/evaluate/run_draft_prefix_loop.sh /path/to/out
-```
-
-官方 T2I / Editing / Understanding 接口见 [inference.ipynb](inference.ipynb)。
