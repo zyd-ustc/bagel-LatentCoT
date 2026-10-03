@@ -61,6 +61,8 @@ def autocast_for(device):
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     if kind == "npu":
         return torch.npu.amp.autocast(dtype=torch.bfloat16)
+    if kind == "cpu":
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
     return nullcontext()
 
 
@@ -85,3 +87,12 @@ def enable_dynamo_flex_attention() -> bool:
     if os.environ.get("LCOT_DISABLE_FLEX", "").strip() in ("1", "true", "True"):
         return False
     return cuda_available()
+
+
+def synchronize(device):
+    """Finish accelerator work before reading wall-clock inference latency."""
+    kind = str(getattr(device, "type", device))
+    if kind == "cuda":
+        torch.cuda.synchronize(device)
+    elif kind == "npu":
+        torch.npu.synchronize(device)

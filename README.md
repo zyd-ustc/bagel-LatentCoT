@@ -1,131 +1,113 @@
-# bagel-LatentCoT
+# UMM T2ILoop on BAGEL
 
-BAGEL-7B-MoT 上的 latent-condition research code。Phase 0.5 当前主线是
-**Anchored Dynamic Prompt Memory**：原生 prompt KV 始终作为 anchor，active
-prompt-copy 在固定 \(x_t\) 上做 Read，随后只把同层 \(\Delta V_P\) 残差写回
-GEN 的原生 prompt attention route。不再把 K=8 side memory 当成 semantic carrier。
+本分支按 `UMM_T2ILoop_Anchored_Loop_Design.docx` 重构为 **Anchored GEN Loop + Memory Scratchpad**。
+原生 prompt KV、同一 diffusion timestep 的 `x_t` 和 loop entry `G₀` 是固定 anchor。
+主要循环状态是 GEN correction `ΔG`；memory 是可选的 UND 工作区。
 
-设计文档：[docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx](docs/BAGEL_MoT_Latent_Loop_MDP_Research_Design.docx)
+```text
+native prefix → G₀ → native body → G_base
+                    extra body × R:
+                    G₀ + A(ΔG, M) → gated body → G_r, M_r
+                    G_base + α_r(G_r − G_base) → shared suffix → v_r
+final velocity → one native Euler update of x_t
+```
 
-## 现在做到哪
-
-| 阶段 | 状态 |
-|---|---|
-| **Phase 0** | 已实现。默认 **same-depth body loop**：prefix 一次、只在 \([s,e)\) 上把 memory slots recycle \(R\) 次、suffix 一次。Round-0 禁止所有 non-memory query 读取 memory，关闭跨层 UND relay。CFG 三条分支各自维护 memory；`K=0` 走原 `_forward_flow`。 |
-| **Phase 0.5** | 已重构。保留 full-length native prompt anchor；`[12,20)` Read 产生同层 `ΔV`，Write 仅注入 `V₀ + αΔV`；默认只开 early 35% denoising steps。 |
-| **Phase 1.1** | 已实现 Pair-Grounded Memory Read：同一 target-noised state 上用 source/target frozen visual reference 构造 memory delta，只训练 `[12,20)` UND-Q LoRA。 |
-| **Phase 1.2A** | 已实现 Target Flow SFT：加载并冻结 Phase 1.1 UND-Q，只训练 GEN-Q，直接拟合 `epsilon - x1`；structured reflection 降级为 ablation。 |
-| Phase 1.3+ | 等 1.1/1.2 go gate 后再做 joint relaxation、memory swap、persist 与 RL。 |
-| **B2 FlowEdit** | 官方速度场差速积分，对照「纯 flow 编辑」 |
-| **B3 显式反思链** | `draft_prefix_loop`：decode → UND 文本 → 官方 Editing |
+`loop_depth=R` **仅计额外 body 执行次数**。它与旧版含首轮 Read 的 `loop_depth` 含义不同。
+旧 memory-loop、动态 prompt KV、pair-memory / teacher distillation、GRPO、FlowEdit
+及显式反思链入口已经删除。旧 checkpoint 和旧配置不兼容新循环架构。
+原生模型权重名称与计算路径保留；新 checkpoint 只保存 `t2i_loop` 参数。
 
 ## 代码
 
-```
-qwen_latent_cot/bagel/           # 官方 BAGEL + Phase-0 loop
-  modeling/bagel/bagel.py        # prepare_vae_latent / _forward_flow / _forward_flow_loop
-  inferencer.py                  # InterleaveInferencer + gen_image_flowedit
-scripts/evaluate/                # B2 / B3 / GenEval2
-scripts/train/                   # Phase 1 paired memory/flow + 后续 GRPO
-experiments/data/                # GenEval2-hard 16
-docs/                            # 主设计 + FlowEdit / 外循环说明
-tests/test_mot_loop_phase0.py
-```
+| 文件 | 职责 |
+| --- | --- |
+| `qwen_latent_cot/bagel/anchored_loop.py` | 统一配置、re-entry、gate、memory、输出 merge、循环与直接 flow loss |
+| `qwen_latent_cot/bagel/navit_loop.py` | 原生 prefix/base/body/suffix、MoT 路由和只读 KV |
+| `qwen_latent_cot/bagel/modeling/bagel/bagel.py` | velocity、分支隔离、CFG 组合与原生 sampler |
+| `qwen_latent_cot/bagel/inferencer.py` | T2I prompt cache、输入准备与 VAE decode |
+| `scripts/train/train_t2i_loop.py` | adapter-only Stage 1 与可变循环深度 |
+| `scripts/evaluate/t2i_loop_matrix.py` | 模式/深度对照、memory 干预和 timestep 诊断 |
 
-Phase 1 新主线入口：
+完整方案的文本转录见 [设计原文](docs/UMM_T2ILoop_Anchored_Loop_Design.md)。
+逐项实现与验收范围见 [实现对应表](docs/IMPLEMENTATION.md)。
 
-```bash
-# 1.1: prefix -> strict Read -> STOP; UND-Q only
-python scripts/train/bagel_loop_pair_memory.py \
-  --config configs/training/loop_pair_memory_early.yaml
+## 安装与测试
 
-# 1.2A: Read -> Write -> suffix; frozen UND-Q + trainable GEN-Q
-python scripts/train/bagel_loop_pair_flow_sft.py \
-  --config configs/training/loop_pair_flow_early_fresh.yaml \
-  --read-adapter /path/to/pair_memory_adapter.safetensors
-```
-
-完整协议见
-[`docs/BAGEL_LatentCoT_Phase1_Pair_Grounded_Memory_Plan.md`](docs/BAGEL_LatentCoT_Phase1_Pair_Grounded_Memory_Plan.md)。
-旧 `bagel_loop_delta_v_distill.py` 仅保留作 structured-reflection ablation。
-
-启用 Phase-0 memory（默认 `K=0`，不改官方路径）：
-
-```python
-BagelConfig(
-    ...,
-    num_loop_tokens=8,
-    loop_depth=2,
-    loop_recycle_mode="same_depth",  # or "full_depth"
-    loop_memory_persist=False,
-    memory_loop_start_layer=16,
-    memory_loop_end_layer=24,
-    round0_memory_write_enabled=False,  # strict read round
-)
-# BagelBackbone.load() 会用原生 SOI/EOI embedding 确定性初始化 m0。
-```
-
-`return_loop_diagnostics=False` 是正式推理/训练默认值，此时严格只跑
-`prefix ×1 + body ×R + suffix ×1`；机制探针显式设为 `True` 才计算逐轮
-`ΔM / ΔG / Δv`。
-
-旧配置 `round0_gen_reads_memory` 仍可读取，但已由语义准确的
-`round0_memory_write_enabled` 取代。实验 metadata 同时记录
-`num_read_rounds` / `num_write_rounds`，例如 `loop_depth=2` 表示 `1R + 1W`。
-
-## 安装
+在仓库根目录执行。先安装与目标 CUDA / Ascend 环境匹配的 PyTorch 与 torchvision。
 
 ```bash
 pip install -e '.[dev]'
-pytest -q tests/test_mot_loop_phase0.py tests/test_bagel_flowedit.py
+pytest -q
 ```
 
-权重用官方 [BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT)（需要完整 `ema.safetensors`）。
+## Training-free topology 对照
 
-## 对照实验
-
-Phase 0.5 先做固定 \(x_t\) 数值验证，再跑端到端 trajectory。两种模式都共享
-prompt、initial noise、geometry、CFG 与 schedule；`alpha=0` 直接走原生
-`_forward_flow`，用于 exact native parity。
+需要原生 BAGEL-7B-MoT 权重、其 tokenizer 配置和 `ae.safetensors`。
+参数 `--alpha` 是手动 topology intervention，不能当作训练收益。
+所有 arm 使用同一初始噪声、prompt、CFG、schedule 与 body 区间。
+循环开始后各 arm 的 sampler 轨迹会随 velocity 自然分叉。
 
 ```bash
-python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
-  --mode probe --model-path /path/to/BAGEL-7B-MoT \
-  --output-dir /data/zyd_workspace/outputs/dynamic_prompt_probe \
-  --alphas 0,0.1,-0.1,0.2 --max-prompts 16
+python scripts/evaluate/t2i_loop_matrix.py \
+  --model-path /path/to/BAGEL-7B-MoT \
+  --prompts experiments/data/geneval2_hard_16.jsonl \
+  --output-dir outputs/topology \
+  --modes gen_only,gen_memory_anchored,memory_only,direct_native \
+  --depths 0,1,2,3,4 --memory-slots 8 \
+  --start-layer 16 --end-layer 24 \
+  --alpha 0.1 --gate 0.02 --save-readouts
 ```
 
-端到端 hard16：
+输出包含各 arm 的最终图、每轮 velocity、early/middle/late 的 `x0` 估计图和诊断记录。
+`x0` 估计图是固定 `x_t` 上的 functional probe，不是完整采样得到的图。
+`--memory-control correct|zero|frozen|shuffled` 提供内容对照。
+`shuffled` 在 batch 维度交换 memory，要求每个 batch 至少有两个样本。
+比较 `K=8` 与 `K=16` 时分别运行上述矩阵。
+
+## Stage 1 训练
+
+仅在 topology 实验达到文档中的语义与质量门槛后运行训练。
+训练集为 JSONL。每行包含 `prompt`、`image` 和可选 `bucket`。
+相对图片路径按 JSONL 所在目录解析；`bucket` 支持 `ordinary`、`structural`、`easy`、`noop`。
+首轮数据应排除复杂文字、风格和文化实体。
+
+```json
+{"prompt":"two red cubes left of a blue sphere","image":"images/0001.png","bucket":"structural"}
+```
+
+先修改 `configs/training/t2i_loop_stage1.yaml` 中的模型、数据和输出路径，再运行：
 
 ```bash
-python scripts/evaluate/bagel_dynamic_prompt_phase05.py \
-  --mode generate --model-path /path/to/BAGEL-7B-MoT \
-  --output-dir /data/zyd_workspace/outputs/dynamic_prompt_hard16 \
-  --alphas 0,0.1,-0.1,0.2 --body-start 12 --body-end 20 \
-  --step-fraction 0.35 --max-prompts 16
+python scripts/train/train_t2i_loop.py \
+  --config configs/training/t2i_loop_stage1.yaml
 ```
 
-probe 的 `manifest.json` 记录 `relative_l2`、
-`cos(Δv(+a), -Δv(-a))`、`2a/a` scaling 与逐层 `ΔV` norm；generate 模式保存
-每个 alpha 的图和逐 step 诊断。当前不做 prompt compression、persistent memory、
-K residual 或 learnable gate。
+训练冻结全部原生权重。仅新增 adapter、每层 gate、每轮 α 和 memory 参数可训练。
+adapter 最后一层与 memory-to-entry projection 初始化为零；α 初始化为零；gate 默认 0.02。
+初始 α 为零时仍执行循环，以保留让 α 打开的梯度。
+损失为最终轮 flow MSE，加上中间轮 flow MSE 的平均值乘 `loop_ds_weight`。
+目标 velocity 为 `epsilon − x1`。训练不使用最终轮 self-distillation、RL 或 monotonic margin loss。
 
-原 paired-edit specification 与 runner 保留在
-`experiments/data/semantic_edit_phase05.jsonl` 和
-`scripts/evaluate/bagel_loop_edit_zeroshot.py`，留待 Phase 2 editing 使用。
-完整协议、arm 定义和评分命令见
-[`docs/BAGEL_LatentCoT_T2I_Phase05.md`](docs/BAGEL_LatentCoT_T2I_Phase05.md)。
-
-FlowEdit 4.1（文档 B2），16 卡：
+配置中的 `loop_depth` 是参数分配的最大深度，`depth_curriculum` 是当前采样的训练深度。
+评估 checkpoint 时 `--depths` 不得超过该分配上限，`--memory-slots` 不得超过训练时的分配。
 
 ```bash
-bash scripts/evaluate/run_bagel_flowedit_zeroshot.sh /path/to/out
+python scripts/evaluate/t2i_loop_matrix.py \
+  --model-path /path/to/BAGEL-7B-MoT \
+  --checkpoint outputs/umm_stage1/step_001000 \
+  --prompts experiments/data/geneval2_hard_16.jsonl \
+  --output-dir outputs/stage1_eval \
+  --modes gen_only,gen_memory_anchored \
+  --depths 0,1,2,3 --memory-slots 8 --save-readouts
 ```
 
-Draft-prefix 外循环（文档 B3）：
+外部 GenEval2 scorer 的分数可用 `scripts/evaluate/geneval2_report.py` 汇总。
+必须同时评估结构任务分数、通用质量、invalid rate、Repair/Damage 和计算成本。
+诊断变化或更低训练 loss 均不能单独证明语义提升。
 
-```bash
-bash scripts/evaluate/run_draft_prefix_loop.sh /path/to/out
-```
+## 当前范围
 
-官方 T2I / Editing / Understanding 接口见 [inference.ipynb](inference.ipynb)。
+已实现第一版架构、training-free 对照和 Stage 1 训练路径。
+Stage 2 workspace 专项训练与 Stage 3 body LoRA 是文档规定的后续实验阶段，尚未开放。
+本次本地验收不包含完整 7B 模型的图像质量、benchmark 收益或 accelerator FLOPs。
+单个 packed batch 要求相同 image-token 数量；memory 不跨 diffusion timestep 持久化。

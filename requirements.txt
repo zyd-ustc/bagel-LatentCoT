@@ -1,10 +1,11 @@
 # Install PyTorch for your CUDA / Ascend stack first, then:
 #   pip install -e '.[dev]'
+torchvision>=0.20.0
 einops>=0.7.0
 transformers>=4.56.0
 safetensors>=0.4.0
 Pillow>=10.0.0
 PyYAML>=6.0
 tqdm>=4.66.0
-requests>=2.32.0
+numpy>=1.26.0
 pytest>=8.0.0

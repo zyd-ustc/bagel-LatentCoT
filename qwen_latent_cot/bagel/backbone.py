@@ -1,4 +1,4 @@
-"""Load BAGEL-7B-MoT and apply the internal-loop LoRA policy."""
+"""Load the original BAGEL weights and new anchored-loop modules."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 import torch
 
+from .anchored_loop import LoopConfig, configure_stage1
 from .modeling import (
     Bagel,
     BagelConfig,
@@ -20,25 +21,8 @@ from .modeling import (
     load_ae,
 )
 from .modeling.qwen2 import Qwen2Tokenizer
-from .special_tokens import (
-    BagelSpecialTokenIds,
-    add_bagel_special_tokens,
-    resolve_bagel_special_token_ids,
-)
-from .loop import (
-    inject_loop_lora,
-    loop_lora_projections,
-    loop_trainable_names,
-)
-
 
 logger = logging.getLogger(__name__)
-
-
-def _configured_num_loop_tokens(cfg: Dict[str, object]) -> int:
-    """Vanilla loaders must opt into memory tokens explicitly."""
-
-    return int(cfg.get("num_loop_tokens", 0) or 0)
 
 
 @dataclass
@@ -48,7 +32,7 @@ class BagelBackbone:
     Attributes:
         cfg: BAGEL checkpoint and loading configuration.
         raw_model: BAGEL `nn.Module` after weight load + vocab resize.
-        tokenizer: BAGEL Qwen2 tokenizer with CoRT latent special tokens.
+        tokenizer: BAGEL Qwen2 tokenizer with its native special tokens.
         token_ids: Resolved special-token id bundle.
         vit_image_size: Square image side length used by ViT (px).
         vit_patch_size: ViT patch size (14 for SigLIP-NaViT).
@@ -59,7 +43,7 @@ class BagelBackbone:
     raw_model: Optional[torch.nn.Module] = None
     bagel: Optional[torch.nn.Module] = field(default=None, repr=False)
     tokenizer: Optional[object] = None
-    token_ids: Optional[BagelSpecialTokenIds] = None
+    token_ids: Optional[Dict[str, int]] = None
     vit_image_size: int = 0
     vit_patch_size: int = 0
     vit_max_num_patch_per_side: int = 70
@@ -79,7 +63,7 @@ class BagelBackbone:
         Supports two on-disk variants:
 
         1. **Combined**: a single ``model.safetensors`` (or ``ema.safetensors``)
-           containing every parameter (CoRT's expected layout).
+           containing every parameter (native combined layout).
         2. **Sharded**: a directory of ``language_model_model_layers_*.safetensors``,
            ``language_model_lm_head.safetensors``, ``vit_model.safetensors``,
            etc., plus a ``model.safetensors`` that only carries the residual
@@ -100,7 +84,8 @@ class BagelBackbone:
             return load_file(str(combined_path), device="cpu")
 
         shard_paths: List[Path] = sorted(
-            p for p in model_path.glob("*.safetensors")
+            p
+            for p in model_path.glob("*.safetensors")
             if ae_resolved is None or p.resolve() != ae_resolved
         )
         if not shard_paths:
@@ -146,11 +131,11 @@ class BagelBackbone:
 
         disable_visual_gen = bool(self.cfg.get("disable_visual_gen", True))
         visual_gen = not disable_visual_gen
-        disable_gen_expert = bool(self.cfg.get("disable_gen_expert", disable_visual_gen))
+        disable_gen_expert = bool(
+            self.cfg.get("disable_gen_expert", disable_visual_gen)
+        )
         llm_config.layer_module = (
-            "Qwen2DecoderLayer"
-            if disable_gen_expert
-            else "Qwen2MoTDecoderLayer"
+            "Qwen2DecoderLayer" if disable_gen_expert else "Qwen2MoTDecoderLayer"
         )
 
         ae_candidates = [
@@ -179,16 +164,7 @@ class BagelBackbone:
             connector_act="gelu_pytorch_tanh",
             latent_patch_size=2,
             max_latent_size=64,
-            num_loop_tokens=_configured_num_loop_tokens(self.cfg),
-            loop_depth=int(self.cfg.get("loop_depth", 2) or 1),
-            loop_recycle_mode=str(self.cfg.get("loop_recycle_mode", "same_depth")),
-            loop_memory_persist=bool(self.cfg.get("loop_memory_persist", False)),
-            memory_loop_start_layer=int(self.cfg.get("memory_loop_start_layer", 16)),
-            memory_loop_end_layer=int(self.cfg.get("memory_loop_end_layer", 24)),
-            round0_memory_write_enabled=self.cfg.get(
-                "round0_memory_write_enabled"
-            ),
-            round0_gen_reads_memory=self.cfg.get("round0_gen_reads_memory"),
+            t2i_loop=LoopConfig(**dict(self.cfg.get("t2i_loop", {}))).to_dict(),
         )
 
         llm = Qwen2ForCausalLM(llm_config)
@@ -216,19 +192,40 @@ class BagelBackbone:
             if ckpt_vocab != cur_vocab:
                 model.language_model.resize_token_embeddings(ckpt_vocab)
 
-        model.load_state_dict(state_dict, strict=False)
-
-        add_bagel_special_tokens(tokenizer)
-        resized_vocab = int(model.language_model.model.embed_tokens.weight.shape[0])
-        desired_vocab = max(int(len(tokenizer)), resized_vocab)
-        if desired_vocab != resized_vocab:
-            model.language_model.resize_token_embeddings(desired_vocab)
-        final_vocab = int(model.language_model.model.embed_tokens.weight.shape[0])
-        model.config.llm_config.vocab_size = final_vocab
-        model.language_model.config.vocab_size = final_vocab
+        # Every native tensor is required. Only new loop modules are allowed
+        # to be absent from the original checkpoint.
+        native = {
+            key: value
+            for key, value in model.state_dict().items()
+            if not key.startswith("t2i_loop.")
+        }
+        missing = sorted(set(native) - set(state_dict))
+        mismatched = sorted(
+            key
+            for key in native.keys() & state_dict.keys()
+            if native[key].shape != state_dict[key].shape
+        )
+        if missing or mismatched:
+            raise RuntimeError(
+                f"Incomplete native BAGEL checkpoint: missing={missing[:8]} mismatched={mismatched[:8]}"
+            )
+        model.load_state_dict({key: state_dict[key] for key in native}, strict=False)
+        # Preserve the native vocabulary. No CoRT or reasoning schema tokens.
+        token_ids = {}
+        for name, text in {
+            "bos_token_id": "<|im_start|>",
+            "eos_token_id": "<|im_end|>",
+            "start_of_image": "<|vision_start|>",
+            "end_of_image": "<|vision_end|>",
+        }.items():
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if (
+                len(ids) != 1
+                or ids[0] >= model.language_model.model.embed_tokens.num_embeddings
+            ):
+                raise RuntimeError(f"Missing native BAGEL special token {text}")
+            token_ids[name] = int(ids[0])
         model.config.use_cache = False
-
-        token_ids = resolve_bagel_special_token_ids(tokenizer)
 
         num_image_tokens = int(self.cfg.get("num_image_tokens", 4900))  # 70x70 default
         per_side = int(math.isqrt(num_image_tokens))
@@ -246,10 +243,19 @@ class BagelBackbone:
         self.vit_image_size = vit_image_size
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = int(model.config.vit_max_num_patch_per_side)
-        self.initialize_loop_memory()
+        if bagel.t2i_loop.memory_init is not None:
+            with torch.no_grad():
+                boundaries = bagel.language_model.model.embed_tokens.weight[
+                    [token_ids["start_of_image"], token_ids["end_of_image"]]
+                ].mean(0)
+                bagel.t2i_loop.memory_init.copy_(
+                    boundaries.expand_as(bagel.t2i_loop.memory_init)
+                )
 
         if disable_visual_gen:
-            logger.info("Loaded BAGEL in understanding-only mode (visual_gen disabled).")
+            logger.info(
+                "Loaded BAGEL in understanding-only mode (visual_gen disabled)."
+            )
         if disable_gen_expert:
             logger.info("Loaded BAGEL language model without MoT generation experts.")
 
@@ -262,84 +268,7 @@ class BagelBackbone:
 
         return self
 
-    def initialize_loop_memory(self, *, seed: int = 0) -> None:
-        """Initialize frozen m0 from BAGEL's native image boundary tokens."""
-
-        if self.bagel is None or self.token_ids is None:
-            raise RuntimeError("load the BAGEL backbone before initializing loop memory")
-        self.bagel.init_loop_memory_from_boundary_embeddings(
-            [int(self.token_ids.vision_start), int(self.token_ids.vision_end)],
-            seed=int(seed),
-        )
-        if self.bagel.loop_memory is not None:
-            self.bagel.loop_memory.requires_grad_(False)
-
-    def apply_loop_trainable_policy(
-        self,
-        *,
-        start_layer: int,
-        end_layer: int,
-        rank: int = 8,
-        alpha: int = 16,
-        dropout: float = 0.0,
-        gen_attention_o_lora: bool = False,
-        k_v_lora: bool = False,
-    ) -> List[str]:
-        """Freeze BAGEL and open only loop-gated attention LoRA in the body."""
-
-        assert self.bagel is not None
-        model = self.bagel
-        if not bool(getattr(model.config, "visual_gen", False)):
-            raise RuntimeError("internal loop requires BAGEL visual generation")
-        if not bool(getattr(model, "use_moe", False)):
-            raise RuntimeError("internal loop requires BAGEL MoT generation experts")
-        if int(rank) <= 0 or int(alpha) <= 0:
-            raise ValueError("LoRA rank and alpha must be positive")
-
-        for parameter in model.parameters():
-            parameter.requires_grad = False
-        inject_loop_lora(
-            model,
-            start_layer=int(start_layer),
-            end_layer=int(end_layer),
-            rank=int(rank),
-            alpha=int(alpha),
-            dropout=float(dropout),
-            gen_attention_o_lora=bool(gen_attention_o_lora),
-            k_v_lora=bool(k_v_lora),
-        )
-
-        allowed_projections = loop_lora_projections(
-            gen_attention_o_lora=bool(gen_attention_o_lora),
-            k_v_lora=bool(k_v_lora),
-        )
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad = bool(
-                (".lora_A." in name or ".lora_B." in name)
-                and any(
-                    f".{projection}." in name
-                    for projection in allowed_projections
-                )
-            )
-        trainable = loop_trainable_names(
-            model,
-            start_layer=int(start_layer),
-            end_layer=int(end_layer),
-            gen_attention_o_lora=bool(gen_attention_o_lora),
-            k_v_lora=bool(k_v_lora),
-        )
-        count = sum(
-            parameter.numel()
-            for _, parameter in model.named_parameters()
-            if parameter.requires_grad
-        )
-        logger.info(
-            "BAGEL loop policy: layers=[%d,%d) trainable=%.3fM tensors=%d "
-            "targets=%s",
-            int(start_layer),
-            int(end_layer),
-            count / 1e6,
-            len(trainable),
-            ",".join(allowed_projections),
-        )
-        return trainable
+    def apply_stage1_policy(self) -> List[str]:
+        if self.bagel is None:
+            raise RuntimeError("load the backbone first")
+        return configure_stage1(self.bagel)

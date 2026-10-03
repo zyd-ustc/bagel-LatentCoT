@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Matched-noise topology/depth matrix, timestep logs, and functional readouts."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import argparse
+import json
+import time
+from dataclasses import replace
+
+import torch
+
+from qwen_latent_cot.bagel import BagelBackbone, LoopConfig
+from qwen_latent_cot.bagel.accelerator import (
+    autocast_for,
+    manual_seed_all,
+    resolve_device,
+    synchronize,
+)
+from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
+from qwen_latent_cot.bagel.loop_checkpoint import (
+    checkpoint_config,
+    load_loop_checkpoint,
+)
+
+
+def timestep_bin(index, count):
+    fraction = index / max(count, 1)
+    return "early" if fraction < 1 / 3 else "middle" if fraction < 2 / 3 else "late"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument(
+        "--prompts", required=True, help="JSONL with prompt; optional bucket/skills"
+    )
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--modes", default="gen_only,gen_memory_anchored,memory_only")
+    parser.add_argument("--depths", default="0,1,2,3,4")
+    parser.add_argument("--memory-slots", type=int, default=8)
+    parser.add_argument(
+        "--memory-control",
+        choices=["correct", "zero", "frozen", "shuffled"],
+        default="correct",
+    )
+    parser.add_argument("--start-layer", type=int, default=16)
+    parser.add_argument("--end-layer", type=int, default=24)
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.1,
+        help="manual topology alpha; ignored with trained checkpoint",
+    )
+    parser.add_argument("--gate", type=float, default=0.02)
+    parser.add_argument("--reentry-scale", type=float, default=0.05)
+    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--num-timesteps", type=int, default=50)
+    parser.add_argument("--timestep-shift", type=float, default=3.0)
+    parser.add_argument("--cfg-text-scale", type=float, default=4.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-prompts", type=int, default=16)
+    parser.add_argument(
+        "--save-readouts",
+        action="store_true",
+        help="save per-round velocity and x0 estimates at early/middle/late probes",
+    )
+    args = parser.parse_args()
+    if args.num_timesteps < 2 or args.timestep_shift <= 0:
+        raise ValueError("require >=2 timesteps and positive shift")
+    rows = [
+        json.loads(line)
+        for line in Path(args.prompts).read_text().splitlines()
+        if line.strip()
+    ][: args.max_prompts]
+    if not rows or any(not row.get("prompt") for row in rows):
+        raise ValueError("nonempty prompt JSONL is required")
+    if args.batch_size < 1 or args.max_prompts < 1:
+        raise ValueError("batch-size and max-prompts must be positive")
+    modes = [value.strip() for value in args.modes.split(",") if value.strip()]
+    valid_modes = {"gen_only", "gen_memory_anchored", "memory_only", "direct_native"}
+    if not modes or not set(modes) <= valid_modes:
+        raise ValueError("unsupported or empty mode list")
+    if "memory_only" in modes and args.memory_slots == 0:
+        raise ValueError("memory_only requires positive memory slots")
+    if args.memory_control == "shuffled" and any(mode != "gen_only" for mode in modes):
+        if args.batch_size < 2 or len(rows) % args.batch_size == 1:
+            raise ValueError(
+                "shuffled workspace requires every batch to contain at least two samples"
+            )
+    depths = sorted(set(int(value) for value in args.depths.split(",")))
+    config = LoopConfig(
+        enable_t2i_loop=True,
+        loop_start_layer=args.start_layer,
+        loop_end_layer=args.end_layer,
+        loop_depth=max(depths),
+        memory_slots=args.memory_slots,
+        reentry_adapter_type="fixed",
+        fixed_reentry_scale=args.reentry_scale,
+        loop_output_alpha_init=args.alpha,
+        loop_gate_init=args.gate,
+    )
+    if args.checkpoint:
+        config = LoopConfig(**checkpoint_config(args.checkpoint)["loop_config"])
+        if max(depths) > config.loop_depth:
+            raise ValueError("depth matrix exceeds checkpoint allocation")
+        if args.memory_slots > config.memory_slots and any(
+            mode != "gen_only" for mode in modes
+        ):
+            raise ValueError("memory matrix exceeds checkpoint workspace allocation")
+    backbone = BagelBackbone(
+        {
+            "model_path": args.model_path,
+            "disable_visual_gen": False,
+            "disable_gen_expert": False,
+            "t2i_loop": config.to_dict(),
+        }
+    ).load()
+    device = resolve_device(args.device)
+    manual_seed_all(args.seed)
+    model, vae = backbone.bagel.to(device).eval(), backbone.vae_model.to(device).eval()
+    model.requires_grad_(False)
+    if args.checkpoint:
+        load_loop_checkpoint(model, args.checkpoint)
+    inferencer = InterleaveInferencer(
+        model, vae, backbone.tokenizer, backbone.token_ids
+    )
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    records = []
+    schedule = torch.linspace(1, 0, args.num_timesteps, device=device)
+    schedule = (
+        args.timestep_shift * schedule / (1 + (args.timestep_shift - 1) * schedule)
+    )
+    dts = schedule[:-1] - schedule[1:]
+    probe_steps = {0, len(dts) // 2, len(dts) - 1}
+    arms = [("base", 0)] + [
+        (mode, depth) for mode in modes for depth in depths if depth > 0
+    ]
+    with torch.no_grad(), autocast_for(device):
+        for offset in range(0, len(rows), args.batch_size):
+            batch = rows[offset : offset + args.batch_size]
+            condition = inferencer.prepare_condition(
+                [row["prompt"] for row in batch], (args.image_size, args.image_size)
+            )
+            count = len(condition.inputs["packed_vae_token_indexes"])
+            generator = torch.Generator().manual_seed(args.seed + offset)
+            initial_noise = torch.randn(
+                count, model.patch_latent_dim, generator=generator
+            ).to(device)
+            for mode, depth in arms:
+                slots = 0 if mode in {"base", "gen_only"} else args.memory_slots
+                runtime = replace(
+                    config,
+                    enable_t2i_loop=depth > 0,
+                    loop_depth=depth,
+                    loop_mode="gen_only" if mode == "base" else mode,
+                    memory_slots=slots,
+                    memory_control=args.memory_control,
+                    log_loop_stats=True,
+                )
+                arm = f"{mode}_R{depth}_K{slots}_{args.memory_control}"
+                directory = out / arm
+                directory.mkdir(exist_ok=True)
+                x_t = initial_noise.clone()
+                logs = []
+                synchronize(device)
+                started = time.perf_counter()
+                for step, (t, dt) in enumerate(zip(schedule[:-1], dts)):
+                    scale = args.cfg_text_scale if 0.4 < float(t) <= 1 else 1.0
+                    result = model.forward_t2i_loop(
+                        x_t=x_t,
+                        timestep=t.expand(count),
+                        loop_config=runtime,
+                        cfg_text_scale=scale,
+                        **condition.inputs,
+                    )
+                    logs.extend(
+                        {
+                            "step": step,
+                            "timestep": float(t),
+                            "bin": timestep_bin(step, len(dts)),
+                            **item,
+                        }
+                        for item in result.stats
+                    )
+                    if args.save_readouts and step in probe_steps:
+                        per_round = [result.base_velocity] + result.velocities
+                        torch.save(
+                            [value.cpu() for value in per_round],
+                            directory
+                            / f"batch_{offset:04d}_step_{step:03d}_velocities.pt",
+                        )
+                        image_tokens = count // len(batch)
+                        for r, velocity in enumerate(per_round):
+                            estimates = (x_t - t * velocity).split(image_tokens)
+                            for i, latent in enumerate(estimates):
+                                inferencer.decode_image(latent, condition.shape).save(
+                                    directory
+                                    / f"{offset + i:04d}_step_{step:03d}_r{r}.png"
+                                )
+                    # Exactly one sampler update, after the final inner readout.
+                    x_t = x_t - result.velocity * dt
+                synchronize(device)
+                elapsed = time.perf_counter() - started
+                for i, latent in enumerate(x_t.split(count // len(batch))):
+                    path = directory / f"{offset + i:04d}.png"
+                    inferencer.decode_image(latent, condition.shape).save(path)
+                    records.append(
+                        {
+                            "index": offset + i,
+                            "prompt": batch[i]["prompt"],
+                            "arm": arm,
+                            "path": str(path.resolve()),
+                            "seed": args.seed + offset,
+                            "elapsed_batch_seconds": elapsed,
+                        }
+                    )
+                (directory / f"batch_{offset:04d}_loop_logs.json").write_text(
+                    json.dumps(logs, indent=2)
+                )
+    (out / "manifest.json").write_text(
+        json.dumps(
+            {
+                "arguments": vars(args),
+                "allocated_loop_config": config.to_dict(),
+                "images": records,
+                "compute_note": "Each active branch runs prefix once, body 1+R times, and suffix 1+R times. FLOPs require accelerator profiling; image timing includes readout probes.",
+            },
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
