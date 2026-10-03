@@ -33,12 +33,15 @@ python -m pytest -q
 | Reader Warm-up、续训 | `scripts/train/bagel_memory_reader_warmup.py` |
 | 8卡新训练：数据导出、smoke、正式训练 | `scripts/train/launch_reader_warmup_8gpu.sh` |
 | 独立检查 reader checkpoint | `scripts/evaluate/bagel_memory_reader_warmup_eval.py` |
+| 固定注入：native / untrained reader / step5000 reader，8卡 hard16 | `scripts/evaluate/run_bagel_reader_injection.sh` |
 | Self-CoT teacher 数据与 OPD | `scripts/data/build_bagel_cot_teacher.py`、`scripts/train/bagel_memory_opd.py` |
 | checkpoint 生图、评分清单与离线诊断 | `scripts/evaluate/bagel_memory_opd_eval.py`、`scripts/evaluate/prepare_phase1a_score_inputs.py`、`scripts/evaluate/analyze_reader_warmup.py` |
 
 完整参数、运行顺序和进入 OPD 的两项门槛见
 [Phase 1A 运行说明](docs/experiments/phase1a_v4/README.md)。
 续训时 `--max-steps` 是最终总步数，必须使用全新输出目录；不得覆盖旧 run。
+固定注入的对照定义、8卡执行命令与后续评分见
+[Reader 注入诊断](docs/experiments/reader_injection/README.md)。这不是已训练的 OPD。
 
 ## 已有结果与证据范围
 

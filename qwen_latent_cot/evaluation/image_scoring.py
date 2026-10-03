@@ -13,7 +13,8 @@ from .geneval2 import load_benchmark, validate_score_lists
 from .offline_reader import sha256
 
 
-PHASE1A_ARMS = ("native", "teacher", "correct", "shuffled", "zero")
+PHASE1A_ARMS = ("native", "teacher", "correct", "shuffled", "zero",
+                "untrained_reader", "step5000_reader")
 
 
 def verified_image(path):
