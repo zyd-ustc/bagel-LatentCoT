@@ -18,6 +18,7 @@ def save_loop_checkpoint(
     training_depth_counts=None,
     round_training_steps=None,
     depth_curriculum=None,
+    distributed_training=None,
 ):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,8 @@ def save_loop_checkpoint(
         metadata["training_depth_counts"] = dict(training_depth_counts)
         metadata["round_training_steps"] = list(round_training_steps)
         metadata["depth_curriculum"] = depth_curriculum
+    if distributed_training is not None:
+        metadata["distributed_training"] = distributed_training
     (directory / "loop.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 

@@ -74,7 +74,12 @@ class BucketBatchSampler(Sampler):
     Draws use replacement, so small buckets retain their configured mass.
     """
 
-    def __init__(self, dataset, batch_size, num_batches, *, weights=None, seed=0):
+    def __init__(
+        self, dataset, batch_size, num_batches, *, weights=None, seed=0,
+        rank=0, world_size=1,
+    ):
+        if world_size < 1 or not 0 <= rank < world_size:
+            raise ValueError("invalid bucket sampler rank/world_size")
         self.indices = {
             bucket: [i for i, row in enumerate(dataset.rows) if row["bucket"] == bucket]
             for bucket in BUCKET_WEIGHTS
@@ -105,6 +110,7 @@ class BucketBatchSampler(Sampler):
             bucket: value / total for bucket, value in selected.items()
         }
         self.batch_size, self.num_batches, self.seed = batch_size, num_batches, seed
+        self.rank, self.world_size = rank, world_size
 
     def __len__(self):
         return self.num_batches
@@ -116,10 +122,13 @@ class BucketBatchSampler(Sampler):
         for _ in range(self.num_batches):
             bucket = names[int(torch.multinomial(weights, 1, generator=generator))]
             indices = self.indices[bucket]
+            # All ranks choose the same bucket/global draws, then take their
+            # shard. Replacement remains intentional for small semantic pools.
             draws = torch.randint(
-                len(indices), (self.batch_size,), generator=generator
+                len(indices), (self.batch_size * self.world_size,), generator=generator
             ).tolist()
-            yield [indices[i] for i in draws]
+            start = self.rank * self.batch_size
+            yield [indices[i] for i in draws[start : start + self.batch_size]]
 
 
 def collate_t2i(rows):

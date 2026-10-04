@@ -86,7 +86,7 @@ shuffled 多执行一次 writer body，日志记录实际 body pass 数；不能
 
 ## Stage 1 训练
 
-仅在 topology 实验达到文档中的语义与质量门槛后运行训练。
+完成小规模 training-free 工程检查后可运行 Stage 1。未训练模块的语义增益不是 Stage 1 的前置条件；语义与质量门槛用于判断训练后的模块能否进入后续阶段。
 训练集为 JSONL。每行包含 `prompt`、`image` 和可选 `bucket`。
 相对图片路径按 JSONL 所在目录解析；`bucket` 支持 `ordinary`、`structural`、`easy`、`noop`。
 首轮数据应排除复杂文字、风格和文化实体。
@@ -101,6 +101,19 @@ shuffled 多执行一次 writer body，日志记录实际 body pass 数；不能
 python scripts/train/train_t2i_loop.py \
   --config configs/training/t2i_loop_stage1.yaml
 ```
+
+单机 8 卡使用 PyTorch DDP，每张卡加载相同冻结原生权重，仅同步新增模块的梯度：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  scripts/train/train_t2i_loop.py --config configs/training/t2i_loop_stage1.yaml
+```
+
+`batch_size` 是每卡 batch size；设为 1 时全局 batch size 为 8，`steps` 仍是 optimizer step 数。
+各 rank 共享 bucket 抽样与循环深度，分别获取 global batch 的数据分片，并独立抽取 timestep、noise 和 condition dropout。
+可变分辨率使各卡 token 数不同；梯度按全局 packed token 数归一化，避免简单平均 rank loss 改变训练目标。
+只有 rank 0 写日志和 checkpoint。日志保存各 rank 的 index、timestep、condition、图像长宽和循环诊断；checkpoint 记录 world size 与有效 batch size。
 
 训练冻结全部原生权重。仅新增 adapter、每层 gate、共享 α 和 memory 参数可训练。
 adapter 最后一层的 weight/bias 与 memory-to-entry projection 初始化为零；gate 默认 0.02。

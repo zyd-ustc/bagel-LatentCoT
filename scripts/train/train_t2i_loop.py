@@ -7,25 +7,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import argparse
 import json
+from contextlib import nullcontext
 from dataclasses import replace
 
 import torch
 import yaml
 from torch.utils.data import DataLoader
+from torch import distributed as dist
 
-from qwen_latent_cot.bagel import BagelBackbone, LoopConfig, direct_flow_loss
+from qwen_latent_cot.bagel import BagelBackbone, LoopConfig
 from qwen_latent_cot.bagel.accelerator import (
     autocast_for,
     manual_seed_all,
-    resolve_device,
 )
 from qwen_latent_cot.bagel.depth_curriculum import (
     resolve_depth_curriculum,
-    sample_curriculum_depth,
 )
 from qwen_latent_cot.bagel.flow_time import sample_native_flow_timestep
 from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
 from qwen_latent_cot.bagel.loop_checkpoint import save_loop_checkpoint
+from qwen_latent_cot.bagel.stage1_distributed import (
+    gather_rank_metrics,
+    initialize_stage1_distributed,
+    stage1_objective,
+    synchronized_depth,
+    token_weighted_backward_loss,
+)
 from qwen_latent_cot.data.t2i import (
     BucketBatchSampler,
     T2IDataset,
@@ -83,7 +90,7 @@ def main():
     round_training_steps = [0] * config.allocated_max_loop_depth
     seed = int(cfg.get("seed", 0))
     manual_seed_all(seed)
-    device = resolve_device(cfg.get("device", "auto"))
+    device, rank, world_size = initialize_stage1_distributed(cfg.get("device", "auto"))
     backbone = BagelBackbone(
         {
             "model_path": cfg["model_path"],
@@ -97,6 +104,9 @@ def main():
     # Packed inference retains autograd. Native weights and dropout stay frozen.
     model.eval()
     trainable_names = backbone.apply_stage1_policy()
+    objective = stage1_objective(model, device, world_size)
+    # The initial loop state is shared, but noise/dropout/time must differ.
+    manual_seed_all(seed + rank)
     model.language_model.model.gradient_checkpointing = bool(
         cfg.get("gradient_checkpointing", True)
     )
@@ -119,6 +129,8 @@ def main():
         total,
         weights=cfg.get("bucket_weights"),
         seed=seed,
+        rank=rank,
+        world_size=world_size,
     )
     loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_t2i)
     bucket_metrics = {}
@@ -129,21 +141,33 @@ def main():
         weight_decay=float(cfg.get("weight_decay", 0.0)),
     )
     out = Path(cfg["output_dir"])
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "data_policy.json").write_text(
-        json.dumps(
-            {
-                "effective_bucket_weights": sampler.effective_weights,
-                "text_cond_dropout_prob": text_dropout,
-                "image_preprocessing": "native_bagel_resize_no_crop",
-            },
-            indent=2,
+    distributed_training = {
+        "world_size": world_size,
+        "batch_size_per_rank": int(cfg.get("batch_size", 1)),
+        "global_batch_size": int(cfg.get("batch_size", 1)) * world_size,
+        "loss_reduction": "global_packed_token_mean",
+        "depth_sampling": "rank0_broadcast",
+    }
+    if rank == 0:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "data_policy.json").write_text(
+            json.dumps(
+                {
+                    "effective_bucket_weights": sampler.effective_weights,
+                    "text_cond_dropout_prob": text_dropout,
+                    "image_preprocessing": "native_bagel_resize_no_crop",
+                    "distributed_training": distributed_training,
+                },
+                indent=2,
+            )
         )
-    )
-    (out / "trainable.json").write_text(json.dumps(trainable_names, indent=2))
-    (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+        (out / "trainable.json").write_text(json.dumps(trainable_names, indent=2))
+        (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    if world_size > 1:
+        dist.barrier()
     step = 0
-    with (out / "metrics.jsonl").open("w") as log:
+    log_context = (out / "metrics.jsonl").open("w") if rank == 0 else nullcontext(None)
+    with log_context as log:
         while step < total:
             for batch in loader:
                 optimizer.zero_grad(set_to_none=True)
@@ -167,7 +191,9 @@ def main():
                         for key, value in condition.inputs.items()
                         if not key.startswith("cfg_")
                     }
-                depth, phase_index = sample_curriculum_depth(phases, step)
+                depth, phase_index = synchronized_depth(
+                    phases, step, device, rank, world_size
+                )
                 runtime = replace(config, runtime_loop_depth=depth)
                 t = sample_native_flow_timestep(
                     device=device, timestep_shift=model.timestep_shift
@@ -175,16 +201,19 @@ def main():
                 noise = torch.randn_like(clean)
                 x_t, target = sample_flow_state(clean, t, noise)
                 with autocast_for(device):
-                    result = model.forward_t2i_loop(
+                    loss, result = objective(
+                        target=target,
                         x_t=x_t,
                         timestep=t.expand(clean.shape[0]),
                         loop_config=runtime,
                         **inputs,
                     )
-                    loss = direct_flow_loss(result, target, runtime)
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"nonfinite flow loss at step {step}")
-                loss.backward()
+                backward_loss = token_weighted_backward_loss(
+                    loss, len(clean), device, world_size
+                )
+                backward_loss.backward()
                 norm = torch.nn.utils.clip_grad_norm_(
                     parameters, float(cfg.get("max_grad_norm", 1.0))
                 )
@@ -196,11 +225,6 @@ def main():
                 for index in range(depth):
                     round_training_steps[index] += 1
                 bucket = batch["bucket"][0]
-                metric = bucket_metrics.setdefault(
-                    bucket, {"steps": 0, "loss_sum": 0.0}
-                )
-                metric["steps"] += 1
-                metric["loss_sum"] += float(loss.detach())
                 alpha = model.t2i_loop.output_alpha.detach().float().cpu().tolist()
                 gates = (
                     model.t2i_loop.gate_logits.detach().sigmoid().float().cpu().tolist()
@@ -226,6 +250,42 @@ def main():
                         "text_removed" if dropped else "conditional"
                     ].append(float(sample_loss.detach()))
                     offset += count
+                per_rank = gather_rank_metrics(
+                    {
+                        "rank": rank,
+                        "indices": batch["index"],
+                        "bucket": bucket,
+                        "flow_loss": float(loss.detach()),
+                        "tokens": len(clean),
+                        "timestep": float(t),
+                        "text_drop_mask": drops,
+                        "condition_sample_losses": losses_by_condition,
+                        "image_shapes": batch["image_shape"],
+                        "original_shapes": batch["original_shape"],
+                        "loop_stats": result.stats,
+                    },
+                    rank,
+                    world_size,
+                )
+                if rank == 0:
+                    global_loss = sum(
+                        item["flow_loss"] * item["tokens"] for item in per_rank
+                    ) / sum(item["tokens"] for item in per_rank)
+                    metric = bucket_metrics.setdefault(
+                        bucket, {"steps": 0, "loss_sum": 0.0}
+                    )
+                    metric["steps"] += 1
+                    metric["loss_sum"] += global_loss
+                    losses_by_condition = {
+                        key: [
+                            value
+                            for item in per_rank
+                            for value in item["condition_sample_losses"][key]
+                        ]
+                        for key in ("conditional", "text_removed")
+                    }
+                else:
+                    global_loss = None
                 record = {
                     "step": step,
                     "depth": depth,
@@ -235,7 +295,10 @@ def main():
                     "round_training_steps": list(round_training_steps),
                     "timestep": float(t),
                     "timestep_shift": model.timestep_shift,
-                    "flow_loss": float(loss.detach()),
+                    "flow_loss": global_loss,
+                    "distributed_training": distributed_training,
+                    "per_rank": per_rank,
+                    "loop_stats_rank": 0,
                     "loop_stats": result.stats,
                     "bucket": bucket,
                     "bucket_metrics": {
@@ -264,21 +327,28 @@ def main():
                     .cpu()
                     .tolist(),
                 }
-                log.write(json.dumps(record) + "\n")
-                log.flush()
-                print(json.dumps(record), flush=True)
+                if rank == 0:
+                    log.write(json.dumps(record) + "\n")
+                    log.flush()
+                    print(json.dumps(record), flush=True)
                 if step % int(cfg.get("save_every", 100)) == 0 or step == total:
-                    save_loop_checkpoint(
-                        model,
-                        out / f"step_{step:06d}",
-                        step=step,
-                        model_path=cfg["model_path"],
-                        training_depth_counts=depth_counts,
-                        round_training_steps=round_training_steps,
-                        depth_curriculum=phases,
-                    )
+                    if rank == 0:
+                        save_loop_checkpoint(
+                            model,
+                            out / f"step_{step:06d}",
+                            step=step,
+                            model_path=cfg["model_path"],
+                            training_depth_counts=depth_counts,
+                            round_training_steps=round_training_steps,
+                            depth_curriculum=phases,
+                            distributed_training=distributed_training,
+                        )
+                    if world_size > 1:
+                        dist.barrier()
                 if step >= total:
                     break
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
