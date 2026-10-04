@@ -137,6 +137,16 @@ R=1–4 的 GEN-only 与 GEN+Memory 各占一张卡，LegacyMem 控制分配到�
 每个进程只加载一次原生模型，在作业间替换完整 loop module；关闭逐轮 suffix/诊断读出，保留最终采样输出。
 随后八张卡按 prompt 分片评分。评分时映射局部 benchmark index，汇总前恢复全局 index，再统一计算 paired CI、Repair/Damage 与质量代理。
 `--phase check` 仅检查资源；`--phase generate` 和 `--phase score` 可分开运行。独立评分必须保留原生成的 benchmark、seed、batch size 和 timestep 设置。
+Memory 贡献消融使用同一个 GEN+Memory checkpoint：
+`scripts/evaluate/stage1_8gpu.py --suite memory-ablation --ablation-depth 2 --phase all --output-dir NEW_DIR`。
+默认 hard128/easy16、batch=2、起始 seed=0，生成 Base 和 R2 correct/shuffled/no_read，共 576 张图。
+八个生成进程按两个数据集和四个条件分配，评分继续按 prompt 分到八张卡。
+shuffled 使用固定 donor permutation，只置换深度对齐的 Memory 读取；canonical writer 始终保留正确轨迹。
+no_read 保持 K=8 和正确 canonical writer，但 GEN attention 排除 Memory keys，reentry adapter 不接收 Memory conditioning。
+no_read 不是零值 Memory；零值 token 仍参与 attention 的 softmax。
+`results/memory_comparisons.md` 和 `.json` 直接报告 correct-minus-shuffled、correct-minus-no_read 的配对 CI，另保留全部相对 Base 的结果。
+此消融的 writer/reader 分开计算，不用于比较部署速度。现有 depth suite 的默认行为保持不变。
+
 memory 初始化为 boundary embedding 加 `1e-4` 独立 slot noise。
 训练默认开启诊断，逐轮记录 centered effective rank、pairwise cosine、slot std、sigma1 ratio 和 memory update ratio。
 Stage 1 timestep 使用 `raw N(0,1) → sigmoid → timestep_shift`，与原生 BAGEL forward 共用实现。

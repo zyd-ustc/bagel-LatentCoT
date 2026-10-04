@@ -143,6 +143,74 @@ def test_generation_merge_rejects_changed_noise(tmp_path):
         module.merge_generation(options, jobs)
 
 
+def test_memory_suite_covers_controls_and_compares_correct_directly(tmp_path):
+    module = script_module(ROOT / "scripts/evaluate/stage1_8gpu.py")
+    tools, out = tmp_path / "tools", tmp_path / "out"
+    (tools / "data").mkdir(parents=True)
+    out.mkdir()
+    options = SimpleNamespace(gpus=list(map(str, range(8))), tools_dir=tools,
+                              output_dir=out, hard_benchmark="hard16", max_prompts=8,
+                              judge_model_path=tmp_path / "judge", suite="memory-ablation",
+                              ablation_depth=2)
+    for dataset in ("hard16", "easy16"):
+        (tools / "data" / f"{dataset}.jsonl").write_text("\n".join(
+            json.dumps(dict(prompt=f"{dataset} {i}", vqa_list=["Red?"])) for i in range(8)))
+    jobs = module.generation_plan(options)
+    assert len(jobs) == 8 and all(j["mode"] == "gen_memory_anchored" for j in jobs)
+    assert [j["memory_control"] for j in jobs[:4]] == ["correct", "correct", "shuffled", "no_read"]
+    for job in jobs:
+        job["output_dir"] = str(out / "workers" / str(job["rank"]))
+        dataset = job["datasets"][0]
+        directory = Path(job["output_dir"]) / dataset / job["mode"]
+        directory.mkdir(parents=True)
+        arm = "base_R0_K0_correct" if job["include_base"] else f"gen_memory_anchored_R2_K8_{job['memory_control']}"
+        images = []
+        for i in range(8):
+            image = directory / f"{i}.png"
+            Image.new("RGB", (8, 8), "red").save(image)
+            images.append(dict(arm=arm, index=i, prompt=f"{dataset} {i}", seed=i//2*2,
+                               initial_noise_sha256=f"noise{i}", path=str(image), depth_status="seen"))
+        (directory / "manifest.json").write_text(json.dumps(dict(
+            images=images, arms={arm:{}}, allocated_loop_config=dict(loop_start_layer=1, loop_end_layer=3),
+            arguments=dict(model_path="native", seed=0, num_timesteps=4, timestep_shift=3.,
+                           cfg_text_scale=4., start_layer=1, end_layer=3, batch_size=2, image_size=8))))
+    module.merge_generation(options, jobs)
+    (out / "launch_provenance.json").write_text('{}')
+    score_jobs = module.scoring_plan(options)
+    assert len(score_jobs) == 8
+    for job in score_jobs:
+        cfg = yaml.safe_load(Path(job["config"]).read_text())
+        assert cfg["required_depths"] == [0]
+        settings = cfg["datasets"][job["dataset"]]
+        manifest = json.loads(Path(settings["manifest"]).read_text())
+        benchmark = [json.loads(x) for x in Path(settings["benchmark"]).read_text().splitlines()]
+
+        def scorer(rows, _):
+            arm = rows[0]["arm"]
+            value = 0.8 if arm.endswith("K8_correct") else 0.6 if arm.endswith("no_read") else 0.5
+            return [[value]] * len(rows)
+
+        scored = score_manifest(manifest, benchmark, dataset=job["dataset"], semantic_scorer=scorer,
+                                quality_judge=lambda _: dict(quality_proxy=.75, invalid=False))
+        write_reports(cfg["output_dir"], scored, summarize_results(scored), {})
+    module.merge_scoring(options, score_jobs)
+    comparisons = json.loads((out / "results/memory_comparisons.json").read_text())
+    assert len(comparisons) == 4
+    for item in comparisons:
+        expected = .2 if item["reference"] == "no_read" else .3
+        assert item["semantic_GM_delta"]["mean"] == pytest.approx(expected)
+        assert item["semantic_GM_delta"]["pairs"] == 8
+        assert item["semantic_GM_delta"]["ci95"] == pytest.approx([expected, expected])
+    merged = [json.loads(x) for x in (out / "results/scores.jsonl").read_text().splitlines()]
+    assert len(merged) == 64 and {r["index"] for r in merged} == set(range(8))
+    # An omitted intervention must fail before scoring.
+    path = out / "hard16/manifest.json"
+    bad = json.loads(path.read_text())
+    bad["images"] = [r for r in bad["images"] if not r["arm"].endswith("no_read")]
+    with pytest.raises(ValueError, match="exactly Base"):
+        module.validate_suite_arms(options, bad)
+
+
 def test_failed_worker_stops_its_peers_and_preserves_failure(tmp_path, monkeypatch):
     import signal
     import threading

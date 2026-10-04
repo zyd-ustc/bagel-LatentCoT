@@ -103,6 +103,48 @@ def test_real_shuffled_reads_differ_but_canonical_writer_matches_correct(monkeyp
     assert all(row["memory_permutation"] == [1, 0] for row in shuffled.stats)
 
 
+def test_no_read_preserves_canonical_writer_and_matches_same_checkpoint_without_memory(monkeypatch):
+    model, config = tiny_model(2, alpha=1)
+    with torch.no_grad():
+        model.t2i_loop.gate_logits.zero_()
+        model.t2i_loop.reentry.memory_projection.weight.fill_(0.03)
+    inputs = flow_inputs(model)
+    recorded = []
+    original = runner.memory_slot_stats
+
+    def capture(value):
+        recorded.append(value.clone())
+        return original(value)
+
+    monkeypatch.setattr(runner, "memory_slot_stats", capture)
+    with torch.no_grad():
+        correct = model.forward_t2i_loop(**inputs)
+        correct_states = recorded[:]
+        recorded.clear()
+        blocked = model.forward_t2i_loop(
+            **inputs, loop_config=replace(config, memory_control="no_read")
+        )
+        for actual, expected in zip(recorded, correct_states):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert len(recorded) == len(correct_states) == 6
+        # Remove the probe before testing K=0, where memory is absent.
+        monkeypatch.setattr(runner, "memory_slot_stats", original)
+        removed = model.forward_t2i_loop(
+            **inputs, loop_config=replace(config, memory_slots=0)
+        )
+        torch.testing.assert_close(blocked.velocity, removed.velocity, rtol=0, atol=0)
+        assert not torch.equal(correct.velocity, blocked.velocity)
+        model.t2i_loop.memory_init.add_(100)
+        model.t2i_loop.reentry.memory_projection.weight.fill_(9)
+        poisoned = model.forward_t2i_loop(
+            **inputs, loop_config=replace(config, memory_control="no_read")
+        )
+    torch.testing.assert_close(blocked.velocity, poisoned.velocity, rtol=0, atol=0)
+    assert all(row["memory_writer"] == "canonical_correct" for row in blocked.stats)
+    assert all(not row["gen_memory_read_enabled"] for row in blocked.stats)
+    assert all(not layer["gen_memory_read_enabled"] for row in blocked.stats for layer in row["layers"])
+
+
 @pytest.mark.parametrize(
     "mode,slots", [("direct_native_gen_only", 0), ("direct_native_memory", 2)]
 )

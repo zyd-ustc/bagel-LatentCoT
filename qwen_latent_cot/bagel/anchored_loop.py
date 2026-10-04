@@ -76,7 +76,7 @@ class LoopConfig:
             raise ValueError("loop_gate_init must lie in [0, 1)")
         if self.loop_ds_weight < 0:
             raise ValueError("loop_ds_weight must be nonnegative")
-        if self.memory_control not in {"correct", "zero", "frozen", "shuffled"}:
+        if self.memory_control not in {"correct", "zero", "frozen", "shuffled", "no_read"}:
             raise ValueError("unsupported memory_control")
 
     def to_dict(self):
@@ -336,7 +336,10 @@ def run_anchored_loop(
         previous_memory = (
             memory.clone() if memory is not None and config.log_loop_stats else None
         )
-        read_memory = memory if permutation is None else memory[permutation]
+        read_memory = (
+            None if config.memory_control == "no_read"
+            else memory if permutation is None else memory[permutation]
+        )
         entry = (
             previous_gen
             if direct
@@ -344,7 +347,10 @@ def run_anchored_loop(
                 anchor.gen_entry, delta, read_memory, config, anchor.gen_counts
             )
         )
-        if permutation is None:
+        separate_writer = permutation is not None or (
+            memory is not None and config.memory_control == "no_read"
+        )
+        if not separate_writer:
             current_gen, memory, layer_stats = body(entry, memory, modules)
         else:
             canonical_entry = (
@@ -360,13 +366,15 @@ def run_anchored_loop(
             )
             # Replace only depth-aligned memory inputs for the reader. Its
             # memory outputs are discarded, so permutation never compounds.
-            current_gen, _, layer_stats = body(
-                entry,
-                memory,
-                modules,
-                memory_read_overrides=[value[permutation] for value in layer_memories],
-                memory_reference_reads=layer_memories,
+            reader_options = (
+                dict(block_memory_reads=True)
+                if config.memory_control == "no_read"
+                else dict(
+                    memory_read_overrides=[value[permutation] for value in layer_memories],
+                    memory_reference_reads=layer_memories,
+                )
             )
+            current_gen, _, layer_stats = body(entry, memory, modules, **reader_options)
             memory = canonical_memory
             canonical_delta = canonical_gen - anchor.gen_base
             canonical_previous_gen = canonical_gen
@@ -396,9 +404,10 @@ def run_anchored_loop(
                 if permutation is not None
                 else None,
                 "memory_writer": "canonical_correct"
-                if permutation is not None
+                if separate_writer
                 else "shared",
-                "body_passes_this_round": 2 if permutation is not None else 1,
+                "gen_memory_read_enabled": config.memory_control != "no_read",
+                "body_passes_this_round": 2 if separate_writer else 1,
                 "memory_update_ratio": ratio(memory - previous_memory, previous_memory)
                 if memory is not None
                 else 0.0,

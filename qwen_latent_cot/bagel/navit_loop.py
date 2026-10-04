@@ -146,6 +146,7 @@ def forward_anchored_branch(
         capture_memory_reads=None,
         memory_read_overrides=None,
         memory_reference_reads=None,
+        block_memory_reads=False,
     ):
         sequence = entry_sequence.new_zeros(
             (int(workspace_layout.lengths.sum()), hidden.shape[-1])
@@ -181,7 +182,15 @@ def forward_anchored_branch(
                 sequence[memory_indexes] = memory_read_overrides[local].reshape(
                     -1, hidden.shape[-1]
                 ).to(sequence.dtype)
-            after = layer_call(index, sequence, workspace_kwargs, checkpoint=True)
+            if block_memory_reads:
+                # GEN attends to native query/cache keys only. Memory remains
+                # in the canonical writer; this reader's writes are discarded.
+                after = sequence.clone()
+                after[native_indexes] = layer_call(
+                    index, sequence[native_indexes], original_kwargs, checkpoint=True
+                )
+            else:
+                after = layer_call(index, sequence, workspace_kwargs, checkpoint=True)
             # Native transformation plus the incoming correction is the
             # reference for the new write. UND/M retain their full expert update.
             sequence = after.clone()
@@ -216,6 +225,7 @@ def forward_anchored_branch(
                         "gate": None
                         if config.loop_mode.startswith("direct_native_")
                         else float(loop_modules.gate_logits[local].detach().sigmoid()),
+                        "gen_memory_read_enabled": not block_memory_reads,
                         "memory_read_delta_ratio": ratio(
                             memory_read_overrides[local]
                             - memory_reference_reads[local],

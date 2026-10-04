@@ -70,8 +70,10 @@ def arm_semantics(runtime):
         "gate": "carry_gen_delta_gate_new_layer_write",
         "readout": "base_plus_alpha_delta",
         "memory_writer": "canonical_correct"
-        if runtime.memory_control == "shuffled"
+        if runtime.memory_control in {"shuffled", "no_read"}
         else "shared",
+        "memory_reader": "blocked_native_keys_and_adapter"
+        if runtime.memory_control == "no_read" else runtime.memory_control,
     }
 
 
@@ -92,7 +94,7 @@ def main():
     parser.add_argument("--memory-slots", type=int, default=8)
     parser.add_argument(
         "--memory-control",
-        choices=["correct", "zero", "frozen", "shuffled"],
+        choices=["correct", "zero", "frozen", "shuffled", "no_read"],
         default="correct",
     )
     parser.add_argument("--start-layer", type=int, default=16)
@@ -370,7 +372,7 @@ def run_matrix(args, backbone=None):
                 "memory_control_semantics": "fixed_donor_read_only_with_correct_canonical_writer",
                 "loop_diagnostics_enabled": config.log_loop_stats,
                 "readout_probes_saved": args.save_readouts,
-                "compute_note": "Anchored/direct branches run native reference plus R extra bodies; shuffled uses a separate correct writer body each round. Enabled legacy diagnostics add a native reference pass. Timing includes probes only when enabled; FLOPs require accelerator profiling.",
+                "compute_note": "Anchored/direct branches run native reference plus R extra bodies; shuffled/no_read use a separate correct writer body each round. no_read excludes Memory keys and adapter conditioning from GEN. Enabled legacy diagnostics add a native reference pass. Timing includes probes only when enabled; FLOPs require accelerator profiling.",
             },
             indent=2,
         )
