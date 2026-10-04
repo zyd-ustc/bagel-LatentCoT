@@ -19,6 +19,10 @@ from qwen_latent_cot.bagel.accelerator import (
     manual_seed_all,
     resolve_device,
 )
+from qwen_latent_cot.bagel.depth_curriculum import (
+    resolve_depth_curriculum,
+    sample_curriculum_depth,
+)
 from qwen_latent_cot.bagel.flow_time import sample_native_flow_timestep
 from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
 from qwen_latent_cot.bagel.loop_checkpoint import save_loop_checkpoint
@@ -40,7 +44,8 @@ def main():
             "Stage 1 requires enabled extra loops with a trainable low_rank adapter"
         )
     if (
-        config.loop_mode in {"direct_native", "legacy_memory_only"}
+        config.loop_mode == "legacy_memory_only"
+        or config.loop_mode.startswith("direct_native_")
         or config.memory_control != "correct"
     ):
         raise ValueError(
@@ -56,9 +61,14 @@ def main():
         )
     if int(cfg.get("save_every", 100)) < 1 or int(cfg.get("batch_size", 1)) < 1:
         raise ValueError("save_every and batch_size must be positive")
-    depths = cfg.get("depth_curriculum", [1, 2])
-    if not depths or min(depths) < 1 or max(depths) > config.loop_depth:
-        raise ValueError("depth curriculum must lie within allocated loop_depth")
+    total = int(cfg.get("steps", 1000))
+    phases = resolve_depth_curriculum(
+        cfg.get("depth_curriculum", list(range(1, config.loop_depth + 1))),
+        config.loop_depth,
+        total,
+    )
+    depth_counts = {str(depth): 0 for depth in range(1, config.loop_depth + 1)}
+    round_training_steps = [0] * config.loop_depth
     seed = int(cfg.get("seed", 0))
     manual_seed_all(seed)
     device = resolve_device(cfg.get("device", "auto"))
@@ -101,9 +111,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / "trainable.json").write_text(json.dumps(trainable_names, indent=2))
     (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
-    step, total = 0, int(cfg.get("steps", 1000))
-    if total < 1:
-        raise ValueError("steps must be positive")
+    step = 0
     with (out / "metrics.jsonl").open("w") as log:
         while step < total:
             for batch in loader:
@@ -121,7 +129,7 @@ def main():
                         for key, value in condition.inputs.items()
                         if not key.startswith("cfg_")
                     }
-                depth = int(depths[int(torch.randint(len(depths), ()).item())])
+                depth, phase_index = sample_curriculum_depth(phases, step)
                 runtime = replace(config, loop_depth=depth)
                 t = sample_native_flow_timestep(
                     device=device, timestep_shift=model.timestep_shift
@@ -146,9 +154,16 @@ def main():
                     raise RuntimeError(f"nonfinite loop gradients at step {step}")
                 optimizer.step()
                 step += 1
+                depth_counts[str(depth)] += 1
+                for index in range(depth):
+                    round_training_steps[index] += 1
                 record = {
                     "step": step,
                     "depth": depth,
+                    "curriculum_phase": phase_index,
+                    "allowed_depths": phases[phase_index]["depths"],
+                    "depth_counts": dict(depth_counts),
+                    "round_training_steps": list(round_training_steps),
                     "timestep": float(t),
                     "timestep_shift": model.timestep_shift,
                     "flow_loss": float(loss.detach()),
@@ -167,6 +182,9 @@ def main():
                         out / f"step_{step:06d}",
                         step=step,
                         model_path=cfg["model_path"],
+                        training_depth_counts=depth_counts,
+                        round_training_steps=round_training_steps,
+                        depth_curriculum=phases,
                     )
                 if step >= total:
                     break

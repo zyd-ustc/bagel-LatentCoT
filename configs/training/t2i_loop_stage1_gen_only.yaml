@@ -14,7 +14,15 @@ weight_decay: 0.0
 max_grad_norm: 1.0
 save_every: 100
 gradient_checkpointing: true
-depth_curriculum: [1, 2]
+# First 30% R=1; middle 40% R in {1,2}; last 30% R in {1,2,3}.
+# A new maximum depth runs at the first step of each phase.
+depth_curriculum:
+  - until: 0.3
+    depths: [1]
+  - until: 0.7
+    depths: [1, 2]
+  - until: 1.0
+    depths: [1, 2, 3]
 loop:
   enable_t2i_loop: true
   loop_mode: gen_only

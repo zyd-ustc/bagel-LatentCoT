@@ -40,17 +40,22 @@ class LoopConfig:
             "legacy_memory_only",
             "gen_only",
             "gen_memory_anchored",
-            "direct_native",
+            "direct_native_gen_only",
+            "direct_native_memory",
         }:
             raise ValueError("unsupported loop_mode")
         if not 0 <= self.loop_start_layer < self.loop_end_layer:
             raise ValueError("require 0 <= loop_start_layer < loop_end_layer")
         if self.loop_depth < 0 or self.memory_slots < 0:
             raise ValueError("loop_depth and memory_slots must be nonnegative")
-        if self.loop_mode == "gen_only" and self.memory_slots != 0:
-            raise ValueError("gen_only requires memory_slots=0")
         if (
-            self.loop_mode in {"memory_only", "legacy_memory_only"}
+            self.loop_mode in {"gen_only", "direct_native_gen_only"}
+            and self.memory_slots != 0
+        ):
+            raise ValueError("gen_only/direct_native_gen_only requires memory_slots=0")
+        if (
+            self.loop_mode
+            in {"memory_only", "legacy_memory_only", "direct_native_memory"}
             and self.memory_slots == 0
         ):
             raise ValueError("memory_only requires memory_slots>0")
@@ -163,7 +168,7 @@ class LoopModules(nn.Module):
     def entry(self, anchor, delta, memory, config):
         if config.loop_mode == "memory_only":
             return anchor.clone()
-        if config.loop_mode == "direct_native":
+        if config.loop_mode.startswith("direct_native_"):
             # The runner replaces this with the previous body endpoint.
             raise RuntimeError("direct_native entry must use previous endpoint")
         if config.reentry_adapter_type == "fixed":
@@ -251,13 +256,19 @@ def run_anchored_loop(
     caches in both callbacks. Recurrent states are local to this invocation.
     """
     base_velocity = readout(anchor.gen_base)
+    direct = config.loop_mode.startswith("direct_native_")
     if (
         not config.enable_t2i_loop
         or config.loop_depth == 0
-        or not bool(torch.count_nonzero(modules.gate_logits.detach().sigmoid()).item())
+        or (
+            not direct
+            and not bool(
+                torch.count_nonzero(modules.gate_logits.detach().sigmoid()).item()
+            )
+        )
     ):
         return LoopResult(base_velocity, base_velocity, [], [])
-    if config.loop_depth > modules.output_alpha.numel():
+    if not direct and config.loop_depth > modules.output_alpha.numel():
         raise ValueError(
             "requested depth exceeds allocated output_alpha; allocate maximum curriculum depth"
         )
@@ -265,6 +276,14 @@ def run_anchored_loop(
     initial_memory = memory.clone() if memory is not None else None
     delta = torch.zeros_like(anchor.gen_base)
     previous_gen = anchor.gen_base
+    # Canonical writer follows the correct recurrence, never reader feedback.
+    canonical_delta = torch.zeros_like(anchor.gen_base)
+    canonical_previous_gen = anchor.gen_base
+    permutation = None
+    if memory is not None and config.memory_control == "shuffled":
+        if memory.shape[0] < 2:
+            raise ValueError("shuffled-across-sample memory requires batch>=2")
+        permutation = torch.arange(memory.shape[0], device=memory.device).roll(1)
     velocities, stats = [], []
     previous_velocity_delta = None
     for r in range(config.loop_depth):
@@ -273,19 +292,43 @@ def run_anchored_loop(
                 memory = torch.zeros_like(memory)
             elif config.memory_control == "frozen":
                 memory = initial_memory.clone()
-            elif config.memory_control == "shuffled":
-                if memory.shape[0] < 2:
-                    raise ValueError("shuffled-across-sample memory requires batch>=2")
-                memory = memory.roll(1, dims=0)
+        read_memory = memory if permutation is None else memory[permutation]
         entry = (
             previous_gen
-            if config.loop_mode == "direct_native"
-            else modules.entry(anchor.gen_entry, delta, memory, config)
+            if direct
+            else modules.entry(anchor.gen_entry, delta, read_memory, config)
         )
-        current_gen, memory, layer_stats = body(entry, memory, modules)
+        if permutation is None:
+            current_gen, memory, layer_stats = body(entry, memory, modules)
+        else:
+            canonical_entry = (
+                canonical_previous_gen
+                if direct
+                else modules.entry(anchor.gen_entry, canonical_delta, memory, config)
+            )
+            layer_memories = []
+            canonical_gen, canonical_memory, _ = body(
+                canonical_entry, memory, modules, capture_memory_reads=layer_memories
+            )
+            # Replace only depth-aligned memory inputs for the reader. Its
+            # memory outputs are discarded, so permutation never compounds.
+            current_gen, _, layer_stats = body(
+                entry,
+                memory,
+                modules,
+                memory_read_overrides=[value[permutation] for value in layer_memories],
+                memory_reference_reads=layer_memories,
+            )
+            memory = canonical_memory
+            canonical_delta = canonical_gen - anchor.gen_base
+            canonical_previous_gen = canonical_gen
         delta = current_gen - anchor.gen_base
         previous_gen = current_gen
-        merged = anchor.gen_base + modules.output_alpha[r].to(delta.dtype) * delta
+        merged = (
+            current_gen
+            if direct
+            else anchor.gen_base + modules.output_alpha[r].to(delta.dtype) * delta
+        )
         velocity = readout(merged)
         velocities.append(velocity)
         if config.log_loop_stats:
@@ -299,7 +342,14 @@ def run_anchored_loop(
                 "memory_norm": float(memory.detach().float().norm())
                 if memory is not None
                 else 0.0,
-                "alpha": float(modules.output_alpha[r].detach()),
+                "alpha": None if direct else float(modules.output_alpha[r].detach()),
+                "memory_permutation": permutation.tolist()
+                if permutation is not None
+                else None,
+                "memory_writer": "canonical_correct"
+                if permutation is not None
+                else "shared",
+                "body_passes_this_round": 2 if permutation is not None else 1,
                 "memory_slot_stats": memory_slot_stats(memory),
                 "memory_initial_slot_stats": memory_slot_stats(initial_memory),
                 "layers": layer_stats,

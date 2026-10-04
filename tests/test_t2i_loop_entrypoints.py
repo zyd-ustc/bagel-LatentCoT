@@ -199,7 +199,7 @@ def test_topology_cli_exports_matched_arms_and_all_timestep_bins(tmp_path, monke
     )
     module.main()
     manifest = json.loads((tmp_path / "eval/manifest.json").read_text())
-    assert len(manifest["images"]) == 18  # base + 4 modes * 2 depths, two samples
+    assert len(manifest["images"]) == 22  # base + 5 modes * 2 depths, two samples
     assert all(Path(row["path"]).is_file() for row in manifest["images"])
     arm = tmp_path / "eval/gen_memory_anchored_R2_K2_correct"
     logs = json.loads((arm / "batch_0000_loop_logs.json").read_text())

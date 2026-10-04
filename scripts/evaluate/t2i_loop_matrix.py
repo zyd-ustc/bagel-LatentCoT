@@ -32,6 +32,47 @@ def timestep_bin(index, count):
     return "early" if fraction < 1 / 3 else "middle" if fraction < 2 / 3 else "late"
 
 
+def arm_config(config, mode, depth, memory_slots, memory_control):
+    native_control = mode == "legacy_memory_only" or mode.startswith("direct_native_")
+    return replace(
+        config,
+        enable_t2i_loop=depth > 0,
+        loop_depth=depth,
+        loop_mode="gen_only" if mode == "base" else mode,
+        memory_slots=0
+        if mode in {"base", "gen_only", "direct_native_gen_only"}
+        else memory_slots,
+        memory_control=memory_control,
+        log_loop_stats=True,
+        loop_gate_init=0.0 if native_control else config.loop_gate_init,
+        loop_output_alpha_init=0.0 if native_control else config.loop_output_alpha_init,
+    )
+
+
+def arm_semantics(runtime):
+    if runtime.loop_mode == "legacy_memory_only":
+        return {
+            "gate": "parent_ungated",
+            "readout": "parent_suffix_no_alpha",
+            "memory_writer": "parent",
+        }
+    if runtime.loop_mode.startswith("direct_native_"):
+        return {
+            "gate": "ungated",
+            "readout": "current_gen_no_alpha",
+            "memory_writer": "canonical_correct"
+            if runtime.memory_control == "shuffled"
+            else "shared",
+        }
+    return {
+        "gate": "native_gen_reference_correction",
+        "readout": "base_plus_alpha_delta",
+        "memory_writer": "canonical_correct"
+        if runtime.memory_control == "shuffled"
+        else "shared",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -42,7 +83,8 @@ def main():
     parser.add_argument("--checkpoint")
     parser.add_argument("--device", default="auto")
     parser.add_argument(
-        "--modes", default="gen_only,gen_memory_anchored,memory_only,legacy_memory_only"
+        "--modes",
+        default="gen_only,gen_memory_anchored,memory_only,legacy_memory_only,direct_native_gen_only",
     )
     parser.add_argument("--depths", default="0,1,2,3,4")
     parser.add_argument("--memory-slots", type=int, default=8)
@@ -91,17 +133,22 @@ def main():
         "gen_memory_anchored",
         "memory_only",
         "legacy_memory_only",
-        "direct_native",
+        "direct_native_gen_only",
+        "direct_native_memory",
     }
     if not modes or not set(modes) <= valid_modes:
         raise ValueError("unsupported or empty mode list")
-    if {"memory_only", "legacy_memory_only"} & set(modes) and args.memory_slots == 0:
+    if {"memory_only", "legacy_memory_only", "direct_native_memory"} & set(
+        modes
+    ) and args.memory_slots == 0:
         raise ValueError("memory_only requires positive memory slots")
     if "legacy_memory_only" in modes and args.memory_control != "correct":
         raise ValueError(
             "legacy_memory_only is an unchanged control; choose new workspace modes for memory interventions"
         )
-    if args.memory_control == "shuffled" and any(mode != "gen_only" for mode in modes):
+    if args.memory_control == "shuffled" and any(
+        mode not in {"gen_only", "direct_native_gen_only"} for mode in modes
+    ):
         if args.batch_size < 2 or len(rows) % args.batch_size == 1:
             raise ValueError(
                 "shuffled workspace requires every batch to contain at least two samples"
@@ -119,14 +166,25 @@ def main():
         loop_gate_init=args.gate,
     )
     if args.checkpoint:
-        config = LoopConfig(**checkpoint_config(args.checkpoint)["loop_config"])
-        if max(depths) > config.loop_depth:
+        metadata = checkpoint_config(args.checkpoint)
+        config = LoopConfig(**metadata["loop_config"])
+        anchored_modes = {"gen_only", "gen_memory_anchored", "memory_only"} & set(modes)
+        if anchored_modes and max(depths) > config.loop_depth:
             raise ValueError("depth matrix exceeds checkpoint allocation")
         if args.memory_slots > config.memory_slots and any(
-            mode in {"gen_memory_anchored", "memory_only", "direct_native"}
+            mode in {"gen_memory_anchored", "memory_only", "direct_native_memory"}
             for mode in modes
         ):
             raise ValueError("memory matrix exceeds checkpoint workspace allocation")
+        trained_rounds = metadata.get("round_training_steps")
+        if (
+            anchored_modes
+            and trained_rounds is not None
+            and any(count == 0 for count in trained_rounds[: max(depths)])
+        ):
+            raise ValueError(
+                "requested loop depth includes an untrained round in this checkpoint"
+            )
     backbone = BagelBackbone(
         {
             "model_path": args.model_path,
@@ -146,7 +204,7 @@ def main():
     )
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    records = []
+    records, arm_metadata = [], {}
     schedule = torch.linspace(1, 0, args.num_timesteps, device=device)
     schedule = shift_flow_timestep(schedule, args.timestep_shift)
     dts = schedule[:-1] - schedule[1:]
@@ -166,17 +224,15 @@ def main():
                 count, model.patch_latent_dim, generator=generator
             ).to(device)
             for mode, depth in arms:
-                slots = 0 if mode in {"base", "gen_only"} else args.memory_slots
-                runtime = replace(
-                    config,
-                    enable_t2i_loop=depth > 0,
-                    loop_depth=depth,
-                    loop_mode="gen_only" if mode == "base" else mode,
-                    memory_slots=slots,
-                    memory_control=args.memory_control,
-                    log_loop_stats=True,
+                runtime = arm_config(
+                    config, mode, depth, args.memory_slots, args.memory_control
                 )
+                slots = runtime.memory_slots
                 arm = f"{mode}_R{depth}_K{slots}_{args.memory_control}"
+                arm_metadata[arm] = {
+                    "runtime_config": runtime.to_dict(),
+                    **arm_semantics(runtime),
+                }
                 directory = out / arm
                 directory.mkdir(exist_ok=True)
                 x_t = initial_noise.clone()
@@ -231,6 +287,7 @@ def main():
                             "path": str(path.resolve()),
                             "seed": args.seed + offset,
                             "elapsed_batch_seconds": elapsed,
+                            "semantics": arm_semantics(runtime),
                         }
                     )
                 (directory / f"batch_{offset:04d}_loop_logs.json").write_text(
@@ -242,7 +299,14 @@ def main():
                 "arguments": vars(args),
                 "allocated_loop_config": config.to_dict(),
                 "images": records,
-                "compute_note": "Each active branch runs prefix once, body 1+R times, and suffix 1+R times. FLOPs require accelerator profiling; image timing includes readout probes.",
+                "arms": arm_metadata,
+                "checkpoint_training_coverage": metadata.get(
+                    "round_training_steps", "unknown"
+                )
+                if args.checkpoint
+                else "training_free",
+                "memory_control_semantics": "fixed_donor_read_only_with_correct_canonical_writer",
+                "compute_note": "Anchored/direct branches run native reference plus R extra bodies; shuffled uses a separate correct writer body each round. Legacy diagnostics add a native reference pass. Timing includes all readout probes; FLOPs require accelerator profiling.",
             },
             indent=2,
         )

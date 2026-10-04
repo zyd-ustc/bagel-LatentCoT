@@ -127,7 +127,8 @@ def test_off_controls_match_native_velocity(control, slots):
         ("memory_only", 2),
         ("gen_only", 0),
         ("gen_memory_anchored", 2),
-        ("direct_native", 2),
+        ("direct_native_memory", 2),
+        ("direct_native_gen_only", 0),
     ],
 )
 def test_real_mot_recurrence_keeps_prompt_and_sampler_anchors(mode, slots):

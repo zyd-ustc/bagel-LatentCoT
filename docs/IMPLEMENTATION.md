@@ -1,7 +1,8 @@
 # 文档方案与实现对应表
 
 方案来源：用户提供的 `UMM_T2ILoop_Anchored_Loop_Design.docx`。
-实现对象是文档的第一版 Anchored GEN Loop + Memory Scratchpad。
+实现对象是文档的第一版 Anchored GEN Loop + Memory Scratchpad，并应用用户后续 P0/P1 修订。
+设计原文的转录保持不变；本文记录当前实现语义。
 本文区分代码实现、数值验收与需要真实模型实验的研究结论。
 
 | 原文要求 | 实现 | 验收证据 |
@@ -19,12 +20,12 @@
 | Slot 对称性 | boundary mean + `1e-4` 随机 slot noise；恢复 centered effective rank / pairwise cosine | BF16 K=8/16 初始及循环后 slot variation 非零；相同 slot 报 rank=0 |
 | 原生 timestep 分布 | 新训练和 native forward 共用 raw normal → sigmoid → native shift | 固定 seed 4096 个 draw 与公式逐值相同；真实 native forward 捕获 time 输入 |
 | 4.3 三模式 | `memory_only`、`gen_only`、`gen_memory_anchored` | 同一 runner，仅 persistent state 不同 |
-| 4.4 负对照 | `direct_native` 直接以先前 exit 进入 body | 默认仍为 anchored；负对照单独选择 |
-| 6.2、8.3 memory 干预 | correct、zero、frozen、batch-shuffled | zero/frozen 保持 body 中 memory 不变；shuffled 要求 batch≥2 |
+| 4.4 / P1-3 负对照 | `direct_native_gen_only` 强制 K=0；可选 `direct_native_memory` K>0；二者完整 body、无 GEN gate/α blend | 初始 endpoint 直接 recycle；gate/α 被改变后 velocity exact parity；矩阵 K0 检查 |
+| 6.2、8.3 memory 干预 | correct、zero、frozen、batch-shuffled | zero/frozen 保持 body 中 memory 不变；shuffled 使用固定 donor 和独立 correct writer，只改变 Memory→GEN read，reader 写入不 recycle |
 | 6.3、6.4 functional diagnostics | velocity delta ratio、相邻 correction cosine、逐层 GEN write ratio、state norm；early/middle/late bins | 数值记录不是语义质量指标 |
 | 7.1 Stage 1 参数边界 | 所有原生参数冻结，只开放 `t2i_loop.*` | backward + optimizer 后 native 权重逐 tensor 不变 |
 | 7.2 direct flow deep supervision | final MSE + λ×mean intermediate MSE，同一 `epsilon−x1` 目标 | 显式损失数值测试；无 final-loop distillation |
-| 7.6、7.7 数据与 curriculum | 普通/结构/easy/noop prompt-image JSONL；在分配上限内抽取 R | 同 timestep、同 clean image 与噪声目标监督每轮 |
+| 7.6、7.7 / P1-4 curriculum | 前 30% `{1}`、中 40% `{1,2}`、后 30% `{1,2,3}`；新最大深度在阶段首步执行 | 10 步训练真实更新第三轮 α；checkpoint 记录每轮曝光次数，评估拒绝已知未训练轮次 |
 | 7.4、7.5 后续阶段 | workspace 专项训练、body LoRA 尚未实现或启动 | 需先取得文档 M1–M3 的真实语义/质量证据 |
 
 ## 新 workspace 的执行语义
@@ -41,6 +42,11 @@
 - GEN-only 的零 adapter 不产生初始 ΔG；训练配置 α=0.01，使零 bias 能学习。α=0 会阻断全部训练梯度。
 - legacy 的 R 对应 parent repeat=1+R。round0 阻止所有非 M query 读取 M；M 跑过 prefix，下一轮仅 recycle M。
 - legacy 从原生 SOI/EOI 重建 seed-0 m0，因此不会因加载新 loop checkpoint 而改变控制组。
+- Direct Native 两个 arm 不用 gate/α/adapter，纯 GEN arm 强制 K=0；含 M 的 arm 另行选择。
+- shuffled 的固定 permutation 在每个 branch/timestep 内保持不变。canonical writer 的 GEN/M 不接收 reader 的干预结果。
+- reader 每层读取 canonical writer 在该层输入深度的 donor M，仅保存 GEN 输出；新 M 仅来自 correct writer。
+- 初始 M 在样本之间相同；第一层干预强度为零，不能把单层 R=1 的无差异当作 memory 无内容的证据。
+- shuffled 每轮包含 writer + reader 两次 body；manifest 明确记录计算语义。
 - legacy 的诊断另算一次 native reference pass。当前矩阵 wall time 包含 reference 与各轮 readout，不等于原始 MemLoop 的纯计算成本。
 - checkpoint 格式更新为 v2，记录 gate 语义和 native timestep shift；拒绝 v1 whole-layer gate checkpoint。旧 LoRA checkpoint 也不兼容。
 

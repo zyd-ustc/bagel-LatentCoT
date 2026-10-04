@@ -9,7 +9,16 @@ from safetensors.torch import load_file, save_file
 FORMAT = "umm-t2i-anchored-loop-v2"
 
 
-def save_loop_checkpoint(model, directory, *, step, model_path):
+def save_loop_checkpoint(
+    model,
+    directory,
+    *,
+    step,
+    model_path,
+    training_depth_counts=None,
+    round_training_steps=None,
+    depth_curriculum=None,
+):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     save_file(
@@ -28,6 +37,10 @@ def save_loop_checkpoint(model, directory, *, step, model_path):
         "flow_timestep_distribution": "sigmoid_normal_then_native_shift",
         "gate_semantics": "native_gen_reference_plus_gated_loop_correction",
     }
+    if training_depth_counts is not None:
+        metadata["training_depth_counts"] = dict(training_depth_counts)
+        metadata["round_training_steps"] = list(round_training_steps)
+        metadata["depth_curriculum"] = depth_curriculum
     (directory / "loop.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 

@@ -138,7 +138,15 @@ def forward_anchored_branch(
     workspace_kwargs = workspace_layout.kwargs(model, hidden, cache)
     workspace_boundaries = native_indexes[layout.und_indexes]
 
-    def body(gen, memory, loop_modules):
+    def body(
+        gen,
+        memory,
+        loop_modules,
+        *,
+        capture_memory_reads=None,
+        memory_read_overrides=None,
+        memory_reference_reads=None,
+    ):
         sequence = entry_sequence.new_zeros(
             (int(workspace_layout.lengths.sum()), hidden.shape[-1])
         )
@@ -154,14 +162,27 @@ def forward_anchored_branch(
             # Cached prompt tensors are read only (update_past_key_values=False).
             sequence = sequence.clone()
             sequence[workspace_boundaries] = boundary_anchors[local]
+            if capture_memory_reads is not None:
+                capture_memory_reads.append(
+                    sequence[memory_indexes]
+                    .reshape(batch, config.memory_slots, -1)
+                    .clone()
+                )
+            if memory_read_overrides is not None:
+                # Only GEN outputs are retained from this reader layer; UND
+                # boundaries reset next layer and M writes are discarded.
+                sequence[memory_indexes] = memory_read_overrides[local].reshape(
+                    -1, hidden.shape[-1]
+                )
             after = layer_call(index, sequence, workspace_kwargs, checkpoint=True)
             # Native transformation is the reference, not the layer input.
             # UND boundaries and memory retain their full native expert update.
             sequence = after.clone()
             reference_gen = layer_gen_references[local]
-            sequence[workspace_layout.gen_indexes] = loop_modules.gate(
-                local, reference_gen, after[workspace_layout.gen_indexes]
-            )
+            if not config.loop_mode.startswith("direct_native_"):
+                sequence[workspace_layout.gen_indexes] = loop_modules.gate(
+                    local, reference_gen, after[workspace_layout.gen_indexes]
+                )
             if memory is not None and config.memory_control in {"zero", "frozen"}:
                 sequence = sequence.clone()
                 sequence[memory_indexes] = memory.reshape(-1, hidden.shape[-1])
@@ -181,9 +202,16 @@ def forward_anchored_branch(
                             reference_gen - layer_gen_anchors[local],
                             layer_gen_anchors[local],
                         ),
-                        "gate": float(
-                            loop_modules.gate_logits[local].detach().sigmoid()
-                        ),
+                        "gate": None
+                        if config.loop_mode.startswith("direct_native_")
+                        else float(loop_modules.gate_logits[local].detach().sigmoid()),
+                        "memory_read_delta_ratio": ratio(
+                            memory_read_overrides[local]
+                            - memory_reference_reads[local],
+                            memory_reference_reads[local],
+                        )
+                        if memory_read_overrides is not None
+                        else 0.0,
                     }
                 )
         gen_out = sequence[workspace_layout.gen_indexes].reshape(gen_shape)

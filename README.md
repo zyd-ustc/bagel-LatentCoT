@@ -1,6 +1,6 @@
 # UMM T2ILoop on BAGEL
 
-本分支按 `UMM_T2ILoop_Anchored_Loop_Design.docx` 重构为 **Anchored GEN Loop + Memory Scratchpad**。
+本分支按 `UMM_T2ILoop_Anchored_Loop_Design.docx` 及用户后续 P0/P1 修订重构为 **Anchored GEN Loop + Memory Scratchpad**。
 原生 prompt KV、同一 diffusion timestep 的 `x_t` 和 loop entry `G₀` 是固定 anchor。
 主要循环状态是 GEN correction `ΔG`；memory 是可选的 UND 工作区。
 
@@ -54,7 +54,7 @@ python scripts/evaluate/t2i_loop_matrix.py \
   --model-path /path/to/BAGEL-7B-MoT \
   --prompts experiments/data/geneval2_hard_16.jsonl \
   --output-dir outputs/topology \
-  --modes gen_only,gen_memory_anchored,memory_only,legacy_memory_only,direct_native \
+  --modes gen_only,gen_memory_anchored,memory_only,legacy_memory_only,direct_native_gen_only \
   --depths 0,1,2,3,4 --memory-slots 8 \
   --start-layer 16 --end-layer 24 \
   --alpha 0.1 --gate 0.02 --save-readouts
@@ -69,9 +69,18 @@ legacy 不使用新 gate、α 或 adapter，也不读取训练后的 memory 参�
 
 `--memory-control correct|zero|frozen|shuffled` 提供新 workspace 的内容对照。
 运行这些干预时，从 `--modes` 中移除 `legacy_memory_only`，保持历史控制组的原有计算。
-`shuffled` 在 batch 维度交换 memory，要求每个 batch 至少有两个样本。
+`shuffled` 固定一个无自映射的 donor permutation，要求每个 batch 至少有两个样本。
+独立 canonical writer 沿 correct recurrence 生成 Memory；GEN reader 只读取该 writer 在相同 layer depth 的 donor Memory。
+reader 的 Memory 写入会被丢弃；adapter 的 memory→entry 读取也使用同一个 donor 映射。
+每层记录 `memory_read_delta_ratio`。初始 M 在所有 sample 间相同，因此第一层读取差异为零；单层 body 的 R=1 不构成有效内容干预。
+shuffled 多执行一次 writer body，日志记录实际 body pass 数；不能将其 wall time 当作与 correct 等计算量的对照。
 比较 `K=8` 与 `K=16` 时分别运行上述矩阵。
 未经训练、adapter 为零或仅使用固定 ΔG 映射时，GEN-only 初始 ΔG=0，等价于 native；它不能代表有效的训练收益。
+
+纯 Direct Native 负对照为 `direct_native_gen_only`，强制 K=0。
+它完整执行 `G_next=B(G_previous)`，绕过新 gate 与 α merge；共享 suffix 直接读取本轮 GEN endpoint。
+可选 `direct_native_memory` 使用 K>0，必须显式选择。含糊的旧标识 `direct_native` 已移除。
+`legacy_memory_only` 与两个 Direct Native arm 均忽略 `--alpha/--gate`；manifest 分 arm 记录实际 gate/readout 语义。
 
 ## Stage 1 训练
 
@@ -104,8 +113,14 @@ Stage 1 timestep 使用 `raw N(0,1) → sigmoid → timestep_shift`，与原生 
 损失为最终轮 flow MSE，加上中间轮 flow MSE 的平均值乘 `loop_ds_weight`。
 目标 velocity 为 `epsilon − x1`。训练不使用最终轮 self-distillation、RL 或 monotonic margin loss。
 
-配置中的 `loop_depth` 是参数分配的最大深度，`depth_curriculum` 是当前采样的训练深度。
-评估 checkpoint 时 `--depths` 不得超过该分配上限，`--memory-slots` 不得超过训练时的分配。
+配置中的 `loop_depth` 是参数分配的最大深度，必须与 curriculum 的最高训练深度一致。
+两个 Stage 1 默认配置均使用：前 30% `{1}`、中间 40% `{1,2}`、后 30% `{1,2,3}`。
+每个阶段首次引入的新最大深度会立即执行，之后在本阶段的集合内均匀抽样。
+若只训练 `{1,2}`，必须设 `loop_depth=2`；`loop_depth=3` 配 `{1,2}` 会在加载前报错。
+日志和 checkpoint 保存 `training_depth_counts`、`round_training_steps` 与实际阶段边界。
+评估 anchored checkpoint 时，`--depths` 不得超过分配上限，也不得包含记录中尚未训练的轮次。
+历史 v2 checkpoint 缺少训练覆盖记录时，manifest 标记为 `unknown`，不能据此宣称 elastic loop 收益。
+workspace 的 `--memory-slots` 不得超过训练时的分配。
 
 ```bash
 python scripts/evaluate/t2i_loop_matrix.py \

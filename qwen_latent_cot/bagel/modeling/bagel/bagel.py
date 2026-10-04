@@ -807,7 +807,7 @@ class Bagel(PreTrainedModel):
         self._last_branch_stats = []
         loop_active = loop_config.enable_t2i_loop and loop_config.loop_depth > 0
         zero_alpha = not bool(torch.count_nonzero(self.t2i_loop.output_alpha[:loop_config.loop_depth]).item())
-        if loop_active and (torch.is_grad_enabled() or not zero_alpha or loop_config.log_loop_stats or loop_config.loop_mode == "legacy_memory_only"):
+        if loop_active and (torch.is_grad_enabled() or not zero_alpha or loop_config.log_loop_stats or loop_config.loop_mode == "legacy_memory_only" or loop_config.loop_mode.startswith("direct_native_")):
             return self.forward_t2i_loop(
                 x_t=x_t, timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
