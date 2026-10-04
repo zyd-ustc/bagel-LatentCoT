@@ -128,6 +128,15 @@ GEN-only 使用 `configs/training/t2i_loop_stage1_gen_only.yaml`，α=0.01；零
 GEN-only 的 α 与 adapter 同时为零会产生零梯度，训练入口会拒绝该配置。
 GEN-only 从 adapter bias 的有效梯度启动；R≥2 后，上一轮 correction 为 low-rank adapter 提供输入。
 日志同时记录 adapter weight/bias、gate、α 的梯度和参数范数。可据此区分“能执行”和“有实际更新”。
+
+训练后可使用 `scripts/evaluate/stage1_8gpu.py --phase all --output-dir NEW_DIR --training-dir TRAIN_DIR --tools-dir TOOLS_DIR`。
+入口检查八张 GPU 的可用显存和两份最终 v4 checkpoint；每张卡独立生成，不使用训练 DDP。
+R=1–4 的 GEN-only 与 GEN+Memory 各占一张卡，LegacyMem 控制分配到浅层任务所在的卡；仅生成一次 Base。
+同一 prompt 在所有 arm 中使用相同初始噪声；合并时强制检查 prompt、seed、noise hash 和完整 arm 覆盖。
+默认生成 hard128 与 easy16，各 13 个 arm，共 1872 张最终图像；R4 标为 unseen，不作为已训练深度。
+每个进程只加载一次原生模型，在作业间替换完整 loop module；关闭逐轮 suffix/诊断读出，保留最终采样输出。
+随后八张卡按 prompt 分片评分。评分时映射局部 benchmark index，汇总前恢复全局 index，再统一计算 paired CI、Repair/Damage 与质量代理。
+`--phase check` 仅检查资源；`--phase generate` 和 `--phase score` 可分开运行。独立评分必须保留原生成的 benchmark、seed、batch size 和 timestep 设置。
 memory 初始化为 boundary embedding 加 `1e-4` 独立 slot noise。
 训练默认开启诊断，逐轮记录 centered effective rank、pairwise cosine、slot std、sigma1 ratio 和 memory update ratio。
 Stage 1 timestep 使用 `raw N(0,1) → sigmoid → timestep_shift`，与原生 BAGEL forward 共用实现。

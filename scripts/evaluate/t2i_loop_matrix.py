@@ -14,6 +14,7 @@ from dataclasses import replace
 import torch
 
 from qwen_latent_cot.bagel import BagelBackbone, LoopConfig
+from qwen_latent_cot.bagel.anchored_loop import LoopModules
 from qwen_latent_cot.bagel.accelerator import (
     autocast_for,
     manual_seed_all,
@@ -111,12 +112,24 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-prompts", type=int, default=16)
+    parser.add_argument("--skip-base", action="store_true", help="omit duplicate Base when another worker provides it")
+    parser.add_argument(
+        "--no-loop-stats", action="store_true",
+        help="generate final images without per-round suffix/diagnostic probes",
+    )
     parser.add_argument(
         "--save-readouts",
         action="store_true",
         help="save per-round velocity and x0 estimates at early/middle/late probes",
     )
     args = parser.parse_args()
+    run_matrix(args)
+
+
+def run_matrix(args, backbone=None):
+    """Run an arm matrix; optionally reuse frozen native weights across jobs."""
+    if getattr(args, "no_loop_stats", False) and args.save_readouts:
+        raise ValueError("per-round readout probes require loop stats")
     if args.num_timesteps < 2 or args.timestep_shift <= 0:
         raise ValueError("require >=2 timesteps and positive shift")
     rows = [
@@ -178,14 +191,28 @@ def main():
             for mode in modes
         ):
             raise ValueError("memory matrix exceeds checkpoint workspace allocation")
-    backbone = BagelBackbone(
-        {
+    if backbone is None:
+        backbone = BagelBackbone({
             "model_path": args.model_path,
             "disable_visual_gen": False,
             "disable_gen_expert": False,
             "t2i_loop": config.to_dict(),
-        }
-    ).load()
+        }).load()
+    else:
+        if Path(backbone.cfg["model_path"]).resolve() != Path(args.model_path).resolve():
+            raise ValueError("cached native checkpoint differs from requested model")
+        # Each trained arm has its own K and parameter shapes. Reuse only the
+        # immutable native tensors, and replace the complete loop module.
+        model = backbone.bagel
+        model.t2i_loop = LoopModules(model.llm2vae.in_features, config).to(
+            device=next(model.parameters()).device, dtype=torch.float32
+        )
+        model.t2i_loop.initialize_memory_from_boundaries(
+            model.language_model.model.embed_tokens.weight,
+            [backbone.token_ids["start_of_image"], backbone.token_ids["end_of_image"]],
+            seed=int(backbone.cfg.get("memory_init_seed", 0)),
+        )
+    config = replace(config, log_loop_stats=not getattr(args, "no_loop_stats", False))
     device = resolve_device(args.device)
     manual_seed_all(args.seed)
     model, vae = backbone.bagel.to(device).eval(), backbone.vae_model.to(device).eval()
@@ -202,7 +229,7 @@ def main():
     schedule = shift_flow_timestep(schedule, args.timestep_shift)
     dts = schedule[:-1] - schedule[1:]
     probe_steps = {0, len(dts) // 2, len(dts) - 1}
-    arms = [("base", 0)] + [
+    arms = ([] if getattr(args, "skip_base", False) else [("base", 0)]) + [
         (mode, depth) for mode in modes for depth in depths if depth > 0
     ]
     with torch.no_grad(), autocast_for(device):
@@ -234,6 +261,7 @@ def main():
                 runtime = arm_config(
                     config, mode, depth, args.memory_slots, args.memory_control
                 )
+                runtime = replace(runtime, log_loop_stats=config.log_loop_stats)
                 slots = runtime.memory_slots
                 arm = f"{mode}_R{depth}_K{slots}_{args.memory_control}"
                 coverage = (
@@ -258,6 +286,8 @@ def main():
                     "depth_status": depth_status,
                     "runtime_config": runtime.to_dict(),
                     **arm_semantics(runtime),
+                    "learned_alpha": float(model.t2i_loop.output_alpha[0])
+                    if args.checkpoint and depth and not (mode == "legacy_memory_only" or mode.startswith("direct_native_")) else None,
                 }
                 directory = out / arm
                 directory.mkdir(exist_ok=True)
@@ -324,6 +354,7 @@ def main():
                 (directory / f"batch_{offset:04d}_loop_logs.json").write_text(
                     json.dumps(logs, indent=2)
                 )
+                print(f"Generated {arm}: prompts {offset + 1}-{offset + len(batch)}/{len(rows)}", flush=True)
     (out / "manifest.json").write_text(
         json.dumps(
             {
@@ -337,11 +368,14 @@ def main():
                 if args.checkpoint
                 else "training_free",
                 "memory_control_semantics": "fixed_donor_read_only_with_correct_canonical_writer",
-                "compute_note": "Anchored/direct branches run native reference plus R extra bodies; shuffled uses a separate correct writer body each round. Legacy diagnostics add a native reference pass. Timing includes all readout probes; FLOPs require accelerator profiling.",
+                "loop_diagnostics_enabled": config.log_loop_stats,
+                "readout_probes_saved": args.save_readouts,
+                "compute_note": "Anchored/direct branches run native reference plus R extra bodies; shuffled uses a separate correct writer body each round. Enabled legacy diagnostics add a native reference pass. Timing includes probes only when enabled; FLOPs require accelerator profiling.",
             },
             indent=2,
         )
     )
+    return backbone
 
 
 if __name__ == "__main__":
