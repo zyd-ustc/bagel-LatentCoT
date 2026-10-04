@@ -53,6 +53,7 @@ python scripts/evaluate/prepare_tiif_spatial.py \
 
 按 [GenEval2 官方说明](https://github.com/facebookresearch/GenEval2) 准备其独立运行环境。配置填写 checkout 路径与对应 Python；本仓库调用原 `evaluation.py` 的 `soft_tifa_gm`，不改写原题。
 本地 TIIF judge 使用原 yes/no 问题与答案，执行确定性的问答。该协议与 TIIF 官方随机模板/API judge 不同，报告将其标为本地 variant。
+官方 GenEval2 的 float32 token 概率求和可因舍入误差略超过 1。结果解析仅将距 [0,1] 边界不超过 `1e-6` 的值归到边界；明显越界、NaN 和 Inf 仍报错。官方 `score_lists.json` 保持原值，报告 provenance 记录此容差。
 quality judge 独立判断画面连贯性和可见瑕疵，输出 1–5 分并归一化到 0–1。它是质量代理，人工偏好单独统计。
 
 修改 `configs/evaluation/t2i_loop_results.yaml` 中的实际路径和 manifest 选择。TIIF 与质量集也可参照 GenEval2 配置，用 `manifests` 按 mode 从两个独立 checkpoint 选择图片。

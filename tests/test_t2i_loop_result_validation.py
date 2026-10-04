@@ -205,6 +205,34 @@ def test_bad_pair_coverage_prompt_scores_and_index_are_rejected(tmp_path):
         score_manifest(manifest, benchmark, dataset="fixture")
 
 
+def test_official_float32_boundary_roundoff_is_normalized_without_changing_raw(tmp_path):
+    manifest, benchmark = fixture_matrix(tmp_path)
+    raw = [1.0000000790093964, -2.98e-8, 0.3, 2.217040021196313e-12]
+    scored = score_manifest(
+        manifest,
+        benchmark,
+        dataset="float32_roundoff",
+        semantic_scorer=lambda rows, _: [[raw[row["index"]]] for row in rows],
+    )
+    assert [row["semantic_atoms"][0] for row in scored[:4]] == [
+        1.0, 0.0, raw[2], raw[3]
+    ]
+    assert raw[0] > 1 and raw[1] < 0
+    assert summarize_results(scored)[0]["semantic_GM"] is not None
+
+
+@pytest.mark.parametrize("atom", [1.00001, -0.00001, float("nan"), float("inf")])
+def test_semantic_boundary_tolerance_still_rejects_invalid_scores(tmp_path, atom):
+    manifest, benchmark = fixture_matrix(tmp_path)
+    with pytest.raises(ValueError, match="arm=base_R0_K0_correct, index=0"):
+        score_manifest(
+            manifest,
+            benchmark,
+            dataset="invalid_float",
+            semantic_scorer=lambda rows, _: [[atom]] * len(rows),
+        )
+
+
 def test_required_elastic_arms_cannot_be_silently_omitted(tmp_path):
     manifest, _ = fixture_matrix(tmp_path)
     with pytest.raises(ValueError, match="R=2"):

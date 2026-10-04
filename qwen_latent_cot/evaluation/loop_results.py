@@ -13,6 +13,28 @@ from pathlib import Path
 from PIL import Image
 
 
+SEMANTIC_SCORE_BOUNDARY_TOLERANCE = 1e-6
+
+
+def normalize_semantic_atoms(atoms, question_count, *, context=""):
+    """Accept float32 probability sum roundoff, but reject invalid scores.
+
+    Official GenEval2 sums separate float32 token probabilities in Python.
+    The sum can exceed one by a few ulps. Raw official files remain unchanged.
+    """
+    tolerance = SEMANTIC_SCORE_BOUNDARY_TOLERANCE
+    if (
+        len(atoms) != question_count
+        or not atoms
+        or any(
+            not math.isfinite(v) or not -tolerance <= v <= 1 + tolerance
+            for v in atoms
+        )
+    ):
+        raise ValueError(f"semantic scorer returned invalid atom scores: {context}")
+    return [min(1.0, max(0.0, float(v))) for v in atoms]
+
+
 def file_sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -192,13 +214,11 @@ def score_manifest(
                     question_count = len(
                         benchmark.get("vqa_list", benchmark.get("yn_question_list", []))
                     )
-                    if (
-                        len(atoms) != question_count
-                        or not atoms
-                        or any(not math.isfinite(v) or not 0 <= v <= 1 for v in atoms)
-                    ):
-                        raise ValueError("semantic scorer returned invalid atom scores")
-                    value["semantic_atoms"] = [float(v) for v in atoms]
+                    value["semantic_atoms"] = normalize_semantic_atoms(
+                        atoms,
+                        question_count,
+                        context=f"dataset={dataset}, arm={arm}, index={value['index']}",
+                    )
         if quality_judge is not None:
             for value in prepared:
                 quality = (
@@ -417,6 +437,8 @@ class OfficialGenEval2:
             "method": "soft_tifa_gm",
             "script": str(self.script),
             "script_sha256": file_sha256(self.script),
+            "atom_boundary_tolerance": SEMANTIC_SCORE_BOUNDARY_TOLERANCE,
+            "atom_boundary_policy": "clamp_only_within_tolerance; preserve_raw_official_files",
         }
 
     def __call__(self, rows, benchmark_rows):
