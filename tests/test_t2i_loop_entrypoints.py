@@ -111,7 +111,7 @@ def test_stage1_cli_executes_optimizer_and_saves_loop_only_checkpoint(
         enable_t2i_loop=True,
         loop_start_layer=1,
         loop_end_layer=3,
-        loop_depth=2,
+        runtime_loop_depth=2,
         loop_mode=mode,
         memory_slots=0 if mode == "gen_only" else 2,
         loop_output_alpha_init=0.01 if mode == "gen_only" else 0.0,

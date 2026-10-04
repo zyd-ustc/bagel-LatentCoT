@@ -96,9 +96,9 @@ def forward_anchored_branch(
             )
         )
         offset += length
-    if not counts or len(set(counts)) != 1:
-        raise ValueError("one loop batch must use equal image-token counts")
-    gen_shape = (batch, counts[0], hidden.shape[-1])
+    if not counts or min(counts) < 1:
+        raise ValueError("each sample requires GEN tokens")
+    gen_counts = layout.gen_indexes.new_tensor(counts)
     original_kwargs = layout.kwargs(model, hidden, cache)
 
     def layer_call(index, sequence, kwargs, checkpoint=False):
@@ -123,7 +123,7 @@ def forward_anchored_branch(
     for index in range(config.loop_start_layer):
         hidden = layer_call(index, hidden, original_kwargs)
     entry_sequence = hidden.clone()
-    entry_gen = hidden[layout.gen_indexes].reshape(gen_shape)
+    entry_gen = hidden[layout.gen_indexes]
     boundary_anchors, layer_gen_anchors, layer_gen_references = [], [], []
     for index in range(config.loop_start_layer, config.loop_end_layer):
         boundary_anchors.append(hidden[layout.und_indexes].clone())
@@ -131,7 +131,7 @@ def forward_anchored_branch(
         hidden = layer_call(index, hidden, original_kwargs)
         layer_gen_references.append(hidden[layout.gen_indexes].clone())
     base_sequence = hidden.clone()
-    base_gen = hidden[layout.gen_indexes].reshape(gen_shape)
+    base_gen = hidden[layout.gen_indexes]
     workspace_layout, native_indexes, memory_indexes = layout.with_memory(
         config.memory_slots
     )
@@ -214,7 +214,7 @@ def forward_anchored_branch(
                         else 0.0,
                     }
                 )
-        gen_out = sequence[workspace_layout.gen_indexes].reshape(gen_shape)
+        gen_out = sequence[workspace_layout.gen_indexes]
         memory_out = (
             sequence[memory_indexes].reshape(batch, config.memory_slots, -1)
             if memory is not None
@@ -232,5 +232,5 @@ def forward_anchored_branch(
         return velocity_head(model.norm_moe_gen(sequence[layout.gen_indexes]))
 
     return run_anchored_loop(
-        AnchorState(entry_gen, base_gen), modules, config, body, readout
+        AnchorState(entry_gen, base_gen, gen_counts), modules, config, body, readout
     )

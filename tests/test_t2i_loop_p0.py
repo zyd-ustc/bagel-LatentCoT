@@ -53,7 +53,9 @@ def test_legacy_velocity_matches_frozen_parent_same_weights_and_seed(tmp_path):
         (8, 1, 2, 1.0, 2.0, "global", 15),
     ]:
         model, config = tiny_model(slots, "legacy_memory_only", alpha=0)
-        model.t2i_loop.config = replace(config, loop_depth=depth, log_loop_stats=False)
+        model.t2i_loop.config = replace(
+            config, runtime_loop_depth=depth, log_loop_stats=False
+        )
         torch.manual_seed(seed)
         inputs = flow_inputs(model, batch)
         cfg_inputs(model, inputs, batch)
@@ -245,7 +247,7 @@ def test_real_body_gates_only_gen_and_leaves_memory_full_update(monkeypatch):
     monkeypatch.setattr(model.t2i_loop, "gate", record_gate)
     with torch.no_grad():
         result = model.forward_t2i_loop(
-            **flow_inputs(model), loop_config=replace(config, loop_depth=1)
+            **flow_inputs(model), loop_config=replace(config, runtime_loop_depth=1)
         )
     assert gated_shapes == [torch.Size([32, 32]), torch.Size([32, 32])]
     # Query order per sample is 18 original rows + two trailing memory slots.
@@ -257,7 +259,8 @@ def test_real_body_gates_only_gen_and_leaves_memory_full_update(monkeypatch):
     assert result.stats[0]["layers"][0]["native_transform_ratio"] > 0
 
 
-def test_corrected_gate_checkpoint_rejects_old_whole_layer_gate(tmp_path):
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_corrected_checkpoint_rejects_old_gate_or_per_depth_alpha(tmp_path, version):
     import json
 
     from qwen_latent_cot.bagel.loop_checkpoint import (
@@ -272,7 +275,7 @@ def test_corrected_gate_checkpoint_rejects_old_whole_layer_gate(tmp_path):
     assert (
         metadata["gate_semantics"] == "native_gen_reference_plus_gated_loop_correction"
     )
-    metadata["format"] = "umm-t2i-anchored-loop-v1"
+    metadata["format"] = f"umm-t2i-anchored-loop-{version}"
     path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="incompatible"):
         checkpoint_config(tmp_path)

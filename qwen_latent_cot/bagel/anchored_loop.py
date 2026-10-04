@@ -21,7 +21,8 @@ class LoopConfig:
     loop_mode: str = "gen_memory_anchored"
     loop_start_layer: int = 16
     loop_end_layer: int = 24
-    loop_depth: int = 2
+    runtime_loop_depth: int = 2
+    allocated_max_loop_depth: int = 4
     memory_slots: int = 8
     freeze_prompt_kv_in_loop: bool = True
     reentry_adapter_type: str = "low_rank"
@@ -46,8 +47,14 @@ class LoopConfig:
             raise ValueError("unsupported loop_mode")
         if not 0 <= self.loop_start_layer < self.loop_end_layer:
             raise ValueError("require 0 <= loop_start_layer < loop_end_layer")
-        if self.loop_depth < 0 or self.memory_slots < 0:
-            raise ValueError("loop_depth and memory_slots must be nonnegative")
+        if not 0 <= self.runtime_loop_depth <= self.allocated_max_loop_depth:
+            raise ValueError(
+                "runtime_loop_depth must lie within allocated_max_loop_depth"
+            )
+        if self.allocated_max_loop_depth < 1:
+            raise ValueError("allocated_max_loop_depth must be positive")
+        if self.runtime_loop_depth < 0 or self.memory_slots < 0:
+            raise ValueError("runtime_loop_depth and memory_slots must be nonnegative")
         if (
             self.loop_mode in {"gen_only", "direct_native_gen_only"}
             and self.memory_slots != 0
@@ -102,13 +109,19 @@ class ReentryAdapter(nn.Module):
         if self.memory_projection is not None:
             nn.init.zeros_(self.memory_projection.weight)
 
-    def forward(self, delta, memory=None):
+    def forward(self, delta, memory=None, gen_counts=None):
         correction = self.up(self.down(self.norm(delta)))
         if memory is not None and self.memory_projection is not None:
-            # delta: [batch, image tokens, hidden]; M: [batch, K, hidden].
-            correction = correction + self.memory_projection(
-                memory.mean(1, keepdim=True)
-            )
+            projected = self.memory_projection(memory.mean(1))
+            if delta.ndim == 2:
+                if gen_counts is None:
+                    raise ValueError(
+                        "packed GEN memory conditioning requires gen_counts"
+                    )
+                projected = projected.repeat_interleave(gen_counts, dim=0)
+            else:
+                projected = projected.unsqueeze(1)
+            correction = correction + projected
         return correction
 
 
@@ -130,7 +143,7 @@ class LoopModules(nn.Module):
         )
         self.output_alpha = nn.Parameter(
             torch.full(
-                (config.loop_depth,),
+                (1,),
                 float(config.loop_output_alpha_init),
                 dtype=torch.float32,
             )
@@ -165,7 +178,7 @@ class LoopModules(nn.Module):
             raise ValueError("requested memory slots exceed allocated workspace")
         return self.memory_init[:slots].unsqueeze(0).expand(batch, -1, -1).clone()
 
-    def entry(self, anchor, delta, memory, config):
+    def entry(self, anchor, delta, memory, config, gen_counts=None):
         if config.loop_mode == "memory_only":
             return anchor.clone()
         if config.loop_mode.startswith("direct_native_"):
@@ -174,7 +187,7 @@ class LoopModules(nn.Module):
         if config.reentry_adapter_type == "fixed":
             correction = config.fixed_reentry_scale * delta
         else:
-            correction = self.reentry(delta, memory)
+            correction = self.reentry(delta, memory, gen_counts)
         return anchor + correction
 
     def gate(self, layer_offset, reference_gen, loop_gen):
@@ -188,12 +201,13 @@ class LoopModules(nn.Module):
 class AnchorState:
     gen_entry: torch.Tensor
     gen_base: torch.Tensor
+    gen_counts: torch.Tensor | None = None
 
 
 @dataclass
 class LoopResult:
     velocity: torch.Tensor
-    base_velocity: torch.Tensor
+    base_velocity: torch.Tensor | None
     velocities: list[torch.Tensor]
     stats: list[dict]
 
@@ -216,6 +230,10 @@ def memory_slot_stats(memory):
             "effective_rank": 0.0,
             "mean_abs_pairwise_cosine": None,
             "slot_variation_norm": 0.0,
+            "slot_std": 0.0,
+            "mean_pairwise_cosine": None,
+            "effective_rank_min": 0.0,
+            "sigma1_ratio": 0.0,
         }
     slots = memory.detach().float().cpu()
     if slots.ndim == 2:
@@ -234,10 +252,13 @@ def memory_slot_stats(memory):
     gram = normed @ normed.transpose(-1, -2)
     mask = ~torch.eye(k, dtype=torch.bool)
     cosine = float(gram[:, mask].abs().mean()) if k > 1 else None
+    signed_cosine = float(gram[:, mask].mean()) if k > 1 else None
     return {
         "effective_rank": float(ranks.mean()),
         "effective_rank_min": float(ranks.min()),
         "mean_abs_pairwise_cosine": cosine,
+        "mean_pairwise_cosine": signed_cosine,
+        "slot_std": float(slots.std(dim=1, unbiased=False).mean()),
         "slot_variation_norm": float(centered.norm()),
         "sigma1_ratio": float((singular[:, 0] / total.clamp_min(1e-12)).mean()),
     }
@@ -255,11 +276,14 @@ def run_anchored_loop(
     Callers supply the native base endpoint and enforce read-only condition
     caches in both callbacks. Recurrent states are local to this invocation.
     """
-    base_velocity = readout(anchor.gen_base)
+    need_readouts = config.log_loop_stats or (
+        torch.is_grad_enabled() and config.loop_deep_supervision
+    )
+    base_velocity = readout(anchor.gen_base) if need_readouts else None
     direct = config.loop_mode.startswith("direct_native_")
     if (
         not config.enable_t2i_loop
-        or config.loop_depth == 0
+        or config.runtime_loop_depth == 0
         or (
             not direct
             and not bool(
@@ -267,12 +291,15 @@ def run_anchored_loop(
             )
         )
     ):
+        if base_velocity is None:
+            base_velocity = readout(anchor.gen_base)
         return LoopResult(base_velocity, base_velocity, [], [])
-    if not direct and config.loop_depth > modules.output_alpha.numel():
-        raise ValueError(
-            "requested depth exceeds allocated output_alpha; allocate maximum curriculum depth"
-        )
-    memory = modules.initial_memory(anchor.gen_entry.shape[0], config.memory_slots)
+    batch = (
+        len(anchor.gen_counts)
+        if anchor.gen_counts is not None
+        else anchor.gen_entry.shape[0]
+    )
+    memory = modules.initial_memory(batch, config.memory_slots)
     initial_memory = memory.clone() if memory is not None else None
     delta = torch.zeros_like(anchor.gen_base)
     previous_gen = anchor.gen_base
@@ -286,17 +313,22 @@ def run_anchored_loop(
         permutation = torch.arange(memory.shape[0], device=memory.device).roll(1)
     velocities, stats = [], []
     previous_velocity_delta = None
-    for r in range(config.loop_depth):
+    for r in range(config.runtime_loop_depth):
         if memory is not None:
             if config.memory_control == "zero":
                 memory = torch.zeros_like(memory)
             elif config.memory_control == "frozen":
                 memory = initial_memory.clone()
+        previous_memory = (
+            memory.clone() if memory is not None and config.log_loop_stats else None
+        )
         read_memory = memory if permutation is None else memory[permutation]
         entry = (
             previous_gen
             if direct
-            else modules.entry(anchor.gen_entry, delta, read_memory, config)
+            else modules.entry(
+                anchor.gen_entry, delta, read_memory, config, anchor.gen_counts
+            )
         )
         if permutation is None:
             current_gen, memory, layer_stats = body(entry, memory, modules)
@@ -304,7 +336,9 @@ def run_anchored_loop(
             canonical_entry = (
                 canonical_previous_gen
                 if direct
-                else modules.entry(anchor.gen_entry, canonical_delta, memory, config)
+                else modules.entry(
+                    anchor.gen_entry, canonical_delta, memory, config, anchor.gen_counts
+                )
             )
             layer_memories = []
             canonical_gen, canonical_memory, _ = body(
@@ -327,10 +361,11 @@ def run_anchored_loop(
         merged = (
             current_gen
             if direct
-            else anchor.gen_base + modules.output_alpha[r].to(delta.dtype) * delta
+            else anchor.gen_base + modules.output_alpha[0].to(delta.dtype) * delta
         )
-        velocity = readout(merged)
-        velocities.append(velocity)
+        if need_readouts or r == config.runtime_loop_depth - 1:
+            velocity = readout(merged)
+            velocities.append(velocity)
         if config.log_loop_stats:
             dv = velocity - base_velocity
             item = {
@@ -342,7 +377,7 @@ def run_anchored_loop(
                 "memory_norm": float(memory.detach().float().norm())
                 if memory is not None
                 else 0.0,
-                "alpha": None if direct else float(modules.output_alpha[r].detach()),
+                "alpha": None if direct else float(modules.output_alpha[0].detach()),
                 "memory_permutation": permutation.tolist()
                 if permutation is not None
                 else None,
@@ -350,6 +385,9 @@ def run_anchored_loop(
                 if permutation is not None
                 else "shared",
                 "body_passes_this_round": 2 if permutation is not None else 1,
+                "memory_update_ratio": ratio(memory - previous_memory, previous_memory)
+                if memory is not None
+                else 0.0,
                 "memory_slot_stats": memory_slot_stats(memory),
                 "memory_initial_slot_stats": memory_slot_stats(initial_memory),
                 "layers": layer_stats,

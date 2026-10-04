@@ -6,7 +6,7 @@ from pathlib import Path
 
 from safetensors.torch import load_file, save_file
 
-FORMAT = "umm-t2i-anchored-loop-v2"
+FORMAT = "umm-t2i-anchored-loop-v3"
 
 
 def save_loop_checkpoint(
@@ -35,6 +35,7 @@ def save_loop_checkpoint(
         "loop_config": asdict(model.t2i_loop.config),
         "native_timestep_shift": model.timestep_shift,
         "flow_timestep_distribution": "sigmoid_normal_then_native_shift",
+        "alpha_semantics": "shared_across_runtime_depths",
         "gate_semantics": "native_gen_reference_plus_gated_loop_correction",
     }
     if training_depth_counts is not None:
@@ -57,7 +58,7 @@ def load_loop_checkpoint(model, directory):
     for key in (
         "loop_start_layer",
         "loop_end_layer",
-        "loop_depth",
+        "allocated_max_loop_depth",
         "memory_slots",
         "reentry_rank",
         "reentry_adapter_type",

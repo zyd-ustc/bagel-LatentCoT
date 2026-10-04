@@ -26,7 +26,14 @@ def to_device(values, device):
 @dataclass
 class T2ICondition:
     inputs: dict
-    shape: tuple[int, int]
+    shapes: list[tuple[int, int]]
+    text_drop_mask: list[bool]
+
+    @property
+    def shape(self):
+        if len(set(self.shapes)) != 1:
+            raise ValueError("variable-resolution batch has per-sample shapes")
+        return self.shapes[0]
 
 
 class InterleaveInferencer:
@@ -48,27 +55,46 @@ class InterleaveInferencer:
         }
 
     @torch.no_grad()
-    def prepare_condition(self, prompts, image_shape=(1024, 1024)):
-        height, width = image_shape
-        if (
-            height % self.model.latent_downsample
-            or width % self.model.latent_downsample
+    def prepare_condition(
+        self, prompts, image_shape=(1024, 1024), *, text_drop_mask=None
+    ):
+        shapes = (
+            [tuple(image_shape)] * len(prompts)
+            if isinstance(image_shape[0], int)
+            else [tuple(shape) for shape in image_shape]
+        )
+        if len(shapes) != len(prompts) or any(
+            h % self.model.latent_downsample or w % self.model.latent_downsample
+            for h, w in shapes
         ):
-            raise ValueError("image dimensions must be divisible by latent_downsample")
-        context = self.empty_context(len(prompts))
-        prompt_input, lens, ropes = self.model.prepare_prompts(
-            curr_kvlens=context["kv_lens"],
-            curr_rope=context["ropes"],
-            prompts=prompts,
-            tokenizer=self.tokenizer,
-            new_token_ids=self.new_token_ids,
+            raise ValueError(
+                "per-sample image dimensions must be divisible by latent_downsample"
+            )
+        dropped = (
+            [False] * len(prompts) if text_drop_mask is None else list(text_drop_mask)
         )
-        cache = self.model.forward_cache_update_text(
-            context["past_key_values"], **to_device(prompt_input, self.device)
-        )
-        flow = self.model.prepare_vae_latent(
-            lens, ropes, [image_shape] * len(prompts), self.new_token_ids
-        )
+        if len(dropped) != len(prompts):
+            raise ValueError("text_drop_mask must match batch size")
+        kept = [i for i, drop in enumerate(dropped) if not drop]
+        context = self.empty_context(len(kept))
+        cache = context["past_key_values"]
+        lens, ropes = [0] * len(prompts), [0] * len(prompts)
+        if kept:
+            prompt_input, kept_lens, kept_ropes = self.model.prepare_prompts(
+                curr_kvlens=context["kv_lens"],
+                curr_rope=context["ropes"],
+                prompts=[prompts[i] for i in kept],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
+            )
+            cache = self.model.forward_cache_update_text(
+                cache, **to_device(prompt_input, self.device)
+            )
+            for i, length, rope in zip(kept, kept_lens, kept_ropes):
+                lens[i], ropes[i] = length, rope
+        # Native condition dropout skips the complete text segment, including
+        # its boundary tokens: zero prefix length and zero initial RoPE.
+        flow = self.model.prepare_vae_latent(lens, ropes, shapes, self.new_token_ids)
         flow.pop("packed_init_noises")
         flow = to_device(flow, self.device)
         flow["past_key_values"] = cache
@@ -81,10 +107,10 @@ class InterleaveInferencer:
             ),
             ("img", lens, ropes, deepcopy(cache)),
         ]:
-            cfg = self.model.prepare_vae_latent_cfg(
-                branch_lens, branch_ropes, [image_shape] * len(prompts)
+            cfg = to_device(
+                self.model.prepare_vae_latent_cfg(branch_lens, branch_ropes, shapes),
+                self.device,
             )
-            cfg = to_device(cfg, self.device)
             flow.update(
                 {
                     key.replace("cfg_", f"cfg_{branch}_", 1): value
@@ -92,7 +118,7 @@ class InterleaveInferencer:
                 }
             )
             flow[f"cfg_{branch}_past_key_values"] = branch_cache
-        return T2ICondition(flow, tuple(image_shape))
+        return T2ICondition(flow, shapes, dropped)
 
     @torch.no_grad()
     def generate(self, prompts, *, image_shape=(1024, 1024), seed=0, **sampler):
@@ -106,7 +132,10 @@ class InterleaveInferencer:
             latents = self.model.generate_image(
                 packed_init_noises=noise, **condition.inputs, **sampler
             )
-        return [self.decode_image(latent, image_shape) for latent in latents]
+        return [
+            self.decode_image(latent, shape)
+            for latent, shape in zip(latents, condition.shapes)
+        ]
 
     @torch.no_grad()
     def decode_image(self, latent, image_shape):

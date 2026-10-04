@@ -31,7 +31,7 @@ def test_shuffled_donor_is_fixed_and_reader_writes_never_recycle():
         enable_t2i_loop=True,
         loop_start_layer=0,
         loop_end_layer=1,
-        loop_depth=3,
+        runtime_loop_depth=3,
         memory_slots=1,
         loop_mode="memory_only",
         memory_control="shuffled",
@@ -139,7 +139,7 @@ def test_direct_native_recycles_exit_without_base_blend():
         loop_end_layer=1,
         loop_mode="direct_native_gen_only",
         memory_slots=0,
-        loop_depth=2,
+        runtime_loop_depth=2,
         loop_gate_init=0,
         loop_output_alpha_init=0,
     )
@@ -159,7 +159,7 @@ def test_direct_native_recycles_exit_without_base_blend():
 def test_default_curriculum_boundaries_and_every_new_depth_is_exercised():
     cfg = yaml.safe_load((ROOT / "configs/training/t2i_loop_stage1.yaml").read_text())
     phases = resolve_depth_curriculum(
-        cfg["depth_curriculum"], cfg["loop"]["loop_depth"], 1000
+        cfg["depth_curriculum"], cfg["loop"]["runtime_loop_depth"], 1000
     )
     assert [(p["start_step"], p["end_step"], p["depths"]) for p in phases] == [
         (0, 300, [1]),
@@ -197,7 +197,7 @@ def test_invalid_or_untrained_curriculum_fails_before_loading(
         resolve_depth_curriculum(curriculum, max_depth, steps)
 
 
-def test_stage1_scheduled_training_updates_third_alpha_and_records_coverage(
+def test_stage1_scheduled_training_covers_third_round_with_shared_alpha(
     tmp_path, monkeypatch
 ):
     install_tiny_backbone(monkeypatch)
@@ -208,7 +208,7 @@ def test_stage1_scheduled_training_updates_third_alpha_and_records_coverage(
         enable_t2i_loop=True,
         loop_start_layer=1,
         loop_end_layer=3,
-        loop_depth=3,
+        runtime_loop_depth=3,
         memory_slots=2,
     )
     defaults = yaml.safe_load(
@@ -238,12 +238,12 @@ def test_stage1_scheduled_training_updates_third_alpha_and_records_coverage(
     assert [records[index]["depth"] for index in [0, 3, 7]] == [1, 2, 3]
     early = json.loads((tmp_path / "train/step_000003/loop.json").read_text())
     final = json.loads((tmp_path / "train/step_000010/loop.json").read_text())
-    assert early["round_training_steps"] == [3, 0, 0]
+    assert early["round_training_steps"] == [3, 0, 0, 0]
     assert final["round_training_steps"][2] > 0
     assert final["training_depth_counts"]["3"] > 0
     assert (
         load_file(str(tmp_path / "train/step_000010/loop.safetensors"))["output_alpha"][
-            2
+            0
         ]
         != 0
     )
@@ -315,7 +315,10 @@ def test_matrix_legacy_and_pure_direct_ignore_anchored_cli_parameters(
     assert manifest["arms"]["direct_native_gen_only_R1_K0_correct"]["gate"] == "ungated"
 
 
-def test_matrix_rejects_checkpoint_rounds_not_yet_trained(tmp_path, monkeypatch):
+def test_matrix_labels_unseen_checkpoint_depth_instead_of_claiming_training(
+    tmp_path, monkeypatch
+):
+    install_tiny_backbone(monkeypatch)
     model, _ = tiny_model()
     save_loop_checkpoint(
         model,
@@ -347,7 +350,17 @@ def test_matrix_rejects_checkpoint_rounds_not_yet_trained(tmp_path, monkeypatch)
             "3",
             "--memory-slots",
             "2",
+            "--device",
+            "cpu",
+            "--image-size",
+            "16",
+            "--num-timesteps",
+            "2",
         ],
     )
-    with pytest.raises(ValueError, match="untrained round"):
-        module.main()
+    module.main()
+    manifest = json.loads((tmp_path / "eval/manifest.json").read_text())
+    assert (
+        manifest["arms"]["gen_memory_anchored_R3_K2_correct"]["depth_status"]
+        == "unseen"
+    )

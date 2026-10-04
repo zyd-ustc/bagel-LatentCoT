@@ -26,7 +26,13 @@ from qwen_latent_cot.bagel.depth_curriculum import (
 from qwen_latent_cot.bagel.flow_time import sample_native_flow_timestep
 from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
 from qwen_latent_cot.bagel.loop_checkpoint import save_loop_checkpoint
-from qwen_latent_cot.data.t2i import T2IDataset, patchify_latents, sample_flow_state
+from qwen_latent_cot.data.t2i import (
+    BucketBatchSampler,
+    T2IDataset,
+    collate_t2i,
+    patchify_latents,
+    sample_flow_state,
+)
 
 
 def main():
@@ -37,7 +43,7 @@ def main():
     config = LoopConfig(**cfg["loop"])
     if (
         not config.enable_t2i_loop
-        or config.loop_depth == 0
+        or config.runtime_loop_depth == 0
         or config.reentry_adapter_type != "low_rank"
     ):
         raise ValueError(
@@ -62,13 +68,19 @@ def main():
     if int(cfg.get("save_every", 100)) < 1 or int(cfg.get("batch_size", 1)) < 1:
         raise ValueError("save_every and batch_size must be positive")
     total = int(cfg.get("steps", 1000))
+    max_train_depth = int(cfg.get("max_train_loop_depth", config.runtime_loop_depth))
+    if not 1 <= max_train_depth <= config.allocated_max_loop_depth:
+        raise ValueError("training depth must lie within allocated_max_loop_depth")
+    text_dropout = float(cfg.get("text_cond_dropout_prob", 0.1))
+    if not 0 <= text_dropout <= 1:
+        raise ValueError("text_cond_dropout_prob must lie in [0,1]")
     phases = resolve_depth_curriculum(
-        cfg.get("depth_curriculum", list(range(1, config.loop_depth + 1))),
-        config.loop_depth,
+        cfg.get("depth_curriculum", list(range(1, max_train_depth + 1))),
+        max_train_depth,
         total,
     )
-    depth_counts = {str(depth): 0 for depth in range(1, config.loop_depth + 1)}
-    round_training_steps = [0] * config.loop_depth
+    depth_counts = {str(depth): 0 for depth in range(1, max_train_depth + 1)}
+    round_training_steps = [0] * config.allocated_max_loop_depth
     seed = int(cfg.get("seed", 0))
     manual_seed_all(seed)
     device = resolve_device(cfg.get("device", "auto"))
@@ -94,13 +106,22 @@ def main():
     size = int(cfg.get("image_size", 512))
     if size % model.latent_downsample:
         raise ValueError("image_size must be divisible by native latent_downsample")
-    dataset = T2IDataset(cfg["data_path"], size)
-    loader = DataLoader(
-        dataset,
-        batch_size=int(cfg.get("batch_size", 1)),
-        shuffle=True,
-        generator=torch.Generator().manual_seed(seed),
+    dataset = T2IDataset(
+        cfg["data_path"],
+        size,
+        stride=model.latent_downsample,
+        min_image_size=cfg.get("min_image_size"),
+        max_pixels=cfg.get("max_pixels"),
     )
+    sampler = BucketBatchSampler(
+        dataset,
+        int(cfg.get("batch_size", 1)),
+        total,
+        weights=cfg.get("bucket_weights"),
+        seed=seed,
+    )
+    loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_t2i)
+    bucket_metrics = {}
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         parameters,
@@ -109,6 +130,16 @@ def main():
     )
     out = Path(cfg["output_dir"])
     out.mkdir(parents=True, exist_ok=True)
+    (out / "data_policy.json").write_text(
+        json.dumps(
+            {
+                "effective_bucket_weights": sampler.effective_weights,
+                "text_cond_dropout_prob": text_dropout,
+                "image_preprocessing": "native_bagel_resize_no_crop",
+            },
+            indent=2,
+        )
+    )
     (out / "trainable.json").write_text(json.dumps(trainable_names, indent=2))
     (out / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     step = 0
@@ -117,11 +148,18 @@ def main():
             for batch in loader:
                 optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad(), autocast_for(device):
-                    clean = patchify_latents(
-                        vae.encode(batch["pixels"].to(device)), model.latent_patch_size
-                    ).float()
+                    clean_parts = [
+                        patchify_latents(
+                            vae.encode(pixels.unsqueeze(0).to(device)),
+                            model.latent_patch_size,
+                        ).float()
+                        for pixels in batch["pixels"]
+                    ]
+                    clean = torch.cat(clean_parts)
+                    counts = [len(part) for part in clean_parts]
+                    drops = (torch.rand(len(counts)) < text_dropout).tolist()
                     condition = inferencer.prepare_condition(
-                        batch["prompt"], (size, size)
+                        batch["prompt"], batch["image_shape"], text_drop_mask=drops
                     )
                     # Prompt caches are anchors, not data for an autograd graph.
                     inputs = {
@@ -130,7 +168,7 @@ def main():
                         if not key.startswith("cfg_")
                     }
                 depth, phase_index = sample_curriculum_depth(phases, step)
-                runtime = replace(config, loop_depth=depth)
+                runtime = replace(config, runtime_loop_depth=depth)
                 t = sample_native_flow_timestep(
                     device=device, timestep_shift=model.timestep_shift
                 )
@@ -157,6 +195,37 @@ def main():
                 depth_counts[str(depth)] += 1
                 for index in range(depth):
                     round_training_steps[index] += 1
+                bucket = batch["bucket"][0]
+                metric = bucket_metrics.setdefault(
+                    bucket, {"steps": 0, "loss_sum": 0.0}
+                )
+                metric["steps"] += 1
+                metric["loss_sum"] += float(loss.detach())
+                alpha = model.t2i_loop.output_alpha.detach().float().cpu().tolist()
+                gates = (
+                    model.t2i_loop.gate_logits.detach().sigmoid().float().cpu().tolist()
+                )
+                losses_by_condition = {"conditional": [], "text_removed": []}
+                offset = 0
+                for count, dropped in zip(counts, drops):
+                    parts = result.velocities or [result.velocity]
+                    losses = [
+                        torch.nn.functional.mse_loss(
+                            value[offset : offset + count].float(),
+                            target[offset : offset + count].float(),
+                        )
+                        for value in parts
+                    ]
+                    sample_loss = losses[-1]
+                    if runtime.loop_deep_supervision and len(losses) > 1:
+                        sample_loss = (
+                            sample_loss
+                            + runtime.loop_ds_weight * torch.stack(losses[:-1]).mean()
+                        )
+                    losses_by_condition[
+                        "text_removed" if dropped else "conditional"
+                    ].append(float(sample_loss.detach()))
+                    offset += count
                 record = {
                     "step": step,
                     "depth": depth,
@@ -167,6 +236,28 @@ def main():
                     "timestep": float(t),
                     "timestep_shift": model.timestep_shift,
                     "flow_loss": float(loss.detach()),
+                    "loop_stats": result.stats,
+                    "bucket": bucket,
+                    "bucket_metrics": {
+                        key: {
+                            "steps": value["steps"],
+                            "mean_step_loss": value["loss_sum"] / value["steps"],
+                        }
+                        for key, value in bucket_metrics.items()
+                    },
+                    "bucket_parameter_metrics": {
+                        "bucket": bucket,
+                        "alpha": alpha,
+                        "gates": gates,
+                    },
+                    "text_drop_mask": drops,
+                    "condition_losses": {
+                        key: sum(value) / len(value) if value else None
+                        for key, value in losses_by_condition.items()
+                    },
+                    "image_shapes": batch["image_shape"],
+                    "original_shapes": batch["original_shape"],
+                    "gates": gates,
                     "grad_norm": float(norm),
                     "alpha": model.t2i_loop.output_alpha.detach()
                     .float()

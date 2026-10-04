@@ -805,8 +805,8 @@ class Bagel(PreTrainedModel):
     ):
         loop_config = self.t2i_loop.config
         self._last_branch_stats = []
-        loop_active = loop_config.enable_t2i_loop and loop_config.loop_depth > 0
-        zero_alpha = not bool(torch.count_nonzero(self.t2i_loop.output_alpha[:loop_config.loop_depth]).item())
+        loop_active = loop_config.enable_t2i_loop and loop_config.runtime_loop_depth > 0
+        zero_alpha = not bool(torch.count_nonzero(self.t2i_loop.output_alpha).item())
         if loop_active and (torch.is_grad_enabled() or not zero_alpha or loop_config.log_loop_stats or loop_config.loop_mode == "legacy_memory_only" or loop_config.loop_mode.startswith("direct_native_")):
             return self.forward_t2i_loop(
                 x_t=x_t, timestep=timestep,
@@ -994,7 +994,7 @@ class Bagel(PreTrainedModel):
             if any(value is None for value in (positions, queries, lengths, cache, cache_indexes)):
                 raise ValueError(f"missing CFG inputs for {name}")
             layout = QueryLayout(packed_seqlens, positions, queries, cache_indexes, lengths, packed_vae_token_indexes, packed_text_indexes)
-            branch_runner = forward_legacy_memory_branch if config.enable_t2i_loop and config.loop_depth > 0 and config.loop_mode == "legacy_memory_only" else forward_anchored_branch
+            branch_runner = forward_legacy_memory_branch if config.enable_t2i_loop and config.runtime_loop_depth > 0 and config.loop_mode == "legacy_memory_only" else forward_anchored_branch
             result = branch_runner(self.language_model.model, sequence.clone(), layout, cache, self.t2i_loop, config, self.llm2vae)
             outputs[name] = result
             self._last_branch_stats.extend({"branch": name, **item} for item in result.stats)
@@ -1003,6 +1003,8 @@ class Bagel(PreTrainedModel):
             for name, result in outputs.items():
                 value = getattr(result, attribute)
                 values[name] = value[index] if index is not None else value
+            if values["cond"] is None:
+                return None
             return self._combine_loop_cfg(values["cond"], values.get("text_removed"), values.get("image_removed"), cfg_text_scale, cfg_img_scale, cfg_renorm_min, cfg_renorm_type)
         velocities = [combine("velocities", r) for r in range(len(outputs["cond"].velocities))]
         return LoopResult(combine("velocity"), combine("base_velocity"), velocities, self._last_branch_stats)

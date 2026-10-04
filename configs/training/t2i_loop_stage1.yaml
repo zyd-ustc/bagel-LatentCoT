@@ -6,7 +6,17 @@ device: auto
 seed: 0
 # Native BAGEL training default; separate from inference schedule shift.
 timestep_shift: 1.0
+# Native resize retains the full frame and its aspect ratio.
 image_size: 512
+min_image_size: 256
+max_pixels: 262144
+text_cond_dropout_prob: 0.1
+bucket_weights:
+  ordinary: 0.4
+  structural: 0.3
+  easy: 0.2
+  noop: 0.1
+max_train_loop_depth: 3
 batch_size: 1
 steps: 1000
 learning_rate: 0.0001
@@ -28,7 +38,8 @@ loop:
   loop_mode: gen_memory_anchored
   loop_start_layer: 16
   loop_end_layer: 24
-  loop_depth: 3
+  runtime_loop_depth: 3
+  allocated_max_loop_depth: 4
   memory_slots: 8
   freeze_prompt_kv_in_loop: true
   reentry_adapter_type: low_rank
@@ -38,4 +49,4 @@ loop:
   loop_deep_supervision: true
   loop_ds_weight: 0.5
   memory_control: correct
-  log_loop_stats: false
+  log_loop_stats: true

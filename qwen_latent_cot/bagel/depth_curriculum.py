@@ -22,7 +22,7 @@ def resolve_depth_curriculum(curriculum, max_depth, total_steps):
             not isinstance(depth, int) or not 1 <= depth <= max_depth
             for depth in depths
         ):
-            raise ValueError("depth curriculum must lie within allocated loop_depth")
+            raise ValueError("depth curriculum must lie within max_train_loop_depth")
         end = math.ceil(until * total_steps)
         if end <= start:
             raise ValueError(
@@ -34,7 +34,7 @@ def resolve_depth_curriculum(curriculum, max_depth, total_steps):
         raise ValueError("last curriculum boundary must be 1.0")
     if max(depth for phase in phases for depth in phase["depths"]) != max_depth:
         raise ValueError(
-            "loop_depth must equal the maximum trained depth; reduce allocation or add that depth to the curriculum"
+            "max_train_loop_depth must equal the maximum trained depth; reduce the training maximum or extend the curriculum"
         )
     return phases
 

@@ -49,7 +49,7 @@ def tiny_model(slots=2, mode="gen_memory_anchored", alpha=0.0):
         enable_t2i_loop=True,
         loop_start_layer=1,
         loop_end_layer=3,
-        loop_depth=3,
+        runtime_loop_depth=3,
         memory_slots=slots,
         loop_mode=mode,
         loop_output_alpha_init=alpha,
@@ -113,7 +113,7 @@ def test_off_controls_match_native_velocity(control, slots):
         runtime = (
             replace(config, enable_t2i_loop=False)
             if control == "disabled"
-            else replace(config, loop_depth=0)
+            else replace(config, runtime_loop_depth=0)
             if control == "depth_zero"
             else config
         )
@@ -159,7 +159,7 @@ def test_shared_body_receives_anchored_delta_instead_of_native_exit():
         enable_t2i_loop=True,
         loop_start_layer=0,
         loop_end_layer=1,
-        loop_depth=3,
+        runtime_loop_depth=3,
         loop_mode="gen_only",
         memory_slots=0,
         reentry_adapter_type="fixed",
@@ -304,7 +304,7 @@ def test_cached_sdpa_causal_mask_includes_entire_past_prefix():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"loop_depth": -1},
+        {"runtime_loop_depth": -1},
         {"freeze_prompt_kv_in_loop": False},
         {"loop_mode": "gen_only", "memory_slots": 8},
     ],

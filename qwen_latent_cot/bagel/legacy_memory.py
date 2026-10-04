@@ -58,23 +58,25 @@ def forward_legacy_memory_branch(
     if not model.use_moe or getattr(model, "enable_taylorseer", False):
         raise ValueError("legacy_memory_only requires native MoT without TaylorSeer")
     # Reference velocity has no workspace and never uses loop gates/adapters.
-    native_output = model.forward_inference(
-        packed_query_sequence=hidden.clone(),
-        query_lens=layout.lengths,
-        packed_query_position_ids=layout.positions,
-        packed_query_indexes=layout.query_indexes,
-        past_key_values=cache,
-        key_values_lens=layout.cache_lengths,
-        packed_key_value_indexes=layout.cache_indexes,
-        update_past_key_values=False,
-        is_causal=False,
-        mode="gen",
-        packed_vae_token_indexes=layout.gen_indexes,
-        packed_text_indexes=layout.und_indexes,
-    )
-    base_velocity = velocity_head(native_output.packed_query_sequence)[
-        layout.gen_indexes
-    ]
+    base_velocity = None
+    if config.log_loop_stats:
+        native_output = model.forward_inference(
+            packed_query_sequence=hidden.clone(),
+            query_lens=layout.lengths,
+            packed_query_position_ids=layout.positions,
+            packed_query_indexes=layout.query_indexes,
+            past_key_values=cache,
+            key_values_lens=layout.cache_lengths,
+            packed_key_value_indexes=layout.cache_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            mode="gen",
+            packed_vae_token_indexes=layout.gen_indexes,
+            packed_text_indexes=layout.und_indexes,
+        )
+        base_velocity = velocity_head(native_output.packed_query_sequence)[
+            layout.gen_indexes
+        ]
     workspace, native, mem = legacy_layout(layout, config.memory_slots)
     # Reconstruct the frozen parent's m0 from native SOI/EOI, independent of
     # every trained loop parameter. Parent default initialization seed is 0.
@@ -106,7 +108,7 @@ def forward_legacy_memory_branch(
         packed_vae_token_indexes=workspace.gen_indexes,
         packed_text_indexes=workspace.und_indexes,
         packed_memory_token_indexes=mem,
-        memory_loop_repeat=config.loop_depth + 1,
+        memory_loop_repeat=config.runtime_loop_depth + 1,
         memory_loop_start=config.loop_start_layer,
         memory_loop_end=config.loop_end_layer,
         block_gen_reads_memory=True,
@@ -123,8 +125,23 @@ def forward_legacy_memory_branch(
                 {
                     "round": r,
                     "legacy_round_type": "read" if r == 0 else "write",
-                    "legacy_memory_loop_repeat": config.loop_depth + 1,
+                    "legacy_memory_loop_repeat": config.runtime_loop_depth + 1,
                     "velocity_delta_ratio": ratio(v - base_velocity, base_velocity),
+                    "memory_update_ratio": ratio(
+                        m.reshape_as(initial_memory)
+                        - (
+                            initial_memory
+                            if r == 0
+                            else output.memory_round_hiddens[r - 1].reshape_as(
+                                initial_memory
+                            )
+                        ),
+                        initial_memory
+                        if r == 0
+                        else output.memory_round_hiddens[r - 1].reshape_as(
+                            initial_memory
+                        ),
+                    ),
                     "memory_slot_stats": memory_slot_stats(
                         m.reshape(len(layout.lengths), config.memory_slots, -1)
                     ),

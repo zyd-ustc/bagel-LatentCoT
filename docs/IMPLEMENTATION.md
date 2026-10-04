@@ -13,8 +13,8 @@
 | 3.4 GEN 为主循环状态 | 保存 `ΔG=G_r−G_base`，重新注入固定 `G₀` | GEN-only 无 dummy memory 完整运行 |
 | 3.5 可选 memory workspace | extra body 每个 sample 追加 K 个 UND tokens；body exit memory 在本 timestep 内传递 | K=0/8/16 与真实 packed MoT 测试 |
 | 3.6 loop-only write gate | 每层以 native GEN layer output 为 reference，仅 gate loop-induced GEN correction；UND/M ungated | base 不经过 gate；所有 gate=0 明确退回 native |
-| 3.7 base residual merge | `G_base+α_r(G_r−G_base)`，GEN+M 的 per-loop α zero-init；GEN-only α=0.01 | GEN+M α=0 exact parity 且 α 有梯度；GEN-only 近零 α 与零 adapter 保持初始 parity，并允许 bias 梯度 |
-| 3.8 shared suffix | 每轮去掉 memory，以原生 endpoint boundary 和当前 GEN merge 执行共享 suffix | 同一 readout 供训练和推理使用 |
+| 3.7 base residual merge | `G_base+α(G_r−G_base)`，α 跨轮共享；GEN+M zero-init；GEN-only α=0.01 | GEN+M α=0 exact parity 且 α 有梯度；GEN-only 近零 α 与零 adapter 保持初始 parity，并允许 bias 梯度 |
+| 3.8 shared suffix | 去掉 memory，以原生 endpoint boundary 和最终 GEN merge 执行共享 suffix；DS/诊断保留中间轮 | 同一 readout 供训练和推理使用 |
 | 3.9 CFG 分支隔离 | 每次 branch 调用独立分配 entry/base/delta/memory；最后组合各轮 velocity | 三分支 workspace 存储独立，深度一致，α=0 CFG parity |
 | 历史 Current MemLoop 控制 | `legacy_memory_only` 复用 parent kernels；不使用新 gate/α/adapter/训练后的 M | 独立 parent 子进程，5 组同权重、同 seed velocity exact parity |
 | Slot 对称性 | boundary mean + `1e-4` 随机 slot noise；恢复 centered effective rank / pairwise cosine | BF16 K=8/16 初始及循环后 slot variation 非零；相同 slot 报 rank=0 |
@@ -25,16 +25,24 @@
 | 6.3、6.4 functional diagnostics | velocity delta ratio、相邻 correction cosine、逐层 GEN write ratio、state norm；early/middle/late bins | 数值记录不是语义质量指标 |
 | 7.1 Stage 1 参数边界 | 所有原生参数冻结，只开放 `t2i_loop.*` | backward + optimizer 后 native 权重逐 tensor 不变 |
 | 7.2 direct flow deep supervision | final MSE + λ×mean intermediate MSE，同一 `epsilon−x1` 目标 | 显式损失数值测试；无 final-loop distillation |
-| 7.6、7.7 / P1-4 curriculum | 前 30% `{1}`、中 40% `{1,2}`、后 30% `{1,2,3}`；新最大深度在阶段首步执行 | 10 步训练真实更新第三轮 α；checkpoint 记录每轮曝光次数，评估拒绝已知未训练轮次 |
+| 7.6、7.7 / P1-4 curriculum | 前 30% `{1}`、中 40% `{1,2}`、后 30% `{1,2,3}`；新最大深度在阶段首步执行 | 10 步训练包含 R3 并更新共享 α；checkpoint 记录每轮曝光次数，R4 标记 unseen |
+| P1-5 elastic depth | allocation=4；共享 α；runtime 可在 0–4 切换 | R3 checkpoint 以 R4 runtime 加载，R0 native parity；R4 unseen 标注 |
+| P1-6 原生 condition dropout | 默认 10% 跳过完整 text segment，包括 BOS/EOS | 全部/混合文本删除与对应 inference 状态 exact parity；真实 optimizer 训练 |
+| P1-7 变分辨率 packed batch | GEN `[N_total,D]` 与 per-sample counts；无等长 reshape | 3 个不同长宽样本与逐样本 velocity exact parity，backward 通过 |
+| P1-8 readout 计算 | 无诊断、无 DS 时只读最终轮 | R4 普通推理 suffix=1，DS/诊断=5；最终 velocity exact parity |
+| P1-9 bucket 比例 | bucket-aware batch sampler，默认 40/30/20/10%；分 bucket loss/α/gate | 6000 batch 抽样比例误差≤2.5%，seed 可复现；缺失正权重 bucket 报错 |
+| P1-10 预处理 | 复用 native ImageTransform，保留完整画面；VAE 逐样本编码后 packed | 横竖矩形和角落像素保持；变形状 batch 真实训练入口通过 |
+| P1-11 memory 诊断 | rank / signed、absolute cosine / slot std / sigma1 / update ratio | 已知 slot 统计精确；训练和评估逐轮输出 |
+| P1-12 结果 evaluator | Base / LegacyMem / GEN / GEN+M × R0–4；原题评分、quality proxy、invalid、paired Repair/Damage 与人工偏好 | 接口 fixture、配对分母、缺失评分、坏图、覆盖、哈希与 CLI 通过；真实 benchmark 分数未运行 |
 | 7.4、7.5 后续阶段 | workspace 专项训练、body LoRA 尚未实现或启动 | 需先取得文档 M1–M3 的真实语义/质量证据 |
 
 ## 新 workspace 的执行语义
 
-- `loop_depth` 为额外 body 次数 R；总 body 执行为 `1+R`。
-- 每个 branch 的 prefix 执行一次。base readout 和每轮 readout 复用 suffix，共 `1+R` 次。
+- `runtime_loop_depth` 为额外 body 次数 R；总 body 执行为 `1+R`。allocation、runtime、max_train 分别配置，默认 4/3/3。
+- 每个 branch 的 prefix 执行一次。普通推理只执行一次最终 suffix；DS 训练或诊断执行 `1+R` 次 readout。
 - 当前 boundary query 每层使用 native base pass 在该深度的状态。它不参与跨轮 recurrence。
 - 新 workspace memory 只存在于 extra body；suffix 与 sampler 的原生 token 布局不变。legacy 沿用旧布局与计算。
-- 同一个 batch 必须使用相同数量的 GEN/image tokens。不同 batch 可使用不同图像尺寸。
+- GEN 保持 packed `[N_total,D]`；gen_counts 记录每个样本长度。Memory projection 用 repeat_interleave 映射到 GEN tokens。
 - GEN+Memory 的训练 re-entry 最后一层为零；training-free topology 对照使用固定小比例 correction mapping。
 - GEN+M 初始 α=0 时训练仍运行 loop 以计算 α 梯度。其无梯度推理可直接使用 native route。
 - GEN gate 公式为 `H_gen=native_GEN_output+g*(loop_GEN_output-native_GEN_output)`。g=0 保留完整 native transformation。
@@ -48,7 +56,7 @@
 - 初始 M 在样本之间相同；第一层干预强度为零，不能把单层 R=1 的无差异当作 memory 无内容的证据。
 - shuffled 每轮包含 writer + reader 两次 body；manifest 明确记录计算语义。
 - legacy 的诊断另算一次 native reference pass。当前矩阵 wall time 包含 reference 与各轮 readout，不等于原始 MemLoop 的纯计算成本。
-- checkpoint 格式更新为 v2，记录 gate 语义和 native timestep shift；拒绝 v1 whole-layer gate checkpoint。旧 LoRA checkpoint 也不兼容。
+- checkpoint 格式为 v3，记录共享 α、allocation、gate、timestep 和训练覆盖；拒绝 v1/v2 与旧 LoRA checkpoint。
 
 ## 本次验证与实验边界
 

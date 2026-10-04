@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import argparse
+import hashlib
 import json
 import time
 from dataclasses import replace
@@ -37,7 +38,7 @@ def arm_config(config, mode, depth, memory_slots, memory_control):
     return replace(
         config,
         enable_t2i_loop=depth > 0,
-        loop_depth=depth,
+        runtime_loop_depth=depth,
         loop_mode="gen_only" if mode == "base" else mode,
         memory_slots=0
         if mode in {"base", "gen_only", "direct_native_gen_only"}
@@ -158,7 +159,8 @@ def main():
         enable_t2i_loop=True,
         loop_start_layer=args.start_layer,
         loop_end_layer=args.end_layer,
-        loop_depth=max(depths),
+        runtime_loop_depth=max(depths),
+        allocated_max_loop_depth=max(4, max(depths)),
         memory_slots=args.memory_slots,
         reentry_adapter_type="fixed",
         fixed_reentry_scale=args.reentry_scale,
@@ -169,22 +171,13 @@ def main():
         metadata = checkpoint_config(args.checkpoint)
         config = LoopConfig(**metadata["loop_config"])
         anchored_modes = {"gen_only", "gen_memory_anchored", "memory_only"} & set(modes)
-        if anchored_modes and max(depths) > config.loop_depth:
+        if anchored_modes and max(depths) > config.allocated_max_loop_depth:
             raise ValueError("depth matrix exceeds checkpoint allocation")
         if args.memory_slots > config.memory_slots and any(
             mode in {"gen_memory_anchored", "memory_only", "direct_native_memory"}
             for mode in modes
         ):
             raise ValueError("memory matrix exceeds checkpoint workspace allocation")
-        trained_rounds = metadata.get("round_training_steps")
-        if (
-            anchored_modes
-            and trained_rounds is not None
-            and any(count == 0 for count in trained_rounds[: max(depths)])
-        ):
-            raise ValueError(
-                "requested loop depth includes an untrained round in this checkpoint"
-            )
     backbone = BagelBackbone(
         {
             "model_path": args.model_path,
@@ -216,20 +209,53 @@ def main():
         for offset in range(0, len(rows), args.batch_size):
             batch = rows[offset : offset + args.batch_size]
             condition = inferencer.prepare_condition(
-                [row["prompt"] for row in batch], (args.image_size, args.image_size)
+                [row["prompt"] for row in batch],
+                [
+                    (
+                        int(row.get("height", args.image_size)),
+                        int(row.get("width", args.image_size)),
+                    )
+                    for row in batch
+                ],
             )
+            gen_counts = (condition.inputs["packed_seqlens"] - 2).tolist()
             count = len(condition.inputs["packed_vae_token_indexes"])
             generator = torch.Generator().manual_seed(args.seed + offset)
             initial_noise = torch.randn(
                 count, model.patch_latent_dim, generator=generator
             ).to(device)
+            noise_hashes = [
+                hashlib.sha256(
+                    part.float().cpu().contiguous().numpy().tobytes()
+                ).hexdigest()
+                for part in initial_noise.split(gen_counts)
+            ]
             for mode, depth in arms:
                 runtime = arm_config(
                     config, mode, depth, args.memory_slots, args.memory_control
                 )
                 slots = runtime.memory_slots
                 arm = f"{mode}_R{depth}_K{slots}_{args.memory_control}"
+                coverage = (
+                    metadata.get("round_training_steps") if args.checkpoint else None
+                )
+                depth_status = (
+                    "training_free"
+                    if not args.checkpoint
+                    else "unknown"
+                    if coverage is None
+                    else "seen"
+                    if depth == 0 or (depth <= len(coverage) and all(coverage[:depth]))
+                    else "unseen"
+                )
+                if (
+                    depth == 0
+                    or mode == "legacy_memory_only"
+                    or mode.startswith("direct_native_")
+                ):
+                    depth_status = "training_free"
                 arm_metadata[arm] = {
+                    "depth_status": depth_status,
                     "runtime_config": runtime.to_dict(),
                     **arm_semantics(runtime),
                 }
@@ -264,11 +290,12 @@ def main():
                             directory
                             / f"batch_{offset:04d}_step_{step:03d}_velocities.pt",
                         )
-                        image_tokens = count // len(batch)
                         for r, velocity in enumerate(per_round):
-                            estimates = (x_t - t * velocity).split(image_tokens)
+                            estimates = (x_t - t * velocity).split(gen_counts)
                             for i, latent in enumerate(estimates):
-                                inferencer.decode_image(latent, condition.shape).save(
+                                inferencer.decode_image(
+                                    latent, condition.shapes[i]
+                                ).save(
                                     directory
                                     / f"{offset + i:04d}_step_{step:03d}_r{r}.png"
                                 )
@@ -276,9 +303,9 @@ def main():
                     x_t = x_t - result.velocity * dt
                 synchronize(device)
                 elapsed = time.perf_counter() - started
-                for i, latent in enumerate(x_t.split(count // len(batch))):
+                for i, latent in enumerate(x_t.split(gen_counts)):
                     path = directory / f"{offset + i:04d}.png"
-                    inferencer.decode_image(latent, condition.shape).save(path)
+                    inferencer.decode_image(latent, condition.shapes[i]).save(path)
                     records.append(
                         {
                             "index": offset + i,
@@ -286,8 +313,12 @@ def main():
                             "arm": arm,
                             "path": str(path.resolve()),
                             "seed": args.seed + offset,
+                            "image_shape": condition.shapes[i],
+                            "initial_noise_sha256": noise_hashes[i],
                             "elapsed_batch_seconds": elapsed,
                             "semantics": arm_semantics(runtime),
+                            "depth_status": depth_status,
+                            "benchmark_record": batch[i],
                         }
                     )
                 (directory / f"batch_{offset:04d}_loop_logs.json").write_text(

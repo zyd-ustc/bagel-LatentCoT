@@ -1,0 +1,36 @@
+# First generate matched Base / LegacyMem / GEN / GEN+M images for R0..4.
+# Use independent checkpoints for trained GEN-only and GEN+M when applicable;
+# keep prompt, seed, CFG, schedule and native checkpoint identical.
+output_dir: outputs/result_validation
+geneval2_root: /path/to/official/GenEval2
+geneval2_python: /path/to/geneval2/env/bin/python
+judge_model_path: /path/to/local/VLM-judge-weights
+judge_device: auto
+require_quality: true
+semantic_pass_threshold: 0.5
+required_depths: [0, 1, 2, 3, 4]
+datasets:
+  geneval2_hard:
+    kind: geneval2_hard
+    manifests:
+      - path: outputs/geneval2_hard_gen/manifest.json
+        modes: [base, legacy_memory_only, gen_only]
+      - path: outputs/geneval2_hard_gen_memory/manifest.json
+        modes: [gen_memory_anchored]
+    benchmark: experiments/data/geneval2_hard_128.jsonl
+  tiif_spatial:
+    kind: tiif_spatial
+    manifests:
+      - path: outputs/tiif_spatial_gen/manifest.json
+        modes: [base, legacy_memory_only, gen_only]
+      - path: outputs/tiif_spatial_gen_memory/manifest.json
+        modes: [gen_memory_anchored]
+    benchmark: /path/to/normalized_tiif_spatial.jsonl
+  quality_general:
+    kind: quality
+    manifests:
+      - path: outputs/quality_general_gen/manifest.json
+        modes: [base, legacy_memory_only, gen_only]
+      - path: outputs/quality_general_gen_memory/manifest.json
+        modes: [gen_memory_anchored]
+    benchmark: /path/to/general_prompts.jsonl
