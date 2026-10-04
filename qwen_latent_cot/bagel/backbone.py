@@ -164,6 +164,7 @@ class BagelBackbone:
             connector_act="gelu_pytorch_tanh",
             latent_patch_size=2,
             max_latent_size=64,
+            timestep_shift=float(self.cfg.get("timestep_shift", 1.0)),
             t2i_loop=LoopConfig(**dict(self.cfg.get("t2i_loop", {}))).to_dict(),
         )
 
@@ -243,14 +244,11 @@ class BagelBackbone:
         self.vit_image_size = vit_image_size
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = int(model.config.vit_max_num_patch_per_side)
-        if bagel.t2i_loop.memory_init is not None:
-            with torch.no_grad():
-                boundaries = bagel.language_model.model.embed_tokens.weight[
-                    [token_ids["start_of_image"], token_ids["end_of_image"]]
-                ].mean(0)
-                bagel.t2i_loop.memory_init.copy_(
-                    boundaries.expand_as(bagel.t2i_loop.memory_init)
-                )
+        bagel.t2i_loop.initialize_memory_from_boundaries(
+            bagel.language_model.model.embed_tokens.weight,
+            [token_ids["start_of_image"], token_ids["end_of_image"]],
+            seed=int(self.cfg.get("memory_init_seed", 0)),
+        )
 
         if disable_visual_gen:
             logger.info(

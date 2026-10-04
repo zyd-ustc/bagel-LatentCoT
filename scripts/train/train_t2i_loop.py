@@ -19,6 +19,7 @@ from qwen_latent_cot.bagel.accelerator import (
     manual_seed_all,
     resolve_device,
 )
+from qwen_latent_cot.bagel.flow_time import sample_native_flow_timestep
 from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
 from qwen_latent_cot.bagel.loop_checkpoint import save_loop_checkpoint
 from qwen_latent_cot.data.t2i import T2IDataset, patchify_latents, sample_flow_state
@@ -38,13 +39,20 @@ def main():
         raise ValueError(
             "Stage 1 requires enabled extra loops with a trainable low_rank adapter"
         )
-    if config.loop_mode == "direct_native" or config.memory_control != "correct":
+    if (
+        config.loop_mode in {"direct_native", "legacy_memory_only"}
+        or config.memory_control != "correct"
+    ):
         raise ValueError(
             "Stage 1 trains anchored states with correct workspace; use evaluation for negative controls"
         )
     if config.loop_gate_init == 0:
         raise ValueError(
             "Stage 1 needs positive loop_gate_init so output alpha can learn"
+        )
+    if config.loop_mode == "gen_only" and config.loop_output_alpha_init == 0:
+        raise ValueError(
+            "GEN-only needs nonzero loop_output_alpha_init (e.g. 0.01) to train the zero adapter bias; initial velocity remains native"
         )
     if int(cfg.get("save_every", 100)) < 1 or int(cfg.get("batch_size", 1)) < 1:
         raise ValueError("save_every and batch_size must be positive")
@@ -57,6 +65,7 @@ def main():
     backbone = BagelBackbone(
         {
             "model_path": cfg["model_path"],
+            "timestep_shift": float(cfg.get("timestep_shift", 1.0)),
             "disable_visual_gen": False,
             "disable_gen_expert": False,
             "t2i_loop": config.to_dict(),
@@ -114,7 +123,9 @@ def main():
                     }
                 depth = int(depths[int(torch.randint(len(depths), ()).item())])
                 runtime = replace(config, loop_depth=depth)
-                t = torch.rand((), device=device)
+                t = sample_native_flow_timestep(
+                    device=device, timestep_shift=model.timestep_shift
+                )
                 noise = torch.randn_like(clean)
                 x_t, target = sample_flow_state(clean, t, noise)
                 with autocast_for(device):
@@ -138,6 +149,8 @@ def main():
                 record = {
                     "step": step,
                     "depth": depth,
+                    "timestep": float(t),
+                    "timestep_shift": model.timestep_shift,
                     "flow_loss": float(loss.detach()),
                     "grad_norm": float(norm),
                     "alpha": model.t2i_loop.output_alpha.detach()

@@ -19,6 +19,7 @@ from qwen_latent_cot.bagel.accelerator import (
     resolve_device,
     synchronize,
 )
+from qwen_latent_cot.bagel.flow_time import shift_flow_timestep
 from qwen_latent_cot.bagel.inferencer import InterleaveInferencer
 from qwen_latent_cot.bagel.loop_checkpoint import (
     checkpoint_config,
@@ -40,7 +41,9 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--checkpoint")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--modes", default="gen_only,gen_memory_anchored,memory_only")
+    parser.add_argument(
+        "--modes", default="gen_only,gen_memory_anchored,memory_only,legacy_memory_only"
+    )
     parser.add_argument("--depths", default="0,1,2,3,4")
     parser.add_argument("--memory-slots", type=int, default=8)
     parser.add_argument(
@@ -83,11 +86,21 @@ def main():
     if args.batch_size < 1 or args.max_prompts < 1:
         raise ValueError("batch-size and max-prompts must be positive")
     modes = [value.strip() for value in args.modes.split(",") if value.strip()]
-    valid_modes = {"gen_only", "gen_memory_anchored", "memory_only", "direct_native"}
+    valid_modes = {
+        "gen_only",
+        "gen_memory_anchored",
+        "memory_only",
+        "legacy_memory_only",
+        "direct_native",
+    }
     if not modes or not set(modes) <= valid_modes:
         raise ValueError("unsupported or empty mode list")
-    if "memory_only" in modes and args.memory_slots == 0:
+    if {"memory_only", "legacy_memory_only"} & set(modes) and args.memory_slots == 0:
         raise ValueError("memory_only requires positive memory slots")
+    if "legacy_memory_only" in modes and args.memory_control != "correct":
+        raise ValueError(
+            "legacy_memory_only is an unchanged control; choose new workspace modes for memory interventions"
+        )
     if args.memory_control == "shuffled" and any(mode != "gen_only" for mode in modes):
         if args.batch_size < 2 or len(rows) % args.batch_size == 1:
             raise ValueError(
@@ -110,7 +123,8 @@ def main():
         if max(depths) > config.loop_depth:
             raise ValueError("depth matrix exceeds checkpoint allocation")
         if args.memory_slots > config.memory_slots and any(
-            mode != "gen_only" for mode in modes
+            mode in {"gen_memory_anchored", "memory_only", "direct_native"}
+            for mode in modes
         ):
             raise ValueError("memory matrix exceeds checkpoint workspace allocation")
     backbone = BagelBackbone(
@@ -134,9 +148,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     records = []
     schedule = torch.linspace(1, 0, args.num_timesteps, device=device)
-    schedule = (
-        args.timestep_shift * schedule / (1 + (args.timestep_shift - 1) * schedule)
-    )
+    schedule = shift_flow_timestep(schedule, args.timestep_shift)
     dts = schedule[:-1] - schedule[1:]
     probe_steps = {0, len(dts) // 2, len(dts) - 1}
     arms = [("base", 0)] + [

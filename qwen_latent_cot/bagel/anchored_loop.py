@@ -37,6 +37,7 @@ class LoopConfig:
     def __post_init__(self):
         if self.loop_mode not in {
             "memory_only",
+            "legacy_memory_only",
             "gen_only",
             "gen_memory_anchored",
             "direct_native",
@@ -48,7 +49,10 @@ class LoopConfig:
             raise ValueError("loop_depth and memory_slots must be nonnegative")
         if self.loop_mode == "gen_only" and self.memory_slots != 0:
             raise ValueError("gen_only requires memory_slots=0")
-        if self.loop_mode == "memory_only" and self.memory_slots == 0:
+        if (
+            self.loop_mode in {"memory_only", "legacy_memory_only"}
+            and self.memory_slots == 0
+        ):
             raise ValueError("memory_only requires memory_slots>0")
         if not self.freeze_prompt_kv_in_loop:
             raise ValueError("prompt KV must remain frozen")
@@ -84,8 +88,9 @@ class ReentryAdapter(nn.Module):
         super().__init__()
         self.norm = RMSNorm(width)
         self.down = nn.Linear(width, rank, bias=False)
-        self.up = nn.Linear(rank, width, bias=False)
+        self.up = nn.Linear(rank, width, bias=True)
         nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
         self.memory_projection = (
             nn.Linear(width, width, bias=False) if use_memory else None
         )
@@ -131,6 +136,22 @@ class LoopModules(nn.Module):
         else:
             self.register_parameter("memory_init", None)
 
+    @torch.no_grad()
+    def initialize_memory_from_boundaries(self, embedding_weight, token_ids, *, seed=0):
+        """Parent initialization, including dtype/order and independent slot noise."""
+        if self.memory_init is None:
+            return
+        base = embedding_weight[token_ids].float().mean(dim=0)
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        noise = torch.randn(
+            self.memory_init.shape, generator=generator, dtype=torch.float32
+        )
+        noise = noise.to(device=self.memory_init.device, dtype=self.memory_init.dtype)
+        noise = 1e-4 * noise
+        self.memory_init.copy_(
+            base.to(self.memory_init).unsqueeze(0).expand_as(self.memory_init) + noise
+        )
+
     def initial_memory(self, batch, slots=None):
         slots = self.config.memory_slots if slots is None else slots
         if slots == 0:
@@ -151,10 +172,11 @@ class LoopModules(nn.Module):
             correction = self.reentry(delta, memory)
         return anchor + correction
 
-    def gate(self, layer_offset, before, after):
-        return before + self.gate_logits[layer_offset].sigmoid().to(before.dtype) * (
-            after - before
-        )
+    def gate(self, layer_offset, reference_gen, loop_gen):
+        """Preserve the full native transformation; gate only loop-induced GEN delta."""
+        return reference_gen + self.gate_logits[layer_offset].sigmoid().to(
+            loop_gen.dtype
+        ) * (loop_gen - reference_gen)
 
 
 @dataclass
@@ -176,6 +198,44 @@ def ratio(delta, reference):
         delta.detach().float().norm()
         / reference.detach().float().norm().clamp_min(1e-12)
     )
+
+
+def memory_slot_stats(memory):
+    """Measure slots per sample; effective rank is of centered slot variation.
+
+    Identical slots have centered rank 0. Samples are never pooled into one
+    slot matrix, which would inflate rank by mixing unrelated images.
+    """
+    if memory is None or memory.numel() == 0:
+        return {
+            "effective_rank": 0.0,
+            "mean_abs_pairwise_cosine": None,
+            "slot_variation_norm": 0.0,
+        }
+    slots = memory.detach().float().cpu()
+    if slots.ndim == 2:
+        slots = slots.unsqueeze(0)
+    k = slots.shape[1]
+    centered = slots - slots.mean(dim=1, keepdim=True)
+    singular = torch.linalg.svdvals(centered)
+    total = singular.sum(dim=-1)
+    share = singular / total.unsqueeze(-1).clamp_min(1e-12)
+    ranks = torch.where(
+        total > 1e-12,
+        torch.exp(-(share * share.clamp_min(1e-12).log()).sum(-1)),
+        torch.zeros_like(total),
+    )
+    normed = F.normalize(slots, dim=-1)
+    gram = normed @ normed.transpose(-1, -2)
+    mask = ~torch.eye(k, dtype=torch.bool)
+    cosine = float(gram[:, mask].abs().mean()) if k > 1 else None
+    return {
+        "effective_rank": float(ranks.mean()),
+        "effective_rank_min": float(ranks.min()),
+        "mean_abs_pairwise_cosine": cosine,
+        "slot_variation_norm": float(centered.norm()),
+        "sigma1_ratio": float((singular[:, 0] / total.clamp_min(1e-12)).mean()),
+    }
 
 
 def run_anchored_loop(
@@ -240,6 +300,8 @@ def run_anchored_loop(
                 if memory is not None
                 else 0.0,
                 "alpha": float(modules.output_alpha[r].detach()),
+                "memory_slot_stats": memory_slot_stats(memory),
+                "memory_initial_slot_stats": memory_slot_stats(initial_memory),
                 "layers": layer_stats,
             }
             if previous_velocity_delta is not None:

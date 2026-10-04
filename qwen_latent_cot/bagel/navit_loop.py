@@ -124,11 +124,12 @@ def forward_anchored_branch(
         hidden = layer_call(index, hidden, original_kwargs)
     entry_sequence = hidden.clone()
     entry_gen = hidden[layout.gen_indexes].reshape(gen_shape)
-    boundary_anchors, layer_gen_anchors = [], []
+    boundary_anchors, layer_gen_anchors, layer_gen_references = [], [], []
     for index in range(config.loop_start_layer, config.loop_end_layer):
         boundary_anchors.append(hidden[layout.und_indexes].clone())
         layer_gen_anchors.append(hidden[layout.gen_indexes].clone())
         hidden = layer_call(index, hidden, original_kwargs)
+        layer_gen_references.append(hidden[layout.gen_indexes].clone())
     base_sequence = hidden.clone()
     base_gen = hidden[layout.gen_indexes].reshape(gen_shape)
     workspace_layout, native_indexes, memory_indexes = layout.with_memory(
@@ -153,9 +154,14 @@ def forward_anchored_branch(
             # Cached prompt tensors are read only (update_past_key_values=False).
             sequence = sequence.clone()
             sequence[workspace_boundaries] = boundary_anchors[local]
-            before = sequence
             after = layer_call(index, sequence, workspace_kwargs, checkpoint=True)
-            sequence = loop_modules.gate(local, before, after)
+            # Native transformation is the reference, not the layer input.
+            # UND boundaries and memory retain their full native expert update.
+            sequence = after.clone()
+            reference_gen = layer_gen_references[local]
+            sequence[workspace_layout.gen_indexes] = loop_modules.gate(
+                local, reference_gen, after[workspace_layout.gen_indexes]
+            )
             if memory is not None and config.memory_control in {"zero", "frozen"}:
                 sequence = sequence.clone()
                 sequence[memory_indexes] = memory.reshape(-1, hidden.shape[-1])
@@ -164,8 +170,15 @@ def forward_anchored_branch(
                     {
                         "layer": index,
                         "gen_write_ratio": ratio(
-                            sequence[workspace_layout.gen_indexes]
-                            - before[workspace_layout.gen_indexes],
+                            sequence[workspace_layout.gen_indexes] - reference_gen,
+                            reference_gen,
+                        ),
+                        "raw_gen_correction_ratio": ratio(
+                            after[workspace_layout.gen_indexes] - reference_gen,
+                            reference_gen,
+                        ),
+                        "native_transform_ratio": ratio(
+                            reference_gen - layer_gen_anchors[local],
                             layer_gen_anchors[local],
                         ),
                         "gate": float(

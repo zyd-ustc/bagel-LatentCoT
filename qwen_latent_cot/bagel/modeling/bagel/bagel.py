@@ -22,6 +22,8 @@ from ..cache_utils.taylorseer import cache_init
 from tqdm import tqdm
 from ...anchored_loop import LoopConfig, LoopModules, LoopResult
 from ...navit_loop import QueryLayout, forward_anchored_branch
+from ...legacy_memory import forward_legacy_memory_branch
+from ...flow_time import sample_native_flow_timestep, shift_flow_timestep
 
 
 class BagelConfig(PretrainedConfig):
@@ -149,7 +151,7 @@ class Bagel(PreTrainedModel):
             patchified_vae_latent_shapes: A list of (h, w) tuples, patchfied latent shapes of each image.
             packed_latent_position_ids: 1-D int tensor, the position of each token for latent.
             packed_vae_token_indexes: 1-D int tensor, padded image token indexes in sequence.
-            packed_timesteps: 1-D float tensor, flow timesteps. 0 indicates use clean image.
+            packed_timesteps: 1-D raw normal logits, transformed by sigmoid and native timestep shift.
             mse_loss_indexes: 1-D bool tensor, where to compute mse loss.
         """
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
@@ -192,8 +194,7 @@ class Bagel(PreTrainedModel):
             packed_latent_clean = torch.cat(packed_latent, dim=0)
 
             noise = torch.randn_like(packed_latent_clean)
-            packed_timesteps = torch.sigmoid(packed_timesteps)
-            packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
+            packed_timesteps = sample_native_flow_timestep(raw_t=packed_timesteps, timestep_shift=self.timestep_shift)
             packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
             packed_timestep_embeds = self.time_embedder(packed_timesteps)
             latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
@@ -698,7 +699,7 @@ class Bagel(PreTrainedModel):
         x_t = packed_init_noises
 
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
-        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
+        timesteps = shift_flow_timestep(timesteps, timestep_shift)
         dts =  timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
@@ -806,7 +807,7 @@ class Bagel(PreTrainedModel):
         self._last_branch_stats = []
         loop_active = loop_config.enable_t2i_loop and loop_config.loop_depth > 0
         zero_alpha = not bool(torch.count_nonzero(self.t2i_loop.output_alpha[:loop_config.loop_depth]).item())
-        if loop_active and (torch.is_grad_enabled() or not zero_alpha or loop_config.log_loop_stats):
+        if loop_active and (torch.is_grad_enabled() or not zero_alpha or loop_config.log_loop_stats or loop_config.loop_mode == "legacy_memory_only"):
             return self.forward_t2i_loop(
                 x_t=x_t, timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
@@ -993,7 +994,8 @@ class Bagel(PreTrainedModel):
             if any(value is None for value in (positions, queries, lengths, cache, cache_indexes)):
                 raise ValueError(f"missing CFG inputs for {name}")
             layout = QueryLayout(packed_seqlens, positions, queries, cache_indexes, lengths, packed_vae_token_indexes, packed_text_indexes)
-            result = forward_anchored_branch(self.language_model.model, sequence.clone(), layout, cache, self.t2i_loop, config, self.llm2vae)
+            branch_runner = forward_legacy_memory_branch if config.enable_t2i_loop and config.loop_depth > 0 and config.loop_mode == "legacy_memory_only" else forward_anchored_branch
+            result = branch_runner(self.language_model.model, sequence.clone(), layout, cache, self.t2i_loop, config, self.llm2vae)
             outputs[name] = result
             self._last_branch_stats.extend({"branch": name, **item} for item in result.stats)
         def combine(attribute, index=None):

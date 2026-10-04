@@ -139,7 +139,11 @@ def test_real_mot_recurrence_keeps_prompt_and_sampler_anchors(mode, slots):
         result = model.forward_t2i_loop(**inputs)
     assert len(result.velocities) == 3
     assert torch.isfinite(result.velocity).all()
-    assert not torch.equal(result.velocity, result.base_velocity)
+    if mode == "gen_only":
+        # With no memory and a zero adapter there is no recurrent correction.
+        torch.testing.assert_close(
+            result.velocity, result.base_velocity, rtol=0, atol=0
+        )
     torch.testing.assert_close(inputs["x_t"], original_x, rtol=0, atol=0)
     for name, values in original_cache.items():
         for index, value in values.items():

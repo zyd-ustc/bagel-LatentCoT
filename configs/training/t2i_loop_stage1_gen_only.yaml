@@ -1,7 +1,7 @@
 # Set the native checkpoint, prompt/image JSONL, and output directory.
 model_path: /path/to/BAGEL-7B-MoT
 data_path: /path/to/t2i_train.jsonl
-output_dir: outputs/umm_stage1
+output_dir: outputs/umm_stage1_gen_only
 device: auto
 seed: 0
 # Native BAGEL training default; separate from inference schedule shift.
@@ -17,16 +17,18 @@ gradient_checkpointing: true
 depth_curriculum: [1, 2]
 loop:
   enable_t2i_loop: true
-  loop_mode: gen_memory_anchored
+  loop_mode: gen_only
   loop_start_layer: 16
   loop_end_layer: 24
   loop_depth: 3
-  memory_slots: 8
+  memory_slots: 0
   freeze_prompt_kv_in_loop: true
   reentry_adapter_type: low_rank
   reentry_rank: null
   loop_gate_init: 0.02
-  loop_output_alpha_init: 0.0
+  # No memory seed: nonzero alpha lets the zero adapter bias learn.
+  # The initial output is still exactly native because correction is zero.
+  loop_output_alpha_init: 0.01
   loop_deep_supervision: true
   loop_ds_weight: 0.5
   memory_control: correct

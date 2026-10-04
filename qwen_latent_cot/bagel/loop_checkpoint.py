@@ -6,7 +6,7 @@ from pathlib import Path
 
 from safetensors.torch import load_file, save_file
 
-FORMAT = "umm-t2i-anchored-loop-v1"
+FORMAT = "umm-t2i-anchored-loop-v2"
 
 
 def save_loop_checkpoint(model, directory, *, step, model_path):
@@ -24,6 +24,9 @@ def save_loop_checkpoint(model, directory, *, step, model_path):
         "step": step,
         "model_path": str(Path(model_path).resolve()),
         "loop_config": asdict(model.t2i_loop.config),
+        "native_timestep_shift": model.timestep_shift,
+        "flow_timestep_distribution": "sigmoid_normal_then_native_shift",
+        "gate_semantics": "native_gen_reference_plus_gated_loop_correction",
     }
     (directory / "loop.json").write_text(json.dumps(metadata, indent=2) + "\n")
 

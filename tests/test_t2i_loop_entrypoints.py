@@ -5,6 +5,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 import yaml
@@ -93,8 +94,9 @@ def test_zero_alpha_has_identical_final_pixels_and_resets_workspace_each_step():
     assert all(item["velocity_delta_ratio"] == 0 for item in logs)
 
 
+@pytest.mark.parametrize("mode", ["gen_memory_anchored", "gen_only"])
 def test_stage1_cli_executes_optimizer_and_saves_loop_only_checkpoint(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, mode
 ):
     install_tiny_backbone(monkeypatch)
     Image.new("RGB", (16, 16), "red").save(tmp_path / "image.png")
@@ -110,7 +112,9 @@ def test_stage1_cli_executes_optimizer_and_saves_loop_only_checkpoint(
         loop_start_layer=1,
         loop_end_layer=3,
         loop_depth=2,
-        memory_slots=2,
+        loop_mode=mode,
+        memory_slots=0 if mode == "gen_only" else 2,
+        loop_output_alpha_init=0.01 if mode == "gen_only" else 0.0,
     )
     cfg = {
         "model_path": str(tmp_path / "base"),
@@ -141,6 +145,16 @@ def test_stage1_cli_executes_optimizer_and_saves_loop_only_checkpoint(
     assert (checkpoint / "loop.safetensors").is_file()
     names = json.loads((tmp_path / "train/trainable.json").read_text())
     assert all(name.startswith("t2i_loop.") for name in names)
+    assert all(record["grad_norm"] > 0 for record in records)
+    if mode == "gen_only":
+        from safetensors.torch import load_file
+
+        assert (
+            load_file(str(checkpoint / "loop.safetensors"))["reentry.up.bias"]
+            .abs()
+            .sum()
+            > 0
+        )
 
 
 def test_topology_cli_exports_matched_arms_and_all_timestep_bins(tmp_path, monkeypatch):
@@ -185,7 +199,7 @@ def test_topology_cli_exports_matched_arms_and_all_timestep_bins(tmp_path, monke
     )
     module.main()
     manifest = json.loads((tmp_path / "eval/manifest.json").read_text())
-    assert len(manifest["images"]) == 14  # base + 3 modes * 2 depths, two samples
+    assert len(manifest["images"]) == 18  # base + 4 modes * 2 depths, two samples
     assert all(Path(row["path"]).is_file() for row in manifest["images"])
     arm = tmp_path / "eval/gen_memory_anchored_R2_K2_correct"
     logs = json.loads((arm / "batch_0000_loop_logs.json").read_text())

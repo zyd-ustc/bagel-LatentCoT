@@ -7,21 +7,23 @@
 ```text
 native prefix → G₀ → native body → G_base
                     extra body × R:
-                    G₀ + A(ΔG, M) → gated body → G_r, M_r
+                    G₀ + A(ΔG, M) → body + GEN correction gate → G_r, M_r
                     G_base + α_r(G_r − G_base) → shared suffix → v_r
 final velocity → one native Euler update of x_t
 ```
 
 `loop_depth=R` **仅计额外 body 执行次数**。它与旧版含首轮 Read 的 `loop_depth` 含义不同。
-旧 memory-loop、动态 prompt KV、pair-memory / teacher distillation、GRPO、FlowEdit
+旧 Current MemLoop 仅通过 `legacy_memory_only` 保留为冻结控制组。动态 prompt KV、pair-memory / teacher distillation、GRPO、FlowEdit
 及显式反思链入口已经删除。旧 checkpoint 和旧配置不兼容新循环架构。
-原生模型权重名称与计算路径保留；新 checkpoint 只保存 `t2i_loop` 参数。
+原生模型权重名称与计算路径保留；新 checkpoint 只保存 `t2i_loop` 参数。当前格式为 v2；v1 的 whole-layer gate checkpoint 会被拒绝。
 
 ## 代码
 
 | 文件 | 职责 |
 | --- | --- |
 | `qwen_latent_cot/bagel/anchored_loop.py` | 统一配置、re-entry、gate、memory、输出 merge、循环与直接 flow loss |
+| `qwen_latent_cot/bagel/legacy_memory.py` | Current MemLoop 的独立兼容控制组，复用冻结 parent kernels |
+| `qwen_latent_cot/bagel/flow_time.py` | 原生 logit-normal timestep 与 shift 变换 |
 | `qwen_latent_cot/bagel/navit_loop.py` | 原生 prefix/base/body/suffix、MoT 路由和只读 KV |
 | `qwen_latent_cot/bagel/modeling/bagel/bagel.py` | velocity、分支隔离、CFG 组合与原生 sampler |
 | `qwen_latent_cot/bagel/inferencer.py` | T2I prompt cache、输入准备与 VAE decode |
@@ -52,7 +54,7 @@ python scripts/evaluate/t2i_loop_matrix.py \
   --model-path /path/to/BAGEL-7B-MoT \
   --prompts experiments/data/geneval2_hard_16.jsonl \
   --output-dir outputs/topology \
-  --modes gen_only,gen_memory_anchored,memory_only,direct_native \
+  --modes gen_only,gen_memory_anchored,memory_only,legacy_memory_only,direct_native \
   --depths 0,1,2,3,4 --memory-slots 8 \
   --start-layer 16 --end-layer 24 \
   --alpha 0.1 --gate 0.02 --save-readouts
@@ -60,9 +62,16 @@ python scripts/evaluate/t2i_loop_matrix.py \
 
 输出包含各 arm 的最终图、每轮 velocity、early/middle/late 的 `x0` 估计图和诊断记录。
 `x0` 估计图是固定 `x_t` 上的 functional probe，不是完整采样得到的图。
-`--memory-control correct|zero|frozen|shuffled` 提供内容对照。
+`memory_only` 是新 workspace 拓扑消融；历史 Current MemLoop 对照必须使用 `legacy_memory_only`。
+legacy 的 R 对应旧版 `memory_loop_repeat=1+R`，包括一次 strict Read 和 R 次 Write。
+memory 经过原生 prefix、body 与 suffix；round0 阻止非 memory query 读取 memory；跨轮只 recycle M。
+legacy 不使用新 gate、α 或 adapter，也不读取训练后的 memory 参数；m0 固定使用 parent 的 boundary + seed-0 slot noise。
+
+`--memory-control correct|zero|frozen|shuffled` 提供新 workspace 的内容对照。
+运行这些干预时，从 `--modes` 中移除 `legacy_memory_only`，保持历史控制组的原有计算。
 `shuffled` 在 batch 维度交换 memory，要求每个 batch 至少有两个样本。
 比较 `K=8` 与 `K=16` 时分别运行上述矩阵。
+未经训练、adapter 为零或仅使用固定 ΔG 映射时，GEN-only 初始 ΔG=0，等价于 native；它不能代表有效的训练收益。
 
 ## Stage 1 训练
 
@@ -83,8 +92,15 @@ python scripts/train/train_t2i_loop.py \
 ```
 
 训练冻结全部原生权重。仅新增 adapter、每层 gate、每轮 α 和 memory 参数可训练。
-adapter 最后一层与 memory-to-entry projection 初始化为零；α 初始化为零；gate 默认 0.02。
-初始 α 为零时仍执行循环，以保留让 α 打开的梯度。
+adapter 最后一层的 weight/bias 与 memory-to-entry projection 初始化为零；gate 默认 0.02。
+GEN gate 使用 `native_GEN_output + g × (loop_GEN_output − native_GEN_output)`。
+UND 和 memory 执行完整的原生 expert update，不经过 GEN gate。
+GEN+Memory 默认 α=0，训练仍执行循环，以计算 α 梯度。
+GEN-only 使用 `configs/training/t2i_loop_stage1_gen_only.yaml`，α=0.01；零 adapter 使初始输出仍与 native 完全一致。
+GEN-only 的 α 与 adapter 同时为零会产生零梯度，训练入口会拒绝该配置。
+memory 初始化恢复为 boundary embedding 加 `1e-4` 独立 slot noise；日志记录 centered effective rank 和 pairwise cosine。
+Stage 1 timestep 使用 `raw N(0,1) → sigmoid → timestep_shift`，与原生 BAGEL forward 共用实现。
+训练 shift 读取模型配置（默认 1.0）；推理 schedule 的 shift 单独指定（默认 3.0）。
 损失为最终轮 flow MSE，加上中间轮 flow MSE 的平均值乘 `loop_ds_weight`。
 目标 velocity 为 `epsilon − x1`。训练不使用最终轮 self-distillation、RL 或 monotonic margin loss。
 
