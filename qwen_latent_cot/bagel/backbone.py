@@ -249,6 +249,7 @@ class BagelBackbone:
             [token_ids["start_of_image"], token_ids["end_of_image"]],
             seed=int(self.cfg.get("memory_init_seed", 0)),
         )
+        bagel.t2i_loop.float()
 
         if disable_visual_gen:
             logger.info(

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from safetensors.torch import load_file, save_file
 
-FORMAT = "umm-t2i-anchored-loop-v3"
+FORMAT = "umm-t2i-anchored-loop-v4"
 
 
 def save_loop_checkpoint(
@@ -37,7 +37,9 @@ def save_loop_checkpoint(
         "native_timestep_shift": model.timestep_shift,
         "flow_timestep_distribution": "sigmoid_normal_then_native_shift",
         "alpha_semantics": "shared_across_runtime_depths",
-        "gate_semantics": "native_gen_reference_plus_gated_loop_correction",
+        "gate_semantics": "carry_gen_delta_gate_new_layer_write",
+        "loop_parameter_dtype": str(model.t2i_loop.output_alpha.dtype),
+        "gen_delta_dtype": "torch.float32",
     }
     if training_depth_counts is not None:
         metadata["training_depth_counts"] = dict(training_depth_counts)
@@ -69,6 +71,8 @@ def load_loop_checkpoint(model, directory):
     ):
         if metadata["loop_config"][key] != current[key]:
             raise ValueError(f"loop checkpoint configuration mismatch: {key}")
+    # Do not round learned adapter/gate updates back to the backbone dtype.
+    model.t2i_loop.float()
     model.t2i_loop.load_state_dict(
         load_file(str(Path(directory) / "loop.safetensors")), strict=True
     )

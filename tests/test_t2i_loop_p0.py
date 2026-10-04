@@ -167,18 +167,20 @@ def test_timestep_draw_is_exact_native_logit_normal_then_shift(shift):
     assert shift_flow_timestep(torch.tensor([0.0, 1.0]), shift).tolist() == [0.0, 1.0]
 
 
-def test_gate_preserves_native_update_and_scales_only_gen_correction():
+def test_gate_carries_incoming_delta_and_scales_only_new_gen_write():
     model, config = tiny_model()
     native = torch.randn(2, 4, 32)
-    correction = torch.randn_like(native)
-    actual = model.t2i_loop.gate(0, native, native + correction)
+    incoming = torch.randn_like(native)
+    write = torch.randn_like(native)
+    actual = model.t2i_loop.gate(0, native, native + incoming + write, incoming)
     torch.testing.assert_close(
-        actual, native + model.t2i_loop.gate_logits[0].sigmoid() * correction
+        actual, native + incoming + model.t2i_loop.gate_logits[0].float().sigmoid() * write
     )
     with torch.no_grad():
         model.t2i_loop.gate_logits[0] = -torch.inf
     torch.testing.assert_close(
-        model.t2i_loop.gate(0, native, native + correction), native, rtol=0, atol=0
+        model.t2i_loop.gate(0, native, native + incoming + write, incoming),
+        native + incoming, rtol=0, atol=0
     )
 
 
@@ -239,9 +241,9 @@ def test_real_body_gates_only_gen_and_leaves_memory_full_update(monkeypatch):
         calls.append((kwargs["packed_query_sequence"].clone(), out[0].clone()))
         return out
 
-    def record_gate(offset, reference, current):
+    def record_gate(offset, reference, current, incoming):
         gated_shapes.append(reference.shape)
-        return original_gate(offset, reference, current)
+        return original_gate(offset, reference, current, incoming)
 
     monkeypatch.setattr(layer, "forward_inference", record_layer)
     monkeypatch.setattr(model.t2i_loop, "gate", record_gate)
@@ -259,7 +261,7 @@ def test_real_body_gates_only_gen_and_leaves_memory_full_update(monkeypatch):
     assert result.stats[0]["layers"][0]["native_transform_ratio"] > 0
 
 
-@pytest.mark.parametrize("version", ["v1", "v2"])
+@pytest.mark.parametrize("version", ["v1", "v2", "v3"])
 def test_corrected_checkpoint_rejects_old_gate_or_per_depth_alpha(tmp_path, version):
     import json
 
@@ -273,7 +275,7 @@ def test_corrected_checkpoint_rejects_old_gate_or_per_depth_alpha(tmp_path, vers
     path = tmp_path / "loop.json"
     metadata = json.loads(path.read_text())
     assert (
-        metadata["gate_semantics"] == "native_gen_reference_plus_gated_loop_correction"
+        metadata["gate_semantics"] == "carry_gen_delta_gate_new_layer_write"
     )
     metadata["format"] = f"umm-t2i-anchored-loop-{version}"
     path.write_text(json.dumps(metadata))

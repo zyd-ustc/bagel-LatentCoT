@@ -16,7 +16,7 @@ final velocity → one native Euler update of x_t
 α 跨轮共享，不再按 R 分配参数；Stage 1 可训练 R≤3，再验证 unseen R4。
 旧 Current MemLoop 仅通过 `legacy_memory_only` 保留为冻结控制组。动态 prompt KV、pair-memory / teacher distillation、GRPO、FlowEdit
 及显式反思链入口已经删除。旧 checkpoint 和旧配置不兼容新循环架构。
-原生模型权重名称与计算路径保留；新 checkpoint 只保存 `t2i_loop` 参数。当前格式为 v3；拒绝 v1 的 whole-layer gate 和 v2 的 per-depth α checkpoint。
+原生模型权重名称与计算路径保留；新 checkpoint 只保存 `t2i_loop` 参数。当前格式为 v4；拒绝 v1/v2/v3，其中 v3 的 gate 会反复缩小已有 GEN correction。
 
 ## 代码
 
@@ -117,11 +117,17 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
 
 训练冻结全部原生权重。仅新增 adapter、每层 gate、共享 α 和 memory 参数可训练。
 adapter 最后一层的 weight/bias 与 memory-to-entry projection 初始化为零；gate 默认 0.02。
-GEN gate 使用 `native_GEN_output + g × (loop_GEN_output − native_GEN_output)`。
+GEN gate 保留已有 correction `d_in`，只缩放本层新增的 write：
+`d_out = d_in + g × (loop_GEN_output − native_GEN_output − d_in)`，输出为 `native_GEN_output + d_out`。
+这等于保留原生 layer update，并对 loop 相比原生路径新增的 residual update 门控；不再对全部 correction 连乘每层 gate。
+GEN correction 在 body 内使用 FP32 累积；adapter、gate、α、memory 参数及 AdamW 状态使用 FP32，原生模型仍为 BF16。
+checkpoint 加载保留新增参数的 FP32 精度。保存与加载均使用 v4，不能直接加载旧 v3 训练结果。
 UND 和 memory 执行完整的原生 expert update，不经过 GEN gate。
 GEN+Memory 默认 α=0，训练仍执行循环，以计算 α 梯度。
 GEN-only 使用 `configs/training/t2i_loop_stage1_gen_only.yaml`，α=0.01；零 adapter 使初始输出仍与 native 完全一致。
 GEN-only 的 α 与 adapter 同时为零会产生零梯度，训练入口会拒绝该配置。
+GEN-only 从 adapter bias 的有效梯度启动；R≥2 后，上一轮 correction 为 low-rank adapter 提供输入。
+日志同时记录 adapter weight/bias、gate、α 的梯度和参数范数。可据此区分“能执行”和“有实际更新”。
 memory 初始化为 boundary embedding 加 `1e-4` 独立 slot noise。
 训练默认开启诊断，逐轮记录 centered effective rank、pairwise cosine、slot std、sigma1 ratio 和 memory update ratio。
 Stage 1 timestep 使用 `raw N(0,1) → sigmoid → timestep_shift`，与原生 BAGEL forward 共用实现。

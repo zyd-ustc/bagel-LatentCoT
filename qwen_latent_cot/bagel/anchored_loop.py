@@ -110,18 +110,24 @@ class ReentryAdapter(nn.Module):
             nn.init.zeros_(self.memory_projection.weight)
 
     def forward(self, delta, memory=None, gen_counts=None):
-        correction = self.up(self.down(self.norm(delta)))
-        if memory is not None and self.memory_projection is not None:
-            projected = self.memory_projection(memory.mean(1))
-            if delta.ndim == 2:
-                if gen_counts is None:
-                    raise ValueError(
-                        "packed GEN memory conditioning requires gen_counts"
-                    )
-                projected = projected.repeat_interleave(gen_counts, dim=0)
-            else:
-                projected = projected.unsqueeze(1)
-            correction = correction + projected
+        # Small post-training updates need the module's parameter precision,
+        # rather than the frozen backbone's BF16 autocast precision.
+        with torch.autocast(device_type=delta.device.type, enabled=False):
+            delta = delta.to(self.norm.weight.dtype)
+            correction = self.up(self.down(self.norm(delta)))
+            if memory is not None and self.memory_projection is not None:
+                projected = self.memory_projection(
+                    memory.to(self.memory_projection.weight.dtype).mean(1)
+                )
+                if delta.ndim == 2:
+                    if gen_counts is None:
+                        raise ValueError(
+                            "packed GEN memory conditioning requires gen_counts"
+                        )
+                    projected = projected.repeat_interleave(gen_counts, dim=0)
+                else:
+                    projected = projected.unsqueeze(1)
+                correction = correction + projected
         return correction
 
 
@@ -188,13 +194,21 @@ class LoopModules(nn.Module):
             correction = config.fixed_reentry_scale * delta
         else:
             correction = self.reentry(delta, memory, gen_counts)
-        return anchor + correction
+        return anchor.float() + correction.float()
 
-    def gate(self, layer_offset, reference_gen, loop_gen):
-        """Preserve the full native transformation; gate only loop-induced GEN delta."""
-        return reference_gen + self.gate_logits[layer_offset].sigmoid().to(
-            loop_gen.dtype
-        ) * (loop_gen - reference_gen)
+    def gate(self, layer_offset, reference_gen, loop_gen, incoming_delta):
+        """Carry existing GEN correction; gate only this layer's extra write.
+
+        Let d be the incoming correction relative to the native layer input.
+        The extra write is (loop_output - native_output) - d. Multiplying the
+        entire output difference by g would multiply d by every layer's gate.
+        """
+        with torch.autocast(device_type=loop_gen.device.type, enabled=False):
+            reference = reference_gen.float()
+            delta = incoming_delta.float()
+            extra_write = loop_gen.float() - reference - delta
+            gate = self.gate_logits[layer_offset].float().sigmoid()
+            return reference + delta + gate * extra_write
 
 
 @dataclass
@@ -361,7 +375,7 @@ def run_anchored_loop(
         merged = (
             current_gen
             if direct
-            else anchor.gen_base + modules.output_alpha[0].to(delta.dtype) * delta
+            else anchor.gen_base.float() + modules.output_alpha[0].float() * delta
         )
         if need_readouts or r == config.runtime_loop_depth - 1:
             velocity = readout(merged)
@@ -418,5 +432,6 @@ def direct_flow_loss(result: LoopResult, target: torch.Tensor, config: LoopConfi
 def configure_stage1(model: nn.Module):
     """Freeze every native tensor. Open only the newly added loop modules."""
     model.requires_grad_(False)
+    model.t2i_loop.float()
     model.t2i_loop.requires_grad_(True)
     return [name for name, p in model.named_parameters() if p.requires_grad]

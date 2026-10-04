@@ -147,6 +147,7 @@ def main():
         "global_batch_size": int(cfg.get("batch_size", 1)) * world_size,
         "loss_reduction": "global_packed_token_mean",
         "depth_sampling": "rank0_broadcast",
+        "loop_parameter_dtype": "torch.float32",
     }
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
@@ -219,6 +220,16 @@ def main():
                 )
                 if not torch.isfinite(norm):
                     raise RuntimeError(f"nonfinite loop gradients at step {step}")
+                probes = {
+                    "adapter_up_weight": model.t2i_loop.reentry.up.weight,
+                    "adapter_up_bias": model.t2i_loop.reentry.up.bias,
+                    "gate_logits": model.t2i_loop.gate_logits,
+                    "output_alpha": model.t2i_loop.output_alpha,
+                }
+                gradient_norms = {
+                    name: float(p.grad.detach().float().norm()) if p.grad is not None else None
+                    for name, p in probes.items()
+                }
                 optimizer.step()
                 step += 1
                 depth_counts[str(depth)] += 1
@@ -322,6 +333,10 @@ def main():
                     "original_shapes": batch["original_shape"],
                     "gates": gates,
                     "grad_norm": float(norm),
+                    "loop_gradient_norms_after_clip": gradient_norms,
+                    "loop_parameter_norms": {
+                        name: float(p.detach().float().norm()) for name, p in probes.items()
+                    },
                     "alpha": model.t2i_loop.output_alpha.detach()
                     .float()
                     .cpu()

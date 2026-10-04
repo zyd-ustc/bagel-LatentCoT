@@ -31,13 +31,13 @@ from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import (
 from qwen_latent_cot.data.t2i import patchify_latents, sample_flow_state
 
 
-def tiny_model(slots=2, mode="gen_memory_anchored", alpha=0.0):
+def tiny_model(slots=2, mode="gen_memory_anchored", alpha=0.0, body_layers=2):
     torch.manual_seed(17)
     llm_config = Qwen2Config(
         vocab_size=32,
         hidden_size=32,
         intermediate_size=64,
-        num_hidden_layers=4,
+        num_hidden_layers=body_layers + 2,
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=128,
@@ -48,7 +48,7 @@ def tiny_model(slots=2, mode="gen_memory_anchored", alpha=0.0):
     loop = LoopConfig(
         enable_t2i_loop=True,
         loop_start_layer=1,
-        loop_end_layer=3,
+        loop_end_layer=body_layers + 1,
         runtime_loop_depth=3,
         memory_slots=slots,
         loop_mode=mode,
@@ -77,8 +77,9 @@ def flow_inputs(model, batch=2):
         {"start_of_image": 1, "end_of_image": 2},
     )
     noise = inputs.pop("packed_init_noises").to(torch.bfloat16)
-    cache = NaiveCache(4)
-    for i in range(4):
+    layer_count = len(model.language_model.model.layers)
+    cache = NaiveCache(layer_count)
+    for i in range(layer_count):
         cache.key_cache[i] = torch.randn(sum(lengths), 2, 8, dtype=torch.bfloat16)
         cache.value_cache[i] = torch.randn(sum(lengths), 2, 8, dtype=torch.bfloat16)
     inputs.update(
@@ -265,7 +266,7 @@ def test_direct_flow_supervision_uses_clean_target_for_every_round():
 def test_checkpoint_is_strict_and_contains_only_new_modules(tmp_path):
     model, _ = tiny_model(2, alpha=0.1)
     save_loop_checkpoint(model, tmp_path, step=10, model_path=tmp_path / "base")
-    expected = model.t2i_loop.output_alpha.clone()
+    expected = model.t2i_loop.output_alpha.float().clone()
     with torch.no_grad():
         model.t2i_loop.output_alpha.fill_(9)
     metadata = load_loop_checkpoint(model, tmp_path)

@@ -66,7 +66,7 @@ def arm_semantics(runtime):
             else "shared",
         }
     return {
-        "gate": "native_gen_reference_correction",
+        "gate": "carry_gen_delta_gate_new_layer_write",
         "readout": "base_plus_alpha_delta",
         "memory_writer": "canonical_correct"
         if runtime.memory_control == "shuffled"

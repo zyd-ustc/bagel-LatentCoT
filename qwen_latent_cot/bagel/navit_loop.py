@@ -151,9 +151,12 @@ def forward_anchored_branch(
             (int(workspace_layout.lengths.sum()), hidden.shape[-1])
         )
         sequence[native_indexes] = entry_sequence
-        sequence[workspace_layout.gen_indexes] = gen.reshape(-1, hidden.shape[-1])
+        sequence[workspace_layout.gen_indexes] = gen.reshape(-1, hidden.shape[-1]).to(sequence.dtype)
         if memory is not None:
-            sequence[memory_indexes] = memory.reshape(-1, hidden.shape[-1])
+            sequence[memory_indexes] = memory.reshape(-1, hidden.shape[-1]).to(sequence.dtype)
+        # Carry the correction independently of native BF16 activations. A
+        # small learned entry delta must survive before it exceeds one BF16 ULP.
+        gen_delta = gen.reshape(-1, hidden.shape[-1]).float() - entry_gen.float()
         logs = []
         for local, index in enumerate(
             range(config.loop_start_layer, config.loop_end_layer)
@@ -162,6 +165,10 @@ def forward_anchored_branch(
             # Cached prompt tensors are read only (update_past_key_values=False).
             sequence = sequence.clone()
             sequence[workspace_boundaries] = boundary_anchors[local]
+            if not config.loop_mode.startswith("direct_native_"):
+                sequence[workspace_layout.gen_indexes] = (
+                    layer_gen_anchors[local].float() + gen_delta
+                ).to(sequence.dtype)
             if capture_memory_reads is not None:
                 capture_memory_reads.append(
                     sequence[memory_indexes]
@@ -173,25 +180,29 @@ def forward_anchored_branch(
                 # boundaries reset next layer and M writes are discarded.
                 sequence[memory_indexes] = memory_read_overrides[local].reshape(
                     -1, hidden.shape[-1]
-                )
+                ).to(sequence.dtype)
             after = layer_call(index, sequence, workspace_kwargs, checkpoint=True)
-            # Native transformation is the reference, not the layer input.
-            # UND boundaries and memory retain their full native expert update.
+            # Native transformation plus the incoming correction is the
+            # reference for the new write. UND/M retain their full expert update.
             sequence = after.clone()
             reference_gen = layer_gen_references[local]
             if not config.loop_mode.startswith("direct_native_"):
-                sequence[workspace_layout.gen_indexes] = loop_modules.gate(
-                    local, reference_gen, after[workspace_layout.gen_indexes]
+                gated_gen = loop_modules.gate(
+                    local, reference_gen, after[workspace_layout.gen_indexes], gen_delta
                 )
+                gen_delta = gated_gen - reference_gen.float()
+                sequence[workspace_layout.gen_indexes] = gated_gen.to(sequence.dtype)
             if memory is not None and config.memory_control in {"zero", "frozen"}:
                 sequence = sequence.clone()
-                sequence[memory_indexes] = memory.reshape(-1, hidden.shape[-1])
+                sequence[memory_indexes] = memory.reshape(-1, hidden.shape[-1]).to(sequence.dtype)
             if config.log_loop_stats:
                 logs.append(
                     {
                         "layer": index,
                         "gen_write_ratio": ratio(
-                            sequence[workspace_layout.gen_indexes] - reference_gen,
+                            gen_delta
+                            if not config.loop_mode.startswith("direct_native_")
+                            else sequence[workspace_layout.gen_indexes] - reference_gen,
                             reference_gen,
                         ),
                         "raw_gen_correction_ratio": ratio(
@@ -214,7 +225,11 @@ def forward_anchored_branch(
                         else 0.0,
                     }
                 )
-        gen_out = sequence[workspace_layout.gen_indexes]
+        gen_out = (
+            sequence[workspace_layout.gen_indexes]
+            if config.loop_mode.startswith("direct_native_")
+            else layer_gen_references[-1].float() + gen_delta
+        )
         memory_out = (
             sequence[memory_indexes].reshape(batch, config.memory_slots, -1)
             if memory is not None
@@ -224,7 +239,7 @@ def forward_anchored_branch(
 
     def readout(gen):
         sequence = base_sequence.clone()
-        sequence[layout.gen_indexes] = gen.reshape(-1, hidden.shape[-1])
+        sequence[layout.gen_indexes] = gen.reshape(-1, hidden.shape[-1]).to(sequence.dtype)
         for index in range(config.loop_end_layer, len(model.layers)):
             sequence = layer_call(index, sequence, original_kwargs, checkpoint=True)
         # Only GEN rows contribute to velocity. Norm equals the native final
