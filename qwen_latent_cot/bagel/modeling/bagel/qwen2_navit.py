@@ -697,8 +697,17 @@ class PackedAttentionMoT(Qwen2Attention):
         if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
         elif mode == 'gen':
-            packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            # FlashAttention can return a custom-autograd view. Project into a
+            # distinct buffer when gradients are active; never mutate that view
+            # or the attention values needed by its backward. No-grad inference
+            # retains the original path and allocation behavior.
+            projected_output = (
+                packed_attn_output.clone()
+                if packed_attn_output.requires_grad else packed_attn_output
+            )
+            projected_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+            projected_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            packed_attn_output = projected_output
 
         if update_past_key_values:
             past_key_values.key_cache[self.layer_idx] = merged_key_states
