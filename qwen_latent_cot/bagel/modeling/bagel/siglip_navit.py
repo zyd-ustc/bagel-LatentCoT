@@ -10,18 +10,12 @@
 # This modified file is released under the same license.
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.functional import scaled_dot_product_attention
 
 from transformers.activations import ACT2FN
-from ..siglip.configuration_siglip import SiglipVisionConfig as _SiglipVisionConfig
-from ..siglip.modeling_siglip import SiglipAttention, SiglipPreTrainedModel
-try:
-    from flash_attn import flash_attn_varlen_func
-except ImportError:  # pragma: no cover - optional runtime dependency
-    flash_attn_varlen_func = None
+from qwen_latent_cot.bagel.modeling.siglip.configuration_siglip import SiglipVisionConfig as _SiglipVisionConfig
+from qwen_latent_cot.bagel.modeling.siglip.modeling_siglip import SiglipAttention, SiglipPreTrainedModel
+from qwen_latent_cot.bagel.attention import flash_attn_varlen_func
 
 
 class SiglipVisionConfig(_SiglipVisionConfig):
@@ -235,35 +229,16 @@ class SiglipFlashAttention2(SiglipAttention):
             query_states = torch.cat([qh, qw], dim=-1)
             key_states = torch.cat([kh, kw], dim=-1)
 
-        if flash_attn_varlen_func is not None:
-            attn_output = flash_attn_varlen_func(
-                query_states.to(torch.bfloat16),
-                key_states.to(torch.bfloat16),
-                value_states.to(torch.bfloat16),
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                causal=False,
-            )
-        else:
-            # Fallback path for environments without flash-attn.
-            outputs = []
-            for idx in range(int(cu_seqlens.numel()) - 1):
-                start = int(cu_seqlens[idx].item())
-                end = int(cu_seqlens[idx + 1].item())
-                if end <= start:
-                    continue
-                q = query_states[start:end].transpose(0, 1).unsqueeze(0).to(torch.bfloat16)
-                k = key_states[start:end].transpose(0, 1).unsqueeze(0).to(torch.bfloat16)
-                v = value_states[start:end].transpose(0, 1).unsqueeze(0).to(torch.bfloat16)
-                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
-                    attn = scaled_dot_product_attention(q, k, v, is_causal=False)
-                outputs.append(attn.squeeze(0).transpose(0, 1))
-            if not outputs:
-                attn_output = query_states.new_zeros((0, self.num_heads, self.head_dim), dtype=torch.bfloat16)
-            else:
-                attn_output = torch.cat(outputs, dim=0)
+        attn_output = flash_attn_varlen_func(
+            query_states.to(torch.bfloat16),
+            key_states.to(torch.bfloat16),
+            value_states.to(torch.bfloat16),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+        )
 
         attn_output = self.out_proj(attn_output.reshape(total_q_len, -1))
         return attn_output
@@ -332,14 +307,6 @@ class SiglipEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        # 2026-04-29: matched to the manual GC hook on the LLM side.
-        self.gradient_checkpointing = False
-
-    def gradient_checkpointing_enable(self, **_kwargs) -> None:
-        self.gradient_checkpointing = True
-
-    def gradient_checkpointing_disable(self) -> None:
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -352,26 +319,10 @@ class SiglipEncoder(nn.Module):
         sin_w: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        use_grad_ckpt = bool(self.gradient_checkpointing) and self.training
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            if use_grad_ckpt:
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    encoder_layer,
-                    hidden_states,
-                    cu_seqlens,
-                    max_seqlen,
-                    cos_h=cos_h,
-                    sin_h=sin_h,
-                    cos_w=cos_w,
-                    sin_w=sin_w,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states = encoder_layer(
-                    hidden_states, cu_seqlens, max_seqlen,
-                    cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w,
-                )
+            hidden_states = encoder_layer(hidden_states, cu_seqlens, max_seqlen,
+                                          cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w)
 
         return hidden_states
 

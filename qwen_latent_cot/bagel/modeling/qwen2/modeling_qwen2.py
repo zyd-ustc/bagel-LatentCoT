@@ -41,29 +41,6 @@ _CHECKPOINT_FOR_DOC = "Qwen/Qwen2-7B"
 _CONFIG_FOR_DOC = "Qwen2Config"
 
 
-def _compute_default_rope_parameters(config=None, device=None, seq_len=None, **rope_kwargs):
-    """Transformers 5.x fallback for the removed ``default`` RoPE registry entry."""
-
-    del seq_len
-    if config is not None:
-        base = config.rope_theta
-        dim = getattr(config, "head_dim", None) or (
-            config.hidden_size // config.num_attention_heads
-        )
-    else:
-        base = rope_kwargs["base"]
-        dim = rope_kwargs["dim"]
-    inv_freq = 1.0 / (
-        base
-        ** (
-            torch.arange(0, dim, 2, dtype=torch.int64)
-            .to(device=device, dtype=torch.float)
-            / dim
-        )
-    )
-    return inv_freq, 1.0
-
-
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
 class Qwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -125,10 +102,7 @@ class Qwen2RotaryEmbedding(nn.Module):
             self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        if self.rope_type == "default" and self.rope_type not in ROPE_INIT_FUNCTIONS:
-            self.rope_init_fn = _compute_default_rope_parameters
-        else:
-            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
         self.register_buffer("inv_freq", inv_freq, persistent=False)

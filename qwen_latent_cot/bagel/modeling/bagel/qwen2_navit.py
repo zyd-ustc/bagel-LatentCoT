@@ -15,231 +15,32 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
-try:
-    from flash_attn import flash_attn_varlen_func
-except ImportError:  # pragma: no cover - optional runtime dependency
-    flash_attn_varlen_func = None
-from ..qwen2.modeling_qwen2 import (
-    Qwen2Attention,
-    Qwen2MLP,
-    Qwen2PreTrainedModel,
-    Qwen2RMSNorm,
+from qwen_latent_cot.bagel.attention import flash_attn_varlen_func
+from qwen_latent_cot.bagel.modeling.qwen2.modeling_qwen2 import (
+    Qwen2Attention, 
+    Qwen2MLP, 
+    Qwen2PreTrainedModel, 
+    Qwen2RMSNorm, 
     Qwen2RotaryEmbedding,
     apply_rotary_pos_emb,
 )
 
-from ..qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
-from ..cache_utils.taylorseer import (
-    cal_type,
-    taylor_cache_init,
-    derivative_approximation,
-    taylor_formula,
+from qwen_latent_cot.bagel.modeling.qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
+from qwen_latent_cot.bagel.modeling.cache_utils.taylorseer import (
+    cal_type, taylor_cache_init, derivative_approximation, taylor_formula,
 )
-from ...accelerator import enable_dynamo_flex_attention as _enable_dynamo_flex_attention
-from ...write_sensitivity import append_write_probe, select_write_memory
-from ...memory_mechanism import run_decoder, zero_memory_qkv, append_attention_stats
 
 
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
-if _enable_dynamo_flex_attention():
-    # flex_attention = torch.compile(flex_attention) # , dynamic=True, mode='max-autotune'
-    flex_attention = torch.compile(flex_attention)
-
-
-def round0_blocked_slices(
-    query_lens: torch.Tensor,
-    key_value_lens: torch.Tensor,
-    packed_vae_token_indexes: Optional[torch.Tensor],
-    packed_memory_token_indexes: Optional[torch.Tensor],
-    mask_prompt_kv_for_nonmemory: bool = False,
-    block_gen_reads_memory: bool = True,
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Per-sample non-memory query/key pairs blocked during generation.
-
-    Prompt KV keys occupy [0, K-Q); current memory keys sit after that prefix.
-    Blocking all non-memory queries also closes the UND-boundary relay path.
-    """
-
-    if packed_memory_token_indexes is None and not mask_prompt_kv_for_nonmemory:
-        return []
-    if (
-        packed_memory_token_indexes is not None
-        and int(packed_memory_token_indexes.numel()) == 0
-        and not mask_prompt_kv_for_nonmemory
-    ):
-        return []
-    query_lengths = [int(length) for length in query_lens.tolist()]
-    key_lengths = [int(length) for length in key_value_lens.tolist()]
-    if len(query_lengths) != len(key_lengths):
-        raise ValueError("query and key-value lengths must have equal batch size")
-    mem = (
-        packed_memory_token_indexes.to(dtype=torch.long)
-        if packed_memory_token_indexes is not None
-        else torch.empty(0, device=query_lens.device, dtype=torch.long)
-    )
-    slices: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    query_offset = 0
-    for query_length, key_length in zip(query_lengths, key_lengths):
-        past = key_length - query_length
-        if past < 0:
-            raise ValueError("key length must include the current query")
-        mem_local = mem - query_offset
-        mem_in = mem_local[(mem_local >= 0) & (mem_local < query_length)]
-        non_mem = torch.ones(query_length, device=mem.device, dtype=torch.bool)
-        non_mem[mem_in] = False
-        non_mem_in = torch.arange(
-            query_length, device=mem.device, dtype=torch.long
-        )[non_mem]
-        blocked_keys = past + mem_in if block_gen_reads_memory else mem_in.new_empty((0,))
-        if mask_prompt_kv_for_nonmemory:
-            prompt_keys = torch.arange(past, device=mem.device, dtype=torch.long)
-            blocked_keys = torch.cat((prompt_keys, blocked_keys))
-        slices.append((non_mem_in, blocked_keys))
-        query_offset += query_length
-    return slices
-
-
-def und_memory_row_mask(
-    packed_text_indexes: Optional[torch.Tensor],
-    packed_memory_token_indexes: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    if packed_text_indexes is None:
-        return None
-    n = int(packed_text_indexes.shape[0])
-    if (
-        packed_memory_token_indexes is None
-        or int(packed_memory_token_indexes.numel()) == 0
-    ):
-        return packed_text_indexes.new_zeros((n,), dtype=torch.bool)
-    return torch.isin(
-        packed_text_indexes,
-        packed_memory_token_indexes.to(
-            device=packed_text_indexes.device, dtype=packed_text_indexes.dtype
-        ),
-    )
-
-
-def project_und_queries(
-    q_proj,
-    hidden: torch.Tensor,
-    packed_text_indexes: Optional[torch.Tensor],
-    packed_memory_token_indexes: Optional[torch.Tensor],
-) -> torch.Tensor:
-    forward_rows = getattr(q_proj, "forward_rows", None)
-    if not callable(forward_rows):
-        return q_proj(hidden)
-    return forward_rows(
-        hidden,
-        row_mask=und_memory_row_mask(
-            packed_text_indexes, packed_memory_token_indexes
-        ),
-    )
-
-
-def _sdpa_varlen_inference(
-    *,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    query_lens: torch.Tensor,
-    key_value_lens: torch.Tensor,
-    causal: bool,
-    blocked_slices: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-) -> torch.Tensor:
-    """Exact PyTorch fallback for FlashAttention's packed varlen contract.
-
-    Cached decoding needs a bottom-right causal mask: a one-token query must
-    see every preceding cached key.  ``scaled_dot_product_attention`` uses a
-    top-left triangle when ``is_causal=True`` and query/key lengths differ, so
-    construct the absolute-position mask explicitly instead.
-    """
-
-    query_lengths = [int(length) for length in query_lens.tolist()]
-    key_lengths = [int(length) for length in key_value_lens.tolist()]
-    if len(query_lengths) != len(key_lengths):
-        raise ValueError("query_lens and key_value_lens must have equal batch size")
-    if sum(query_lengths) != int(query.shape[0]):
-        raise ValueError("query_lens do not cover the packed query tensor")
-    if sum(key_lengths) != int(key.shape[0]) or tuple(key.shape) != tuple(value.shape):
-        raise ValueError("key_value_lens do not cover aligned packed key/value tensors")
-    if int(query.shape[-1]) != int(key.shape[-1]):
-        raise ValueError("query and key head dimensions must match")
-
-    outputs = []
-    query_offset = 0
-    key_offset = 0
-    query_heads = int(query.shape[1])
-    key_heads = int(key.shape[1])
-    if query_heads % key_heads:
-        raise ValueError(
-            f"query heads ({query_heads}) must be divisible by KV heads ({key_heads})"
-        )
-    groups = query_heads // key_heads
-    sample_index = 0
-    for query_length, key_length in zip(query_lengths, key_lengths):
-        if query_length <= 0 or key_length < query_length:
-            raise ValueError(
-                "each packed sample requires 0 < query_length <= key_value_length"
-            )
-        sample_query = query[query_offset : query_offset + query_length]
-        sample_key = key[key_offset : key_offset + key_length]
-        sample_value = value[key_offset : key_offset + key_length]
-        if groups > 1:
-            sample_key = sample_key.repeat_interleave(groups, dim=1)
-            sample_value = sample_value.repeat_interleave(groups, dim=1)
-
-        attention_mask = None
-        if bool(causal):
-            cached_length = key_length - query_length
-            query_positions = (
-                torch.arange(query_length, device=query.device, dtype=torch.long)
-                + cached_length
-            )
-            key_positions = torch.arange(
-                key_length, device=query.device, dtype=torch.long
-            )
-            attention_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
-        if blocked_slices is not None and sample_index < len(blocked_slices):
-            non_mem_local, mem_keys = blocked_slices[sample_index]
-            if int(non_mem_local.numel()) > 0 and int(mem_keys.numel()) > 0:
-                if attention_mask is None:
-                    attention_mask = torch.ones(
-                        1,
-                        1,
-                        query_length,
-                        key_length,
-                        device=query.device,
-                        dtype=torch.bool,
-                    )
-                else:
-                    attention_mask = attention_mask.clone()
-                non_mem_idx = non_mem_local.to(device=query.device)
-                mem_idx = mem_keys.to(device=query.device)
-                attention_mask[
-                    0, 0, non_mem_idx[:, None], mem_idx[None, :]
-                ] = False
-        sample_index += 1
-        sample_output = scaled_dot_product_attention(
-            sample_query.transpose(0, 1).unsqueeze(0),
-            sample_key.transpose(0, 1).unsqueeze(0),
-            sample_value.transpose(0, 1).unsqueeze(0),
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        outputs.append(sample_output.squeeze(0).transpose(0, 1))
-        query_offset += query_length
-        key_offset += key_length
-    return torch.cat(outputs, dim=0)
+# flex_attention = torch.compile(flex_attention) # , dynamic=True, mode='max-autotune'
+flex_attention = torch.compile(flex_attention)
 
 
 class Qwen2Config(_Qwen2Config):
@@ -424,15 +225,6 @@ class NaiveCache:
 class BaseNavitOutputWithPast(ModelOutput):
     packed_query_sequence: torch.FloatTensor = None
     past_key_values: Optional[NaiveCache] = None
-    memory_body_out: Optional[torch.FloatTensor] = None
-    memory_body_entries: Optional[Tuple[torch.Tensor, ...]] = None
-    memory_body_kv: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
-    memory_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
-    gen_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
-    gen_suffix_round_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
-    write_round_suffix_hiddens: Optional[Tuple[torch.Tensor, ...]] = None
-    write_round_memories: Optional[Tuple[torch.Tensor, ...]] = None
-    body_entry_hidden: Optional[torch.FloatTensor] = None
 
 
 def pad_sequence(tensor, pad_size):
@@ -464,67 +256,35 @@ class PackedAttention(Qwen2Attention):
         attention_mask: List[torch.Tensor],
         packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ):
-        packed_query_states = self.q_proj(packed_sequence).view(
-            -1, self.num_heads, self.head_dim
-        )
-        packed_key_states = self.k_proj(packed_sequence).view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
-        packed_value_states = self.v_proj(packed_sequence).view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
+        packed_query_states = self.q_proj(packed_sequence).view(-1, self.num_heads, self.head_dim)
+        packed_key_states = self.k_proj(packed_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+        packed_value_states = self.v_proj(packed_sequence).view(-1, self.num_key_value_heads, self.head_dim)
 
         packed_query_states = self.q_norm(packed_query_states)
         packed_key_states = self.k_norm(packed_key_states)
 
         packed_cos, packed_sin = packed_position_embeddings
         packed_query_states, packed_key_states = apply_rotary_pos_emb(
-            packed_query_states,
-            packed_key_states,
-            packed_cos,
-            packed_sin,
-            unsqueeze_dim=1,
+            packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
         if isinstance(attention_mask, List):
-            packed_key_states = packed_key_states[:, :, None, :].repeat(
-                1, 1, self.num_key_value_groups, 1
-            )
-            packed_key_states = packed_key_states.reshape(
-                -1, self.num_heads, self.head_dim
-            )
-            packed_value_states = packed_value_states[:, :, None, :].repeat(
-                1, 1, self.num_key_value_groups, 1
-            )
-            packed_value_states = packed_value_states.reshape(
-                -1, self.num_heads, self.head_dim
-            )
+            packed_key_states = packed_key_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_key_states = packed_key_states.reshape(-1, self.num_heads, self.head_dim)
+            packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
 
-            unpacked_query_states = packed_query_states.transpose(0, 1).split(
-                sample_lens, dim=1
-            )
-            unpacked_key_states = packed_key_states.transpose(0, 1).split(
-                sample_lens, dim=1
-            )
-            unpacked_value_states = packed_value_states.transpose(0, 1).split(
-                sample_lens, dim=1
-            )
+            unpacked_query_states = packed_query_states.transpose(0, 1).split(sample_lens, dim=1)
+            unpacked_key_states = packed_key_states.transpose(0, 1).split(sample_lens, dim=1)
+            unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
             upacked_attn_output = []
-            for (
-                query_states,
-                key_states,
-                value_states,
-                attention_mask_per_sample,
-            ) in zip(
-                unpacked_query_states,
-                unpacked_key_states,
-                unpacked_value_states,
-                attention_mask,
+            for query_states, key_states, value_states, attention_mask_per_sample in zip(
+                unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
             ):
                 with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
                     attn_output = scaled_dot_product_attention(
-                        query_states.to(torch.bfloat16).unsqueeze(0),
-                        key_states.to(torch.bfloat16).unsqueeze(0),
+                        query_states.to(torch.bfloat16).unsqueeze(0), 
+                        key_states.to(torch.bfloat16).unsqueeze(0), 
                         value_states.to(torch.bfloat16).unsqueeze(0),
                         attention_mask_per_sample.to(torch.bfloat16).unsqueeze(0),
                     )
@@ -532,28 +292,20 @@ class PackedAttention(Qwen2Attention):
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
         else:
             pad_size = sum(sample_lens) - packed_query_states.shape[0]
-            packed_query_states = pad_sequence(
-                packed_query_states.permute(1, 0, 2), pad_size
-            )
-            packed_key_states = pad_sequence(
-                packed_key_states.permute(1, 0, 2), pad_size
-            )
-            packed_value_states = pad_sequence(
-                packed_value_states.permute(1, 0, 2), pad_size
-            )
+            packed_query_states = pad_sequence(packed_query_states.permute(1, 0, 2), pad_size)
+            packed_key_states = pad_sequence(packed_key_states.permute(1, 0, 2), pad_size)
+            packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
             packed_attn_output = flex_attention(
-                packed_query_states.unsqueeze(0),
-                packed_key_states.unsqueeze(0),
-                packed_value_states.unsqueeze(0),
+                packed_query_states.unsqueeze(0), 
+                packed_key_states.unsqueeze(0), 
+                packed_value_states.unsqueeze(0), 
                 enable_gqa=True,
                 block_mask=attention_mask,
             )
             end_index = packed_attn_output.shape[2] - pad_size
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
-        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(
-            -1, self.hidden_size
-        )
+        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.hidden_size)
         packed_attn_output = self.o_proj(packed_attn_output)
 
         return packed_attn_output
@@ -570,46 +322,29 @@ class PackedAttention(Qwen2Attention):
         update_past_key_values=True,
         is_causal=True,
     ):
-        packed_query_states = self.q_proj(packed_query_sequence).view(
-            -1, self.num_heads, self.head_dim
-        )
-        packed_key_states = self.k_proj(packed_query_sequence).view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
-        packed_value_states = self.v_proj(packed_query_sequence).view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
+        packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
+        packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+        packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
 
         packed_query_states = self.q_norm(packed_query_states)
         packed_key_states = self.k_norm(packed_key_states)
 
         packed_cos, packed_sin = packed_query_position_embeddings
         packed_query_states, packed_key_states = apply_rotary_pos_emb(
-            packed_query_states,
-            packed_key_states,
-            packed_cos,
-            packed_sin,
-            unsqueeze_dim=1,
+            packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
         packed_query_states = packed_query_states.to(torch.bfloat16)
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
-        if (
-            past_key_values is not None
-            and past_key_values.key_cache[self.layer_idx] is not None
-        ):
+        if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
             seqlens = sum(query_lens) + sum(key_values_lens)
-            merged_key_states = past_key_states.new_zeros(
-                (seqlens, self.num_key_value_heads, self.head_dim)
-            )
-            merged_value_states = past_key_states.new_zeros(
-                (seqlens, self.num_key_value_heads, self.head_dim)
-            )
+            merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
+            merged_value_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_key_states[packed_query_indexes] = packed_key_states
             merged_key_states[packed_key_value_indexes] = past_key_states
             merged_value_states[packed_query_indexes] = packed_value_states
@@ -621,30 +356,18 @@ class PackedAttention(Qwen2Attention):
             key_values_lens = query_lens
 
         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
-        cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(key_values_lens, dim=0), (1, 0)
-        )
+        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
 
-        if flash_attn_varlen_func is None or packed_query_states.device.type != "cuda":
-            packed_attn_output = _sdpa_varlen_inference(
-                query=packed_query_states,
-                key=merged_key_states,
-                value=merged_value_states,
-                query_lens=query_lens,
-                key_value_lens=key_values_lens,
-                causal=bool(is_causal),
-            )
-        else:
-            packed_attn_output = flash_attn_varlen_func(
-                q=packed_query_states,
-                k=merged_key_states,
-                v=merged_value_states,
-                cu_seqlens_q=cu_seqlens_q.to(torch.int32),
-                cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-                max_seqlen_q=max(query_lens).item(),
-                max_seqlen_k=max(key_values_lens).item(),
-                causal=is_causal,
-            )
+        packed_attn_output = flash_attn_varlen_func(
+            q=packed_query_states,
+            k=merged_key_states,
+            v=merged_value_states,
+            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+            max_seqlen_q=max(query_lens).item(),
+            max_seqlen_k=max(key_values_lens).item(),
+            causal=is_causal,
+        )
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
         packed_attn_output = self.o_proj(packed_attn_output)
 
@@ -669,18 +392,10 @@ class PackedAttentionMoT(Qwen2Attention):
             self.q_norm_moe_gen = nn.Identity()
             self.k_norm_moe_gen = nn.Identity()
 
-        self.q_proj_moe_gen = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=True
-        )
-        self.k_proj_moe_gen = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
-        )
-        self.v_proj_moe_gen = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
-        )
-        self.o_proj_moe_gen = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
-        )
+        self.q_proj_moe_gen = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
+        self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -697,121 +412,63 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_und_token_indexes: torch.LongTensor,
         packed_gen_token_indexes: torch.LongTensor,
     ):
-        packed_query_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_heads * self.head_dim)
-        )
-        packed_key_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
-        packed_value_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
+        packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
+        packed_key_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_key_value_heads * self.head_dim))
+        packed_value_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_key_value_heads * self.head_dim))
 
         packed_sequence_und = packed_sequence[packed_und_token_indexes]
         packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
 
         packed_query_states[packed_und_token_indexes] = self.q_proj(packed_sequence_und)
-        packed_query_states[packed_gen_token_indexes] = self.q_proj_moe_gen(
-            packed_sequence_gen
-        )
+        packed_query_states[packed_gen_token_indexes] = self.q_proj_moe_gen(packed_sequence_gen)
 
         packed_key_states[packed_und_token_indexes] = self.k_proj(packed_sequence_und)
-        packed_key_states[packed_gen_token_indexes] = self.k_proj_moe_gen(
-            packed_sequence_gen
-        )
+        packed_key_states[packed_gen_token_indexes] = self.k_proj_moe_gen(packed_sequence_gen)
 
         packed_value_states[packed_und_token_indexes] = self.v_proj(packed_sequence_und)
-        packed_value_states[packed_gen_token_indexes] = self.v_proj_moe_gen(
-            packed_sequence_gen
-        )
+        packed_value_states[packed_gen_token_indexes] = self.v_proj_moe_gen(packed_sequence_gen)
 
-        packed_query_states = packed_query_states.view(
-            -1, self.num_heads, self.head_dim
-        )
-        packed_key_states = packed_key_states.view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
-        packed_value_states = packed_value_states.view(
-            -1, self.num_key_value_heads, self.head_dim
-        )
+        packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+        packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+        packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
         if self.config.freeze_und:
-            packed_value_states[packed_und_token_indexes] = packed_value_states[
-                packed_und_token_indexes
-            ].detach()
+            packed_value_states[packed_und_token_indexes] = packed_value_states[packed_und_token_indexes].detach()
 
         packed_query_states_ = packed_query_states.new_zeros(packed_query_states.shape)
         packed_key_states_ = packed_key_states.new_zeros(packed_key_states.shape)
 
-        packed_query_states_[packed_und_token_indexes] = self.q_norm(
-            packed_query_states[packed_und_token_indexes]
-        )
+        packed_query_states_[packed_und_token_indexes] = self.q_norm(packed_query_states[packed_und_token_indexes])
         if self.config.freeze_und:
-            packed_query_states_[packed_und_token_indexes] = packed_query_states_[
-                packed_und_token_indexes
-            ].detach()
-        packed_query_states_[packed_gen_token_indexes] = self.q_norm_moe_gen(
-            packed_query_states[packed_gen_token_indexes]
-        )
+            packed_query_states_[packed_und_token_indexes] = packed_query_states_[packed_und_token_indexes].detach()
+        packed_query_states_[packed_gen_token_indexes] = self.q_norm_moe_gen(packed_query_states[packed_gen_token_indexes])
 
-        packed_key_states_[packed_und_token_indexes] = self.k_norm(
-            packed_key_states[packed_und_token_indexes]
-        )
+        packed_key_states_[packed_und_token_indexes] = self.k_norm(packed_key_states[packed_und_token_indexes])
         if self.config.freeze_und:
-            packed_key_states_[packed_und_token_indexes] = packed_key_states_[
-                packed_und_token_indexes
-            ].detach()
-        packed_key_states_[packed_gen_token_indexes] = self.k_norm_moe_gen(
-            packed_key_states[packed_gen_token_indexes]
-        )
+            packed_key_states_[packed_und_token_indexes] = packed_key_states_[packed_und_token_indexes].detach()
+        packed_key_states_[packed_gen_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_gen_token_indexes])
 
         packed_cos, packed_sin = packed_position_embeddings
         packed_query_states_, packed_key_states_ = apply_rotary_pos_emb(
-            packed_query_states_,
-            packed_key_states_,
-            packed_cos,
-            packed_sin,
-            unsqueeze_dim=1,
+            packed_query_states_, packed_key_states_, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
         if isinstance(attention_mask, List):
-            packed_key_states_ = packed_key_states_[:, :, None, :].repeat(
-                1, 1, self.num_key_value_groups, 1
-            )
-            packed_key_states_ = packed_key_states_.reshape(
-                -1, self.num_heads, self.head_dim
-            )
-            packed_value_states = packed_value_states[:, :, None, :].repeat(
-                1, 1, self.num_key_value_groups, 1
-            )
-            packed_value_states = packed_value_states.reshape(
-                -1, self.num_heads, self.head_dim
-            )
+            packed_key_states_ = packed_key_states_[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
+            packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
 
-            unpacked_query_states = packed_query_states_.transpose(0, 1).split(
-                sample_lens, dim=1
-            )
-            unpacked_key_states = packed_key_states_.transpose(0, 1).split(
-                sample_lens, dim=1
-            )
-            unpacked_value_states = packed_value_states.transpose(0, 1).split(
-                sample_lens, dim=1
-            )
+            unpacked_query_states = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)
+            unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
+            unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
             upacked_attn_output = []
-            for (
-                query_states,
-                key_states,
-                value_states,
-                attention_mask_per_sample,
-            ) in zip(
-                unpacked_query_states,
-                unpacked_key_states,
-                unpacked_value_states,
-                attention_mask,
+            for query_states, key_states, value_states, attention_mask_per_sample in zip(
+                unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
             ):
                 with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
                     attn_output = scaled_dot_product_attention(
-                        query_states.to(torch.bfloat16).unsqueeze(0),
-                        key_states.to(torch.bfloat16).unsqueeze(0),
+                        query_states.to(torch.bfloat16).unsqueeze(0), 
+                        key_states.to(torch.bfloat16).unsqueeze(0), 
                         value_states.to(torch.bfloat16).unsqueeze(0),
                         attention_mask_per_sample.to(torch.bfloat16).unsqueeze(0),
                     )
@@ -819,35 +476,23 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
         else:
             pad_size = sum(sample_lens) - packed_query_states.shape[0]
-            packed_query_states_ = pad_sequence(
-                packed_query_states_.permute(1, 0, 2), pad_size
-            )
-            packed_key_states_ = pad_sequence(
-                packed_key_states_.permute(1, 0, 2), pad_size
-            )
-            packed_value_states = pad_sequence(
-                packed_value_states.permute(1, 0, 2), pad_size
-            )
+            packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
+            packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
+            packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
             packed_attn_output = flex_attention(
-                packed_query_states_.unsqueeze(0),  # 1, num_head, L, head_dim
-                packed_key_states_.unsqueeze(0),
-                packed_value_states.unsqueeze(0),
+                packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
+                packed_key_states_.unsqueeze(0), 
+                packed_value_states.unsqueeze(0), 
                 enable_gqa=True,
                 block_mask=attention_mask,
             )
             end_index = packed_attn_output.shape[2] - pad_size
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
-        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(
-            -1, self.num_heads * self.head_dim
-        )
+        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
-        packed_attn_output_[packed_und_token_indexes] = self.o_proj(
-            packed_attn_output[packed_und_token_indexes]
-        )
-        packed_attn_output_[packed_gen_token_indexes] = self.o_proj_moe_gen(
-            packed_attn_output[packed_gen_token_indexes]
-        )
+        packed_attn_output_[packed_und_token_indexes] = self.o_proj(packed_attn_output[packed_und_token_indexes])
+        packed_attn_output_[packed_gen_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])
 
         return packed_attn_output_
 
@@ -865,151 +510,59 @@ class PackedAttentionMoT(Qwen2Attention):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        packed_memory_token_indexes=None,
-        block_gen_reads_memory=False,
-        mask_prompt_kv_for_nonmemory=False,
-        force_memory_qkv_zero=False,
-        mechanism_attention_trace=None,
-        mechanism_stage=None,
-        memory_kv_sink=None,
-        reader_query_sink=None,
     ):
-        if mode == "und":
-            packed_query_states = self.q_proj(packed_query_sequence).view(
-                -1, self.num_heads, self.head_dim
-            )
-            packed_key_states = self.k_proj(packed_query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-            packed_value_states = self.v_proj(packed_query_sequence).view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
+        if mode == 'und':
+            packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
+            packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
             packed_query_states = self.q_norm(packed_query_states)
             packed_key_states = self.k_norm(packed_key_states)
-        elif mode == "gen":
+        elif mode == 'gen':
             packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
-            packed_query_states = packed_query_sequence.new_zeros(
-                (packed_query_sequence.shape[0], self.num_heads * self.head_dim)
-            )
-            packed_key_states = packed_query_sequence.new_zeros(
-                (
-                    packed_query_sequence.shape[0],
-                    self.num_key_value_heads * self.head_dim,
-                )
-            )
-            packed_value_states = packed_query_sequence.new_zeros(
-                (
-                    packed_query_sequence.shape[0],
-                    self.num_key_value_heads * self.head_dim,
-                )
-            )
+            packed_query_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_heads * self.head_dim))
+            packed_key_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
+            packed_value_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
 
             packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
             packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
-            packed_query_states[packed_text_indexes] = project_und_queries(
-                self.q_proj,
-                packed_text_query_sequence,
-                packed_text_indexes,
-                packed_memory_token_indexes,
-            )
-            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(
-                packed_vae_query_sequence
-            )
+            packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
+            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
 
-            packed_key_states[packed_text_indexes] = self.k_proj(
-                packed_text_query_sequence
-            )
-            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(
-                packed_vae_query_sequence
-            )
+            packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
+            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
 
-            packed_value_states[packed_text_indexes] = self.v_proj(
-                packed_text_query_sequence
-            )
-            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(
-                packed_vae_query_sequence
-            )
+            packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
+            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
 
-            packed_query_states = packed_query_states.view(
-                -1, self.num_heads, self.head_dim
-            )
-            packed_key_states = packed_key_states.view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
-            packed_value_states = packed_value_states.view(
-                -1, self.num_key_value_heads, self.head_dim
-            )
+            packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+            packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
 
-            # Keep the inference numerics while avoiding read-then-overwrite
-            # mutations on tensors that carry loop-LoRA autograd history.
-            raw_query_states = packed_query_states.to(torch.float32)
-            normalized_query_states = torch.zeros_like(raw_query_states)
-            normalized_query_states[packed_text_indexes] = self.q_norm(
-                raw_query_states[packed_text_indexes]
-            )
-            normalized_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(
-                raw_query_states[packed_vae_token_indexes]
-            )
-            packed_query_states = normalized_query_states
+            packed_query_states = packed_query_states.to(torch.float32)
+            packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
+            packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(packed_query_states[packed_vae_token_indexes])
 
-            raw_key_states = packed_key_states.to(torch.float32)
-            normalized_key_states = torch.zeros_like(raw_key_states)
-            normalized_key_states[packed_text_indexes] = self.k_norm(
-                raw_key_states[packed_text_indexes]
-            )
-            normalized_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(
-                raw_key_states[packed_vae_token_indexes]
-            )
-            packed_key_states = normalized_key_states
+            packed_key_states = packed_key_states.to(torch.float32)
+            packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
+            packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
 
         packed_cos, packed_sin = packed_query_position_embeddings
         packed_query_states, packed_key_states = apply_rotary_pos_emb(
-            packed_query_states,
-            packed_key_states,
-            packed_cos,
-            packed_sin,
-            unsqueeze_dim=1,
+            packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
         packed_query_states = packed_query_states.to(torch.bfloat16)
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
-        if force_memory_qkv_zero:
-            packed_query_states, packed_key_states, packed_value_states = zero_memory_qkv(
-                packed_query_states, packed_key_states, packed_value_states,
-                packed_memory_token_indexes,
-            )
-
-        # Exact tensors used by this native attention call, after RMSNorm,
-        # projections, q/k norm and RoPE. Capture before any cache merge.
-        if memory_kv_sink is not None:
-            if packed_memory_token_indexes is None or not packed_memory_token_indexes.numel():
-                raise ValueError("memory KV capture requires memory token indices")
-            memory_kv_sink.append((
-                packed_key_states[packed_memory_token_indexes].detach().clone(),
-                packed_value_states[packed_memory_token_indexes].detach().clone()))
-        if reader_query_sink is not None:
-            if packed_vae_token_indexes is None or not packed_vae_token_indexes.numel():
-                raise ValueError("reader query capture requires GEN indices")
-            # Frozen Q weights still transmit gradients to earlier OPD gates.
-            reader_query_sink.append(packed_query_states[packed_vae_token_indexes].clone())
-
-        if (
-            past_key_values is not None
-            and past_key_values.key_cache[self.layer_idx] is not None
-        ):
+        if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
             seqlens = sum(query_lens) + sum(key_values_lens)
-            merged_key_states = past_key_states.new_zeros(
-                size=[seqlens, self.num_key_value_heads, self.head_dim]
-            )
-            merged_value_states = past_key_states.new_zeros(
-                size=[seqlens, self.num_key_value_heads, self.head_dim]
-            )
+            merged_key_states = past_key_states.new_zeros(size=[seqlens, self.num_key_value_heads, self.head_dim])
+            merged_value_states = past_key_states.new_zeros(size=[seqlens, self.num_key_value_heads, self.head_dim])
             merged_key_states[packed_query_indexes] = packed_key_states
             merged_key_states[packed_key_value_indexes] = past_key_states
             merged_value_states[packed_query_indexes] = packed_value_states
@@ -1021,68 +574,24 @@ class PackedAttentionMoT(Qwen2Attention):
             key_values_lens = query_lens
 
         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
-        cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(key_values_lens, dim=0), (1, 0)
-        )
+        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
 
-        blocked_slices = None
-        if (bool(block_gen_reads_memory) or bool(mask_prompt_kv_for_nonmemory)) and mode == "gen":
-            blocked_slices = round0_blocked_slices(
-                query_lens,
-                key_values_lens,
-                packed_vae_token_indexes,
-                packed_memory_token_indexes,
-                mask_prompt_kv_for_nonmemory=bool(mask_prompt_kv_for_nonmemory),
-                block_gen_reads_memory=bool(block_gen_reads_memory),
-            )
-            if not any(
-                int(gen.numel()) > 0 and int(mem.numel()) > 0
-                for gen, mem in blocked_slices
-            ):
-                blocked_slices = None
-
-        append_attention_stats(
-            mechanism_attention_trace, query=packed_query_states,
-            key=merged_key_states, query_lens=query_lens, key_lens=key_values_lens,
-            memory_indexes=packed_memory_token_indexes,
-            gen_indexes=packed_vae_token_indexes, blocked_slices=blocked_slices,
-            layer=self.layer_idx, stage=mechanism_stage,
+        packed_attn_output = flash_attn_varlen_func(
+            q=packed_query_states,
+            k=merged_key_states,
+            v=merged_value_states,
+            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+            max_seqlen_q=max(query_lens).item(),
+            max_seqlen_k=max(key_values_lens).item(),
+            causal=is_causal,
         )
-        if (flash_attn_varlen_func is None or packed_query_states.device.type != "cuda"
-                or blocked_slices is not None):
-            packed_attn_output = _sdpa_varlen_inference(
-                query=packed_query_states,
-                key=merged_key_states,
-                value=merged_value_states,
-                query_lens=query_lens,
-                key_value_lens=key_values_lens,
-                causal=bool(is_causal),
-                blocked_slices=blocked_slices,
-            )
-        else:
-            packed_attn_output = flash_attn_varlen_func(
-                q=packed_query_states,
-                k=merged_key_states,
-                v=merged_value_states,
-                cu_seqlens_q=cu_seqlens_q.to(torch.int32),
-                cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-                max_seqlen_q=max(query_lens).item(),
-                max_seqlen_k=max(key_values_lens).item(),
-                causal=is_causal,
-            )
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
-        if mode == "und":
+        if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
-        elif mode == "gen":
-            raw_attn_output = packed_attn_output
-            routed_attn_output = torch.zeros_like(raw_attn_output)
-            routed_attn_output[packed_text_indexes] = self.o_proj(
-                raw_attn_output[packed_text_indexes]
-            )
-            routed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(
-                raw_attn_output[packed_vae_token_indexes]
-            )
-            packed_attn_output = routed_attn_output
+        elif mode == 'gen':
+            packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
 
         if update_past_key_values:
             past_key_values.key_cache[self.layer_idx] = merged_key_states
@@ -1100,9 +609,7 @@ class Qwen2DecoderLayer(nn.Module):
 
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -1122,7 +629,7 @@ class Qwen2DecoderLayer(nn.Module):
         packed_sequence = self.input_layernorm(packed_sequence)
 
         # Self Attention
-        packed_sequence = self.self_attn.forward_train(
+        packed_sequence = self.self_attn(
             packed_sequence=packed_sequence,
             sample_lens=sample_lens,
             attention_mask=attention_mask,
@@ -1155,7 +662,7 @@ class Qwen2DecoderLayer(nn.Module):
         packed_query_sequence = self.input_layernorm(packed_query_sequence)
 
         # Self Attention
-        packed_query_sequence, past_key_values = self.self_attn.forward_inference(
+        packed_query_sequence, past_key_values = self.self_attn(
             packed_query_sequence=packed_query_sequence,
             query_lens=query_lens,
             packed_query_position_embeddings=packed_query_position_embeddings,
@@ -1179,9 +686,9 @@ class Qwen2DecoderLayer(nn.Module):
 
 class Qwen2MoTDecoderLayer(nn.Module):
     def __init__(
-        self,
-        config,
-        layer_idx: Optional[int] = None,
+        self, 
+        config, 
+        layer_idx: Optional[int] = None, 
         attn_module: Optional[Qwen2Attention] = PackedAttentionMoT,
     ):
         super().__init__()
@@ -1193,15 +700,9 @@ class Qwen2MoTDecoderLayer(nn.Module):
         self.mlp = Qwen2MLP(config)
         self.mlp_moe_gen = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_moe_gen = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm_moe_gen = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -1221,15 +722,11 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
         residual = packed_sequence
         packed_sequence_ = packed_sequence.new_zeros(packed_sequence.shape)
-        packed_sequence_[packed_und_token_indexes] = self.input_layernorm(
-            packed_sequence[packed_und_token_indexes]
-        )
-        packed_sequence_[packed_gen_token_indexes] = self.input_layernorm_moe_gen(
-            packed_sequence[packed_gen_token_indexes]
-        )
+        packed_sequence_[packed_und_token_indexes] = self.input_layernorm(packed_sequence[packed_und_token_indexes])
+        packed_sequence_[packed_gen_token_indexes] = self.input_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
 
         # Self Attention
-        packed_sequence_ = self.self_attn.forward_train(
+        packed_sequence_ = self.self_attn(
             packed_sequence=packed_sequence_,
             sample_lens=sample_lens,
             attention_mask=attention_mask,
@@ -1238,9 +735,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
             packed_gen_token_indexes=packed_gen_token_indexes,
         )
         if self.freeze_und:
-            packed_sequence_[packed_und_token_indexes] = packed_sequence_[
-                packed_und_token_indexes
-            ].detach()
+            packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()
         packed_sequence = residual + packed_sequence_
 
         # Fully Connected
@@ -1250,14 +745,10 @@ class Qwen2MoTDecoderLayer(nn.Module):
             self.post_attention_layernorm(packed_sequence[packed_und_token_indexes])
         )
         if self.freeze_und:
-            packed_sequence_[packed_und_token_indexes] = packed_sequence_[
-                packed_und_token_indexes
-            ].detach()
-
+            packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()
+    
         packed_sequence_[packed_gen_token_indexes] = self.mlp_moe_gen(
-            self.post_attention_layernorm_moe_gen(
-                packed_sequence[packed_gen_token_indexes]
-            )
+            self.post_attention_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
         )
         packed_sequence = residual + packed_sequence_
 
@@ -1277,45 +768,26 @@ class Qwen2MoTDecoderLayer(nn.Module):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        packed_memory_token_indexes=None,
-        block_gen_reads_memory=False,
-        mask_prompt_kv_for_nonmemory=False,
-        force_memory_qkv_zero=False,
-        mechanism_attention_trace=None,
-        mechanism_stage=None,
-        opd_memory_hidden=None,
-        memory_kv_sink=None,
-        reader_warmup_bank=None,
-        reader_warmup_sink=None,
     ) -> BaseNavitOutputWithPast:
+        
+        enable_taylorseer = getattr(self, 'enable_taylorseer', False)
 
-        enable_taylorseer = getattr(self, "enable_taylorseer", False)
-
-        if enable_taylorseer and self.current["type"] == "full":
-            self.current["module"] = "total"
+        if enable_taylorseer and self.current['type'] == 'full':
+            self.current['module'] = 'total'
             taylor_cache_init(cache_dic=self.cache_dic, current=self.current)
 
-        if not enable_taylorseer or (
-            enable_taylorseer and self.current["type"] == "full"
-        ):
+        if not enable_taylorseer or (enable_taylorseer and self.current['type'] == 'full'):
             residual = packed_query_sequence
             if mode == "und":
                 packed_query_sequence = self.input_layernorm(packed_query_sequence)
             elif mode == "gen":
                 packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-                packed_query_sequence_[packed_text_indexes] = self.input_layernorm(
-                    packed_query_sequence[packed_text_indexes]
-                )
-                packed_query_sequence_[packed_vae_token_indexes] = (
-                    self.input_layernorm_moe_gen(
-                        packed_query_sequence[packed_vae_token_indexes]
-                    )
-                )
+                packed_query_sequence_[packed_text_indexes] = self.input_layernorm(packed_query_sequence[packed_text_indexes])
+                packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(packed_query_sequence[packed_vae_token_indexes])
                 packed_query_sequence = packed_query_sequence_
 
             # Self Attention
-            reader_query_sink = [] if (opd_memory_hidden is not None or reader_warmup_bank is not None) else None
-            packed_query_sequence, past_key_values = self.self_attn.forward_inference(
+            packed_query_sequence, past_key_values = self.self_attn(
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
                 packed_query_position_embeddings=packed_query_position_embeddings,
@@ -1328,90 +800,33 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 mode=mode,
                 packed_vae_token_indexes=packed_vae_token_indexes,
                 packed_text_indexes=packed_text_indexes,
-                packed_memory_token_indexes=packed_memory_token_indexes,
-                block_gen_reads_memory=block_gen_reads_memory,
-                mask_prompt_kv_for_nonmemory=mask_prompt_kv_for_nonmemory,
-                force_memory_qkv_zero=force_memory_qkv_zero,
-                mechanism_attention_trace=mechanism_attention_trace,
-                mechanism_stage=mechanism_stage,
-                memory_kv_sink=memory_kv_sink,
-                reader_query_sink=reader_query_sink,
             )
-            if opd_memory_hidden is not None or reader_warmup_bank is not None:
-                if mode != "gen" or packed_vae_token_indexes is None or not hasattr(self, "memory_reader"):
-                    raise ValueError("OPD reader requires installed MoT GEN layer")
-                if len(reader_query_sink) != 1:
-                    raise RuntimeError("native GEN query was not captured")
-                memory = opd_memory_hidden if opd_memory_hidden is not None else reader_warmup_bank
-                reader_query=reader_query_sink[0]
-                if reader_warmup_bank is not None:
-                    reader_query=reader_query.detach()
-                readout = self.memory_reader(gen_query=reader_query,
-                    memory_key=memory.key, memory_value=memory.value)
-            if reader_warmup_bank is not None:
-                if opd_memory_hidden is not None or reader_warmup_sink is None:
-                    raise ValueError("warm-up is side-head only and cannot inject")
-                if (past_key_values is None or past_key_values.key_cache[self.self_attn.layer_idx] is None
-                        or query_lens.numel() != 1):
-                    raise ValueError("warm-up prompt bank requires B=1 native prompt cache")
-                target = self.memory_reader.prompt_target(gen_query=reader_query,
-                    prompt_key=past_key_values.key_cache[self.self_attn.layer_idx],
-                    prompt_value=past_key_values.value_cache[self.self_attn.layer_idx])
-                reader_warmup_sink[self.self_attn.layer_idx] = (readout, target)
-            if opd_memory_hidden is not None:
-                native_gen_rms = (packed_query_sequence[packed_vae_token_indexes].detach()
-                    .float().square().mean().sqrt()) if torch.is_grad_enabled() else None
-                packed_query_sequence = packed_query_sequence.clone()
-                packed_query_sequence[packed_vae_token_indexes] += (
-                    self.memory_reader.injection_gate.to(readout.dtype) * readout)
-                if native_gen_rms is not None:
-                    self.memory_reader.last_native_attn_rms = float(native_gen_rms)
             packed_query_sequence = residual + packed_query_sequence
 
             # Fully Connected
             residual = packed_query_sequence
             if mode == "und":
-                packed_query_sequence = self.post_attention_layernorm(
-                    packed_query_sequence
-                )
+                packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
                 packed_query_sequence = self.mlp(packed_query_sequence)
             elif mode == "gen":
                 packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-                packed_vae_query_sequence = packed_query_sequence[
-                    packed_vae_token_indexes
-                ]
-                packed_text_query_sequence = self.post_attention_layernorm(
-                    packed_text_query_sequence
-                ).to(torch.bfloat16)
-                packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(
-                    packed_vae_query_sequence
-                ).to(torch.bfloat16)
+                packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
+                packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
+                packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(torch.bfloat16)
 
-                packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(
-                    torch.bfloat16
-                )
-                packed_query_sequence_[packed_text_indexes] = self.mlp(
-                    packed_text_query_sequence
-                )
-                packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(
-                    packed_vae_query_sequence
-                )
+                packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
+                packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
+                packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
                 packed_query_sequence = packed_query_sequence_
 
             packed_query_sequence = residual + packed_query_sequence
-
+        
         if enable_taylorseer:
-            if self.current["type"] == "full":
-                derivative_approximation(
-                    cache_dic=self.cache_dic,
-                    current=self.current,
-                    feature=packed_query_sequence,
-                )
-            elif self.current["type"] == "Taylor":
-                self.current["module"] = "total"
-                packed_query_sequence = taylor_formula(
-                    cache_dic=self.cache_dic, current=self.current
-                )
+            if self.current['type'] == 'full':
+                derivative_approximation(cache_dic=self.cache_dic, current=self.current, feature=packed_query_sequence)
+            elif self.current['type'] == 'Taylor':
+                self.current['module'] = 'total'
+                packed_query_sequence = taylor_formula(cache_dic=self.cache_dic, current=self.current)
 
         return packed_query_sequence, past_key_values
 
@@ -1426,9 +841,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
         self.mlp = Qwen2MLP(config)
         self.mlp_moe_gen = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -1450,7 +863,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
         packed_sequence = self.input_layernorm(packed_sequence)
 
         # Self Attention
-        packed_sequence = self.self_attn.forward_train(
+        packed_sequence = self.self_attn(
             packed_sequence=packed_sequence,
             sample_lens=sample_lens,
             attention_mask=attention_mask,
@@ -1464,9 +877,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
 
         packed_sequence_new = packed_sequence.new_zeros(packed_sequence.shape)
         packed_sequence_und = self.mlp(packed_sequence[packed_und_token_indexes])
-        packed_sequence_gen = self.mlp_moe_gen(
-            packed_sequence[packed_gen_token_indexes]
-        )
+        packed_sequence_gen = self.mlp_moe_gen(packed_sequence[packed_gen_token_indexes])
         packed_sequence_new[packed_und_token_indexes] = packed_sequence_und
         packed_sequence_new[packed_gen_token_indexes] = packed_sequence_gen
 
@@ -1494,7 +905,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
         packed_query_sequence = self.input_layernorm(packed_query_sequence)
 
         # Self Attention
-        packed_query_sequence, past_key_values = self.self_attn.forward_inference(
+        packed_query_sequence, past_key_values = self.self_attn(
             packed_query_sequence=packed_query_sequence,
             query_lens=query_lens,
             packed_query_position_embeddings=packed_query_position_embeddings,
@@ -1513,15 +924,9 @@ class Qwen2MoEDecoderLayer(nn.Module):
         if mode == "und":
             packed_query_sequence = self.mlp(packed_query_sequence)
         elif mode == "gen":
-            packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(
-                torch.bfloat16
-            )
-            packed_query_sequence_[packed_text_indexes] = self.mlp(
-                packed_query_sequence[packed_text_indexes]
-            )
-            packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(
-                packed_query_sequence[packed_vae_token_indexes]
-            )
+            packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
+            packed_query_sequence_[packed_text_indexes] = self.mlp(packed_query_sequence[packed_text_indexes])
+            packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_query_sequence[packed_vae_token_indexes])
             packed_query_sequence = packed_query_sequence_
         packed_query_sequence = residual + packed_query_sequence
 
@@ -1531,9 +936,7 @@ class Qwen2MoEDecoderLayer(nn.Module):
 Decoder_layer_dict = {
     "Qwen2DecoderLayer": Qwen2DecoderLayer,
     "Qwen2MoEDecoderLayer": Qwen2MoEDecoderLayer,
-    "Qwen2MoTDecoderLayer": partial(
-        Qwen2MoTDecoderLayer, attn_module=PackedAttentionMoT
-    ),
+    "Qwen2MoTDecoderLayer": partial(Qwen2MoTDecoderLayer, attn_module=PackedAttentionMoT),
 }
 
 
@@ -1542,46 +945,21 @@ class Qwen2Model(Qwen2PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.use_moe = "Mo" in config.layer_module
+        self.use_moe = 'Mo' in config.layer_module
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         layer_module = Decoder_layer_dict[config.layer_module]
         self.layers = nn.ModuleList(
-            [
-                layer_module(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [layer_module(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
 
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if self.use_moe:
-            self.norm_moe_gen = Qwen2RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
+            self.norm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
-
-        # 2026-04-29: BAGEL's NaViT Qwen2 stack does NOT inherit HF's
-        # standard `_gradient_checkpointing_func` machinery (that path
-        # lives in `qwen_latent_cot/bagel/modeling/qwen2/modeling_qwen2.py`,
-        # which BAGEL doesn't use). We add a tiny manual flag that
-        # `forward_train` checks; see `gradient_checkpointing_enable`.
-        self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def gradient_checkpointing_enable(self, **_kwargs) -> None:
-        """Enable activation checkpointing on every decoder layer.
-
-        Uses `use_reentrant=False` (the new default contract) which is
-        the only mode compatible with FSDP `use_orig_params=True`.
-        """
-        self.gradient_checkpointing = True
-
-    def gradient_checkpointing_disable(self) -> None:
-        self.gradient_checkpointing = False
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -1597,11 +975,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         packed_position_ids: torch.Tensor,
         packed_und_token_indexes: Optional[torch.LongTensor] = None,
         packed_gen_token_indexes: Optional[torch.LongTensor] = None,
-    ):
+    ) -> torch.Tensor:
+
         if self.config.freeze_und:
-            packed_sequence[packed_und_token_indexes] = packed_sequence[
-                packed_und_token_indexes
-            ].detach()
+            packed_sequence[packed_und_token_indexes] = packed_sequence[packed_und_token_indexes].detach()
 
         # create position embeddings to be shared across the decoder layers
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
@@ -1619,46 +996,24 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 packed_gen_token_indexes=packed_gen_token_indexes,
             )
 
-        use_grad_ckpt = bool(self.gradient_checkpointing) and self.training
-        for layer_index, decoder_layer in enumerate(self.layers):
-            if use_grad_ckpt:
-                packed_sequence = torch.utils.checkpoint.checkpoint(
-                    decoder_layer,
-                    packed_sequence=packed_sequence,
-                    sample_lens=sample_lens,
-                    attention_mask=attention_mask,
-                    packed_position_embeddings=packed_position_embeddings,
-                    use_reentrant=False,
-                    **extra_inputs,
-                )
-            else:
-                actual_layer = getattr(
-                    decoder_layer, "_checkpoint_wrapped_module", decoder_layer
-                )
-                packed_sequence = actual_layer.forward_train(
-                    packed_sequence=packed_sequence,
-                    sample_lens=sample_lens,
-                    attention_mask=attention_mask,
-                    packed_position_embeddings=packed_position_embeddings,
-                    **extra_inputs,
-                )
+        for decoder_layer in self.layers:
+            packed_sequence = decoder_layer(
+                packed_sequence=packed_sequence,
+                sample_lens=sample_lens,
+                attention_mask=attention_mask,
+                packed_position_embeddings=packed_position_embeddings,
+                **extra_inputs
+            )
 
         if self.use_moe:
             packed_sequence_ = torch.zeros_like(packed_sequence)
-            packed_sequence_[packed_und_token_indexes] = self.norm(
-                packed_sequence[packed_und_token_indexes]
-            )
+            packed_sequence_[packed_und_token_indexes] = self.norm(packed_sequence[packed_und_token_indexes])
             if self.config.freeze_und:
-                packed_sequence_[packed_und_token_indexes] = packed_sequence_[
-                    packed_und_token_indexes
-                ].detach()
-            packed_sequence_[packed_gen_token_indexes] = self.norm_moe_gen(
-                packed_sequence[packed_gen_token_indexes]
-            )
-            output = packed_sequence_
+                packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()
+            packed_sequence_[packed_gen_token_indexes] = self.norm_moe_gen(packed_sequence[packed_gen_token_indexes])
+            return packed_sequence_
         else:
-            output = self.norm(packed_sequence)
-        return output
+            return self.norm(packed_sequence)
 
     def forward_inference(
         self,
@@ -1674,655 +1029,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        packed_boundary_token_indexes: Optional[torch.Tensor] = None,
-        within_step_loop_start: Optional[int] = None,
-        within_step_loop_end: Optional[int] = None,
-        within_step_loop_repeat: int = 1,
-        within_step_loop_damping: float = 1.0,
-        packed_memory_token_indexes: Optional[torch.Tensor] = None,
-        memory_loop_repeat: int = 1,
-        memory_loop_start: Optional[int] = None,
-        memory_loop_end: Optional[int] = None,
-        memory_body_in: Optional[torch.Tensor] = None,
-        block_gen_reads_memory: bool = True,
-        collect_round_diagnostics: bool = False,
-        memory_read_only: bool = False,
-        memory_read_adapter_mode: str = "read",
-        memory_write_source: str = "correct",
-        memory_write_probe: Optional[list] = None,
-        capture_body_entry_at: Optional[int] = None,
-        prompt_body_memory_init: Optional[torch.Tensor] = None,
-        prompt_kv_mask_scope: str = "none",
-        single_pass_memory_update_end: Optional[int] = None,
-        single_pass_prompt_mask_start: Optional[int] = None,
-        single_pass_prompt_mask_end: Optional[int] = None,
-        memory_control_mode: Optional[str] = None,
-        memory_control_rounds: int = 2,
-        mechanism_diagnostics: Optional[dict] = None,
-        write_memory_override: Optional[torch.Tensor] = None,
-        write_memory_update: bool = True,
-        mask_prompt_kv_during_write: bool = False,
-        collect_write_round_outputs: bool = False,
-        attention_mass_sink: Optional[list] = None,
-        attention_mass_layers: Tuple[int, ...] = (12, 15, 19),
-        opd_memory_hidden: Optional[torch.Tensor] = None,
-        opd_reader_start: Optional[int] = None,
-        opd_reader_end: Optional[int] = None,
-        capture_memory_body_entries: bool = False,
-        capture_memory_body_kv: bool = False,
-        reader_warmup_bank=None,
-        reader_warmup_sink=None,
     ) -> BaseNavitOutputWithPast:
-
-        enable_taylorseer = getattr(self, "enable_taylorseer", False)
+        
+        enable_taylorseer = getattr(self, 'enable_taylorseer', False)
         if enable_taylorseer:
             cal_type(self.cache_dic, self.current)
-            self.current["stream"] = "layers_stream"
+            self.current['stream'] = 'layers_stream'
 
         # create position embeddings to be shared across the decoder layers
-        cos, sin = self.rotary_emb(
-            packed_query_sequence, packed_query_position_ids.unsqueeze(0)
-        )
-        cos = cos.squeeze(0)
-        sin = sin.squeeze(0)
-        packed_query_position_embeddings = (cos, sin)
-
-        reader_bank = opd_memory_hidden if opd_memory_hidden is not None else reader_warmup_bank
-        if reader_bank is not None:
-            from ...memory_read_bank import MemoryReadBank
-            if not isinstance(reader_bank, MemoryReadBank):
-                raise ValueError("reader requires a layer-matched MemoryReadBank")
-            if (not self.use_moe or mode != "gen" or update_past_key_values or is_causal
-                    or packed_memory_token_indexes is not None or memory_loop_repeat != 1
-                    or within_step_loop_repeat != 1 or memory_read_only
-                    or opd_reader_start is None or opd_reader_end is None
-                    or not 0 <= opd_reader_start < opd_reader_end <= len(self.layers)
-                    or query_lens.numel() != 1 or enable_taylorseer):
-                raise ValueError("reader requires native K=0 GEN forward and explicit body")
-            reader_bank.require_layers(opd_reader_start, opd_reader_end)
-            if opd_memory_hidden is not None and reader_warmup_bank is not None:
-                raise ValueError("OPD injection and warm-up side head are exclusive")
-        if capture_memory_body_entries and (not memory_read_only or memory_loop_repeat != 1):
-            raise ValueError("layer-entry memory capture requires one strict Read round")
-        if capture_memory_body_kv and (not capture_memory_body_entries or not memory_read_only):
-            raise ValueError("native KV capture requires strict Read entry capture")
-        if capture_memory_body_kv and query_lens.numel() != 1:
-            raise ValueError("Read bank capture currently supports B=1")
-        if capture_memory_body_kv and not self.use_moe:
-            raise ValueError("native Read bank capture requires MoT")
-
-        extra_inputs = {}
-        if self.use_moe:
-            extra_inputs.update(mode=mode)
-            if mode == "gen":
-                assert packed_vae_token_indexes is not None
-                assert packed_text_indexes is not None
-                extra_inputs.update(
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_text_indexes=packed_text_indexes,
-                )
-
-        def run_layer(
-            layer_idx,
-            hidden,
-            *,
-            checkpoint=False,
-            loop_adapter_mode="off",
-            packed_memory_token_indexes=None,
-            block_gen_reads_memory=False,
-            mask_prompt_kv_for_nonmemory=False,
-            force_memory_qkv_zero=False,
-            mechanism_attention_trace=None,
-            mechanism_stage=None,
-            memory_kv_sink=None,
-        ):
-            decoder_layer = self.layers[layer_idx]
-            if enable_taylorseer:
-                decoder_layer.current = self.current
-                decoder_layer.cache_dic = self.cache_dic
-                decoder_layer.enable_taylorseer = True
-                self.current["layer"] = layer_idx
-            actual_layer = getattr(
-                decoder_layer, "_checkpoint_wrapped_module", decoder_layer
-            )
-            if attention_mass_sink is not None and layer_idx in attention_mass_layers:
-                mechanism_attention_trace = attention_mass_sink
-                mechanism_stage = loop_adapter_mode
-            layer_kwargs = dict(
-                query_lens=query_lens,
-                packed_query_position_embeddings=packed_query_position_embeddings,
-                packed_query_indexes=packed_query_indexes,
-                past_key_values=past_key_values,
-                key_values_lens=key_values_lens,
-                packed_key_value_indexes=packed_key_value_indexes,
-                update_past_key_values=update_past_key_values,
-                is_causal=is_causal,
-                **extra_inputs,
-            )
-            if reader_bank is not None and opd_reader_start <= layer_idx < opd_reader_end:
-                if opd_memory_hidden is not None:
-                    layer_kwargs["opd_memory_hidden"] = reader_bank.states[layer_idx]
-                else:
-                    layer_kwargs["reader_warmup_bank"] = reader_bank.states[layer_idx]
-                    layer_kwargs["reader_warmup_sink"] = reader_warmup_sink
-            if memory_kv_sink is not None:
-                layer_kwargs["memory_kv_sink"] = memory_kv_sink
-            if packed_memory_token_indexes is not None:
-                layer_kwargs["packed_memory_token_indexes"] = packed_memory_token_indexes
-                layer_kwargs["block_gen_reads_memory"] = bool(block_gen_reads_memory)
-            if mask_prompt_kv_for_nonmemory:
-                layer_kwargs["mask_prompt_kv_for_nonmemory"] = True
-            if force_memory_qkv_zero:
-                layer_kwargs["force_memory_qkv_zero"] = True
-            if mechanism_attention_trace is not None:
-                layer_kwargs["mechanism_attention_trace"] = mechanism_attention_trace
-                layer_kwargs["mechanism_stage"] = mechanism_stage
-            use_checkpoint = (
-                bool(checkpoint)
-                and bool(getattr(self, "gradient_checkpointing", False))
-                and (self.training or opd_memory_hidden is not None)
-                and torch.is_grad_enabled()
-            )
-            def _enable_loop_adapters():
-                # Explicitly disable adapters for native/prefix/suffix too.
-                local_states = []
-                modules_fn = getattr(actual_layer, "modules", None)
-                iterable = modules_fn() if callable(modules_fn) else ()
-                for module in iterable:
-                    setter = getattr(module, "set_loop_mode", None)
-                    if callable(setter):
-                        local_states.append((module, str(getattr(module, "loop_mode", "off"))))
-                        setter(loop_adapter_mode)
-                return local_states
-
-            if use_checkpoint:
-
-                def checkpointed_layer(layer_hidden):
-                    local_states = _enable_loop_adapters()
-                    try:
-                        layer_output, _ = actual_layer.forward_inference(
-                            packed_query_sequence=layer_hidden,
-                            **layer_kwargs,
-                        )
-                        return layer_output
-                    finally:
-                        for module, previous_mode in local_states:
-                            module.set_loop_mode(previous_mode)
-
-                hidden = torch.utils.checkpoint.checkpoint(
-                    checkpointed_layer,
-                    hidden,
-                    use_reentrant=False,
-                )
-                cache = past_key_values
-            else:
-                local_states = _enable_loop_adapters()
-                try:
-                    hidden, cache = actual_layer.forward_inference(
-                        packed_query_sequence=hidden,
-                        **layer_kwargs,
-                    )
-                finally:
-                    for module, previous_mode in local_states:
-                        module.set_loop_mode(previous_mode)
-            return hidden, cache
-
-        def normalize(hidden):
-            if self.use_moe:
-                if mode == "und":
-                    return self.norm(hidden)
-                if mode == "gen":
-                    normalized = torch.zeros_like(hidden)
-                    normalized[packed_text_indexes] = self.norm(
-                        hidden[packed_text_indexes]
-                    )
-                    normalized[packed_vae_token_indexes] = self.norm_moe_gen(
-                        hidden[packed_vae_token_indexes]
-                    )
-                    return normalized
-                raise ValueError(f"unsupported MoT mode: {mode}")
-            return self.norm(hidden)
-
-        if memory_control_mode is not None:
-            if (
-                self.training or torch.is_grad_enabled() or not self.use_moe
-                or mode != "gen" or update_past_key_values or is_causal
-                or enable_taylorseer or within_step_loop_repeat != 1
-                or memory_body_in is not None or prompt_body_memory_init is not None
-                or single_pass_memory_update_end is not None
-                or single_pass_prompt_mask_start is not None
-                or single_pass_prompt_mask_end is not None
-                or prompt_kv_mask_scope != "none" or memory_write_source != "correct"
-                or memory_write_probe is not None or memory_read_only
-                or capture_body_entry_at is not None or collect_round_diagnostics
-                or write_memory_override is not None or not write_memory_update
-                or mask_prompt_kv_during_write or collect_write_round_outputs
-                or attention_mass_sink is not None
-            ):
-                raise ValueError("memory mechanism requires frozen inference without legacy interventions")
-            if memory_loop_start is None or memory_loop_end is None:
-                raise ValueError("memory mechanism requires explicit body bounds")
-            result = run_decoder(
-                packed_query_sequence, mode=memory_control_mode,
-                indexes=packed_memory_token_indexes, gen_indexes=packed_vae_token_indexes,
-                query_lens=query_lens, body_start=memory_loop_start,
-                body_end=memory_loop_end, num_layers=len(self.layers),
-                run_layer=run_layer, normalize=normalize,
-                diagnostics=mechanism_diagnostics,
-                rounds=memory_control_rounds,
-            )
-            return BaseNavitOutputWithPast(
-                packed_query_sequence=result, past_key_values=past_key_values,
-            )
-        if mechanism_diagnostics is not None:
-            raise ValueError("mechanism diagnostics require memory_control_mode")
-
-        memory_body_out = None
-        memory_round_hiddens = None
-        gen_round_hiddens = None
-        gen_suffix_round_hiddens = None
-        write_round_suffix_hiddens = None
-        write_round_memories = None
-        body_entry_hidden = None
-        if capture_body_entry_at is not None:
-            if not update_past_key_values or not 1 <= int(capture_body_entry_at) <= len(self.layers):
-                raise ValueError("body-entry capture requires prompt KV update and valid depth")
-        if prompt_body_memory_init is not None and capture_body_entry_at is not None:
-            raise ValueError("cannot capture and inject body-entry memory in one pass")
-
-        loop_repeat = int(within_step_loop_repeat)
-        mem_repeat = int(memory_loop_repeat)
-        mem_indexes = packed_memory_token_indexes
-        memory_body_active = (
-            mem_indexes is not None
-            and int(mem_indexes.numel()) > 0
-            and memory_loop_start is not None
-            and memory_loop_end is not None
-            and mem_repeat >= 1
-        )
-        single_pass_active = single_pass_memory_update_end is not None
-        v2_active = (write_memory_override is not None or not write_memory_update
-                     or mask_prompt_kv_during_write or collect_write_round_outputs)
-        if v2_active and (
-            not memory_body_active or memory_read_only or mem_repeat < 2
-            or not block_gen_reads_memory or mode != "gen" or not self.use_moe
-            or is_causal or single_pass_active or loop_repeat != 1
-            or memory_body_in is not None or prompt_body_memory_init is not None
-            or prompt_kv_mask_scope != "none" or memory_write_source != "correct"
-            or enable_taylorseer
-        ):
-            raise ValueError("v2 Write controls require fresh strict Read + Write same-depth MoT")
-        if mask_prompt_kv_during_write and (
-            past_key_values is None or past_key_values.key_cache[0] is None
-            or key_values_lens is None or not bool((key_values_lens > 0).all())
-        ):
-            raise ValueError("Write prompt mask requires a nonempty prompt cache")
-        if single_pass_active:
-            if (
-                memory_body_active
-                or mem_indexes is None
-                or int(mem_indexes.numel()) == 0
-                or mode != "gen"
-                or not self.use_moe
-                or update_past_key_values
-                or loop_repeat != 1
-                or mem_repeat != 1
-                or memory_body_in is not None
-                or prompt_body_memory_init is not None
-                or prompt_kv_mask_scope != "none"
-            ):
-                raise ValueError("single-pass memory requires fresh MoT generation without a loop or memory replacement")
-            memory_update_end = int(single_pass_memory_update_end)
-            if not 1 <= memory_update_end <= len(self.layers):
-                raise ValueError("single-pass memory update end is outside model depth")
-            if (single_pass_prompt_mask_start is None) != (single_pass_prompt_mask_end is None):
-                raise ValueError("single-pass prompt mask requires both layer bounds")
-            if single_pass_prompt_mask_start is not None:
-                mask_start = int(single_pass_prompt_mask_start)
-                mask_end = int(single_pass_prompt_mask_end)
-                if not 0 <= mask_start < mask_end <= len(self.layers):
-                    raise ValueError("single-pass prompt mask range is outside model depth")
-                if (
-                    past_key_values is None
-                    or past_key_values.key_cache[0] is None
-                    or key_values_lens is None
-                    or not bool((key_values_lens > 0).all())
-                ):
-                    raise ValueError("single-pass prompt mask requires a nonempty prompt cache")
-        elif single_pass_prompt_mask_start is not None or single_pass_prompt_mask_end is not None:
-            raise ValueError("single-pass prompt mask requires single-pass memory")
-        if prompt_body_memory_init is not None and not memory_body_active:
-            raise ValueError("prompt body memory requires an active same-depth memory body")
-        if prompt_kv_mask_scope not in ("none", "extra_loop", "all_generation"):
-            raise ValueError(f"invalid prompt KV mask scope: {prompt_kv_mask_scope}")
-        if prompt_kv_mask_scope != "none" and (
-            not memory_body_active
-            or prompt_body_memory_init is None
-            or mode != "gen"
-            or update_past_key_values
-            or not self.use_moe
-        ):
-            raise ValueError("prompt KV mask requires prompt-aware MoT same-depth generation")
-        if prompt_kv_mask_scope != "none" and (
-            past_key_values is None
-            or past_key_values.key_cache[0] is None
-            or key_values_lens is None
-            or not bool((key_values_lens > 0).all())
-        ):
-            raise ValueError("prompt KV mask requires a nonempty prompt cache for every sample")
-        if single_pass_active:
-            indexes = mem_indexes.to(device=packed_query_sequence.device, dtype=torch.long)
-            hidden = packed_query_sequence
-            frozen_memory = None
-            for layer_idx in range(len(self.layers)):
-                if layer_idx == memory_update_end:
-                    frozen_memory = hidden[indexes].clone()
-                mask_this_layer = (
-                    single_pass_prompt_mask_start is not None
-                    and mask_start <= layer_idx < mask_end
-                )
-                hidden, past_key_values = run_layer(
-                    layer_idx,
-                    hidden,
-                    packed_memory_token_indexes=indexes,
-                    block_gen_reads_memory=False,
-                    mask_prompt_kv_for_nonmemory=mask_this_layer,
-                )
-                if frozen_memory is not None:
-                    hidden = hidden.clone()
-                    hidden[indexes] = frozen_memory
-            memory_body_out = (
-                frozen_memory if frozen_memory is not None else hidden[indexes]
-            )
-            packed_query_sequence = normalize(hidden)
-        elif memory_body_active:
-            if update_past_key_values:
-                raise ValueError(
-                    "memory body loop cannot mutate the prompt KV cache; "
-                    "set update_past_key_values=False"
-                )
-            s = int(memory_loop_start)
-            e = int(memory_loop_end)
-            if memory_read_only and mem_repeat != 1:
-                raise ValueError("memory_read_only requires memory_loop_repeat=1")
-            if prompt_kv_mask_scope == "extra_loop" and (
-                mem_repeat != 2 or memory_read_only or not bool(block_gen_reads_memory)
-            ):
-                raise ValueError("extra-loop prompt KV mask requires strict Read plus exactly one Write")
-            if memory_read_adapter_mode not in ("off", "read"):
-                raise ValueError(
-                    "memory_read_adapter_mode must be 'off' or 'read'"
-                )
-            if memory_write_source != "correct" and (
-                mem_repeat != 2 or not bool(block_gen_reads_memory) or memory_read_only
-            ):
-                raise ValueError(
-                    "Write sensitivity requires strict Read plus exactly one Write"
-                )
-            if not 0 <= s < e <= len(self.layers):
-                raise ValueError(
-                    f"memory loop range [{s}, {e}) is invalid for "
-                    f"{len(self.layers)} layers"
-                )
-            indexes = mem_indexes.to(
-                device=packed_query_sequence.device, dtype=torch.long
-            )
-            if write_memory_override is not None and write_memory_override.shape != (
-                int(indexes.numel()), int(packed_query_sequence.shape[-1])
-            ):
-                raise ValueError("write_memory_override must match [B*K,D]")
-            if prompt_body_memory_init is not None:
-                if memory_body_in is not None or prompt_body_memory_init.shape != (
-                    int(indexes.numel()), int(packed_query_sequence.shape[-1])
-                ):
-                    raise ValueError("prompt body memory must match [B*K,D] and cannot be persisted")
-            block_round0 = bool(block_gen_reads_memory)
-            hidden = packed_query_sequence
-            for layer_idx in range(0, s):
-                hidden, past_key_values = run_layer(
-                    layer_idx,
-                    hidden,
-                    packed_memory_token_indexes=indexes,
-                    block_gen_reads_memory=block_round0,
-                    mask_prompt_kv_for_nonmemory=prompt_kv_mask_scope == "all_generation",
-                )
-            h_base = hidden.clone()
-            if prompt_body_memory_init is not None:
-                hidden = h_base.clone()
-                hidden[indexes] = prompt_body_memory_init.to(
-                    dtype=hidden.dtype, device=hidden.device
-                )
-            elif memory_body_in is not None:
-                hidden = h_base.clone()
-                hidden[indexes] = memory_body_in.to(
-                    dtype=hidden.dtype, device=hidden.device
-                )
-            else:
-                hidden = h_base
-            memory_r = hidden[indexes]
-            round_memory = [] if collect_round_diagnostics else None
-            round_gen = [] if collect_round_diagnostics else None
-            round_suffix_gen = [] if collect_round_diagnostics else None
-            write_suffix = []
-            write_memories = []
-            read_entries = [] if capture_memory_body_entries else None
-            read_kv = [] if capture_memory_body_kv else None
-            gen_idx = packed_vae_token_indexes
-            has_gen = gen_idx is not None and int(gen_idx.numel()) > 0
-
-            def suffix_gen(body_hidden):
-                cloned = body_hidden.clone()
-                for layer_idx in range(e, len(self.layers)):
-                    cloned, _ = run_layer(
-                        layer_idx,
-                        cloned,
-                        packed_memory_token_indexes=indexes,
-                        block_gen_reads_memory=False,
-                        mask_prompt_kv_for_nonmemory=prompt_kv_mask_scope == "all_generation",
-                    )
-                cloned = normalize(cloned)
-                return cloned[gen_idx] if has_gen else None
-
-            initial_memory = (
-                hidden[indexes].clone()
-                if prompt_body_memory_init is not None
-                else packed_query_sequence[indexes]
-            )
-            for _round in range(mem_repeat):
-                if _round > 0:
-                    nxt = h_base.clone()
-                    write_memory = select_write_memory(
-                        memory_r,
-                        initial_memory,
-                        source=memory_write_source,
-                        batch_size=int(query_lens.numel()),
-                    )
-                    if _round == 1 and write_memory_override is not None:
-                        write_memory = write_memory_override.to(hidden)
-                    if memory_write_probe is not None:
-                        append_write_probe(
-                            memory_write_probe,
-                            memory_r,
-                            initial_memory,
-                            write_memory,
-                            batch_size=int(query_lens.numel()),
-                        )
-                    nxt[indexes] = write_memory
-                    hidden = nxt
-                block_this = block_round0 and _round == 0
-                mask_prompt_this_round = prompt_kv_mask_scope == "all_generation" or (
-                    prompt_kv_mask_scope == "extra_loop" and _round > 0
-                ) or (mask_prompt_kv_during_write and _round > 0)
-                frozen_write_memory = hidden[indexes].clone()
-                for layer_idx in range(s, e):
-                    if read_entries is not None:
-                        read_entries.append(hidden[indexes].detach().clone())
-                    hidden, past_key_values = run_layer(
-                        layer_idx,
-                        hidden,
-                        checkpoint=True,
-                        loop_adapter_mode=(
-                            memory_read_adapter_mode
-                            if block_this
-                            else "write"
-                        ),
-                        packed_memory_token_indexes=indexes,
-                        block_gen_reads_memory=block_this,
-                        mask_prompt_kv_for_nonmemory=mask_prompt_this_round,
-                        memory_kv_sink=read_kv,
-                    )
-                    if _round > 0 and not write_memory_update:
-                        hidden = hidden.clone()
-                        hidden[indexes] = frozen_write_memory
-                memory_r = hidden[indexes]
-                if collect_write_round_outputs and _round > 0:
-                    write_memories.append(memory_r)
-                    if _round + 1 < mem_repeat:
-                        write_suffix.append(suffix_gen(hidden))
-                if collect_round_diagnostics:
-                    round_memory.append(memory_r)
-                if collect_round_diagnostics and has_gen:
-                    round_gen.append(hidden[gen_idx])
-                if collect_round_diagnostics and _round + 1 < mem_repeat:
-                    suffix_hidden = suffix_gen(hidden)
-                    if suffix_hidden is not None:
-                        round_suffix_gen.append(suffix_hidden)
-            if memory_read_only:
-                # Phase 1 pair-grounding must stop at the end of the strict
-                # Read body.  In particular, do not normalize, execute the
-                # suffix, or expose this memory to GEN/context rows.
-                return BaseNavitOutputWithPast(
-                    packed_query_sequence=hidden,
-                    past_key_values=past_key_values,
-                    memory_body_out=memory_r,
-                    memory_body_entries=tuple(read_entries) if read_entries is not None else None,
-                    memory_body_kv=tuple(read_kv) if read_kv is not None else None,
-                    memory_round_hiddens=(memory_r,),
-                )
-            for layer_idx in range(e, len(self.layers)):
-                hidden, past_key_values = run_layer(
-                    layer_idx,
-                    hidden,
-                    packed_memory_token_indexes=indexes,
-                    block_gen_reads_memory=False,
-                    mask_prompt_kv_for_nonmemory=prompt_kv_mask_scope == "all_generation",
-                )
-            packed_query_sequence = normalize(hidden)
-            if collect_write_round_outputs:
-                write_suffix.append(packed_query_sequence[gen_idx])
-                write_round_suffix_hiddens = tuple(write_suffix)
-                write_round_memories = tuple(write_memories)
-            memory_body_out = memory_r
-            memory_round_hiddens = (
-                tuple(round_memory) if collect_round_diagnostics else None
-            )
-            gen_round_hiddens = (
-                tuple(round_gen) if collect_round_diagnostics and round_gen else None
-            )
-            if collect_round_diagnostics and has_gen:
-                round_suffix_gen.append(packed_query_sequence[gen_idx])
-            gen_suffix_round_hiddens = (
-                tuple(round_suffix_gen)
-                if collect_round_diagnostics and round_suffix_gen
-                else None
-            )
-        elif loop_repeat > 1:
-            # Looped-MMDiT style: repeat a shared middle block inside one
-            # denoising step. L=1 is exact parity with the native path.
-            if within_step_loop_start is None or within_step_loop_end is None:
-                raise ValueError(
-                    "within_step_loop_repeat > 1 requires "
-                    "within_step_loop_start and within_step_loop_end"
-                )
-            s = int(within_step_loop_start)
-            e = int(within_step_loop_end)
-            alpha = float(within_step_loop_damping)
-            if not (0 <= s < e <= len(self.layers)):
-                raise ValueError(
-                    f"within_step_loop range [{s}, {e}) is invalid for "
-                    f"{len(self.layers)} layers"
-                )
-            hidden = packed_query_sequence
-            for layer_idx in range(0, s):
-                hidden, past_key_values = run_layer(layer_idx, hidden)
-            for _loop_index in range(loop_repeat):
-                prev_hidden = hidden
-                for layer_idx in range(s, e):
-                    hidden, past_key_values = run_layer(layer_idx, hidden)
-                if alpha != 1.0:
-                    hidden = prev_hidden + alpha * (hidden - prev_hidden)
-            for layer_idx in range(e, len(self.layers)):
-                hidden, past_key_values = run_layer(layer_idx, hidden)
-            packed_query_sequence = normalize(hidden)
-        else:
-            seq_mem = (
-                packed_memory_token_indexes
-                if bool(block_gen_reads_memory)
-                and packed_memory_token_indexes is not None
-                and int(packed_memory_token_indexes.numel()) > 0
-                else None
-            )
-            for layer_idx in range(len(self.layers)):
-                packed_query_sequence, past_key_values = run_layer(
-                    layer_idx,
-                    packed_query_sequence,
-                    checkpoint=opd_memory_hidden is not None and layer_idx >= opd_reader_start,
-                    packed_memory_token_indexes=seq_mem,
-                    block_gen_reads_memory=bool(block_gen_reads_memory)
-                    and seq_mem is not None,
-                )
-                if capture_body_entry_at == layer_idx + 1:
-                    body_entry_hidden = packed_query_sequence.detach().clone()
-            packed_query_sequence = normalize(packed_query_sequence)
-
-        if enable_taylorseer:
-            self.current["step"] += 1
-
-        return BaseNavitOutputWithPast(
-            packed_query_sequence=packed_query_sequence,
-            past_key_values=past_key_values,
-            memory_body_out=memory_body_out,
-            memory_round_hiddens=memory_round_hiddens,
-            gen_round_hiddens=gen_round_hiddens,
-            gen_suffix_round_hiddens=gen_suffix_round_hiddens,
-            write_round_suffix_hiddens=write_round_suffix_hiddens,
-            write_round_memories=write_round_memories,
-            body_entry_hidden=body_entry_hidden,
-        )
-
-    def forward_kvcache(
-        self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
-        update_past_key_values=True,
-        is_causal=True,
-        mode="und",
-        packed_vae_token_indexes=None,
-        packed_text_indexes=None,
-        use_gradient_checkpointing: bool = False,
-    ) -> BaseNavitOutputWithPast:
-        """KV-cache forward with optional per-layer checkpointing.
-
-        Semantic review prefills a long image/text prefix into a mutable
-        ``NaiveCache``. Calling ``forward_inference`` directly keeps every
-        decoder layer's prefix activations alive and OOMs on 5k-token image
-        contexts. This mirrors CoRT's BAGEL path: checkpoint only the long
-        prefill segment, and reset the current layer's cache entry during
-        recomputation so the mutable cache sees the same empty state.
-        """
-        enable_taylorseer = getattr(self, "enable_taylorseer", False)
-        if enable_taylorseer:
-            cal_type(self.cache_dic, self.current)
-            self.current["stream"] = "layers_stream"
-
-        cos, sin = self.rotary_emb(
-            packed_query_sequence, packed_query_position_ids.unsqueeze(0)
-        )
+        cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         cos = cos.squeeze(0)
         sin = sin.squeeze(0)
         packed_query_position_embeddings = (cos, sin)
@@ -2330,7 +1045,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         extra_inputs = {}
         if self.use_moe:
             extra_inputs.update(mode=mode)
-            if mode == "gen":
+            if mode == 'gen':
                 assert packed_vae_token_indexes is not None
                 assert packed_text_indexes is not None
                 extra_inputs.update(
@@ -2343,71 +1058,33 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 decoder_layer.current = self.current
                 decoder_layer.cache_dic = self.cache_dic
                 decoder_layer.enable_taylorseer = True
-                self.current["layer"] = layer_idx
-
-            actual_layer = getattr(
-                decoder_layer, "_checkpoint_wrapped_module", decoder_layer
+                self.current['layer'] = layer_idx
+            packed_query_sequence, past_key_values = decoder_layer(
+                packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
+                packed_query_position_embeddings=packed_query_position_embeddings,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=update_past_key_values,
+                is_causal=is_causal,
+                **extra_inputs,
             )
-            if use_gradient_checkpointing:
-                cache_layer_idx = actual_layer.self_attn.layer_idx
-
-                def _ckpt_layer_fn(
-                    hidden,
-                    _layer=actual_layer,
-                    _idx=cache_layer_idx,
-                ):
-                    past_key_values.key_cache[_idx] = None
-                    past_key_values.value_cache[_idx] = None
-                    h, _ = _layer.forward_inference(
-                        packed_query_sequence=hidden,
-                        query_lens=query_lens,
-                        packed_query_position_embeddings=packed_query_position_embeddings,
-                        packed_query_indexes=packed_query_indexes,
-                        past_key_values=past_key_values,
-                        key_values_lens=key_values_lens,
-                        packed_key_value_indexes=packed_key_value_indexes,
-                        update_past_key_values=update_past_key_values,
-                        is_causal=is_causal,
-                        **extra_inputs,
-                    )
-                    return h
-
-                packed_query_sequence = torch.utils.checkpoint.checkpoint(
-                    _ckpt_layer_fn,
-                    packed_query_sequence,
-                    use_reentrant=False,
-                )
-            else:
-                packed_query_sequence, past_key_values = actual_layer.forward_inference(
-                    packed_query_sequence=packed_query_sequence,
-                    query_lens=query_lens,
-                    packed_query_position_embeddings=packed_query_position_embeddings,
-                    packed_query_indexes=packed_query_indexes,
-                    past_key_values=past_key_values,
-                    key_values_lens=key_values_lens,
-                    packed_key_value_indexes=packed_key_value_indexes,
-                    update_past_key_values=update_past_key_values,
-                    is_causal=is_causal,
-                    **extra_inputs,
-                )
 
         if self.use_moe:
             if mode == "und":
                 packed_query_sequence = self.norm(packed_query_sequence)
             elif mode == "gen":
                 packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-                packed_query_sequence_[packed_text_indexes] = self.norm(
-                    packed_query_sequence[packed_text_indexes]
-                )
-                packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(
-                    packed_query_sequence[packed_vae_token_indexes]
-                )
+                packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
+                packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(packed_query_sequence[packed_vae_token_indexes])
                 packed_query_sequence = packed_query_sequence_
         else:
             packed_query_sequence = self.norm(packed_query_sequence)
-
+        
         if enable_taylorseer:
-            self.current["step"] += 1
+            self.current['step'] += 1
 
         return BaseNavitOutputWithPast(
             packed_query_sequence=packed_query_sequence,
@@ -2465,11 +1142,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         packed_position_ids: torch.Tensor,
         packed_und_token_indexes: Optional[torch.LongTensor] = None,
         packed_gen_token_indexes: Optional[torch.LongTensor] = None,
-    ):
+    ) -> torch.Tensor:
 
-        # Keep wrapper and inner-model contracts aligned even if callers set
-        # their training flags independently.
-        outputs = self.model.forward_train(
+        outputs = self.model(
             packed_sequence=packed_sequence,
             sample_lens=sample_lens,
             packed_position_ids=packed_position_ids,
@@ -2493,47 +1168,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
-        packed_boundary_token_indexes: Optional[torch.Tensor] = None,
-        within_step_loop_start: Optional[int] = None,
-        within_step_loop_end: Optional[int] = None,
-        within_step_loop_repeat: int = 1,
-        within_step_loop_damping: float = 1.0,
-        packed_memory_token_indexes: Optional[torch.Tensor] = None,
-        memory_loop_repeat: int = 1,
-        memory_loop_start: Optional[int] = None,
-        memory_loop_end: Optional[int] = None,
-        memory_body_in: Optional[torch.Tensor] = None,
-        block_gen_reads_memory: bool = True,
-        collect_round_diagnostics: bool = False,
-        memory_read_only: bool = False,
-        memory_read_adapter_mode: str = "read",
-        memory_write_source: str = "correct",
-        memory_write_probe: Optional[list] = None,
-        capture_body_entry_at: Optional[int] = None,
-        prompt_body_memory_init: Optional[torch.Tensor] = None,
-        prompt_kv_mask_scope: str = "none",
-        single_pass_memory_update_end: Optional[int] = None,
-        single_pass_prompt_mask_start: Optional[int] = None,
-        single_pass_prompt_mask_end: Optional[int] = None,
-        memory_control_mode: Optional[str] = None,
-        memory_control_rounds: int = 2,
-        mechanism_diagnostics: Optional[dict] = None,
-        write_memory_override: Optional[torch.Tensor] = None,
-        write_memory_update: bool = True,
-        mask_prompt_kv_during_write: bool = False,
-        collect_write_round_outputs: bool = False,
-        attention_mass_sink: Optional[list] = None,
-        attention_mass_layers: Tuple[int, ...] = (12, 15, 19),
-        opd_memory_hidden: Optional[torch.Tensor] = None,
-        opd_reader_start: Optional[int] = None,
-        opd_reader_end: Optional[int] = None,
-        capture_memory_body_entries: bool = False,
-        capture_memory_body_kv: bool = False,
-        reader_warmup_bank=None,
-        reader_warmup_sink=None,
     ) -> BaseNavitOutputWithPast:
 
-        outputs = self.model.forward_inference(
+        outputs = self.model(
             packed_query_sequence=packed_query_sequence,
             query_lens=query_lens,
             packed_query_position_ids=packed_query_position_ids,
@@ -2546,76 +1183,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             mode=mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
-            packed_boundary_token_indexes=packed_boundary_token_indexes,
-            within_step_loop_start=within_step_loop_start,
-            within_step_loop_end=within_step_loop_end,
-            within_step_loop_repeat=within_step_loop_repeat,
-            within_step_loop_damping=within_step_loop_damping,
-            packed_memory_token_indexes=packed_memory_token_indexes,
-            memory_loop_repeat=memory_loop_repeat,
-            memory_loop_start=memory_loop_start,
-            memory_loop_end=memory_loop_end,
-            memory_body_in=memory_body_in,
-            block_gen_reads_memory=block_gen_reads_memory,
-            collect_round_diagnostics=collect_round_diagnostics,
-            memory_read_only=memory_read_only,
-            memory_read_adapter_mode=memory_read_adapter_mode,
-            memory_write_source=memory_write_source,
-            memory_write_probe=memory_write_probe,
-            capture_body_entry_at=capture_body_entry_at,
-            prompt_body_memory_init=prompt_body_memory_init,
-            prompt_kv_mask_scope=prompt_kv_mask_scope,
-            single_pass_memory_update_end=single_pass_memory_update_end,
-            single_pass_prompt_mask_start=single_pass_prompt_mask_start,
-            single_pass_prompt_mask_end=single_pass_prompt_mask_end,
-            memory_control_mode=memory_control_mode,
-            memory_control_rounds=memory_control_rounds,
-            mechanism_diagnostics=mechanism_diagnostics,
-            write_memory_override=write_memory_override,
-            write_memory_update=write_memory_update,
-            mask_prompt_kv_during_write=mask_prompt_kv_during_write,
-            collect_write_round_outputs=collect_write_round_outputs,
-            attention_mass_sink=attention_mass_sink,
-            attention_mass_layers=attention_mass_layers,
-            opd_memory_hidden=opd_memory_hidden,
-            opd_reader_start=opd_reader_start,
-            opd_reader_end=opd_reader_end,
-            capture_memory_body_entries=capture_memory_body_entries,
-            capture_memory_body_kv=capture_memory_body_kv,
-            reader_warmup_bank=reader_warmup_bank,
-            reader_warmup_sink=reader_warmup_sink,
         )
 
         return outputs
-
-    def forward_kvcache(
-        self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
-        update_past_key_values=True,
-        is_causal=True,
-        mode="und",
-        packed_vae_token_indexes=None,
-        packed_text_indexes=None,
-        use_gradient_checkpointing: bool = False,
-    ) -> BaseNavitOutputWithPast:
-        return self.model.forward_kvcache(
-            packed_query_sequence=packed_query_sequence,
-            query_lens=query_lens,
-            packed_query_position_ids=packed_query_position_ids,
-            packed_query_indexes=packed_query_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
-            update_past_key_values=update_past_key_values,
-            is_causal=is_causal,
-            mode=mode,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_text_indexes=packed_text_indexes,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-        )

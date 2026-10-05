@@ -1,0 +1,14 @@
+# Executed by CLI arguments; exact run binding is stored in run.json.
+mode: MEMORY_DYNAMIC
+evaluations: 2
+start_layer: 16
+end_layer: 24
+memory_slots: 16
+progress_start: 0.0
+progress_end: 0.5
+num_timesteps: 50
+actual_denoiser_calls: 49
+timestep_shift: 3.0
+cfg_text_scale: 4.0
+image_size: 512
+training: false

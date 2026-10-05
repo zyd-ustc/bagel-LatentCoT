@@ -4,19 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bagel-latent-cot"
-version = "0.2.0"
-description = "BAGEL-7B-MoT memory reader warm-up and Self-CoT on-policy distillation"
+version = "0.4.0"
+description = "Frozen BAGEL with layer-local denoiser recurrence and paired quality evaluation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.5.1",
   "einops>=0.7.0",
-  "transformers>=4.56.0",
+  "accelerate>=0.34.0",
+  "transformers>=4.56.0,<4.58.0",
   "safetensors>=0.4.0",
   "Pillow>=10.0.0",
   "PyYAML>=6.0",
   "tqdm>=4.66.0",
-  "requests>=2.32.0",
+  "numpy>=1.26.0",
+  "scipy>=1.10.0",
 ]
 
 [project.optional-dependencies]

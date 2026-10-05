@@ -1,2 +1,1 @@
-"""Evaluation utilities for Qwen-LatentCoT."""
-
+"""Offline paired semantic, quality and budget assessment."""

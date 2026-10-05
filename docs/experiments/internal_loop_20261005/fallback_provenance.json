@@ -1,0 +1,85 @@
+{
+  "run": {
+    "schema": 1,
+    "source_sha256": "8f539273dff39bb394c72f42feb0d0827753f7a788b8b054cf2a53e012765706",
+    "model_sha256": {
+      "ema.safetensors": "0b41c43835fd737b8c948e604870da522c091dcf151f3e8d55f84781765ee1a3",
+      "ae.safetensors": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+      "llm_config.json": "7463bb0ea78315365e6c6b74de4e73bbcc8359dfb0c5a737584e077d42c0b03c",
+      "vit_config.json": "917a59e36337e279c9234b6524c653b10de47345761fa4fbb299c64700f20357",
+      "tokenizer.json": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+      "tokenizer_config.json": "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583",
+      "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+      "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+    },
+    "model_path": "/private/yida_workspace/models/BAGEL-7B-MoT",
+    "benchmark_sha256": "18747b470e00d16ca8dc43e8fb25197856ad2931857377ca77d977023aa13556",
+    "benchmark": "/private/yida_workspace/bagel-LatentCoT-main-internal-20261005/data/engineering8.jsonl",
+    "sampling": {
+      "num_timesteps": 50,
+      "actual_denoiser_calls": 49,
+      "timestep_shift": 3,
+      "cfg_text_scale": 4,
+      "cfg_renorm_type": "global",
+      "matched_base_timesteps": null,
+      "image_size": 512
+    },
+    "loop": {
+      "mode": "MEMORY_DYNAMIC",
+      "evaluations": 2,
+      "start_layer": 12,
+      "end_layer": 20,
+      "memory_slots": 16,
+      "progress_start": 0,
+      "progress_end": 0.5
+    },
+    "arms": [
+      "BASE",
+      "GEN_LAYERWISE",
+      "MEMORY_DYNAMIC",
+      "MEMORY_STATIC",
+      "MEMORY_NO_READ"
+    ],
+    "seeds": [
+      0
+    ],
+    "prompt_ids": [
+      "hard_0",
+      "hard_1",
+      "hard_2",
+      "hard_3",
+      "easy_0",
+      "easy_1",
+      "easy_2",
+      "easy_3"
+    ],
+    "stage": "engineering",
+    "shard": [
+      0,
+      2
+    ],
+    "torch": "2.5.1+cu124",
+    "training": false,
+    "quality_status": "pending"
+  },
+  "scorer": {
+    "semantic": "upstream_GenEval2_soft_tifa_gm_functions",
+    "official_source_sha256": "90791e35321a1a2bf65366517dd60f39037f90435490eb122c0027b52d42cda9",
+    "official_source": "/private/yida_workspace/umm-anchored-eval-tools-d126833/GenEval2/evaluation.py",
+    "judge_model_sha256": {
+      "model-00001-of-00004.safetensors": "d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa",
+      "model-00002-of-00004.safetensors": "8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5",
+      "model-00003-of-00004.safetensors": "83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192",
+      "model-00004-of-00004.safetensors": "0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5"
+    },
+    "judge_config_sha256": "5cd452860dc1e9c29dd71cc3cef7f39b338b7a40793f7a260655c2d3568f3661",
+    "judge_path": "/private/yida_workspace/models/Qwen3-VL-8B-Instruct",
+    "device": "cuda:0",
+    "quality_prompt": "Assess visual coherence and visible artifacts, independently of instruction following. Quality: 1=severely broken, 2=poor, 3=usable, 4=good, 5=excellent. Invalid means an unusable or severely corrupted image. Return only JSON with integer quality and boolean invalid.",
+    "quality_scale": "(integer_1_to_5 - 1)/4",
+    "quality_is_proxy": true,
+    "tiif": "local_deterministic_yes_no_variant",
+    "boundary_tolerance": 1e-06,
+    "raw_atoms_preserved": true
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "native_vs_N1": {
+    "max_abs": 0.0,
+    "equal": true
+  },
+  "gen_vs_memory_no_read": {
+    "max_abs": 0.0,
+    "equal": true
+  },
+  "prompt_cache_unchanged": true,
+  "packed_shapes": [
+    [
+      256,
+      256
+    ],
+    [
+      256,
+      384
+    ]
+  ],
+  "seed": [
+    123,
+    456
+  ],
+  "same_checkpoint": "/private/yida_workspace/models/BAGEL-7B-MoT",
+  "passed": true
+}

@@ -1,0 +1,25 @@
+{
+  "rows": 4,
+  "same_seed_images_match_previous_runtime": [
+    true,
+    true
+  ],
+  "seeds": {
+    "0": {
+      "conditional_records": 400,
+      "mean_effective_rank": 6.368393126726151,
+      "mean_slot_cosine": 0.8792070117592812,
+      "mean_read_mass": 0.0016065740382327932,
+      "mean_update_ratio": 0.08439955299720169,
+      "first_iteration_read_mass_zero": true
+    },
+    "1": {
+      "conditional_records": 400,
+      "mean_effective_rank": 6.368695274591446,
+      "mean_slot_cosine": 0.8791791343688965,
+      "mean_read_mass": 0.001344997299311217,
+      "mean_update_ratio": 0.08416395131498575,
+      "first_iteration_read_mass_zero": true
+    }
+  }
+}

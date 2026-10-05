@@ -311,9 +311,6 @@ class AutoEncoder(nn.Module):
 
         self.scale_factor = params.scale_factor
         self.shift_factor = params.shift_factor
-        # Keep the latent contract inspectable by downstream frozen reward models.
-        self.latent_channels = int(params.z_channels)
-        self.latent_downsample = int(params.downsample)
 
     def encode(self, x: Tensor) -> Tensor:
         z = self.reg(self.encoder(x))

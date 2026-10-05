@@ -1,0 +1,830 @@
+{
+  "status": "engineering_scored",
+  "training_admitted": false,
+  "training_admission_status": "requires independent confirmation, E0/E4, budget and blind review evidence",
+  "quality_is_proxy": true,
+  "blind_review": "pending",
+  "statistics_unit": "prompt_cluster_all_seeds_and_atoms",
+  "arms": {
+    "BASE": {
+      "semantic_gm": 0.4240168968835104,
+      "quality_proxy": 0.8125,
+      "invalid_rate": 0.0,
+      "latency_median_seconds": 6.2783474191091955,
+      "latency_p95_seconds": 7.168313357792795,
+      "peak_allocated_bytes": 30630497280,
+      "timing_is_engineering_only": true,
+      "vs_BASE": {
+        "net_repair": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "semantic_gm_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "quality_proxy_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "invalid_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "all_pass_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "repair_count": 0,
+        "damage_count": 0,
+        "paired_atoms": 61,
+        "repair_given_base_fail": 0.0,
+        "damage_given_base_pass": 0.0,
+        "prompt_clusters": 8,
+        "paired_images": 8,
+        "bootstrap_replicates": 10000
+      },
+      "buckets": {
+        "structural": {
+          "net_repair": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "repair_count": 0,
+          "damage_count": 0,
+          "paired_atoms": 41,
+          "repair_given_base_fail": 0.0,
+          "damage_given_base_pass": 0.0,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        },
+        "ordinary": {
+          "net_repair": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "repair_count": 0,
+          "damage_count": 0,
+          "paired_atoms": 20,
+          "repair_given_base_fail": 0.0,
+          "damage_given_base_pass": 0.0,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        }
+      }
+    },
+    "GEN_LAYERWISE": {
+      "semantic_gm": 0.2583948282894346,
+      "quality_proxy": 0.875,
+      "invalid_rate": 0.0,
+      "latency_median_seconds": 7.100235670804977,
+      "latency_p95_seconds": 7.127399131748826,
+      "peak_allocated_bytes": 30630497280,
+      "timing_is_engineering_only": true,
+      "vs_BASE": {
+        "net_repair": {
+          "mean": -0.03278688524590164,
+          "ci95": [
+            -0.14705882352941177,
+            0.06153846153846154
+          ]
+        },
+        "semantic_gm_delta": {
+          "mean": -0.1656220685940758,
+          "ci95": [
+            -0.39915204946863875,
+            -0.013838579222147306
+          ]
+        },
+        "quality_proxy_delta": {
+          "mean": 0.0625,
+          "ci95": [
+            0.0,
+            0.15625
+          ]
+        },
+        "invalid_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "all_pass_delta": {
+          "mean": -0.125,
+          "ci95": [
+            -0.375,
+            0.0
+          ]
+        },
+        "repair_count": 5,
+        "damage_count": 7,
+        "paired_atoms": 61,
+        "repair_given_base_fail": 0.23809523809523808,
+        "damage_given_base_pass": 0.175,
+        "prompt_clusters": 8,
+        "paired_images": 8,
+        "bootstrap_replicates": 10000
+      },
+      "buckets": {
+        "structural": {
+          "net_repair": {
+            "mean": -0.024390243902439025,
+            "ci95": [
+              -0.18604651162790697,
+              0.1
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": -0.08384161277070418,
+            "ci95": [
+              -0.2495882311451825,
+              -0.0003976975413220947
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.125,
+            "ci95": [
+              0.0,
+              0.25
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "repair_count": 5,
+          "damage_count": 6,
+          "paired_atoms": 41,
+          "repair_given_base_fail": 0.2777777777777778,
+          "damage_given_base_pass": 0.2608695652173913,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        },
+        "ordinary": {
+          "net_repair": {
+            "mean": -0.05,
+            "ci95": [
+              -0.15,
+              0.0
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": -0.2474025244174474,
+            "ci95": [
+              -0.6597828931380465,
+              -1.728048023563744e-07
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": -0.25,
+            "ci95": [
+              -0.75,
+              0.0
+            ]
+          },
+          "repair_count": 0,
+          "damage_count": 1,
+          "paired_atoms": 20,
+          "repair_given_base_fail": 0.0,
+          "damage_given_base_pass": 0.058823529411764705,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        }
+      }
+    },
+    "MEMORY_DYNAMIC": {
+      "semantic_gm": 0.2902265914992913,
+      "quality_proxy": 0.84375,
+      "invalid_rate": 0.0,
+      "latency_median_seconds": 7.513622500002384,
+      "latency_p95_seconds": 7.561116731585935,
+      "peak_allocated_bytes": 30631484416,
+      "timing_is_engineering_only": true,
+      "vs_BASE": {
+        "net_repair": {
+          "mean": -0.03278688524590164,
+          "ci95": [
+            -0.15,
+            0.09090909090909091
+          ]
+        },
+        "semantic_gm_delta": {
+          "mean": -0.1337903053842191,
+          "ci95": [
+            -0.39260897503919956,
+            0.04934420590532613
+          ]
+        },
+        "quality_proxy_delta": {
+          "mean": 0.03125,
+          "ci95": [
+            -0.0625,
+            0.125
+          ]
+        },
+        "invalid_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "all_pass_delta": {
+          "mean": -0.125,
+          "ci95": [
+            -0.375,
+            0.0
+          ]
+        },
+        "repair_count": 6,
+        "damage_count": 8,
+        "paired_atoms": 61,
+        "repair_given_base_fail": 0.2857142857142857,
+        "damage_given_base_pass": 0.2,
+        "prompt_clusters": 8,
+        "paired_images": 8,
+        "bootstrap_replicates": 10000
+      },
+      "vs_GEN_LAYERWISE": {
+        "net_repair": {
+          "mean": 0.0,
+          "ci95": [
+            -0.08333333333333333,
+            0.1
+          ]
+        },
+        "semantic_gm_delta": {
+          "mean": 0.031831763209856714,
+          "ci95": [
+            -0.018945868855315958,
+            0.1162456313365155
+          ]
+        },
+        "quality_proxy_delta": {
+          "mean": -0.03125,
+          "ci95": [
+            -0.125,
+            0.0625
+          ]
+        },
+        "invalid_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "all_pass_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "repair_count": 5,
+        "damage_count": 5,
+        "paired_atoms": 61,
+        "repair_given_base_fail": 0.21739130434782608,
+        "damage_given_base_pass": 0.13157894736842105,
+        "prompt_clusters": 8,
+        "paired_images": 8,
+        "bootstrap_replicates": 10000
+      },
+      "vs_MEMORY_STATIC": {
+        "net_repair": {
+          "mean": 0.0,
+          "ci95": [
+            -0.1,
+            0.06671232876712262
+          ]
+        },
+        "semantic_gm_delta": {
+          "mean": -0.1226072920257687,
+          "ci95": [
+            -0.3739632111774623,
+            0.005530172669320167
+          ]
+        },
+        "quality_proxy_delta": {
+          "mean": -0.0625,
+          "ci95": [
+            -0.15625,
+            0.0
+          ]
+        },
+        "invalid_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "all_pass_delta": {
+          "mean": -0.125,
+          "ci95": [
+            -0.375,
+            0.0
+          ]
+        },
+        "repair_count": 3,
+        "damage_count": 3,
+        "paired_atoms": 61,
+        "repair_given_base_fail": 0.13043478260869565,
+        "damage_given_base_pass": 0.07894736842105263,
+        "prompt_clusters": 8,
+        "paired_images": 8,
+        "bootstrap_replicates": 10000
+      },
+      "buckets": {
+        "structural": {
+          "net_repair": {
+            "mean": -0.04878048780487805,
+            "ci95": [
+              -0.14285714285714285,
+              0.05
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": -0.08575365096104803,
+            "ci95": [
+              -0.24961500019628996,
+              -0.0006698025824586384
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.0,
+            "ci95": [
+              -0.1875,
+              0.1875
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "repair_count": 4,
+          "damage_count": 6,
+          "paired_atoms": 41,
+          "repair_given_base_fail": 0.2222222222222222,
+          "damage_given_base_pass": 0.2608695652173913,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        },
+        "ordinary": {
+          "net_repair": {
+            "mean": 0.0,
+            "ci95": [
+              -0.3,
+              0.3
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": -0.1818269598073901,
+            "ci95": [
+              -0.69745956157958,
+              0.15197875489203966
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.0625,
+            "ci95": [
+              0.0,
+              0.1875
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": -0.25,
+            "ci95": [
+              -0.75,
+              0.0
+            ]
+          },
+          "repair_count": 2,
+          "damage_count": 2,
+          "paired_atoms": 20,
+          "repair_given_base_fail": 0.6666666666666666,
+          "damage_given_base_pass": 0.11764705882352941,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        }
+      }
+    },
+    "MEMORY_STATIC": {
+      "semantic_gm": 0.41283388352506,
+      "quality_proxy": 0.90625,
+      "invalid_rate": 0.0,
+      "latency_median_seconds": 7.502316971775144,
+      "latency_p95_seconds": 7.543945640837774,
+      "peak_allocated_bytes": 30631484416,
+      "timing_is_engineering_only": true,
+      "vs_BASE": {
+        "net_repair": {
+          "mean": -0.03278688524590164,
+          "ci95": [
+            -0.12121212121212122,
+            0.06666666666666667
+          ]
+        },
+        "semantic_gm_delta": {
+          "mean": -0.011183013358450376,
+          "ci95": [
+            -0.11761852401618009,
+            0.07216646232277267
+          ]
+        },
+        "quality_proxy_delta": {
+          "mean": 0.09375,
+          "ci95": [
+            -0.03125,
+            0.21875
+          ]
+        },
+        "invalid_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "all_pass_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "repair_count": 3,
+        "damage_count": 5,
+        "paired_atoms": 61,
+        "repair_given_base_fail": 0.14285714285714285,
+        "damage_given_base_pass": 0.125,
+        "prompt_clusters": 8,
+        "paired_images": 8,
+        "bootstrap_replicates": 10000
+      },
+      "buckets": {
+        "structural": {
+          "net_repair": {
+            "mean": -0.07317073170731707,
+            "ci95": [
+              -0.19047619047619047,
+              0.05
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": -0.08593928036313138,
+            "ci95": [
+              -0.24920875810512455,
+              0.0007159788312501746
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.0625,
+            "ci95": [
+              -0.125,
+              0.25
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "repair_count": 2,
+          "damage_count": 5,
+          "paired_atoms": 41,
+          "repair_given_base_fail": 0.1111111111111111,
+          "damage_given_base_pass": 0.21739130434782608,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        },
+        "ordinary": {
+          "net_repair": {
+            "mean": 0.05,
+            "ci95": [
+              0.0,
+              0.15
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": 0.06357325364623062,
+            "ci95": [
+              -5.705377281728374e-09,
+              0.14023449432371043
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.125,
+            "ci95": [
+              0.0,
+              0.25
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "repair_count": 1,
+          "damage_count": 0,
+          "paired_atoms": 20,
+          "repair_given_base_fail": 0.3333333333333333,
+          "damage_given_base_pass": 0.0,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        }
+      }
+    },
+    "MEMORY_NO_READ": {
+      "semantic_gm": 0.2583948282894346,
+      "quality_proxy": 0.875,
+      "invalid_rate": 0.0,
+      "latency_median_seconds": 7.511370111256838,
+      "latency_p95_seconds": 7.5334177651908245,
+      "peak_allocated_bytes": 30631484416,
+      "timing_is_engineering_only": true,
+      "vs_BASE": {
+        "net_repair": {
+          "mean": -0.03278688524590164,
+          "ci95": [
+            -0.14705882352941177,
+            0.06153846153846154
+          ]
+        },
+        "semantic_gm_delta": {
+          "mean": -0.1656220685940758,
+          "ci95": [
+            -0.39915204946863875,
+            -0.013838579222147306
+          ]
+        },
+        "quality_proxy_delta": {
+          "mean": 0.0625,
+          "ci95": [
+            0.0,
+            0.15625
+          ]
+        },
+        "invalid_delta": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ]
+        },
+        "all_pass_delta": {
+          "mean": -0.125,
+          "ci95": [
+            -0.375,
+            0.0
+          ]
+        },
+        "repair_count": 5,
+        "damage_count": 7,
+        "paired_atoms": 61,
+        "repair_given_base_fail": 0.23809523809523808,
+        "damage_given_base_pass": 0.175,
+        "prompt_clusters": 8,
+        "paired_images": 8,
+        "bootstrap_replicates": 10000
+      },
+      "buckets": {
+        "structural": {
+          "net_repair": {
+            "mean": -0.024390243902439025,
+            "ci95": [
+              -0.18604651162790697,
+              0.1
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": -0.08384161277070418,
+            "ci95": [
+              -0.2495882311451825,
+              -0.0003976975413220947
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.125,
+            "ci95": [
+              0.0,
+              0.25
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "repair_count": 5,
+          "damage_count": 6,
+          "paired_atoms": 41,
+          "repair_given_base_fail": 0.2777777777777778,
+          "damage_given_base_pass": 0.2608695652173913,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        },
+        "ordinary": {
+          "net_repair": {
+            "mean": -0.05,
+            "ci95": [
+              -0.15,
+              0.0
+            ]
+          },
+          "semantic_gm_delta": {
+            "mean": -0.2474025244174474,
+            "ci95": [
+              -0.6597828931380465,
+              -1.728048023563744e-07
+            ]
+          },
+          "quality_proxy_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "invalid_delta": {
+            "mean": 0.0,
+            "ci95": [
+              0.0,
+              0.0
+            ]
+          },
+          "all_pass_delta": {
+            "mean": -0.25,
+            "ci95": [
+              -0.75,
+              0.0
+            ]
+          },
+          "repair_count": 0,
+          "damage_count": 1,
+          "paired_atoms": 20,
+          "repair_given_base_fail": 0.0,
+          "damage_given_base_pass": 0.058823529411764705,
+          "prompt_clusters": 4,
+          "paired_images": 4,
+          "bootstrap_replicates": 10000
+        }
+      }
+    }
+  }
+}
