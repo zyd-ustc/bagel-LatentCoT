@@ -1,11 +1,14 @@
-# Executed by CLI arguments; exact run binding is stored in run.json.
-mode: MEMORY_DYNAMIC
-evaluations: 2
+# R is the number of extra whole-body passes after the strict Read pass.
+architecture: legacy_hidden_memory_body_v1
+mode: MEMORY_LOOP
+extra_rounds: 1
 start_layer: 0
 end_layer: 8
-memory_slots: 16
+memory_slots: 8
+memory_seed: 0
+memory_initialization: boundary_mean_plus_1e-4_slot_noise
 progress_start: 0.0
-progress_end: 0.5
+progress_end: 1.0
 num_timesteps: 50
 actual_denoiser_calls: 49
 timestep_shift: 3.0

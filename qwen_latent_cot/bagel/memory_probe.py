@@ -39,7 +39,8 @@ class ProbeCapture:
                 'question_position_start':max(s['question_position_start'] for s in layers.values()),
                 'layers':sorted(layers),'observed_image_kind':'guided_one_step_x0_proxy'})
         record={**metadata,'snapshots':snapshots,'prompt_kv_exported':False,
-                'memory_does_not_carry_across_layers_in_generation':True}
+                'memory_carries_across_layers_in_generation':True,
+                'memory_state':'body_end_hidden', 'seed_reference':'strict_read_layer_input_kv'}
         (output/'capture.json').write_text(json.dumps(record,indent=2)+'\n')
         return record
 

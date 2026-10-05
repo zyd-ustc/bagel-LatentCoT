@@ -1,258 +1,49 @@
-# Research contract; execution uses CLI arguments and immutable run.json bindings.
-schema_version: 2
-protocol_id: early_native_memory_probe_20261005
-status: early_window_and_probe_implemented_formal_run_user_owned
-runner_implemented: true
-current_formal_experiments_executed: false
-historical_experiments_preserved: true
-early_loop_effectiveness: user_reported_established
-theory_sources: [bagel_native, hidden_state_refinement_2608_29160, looped_dit_2609_40305, slvr, uno]
-
-task:
-  input: [text_prompt, initial_noise]
-  output: image
-  inference_scope: inside_each_denoiser_call
-  inference_vit: false
-  inference_text_reasoning: false
-  inference_external_judge: false
-  inference_candidate_selection: false
-  gen_weight_training: false
-  zero_output_adapter: false
-  learnable_loop_gate: false
-  output_alpha: false
-  default_shuffle_experiment: false
-
-binding:
-  native_model_path: null
-  native_model_sha256_manifest: null
-  scorer_path_and_revision: null
-  scorer_protocol_hash: null
-  native_training_config: null
-  native_condition_dropout_config: null
-  native_timestep_shift: null
-  evaluation_manifest: bound_by_CLI
-  training_manifest: null
-  output_root: null
-  missing_bindings_block_execution: true
-
-algorithm:
-  name: proposed_layerwise_memory_kv
-  repeat_unit: individual_native_layer
-  layer_window_half_open: [0, 8]
-  active_sampling_progress: [0.0, 0.5]
-  progress_definition: "i/(num_timesteps-2), noise_to_data; num_timesteps-1 denoiser calls"
-  initial_total_gen_evaluations_per_layer: 2
-  baseline_total_gen_evaluations_per_layer: 1
-  extra_iterations_definition: "R=N-1"
-  residual_step: "1/N"
-  initial_memory_slots_max: 16
-  seed:
-    source: native_prompt_layer_input_hidden_states
-    selector: uniform_positions_over_non_special_content_tokens
-    short_prompt: use_actual_count_without_duplication
-    empty_prompt: no_memory
-    capture_layers: selected_window_only
-    rope: preserve_source_prompt_positions
-  gen_rope: unchanged_from_native
-  prompt_cache: read_only
-  memory_cache: layer_local_temporary_overlay_after_prompt_kv
-  memory_carry_across_layers: false
-  memory_carry_across_timesteps: false
-  reads_use: pre_update_states_of_same_iteration
-  first_iteration_gen_reads_memory: false
-  subsequent_iteration_gen_reads_memory: true
-  writer_reads: [prompt, current_gen, current_memory]
-  memory_writer_evaluations_per_layer: "N-1"
-  final_unused_writer_query: skip
-  native_expert_routing: preserve_including_soi_eoi
-  packed_variable_resolution: required
-  overlay_lengths_and_indexes: per_layer_per_sample
-  cfg_memory: branch_local_no_conditional_state_transfer
-  cfg_gen_loop_policy: identical_N_window_progress_for_all_executed_branches
-  ordinary_inference_suffix_calls_per_denoiser: 1
-
-generation:
-  image_size_screening: [512, 512]
-  aspect_ratio_evaluation: native_variable_resolution
-  outer_sampling_steps: 50
-  inference_timestep_shift: 3.0
+version: 2
+architecture: legacy_hidden_memory_body_v1
+source: native_BAGEL_UND_GEN_shared_attention_and_frozen_legacy_memory_loop
+final_task: text_to_image
+training: false
+formal_runs_executed_by: user
+state:
+  prompt_kv: immutable
+  feedback: body_end_memory_hidden
+  gen: reset_to_fixed_body_entry_each_round
+  boundaries: reset_with_gen
+  carry_across_sampler_steps: false
+  carry_across_cfg_branches: false
+  memory_initialization: per_sample_boundary_mean_plus_1e-4_slot_noise
+  memory_rope: native_SOI_position
+  gen_rope: unchanged
+computation:
+  prefix_passes: 1
+  body_passes: R_plus_1_when_R_positive
+  suffix_passes: 1
+  round_zero: strict_read_no_non_memory_query_reads_M
+  extra_rounds: full_native_decoder_body
+  residual_scaling: none
+  final_velocity: native_suffix_norm_llm2vae
+  zero_rounds: exact_native_bypass_without_memory
+  cfg: branch_local_memory_for_conditional_and_text_removed
+initial_configuration:
+  R: 1
+  memory_slots: 8
+  start_layer: 0
+  end_layer_exclusive: 8
+  active_sampling_progress: [0.0, 1.0]
+  sampling_timepoints: 50
+  actual_denoiser_calls: 49
   cfg_text_scale: 4.0
-  precision: bfloat16
-  all_other_native_settings: bind_and_hold_identical_across_arms
-  deployable_evaluation_teacher_inputs: prohibited
-  historical_checkpoint_loading: prohibited_for_new_training_free_arms
-
+  timestep_shift: 3.0
 arms:
-  BASE:
-    native_bypass: true
-  GEN_LAYERWISE:
-    memory: absent
-    operator: normalized_native_layer_repeat
-  MEMORY_DYNAMIC:
-    memory: updated_by_native_und
-    first_read_iteration_zero_based: 1
-  MEMORY_STATIC:
-    memory: fixed_at_seed
-    writer_compute_for_matching: compute_then_discard
-    first_read_iteration_zero_based: 1
-  MEMORY_NO_READ:
-    memory: updated_but_hidden_from_gen
-    expected_math_reference: GEN_LAYERWISE
-  BASE_MATCHED_LATENCY:
-    operator: native
-    outer_sampling_steps: calibrated_on_development_only
-    allowed_latency_mismatch_fraction: 0.05
-
-datasets:
-  evaluation:
-    manifest_builder_sources: [hard128, easy16]
-    actual_count: report_after_prompt_deduplication
-    seeds: [0, 1]
-    historical_prompts_allowed: true
-    claim_independent_holdout: false
-  fixed_confirmation_required: false
-  fixed_384_prompt_3_seed_task: canceled_by_user
-
-memory_qa_probe:
-  generation_capture_steps: [8, 16, 24]
-  sources: [DYNAMIC, SEED, EMPTY, VIT_IMAGE]
-  reader: complete_native_UND_decoder_and_LM_head
-  prompt_kv_read: false
-  question_format: native_BOS_question_EOS_BOS_answer
-  memory_layers: read_at_original_depth_empty_elsewhere
-  memory_rope: preserve_source
-  seed_dynamic_empty_question_rope: after_original_prompt_position
-  answer_protocol: fixed_candidates_mean_token_log_likelihood
-  candidate_softmax_is_calibrated: false
-  maximum_questions_per_prompt: 4
-  count_candidates: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, unknown]
-  question_selection: deterministic_skill_stratification
-  observed_image: guided_x0_proxy_xt_minus_t_v
-  observed_labeler_sees: [image, question, candidates]
-  observed_labeler_does_not_see: [full_prompt, desired_answer, memory_QA_answer]
-  uncertain_label: unknown
-  minimum_judge_self_reported_confidence: 0.8
-  confidence_is_calibrated: false
-  report: [actual_accuracy, prompt_echo_on_mismatch, dynamic_vs_seed, same_prompt_different_seed, unknown_by_step_and_skill]
-  VIT_IMAGE_role: offline_native_reader_calibration
-  failure_interpretation_requires_reliable_reader: true
-  final_image_quality_claim_from_probe: false
-  diagnostic_timing_is_deployable_budget: false
-
-statistics:
-  primary: [net_constraint_repair, official_semantic_gm]
-  secondary: [all_constraints_pass, quality_proxy, invalid, latency, peak_memory]
-  net_constraint_repair: "(repair_count-damage_count)/all_paired_atoms"
-  report_conditional_repair_damage_rates_separately: true
-  atom_pass_threshold: 0.5
-  bootstrap_unit: prompt
-  preserve_seeds_and_atoms_in_cluster: true
-  bootstrap_replicates: 10000
-  bootstrap_seed: 20261005
-  paired_ci: 0.95
-  blind_audit_pairs: 128
-  blind_audit_sampling_seed: 20261005
-  training_teacher_and_evaluation_scorer: prefer_independent_record_if_shared
-  decode_invalid: failure_with_reason
-  scorer_failure: incomplete_repair_then_rescore
-  silently_drop_pairs: false
-
-training_admission:
-  requires: [E0_pass, training_free_image_gain, dynamic_memory_content_evidence, quality_retention, budget_pass]
-  against_base:
-    net_repair_point_estimate_min: 0.02
-    net_repair_ci_lower_strictly_above: 0.0
-    semantic_gm_delta_ci_lower_strictly_above: 0.0
-  against_gen_and_static:
-    net_repair_delta_ci_lower_strictly_above: 0.0
-  preservation:
-    ordinary_easy_all_pass_delta_ci_lower_min: -0.02
-    quality_proxy_delta_ci_lower_min: -0.02
-    invalid_delta_ci_upper_max: 0.01
-  matched_latency_baseline: no_clear_disadvantage
-  only_gen_improves: stop_memory_training
-  all_frozen_candidates_fail: stop_operator_no_training
-
-runtime_budget:
-  median_end_to_end_latency_ratio_max: 1.35
-  p95_end_to_end_latency_ratio_max: 1.50
-  peak_gpu_memory_ratio_max: 1.20
-  include: [prompt_prefill, denoising, final_vae_decode, writer_parameters, memory_overlays]
-  exclude: [model_load, disk_image_write, offline_scoring]
-  timing_warmups: 3
-  timing_measured_generations_min: 20
-  timing_batch_size: 1
-  timing_probes: false
-  timing_intermediate_readouts: false
-  throughput_report: separate
-
-training:
-  enabled: false
-  enable_only_after_admission: true
-  writer_parameter_policy: copies_of_selected_native_und_parameters
-  writer_initialization: exact_native_values
-  original_prompt_and_boundary_weights: frozen
-  gen_vae_vit_weights: frozen
-  teacher_weights: frozen
-  teacher_targets: stop_gradient
-  teacher_features_in_student_forward: prohibited
-  gen_forward_grad_to_memory: required
-  optimizer:
-    name: AdamW
-    learning_rate: 0.00001
-    weight_decay: 0.0
-    warmup_steps: 20
-    gradient_clip_norm: 1.0
-    global_batch: 32
-  pilot:
-    max_optimizer_steps: 200
-    training_records: 64
-    development_records: 64
-    check_every_steps: 50
-  bounded_run:
-    max_optimizer_steps: 1000
-    training_records_max: 8192
-    check_every_steps: 200
-  total_steps_cap: 1200
-  bucket_ratios:
-    ordinary: 0.4
-    structural: 0.4
-    easy_noop: 0.2
-  training_depths: only_previously_validated_N_greater_than_1
-  initial_N: [2]
-  optional_N: [3]
-  untrained_depth: [4]
-  multi_depth_graph: independent_valid_window_trajectories_sharing_prefix
-  multi_depth_weights: equal_normalized_over_active_depths
-  losses_initial: [native_flow_multi_depth, grounded_semantic_supervision]
-  vision_loss: conditional_on_justified_target_correspondence
-  source_objective: native_bagel_flow
-  raw_t: standard_normal
-  time_transform: sigmoid_then_native_shift
-  x_t: "(1-t)*x0+t*epsilon"
-  velocity_target: epsilon_minus_x0
-  conditioning_dropout: bind_native_config
-  early_stop: no_image_level_gain_or_quality_damage_or_shortcut
-  final_evaluation: user_selected_manifest_with_declared_evidence_scope
-
-execution:
-  expected_hardware: 8_H200
-  generation_parallelism: independent_prompt_seed_shards
-  one_process_per_gpu: true
-  noise_seed_depends_on_worker_id: false
-  generation_and_scoring_concurrent_on_same_gpu: false
-  commands_available: true
-  formal_execution_owner: user
-  agent_formal_execution: prohibited
-  offline_scoring_parallelism: independent_identity_shards
-
-results:
-  E0: historical_native_parity_passed
-  E1: early_effectiveness_user_reported
-  E2: not_run
-  E3: not_run
-  E4: implemented_waiting_for_user_run
-  E5: fixed_confirmation_canceled_image_and_budget_evidence_separate
-  E6: not_run
-  training_admitted: false
-  semantic_gain_demonstrated: false
+  default: [BASE, MEMORY_LOOP]
+  optional_implementation_diagnostic: MEMORY_NO_READ
+checks:
+  - real_weight_native_R0_velocity_parity
+  - real_weight_native_no_read_velocity_parity
+  - same_weight_seed_legacy_velocity_parity
+  - immutable_prompt_KV
+  - reset_GEN_and_boundary_states
+  - packed_variable_resolution_isolation
+metrics: [semantic_atoms, semantic_GM, quality_proxy, invalid, Repair, Damage]
+not_implemented: [training, layer_indexed_feedback_KV, separate_UND_writer_pass]
+prohibited_default_mechanisms: [adapter, gate, alpha, shuffle, deployed_ViT_feedback]

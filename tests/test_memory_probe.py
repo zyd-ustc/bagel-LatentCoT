@@ -8,7 +8,7 @@ from qwen_latent_cot.bagel.memory_probe import (
     finalize_capture, validate_capture, snapshot_sources,
 )
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Config,Qwen2ForCausalLM
-from qwen_latent_cot.bagel.internal_loop import LoopConfig,recurrent_layer
+from qwen_latent_cot.bagel.internal_loop import LoopConfig,InternalLoopRuntime
 from qwen_latent_cot.evaluation.io import sha256
 from qwen_latent_cot.evaluation.probe_results import label_answer,summarize_probe
 from test_internal_loop import fixture
@@ -60,14 +60,17 @@ def test_native_qa_full_depth_sparse_kv_causal_packing_and_no_cache_write(device
 
 
 def test_snapshot_noninterference_and_dynamic_vs_seed():
-    layer,kwargs,seed=fixture();cfg=LoopConfig(start_layer=0,end_layer=1)
-    expected,_=recurrent_layer(layer,kwargs,seed,cfg)
-    snapshots=[];actual,_=recurrent_layer(layer,kwargs,seed,cfg,snapshot=snapshots.append)
-    assert torch.equal(actual,expected) and len(snapshots)==1
-    snapshot=snapshots[0]
-    assert not torch.equal(snapshot['dynamic_k'],snapshot['seed_k'])
-    assert snapshot['question_position_start']==3
-    assert snapshot['lengths']==[1,2]
+    model,kwargs=fixture(batch=1);cfg=LoopConfig(start_layer=1,end_layer=3)
+    runtime=InternalLoopRuntime(model,cfg)
+    try:
+        expected=model.language_model.model.forward_inference(**kwargs).packed_query_sequence
+        runtime.probe_capture=ProbeCapture([0])
+        actual=model.language_model.model.forward_inference(**kwargs).packed_query_sequence
+        assert torch.equal(actual,expected)
+        snapshot=runtime.probe_capture.layers[0][1]
+        assert not torch.equal(snapshot['dynamic_k'],snapshot['seed_k'])
+        assert snapshot['question_position_start']==9 and snapshot['lengths']==[8]
+    finally:runtime.close()
 
 
 def test_capture_requires_all_steps_layers_and_binds_tensor_image_hashes(tmp_path):
@@ -139,7 +142,7 @@ def test_guided_x0_capture_does_not_change_sampling_trajectory():
                 x=x-.1*velocity
             return [x]
     model=Model();bundle=SimpleNamespace(model=model,vae=None)
-    runtime=SimpleNamespace(diagnostics=[],banks={},probe_capture=None,progress=0)
+    runtime=SimpleNamespace(diagnostics=[],probe_capture=None,progress=0)
     generator=T2IGenerator(bundle,runtime)
     generator.prepare=lambda *a:({},['same_noise'])
     decoded=[]

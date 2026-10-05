@@ -61,8 +61,8 @@ def summarize(rows,resamples=10000):
             'peak_allocated_bytes':max(r['peak_allocated_bytes'] for r in records),
             'timing_is_engineering_only':True,
             'vs_BASE':paired_report(groups['BASE'],values,resamples)}
-        for control in ('GEN_LAYERWISE','MEMORY_STATIC'):
-            if control in groups and arm=='MEMORY_DYNAMIC':
+        for control in ('MEMORY_NO_READ',):
+            if control in groups and arm=='MEMORY_LOOP':
                 output[arm]['vs_'+control]=paired_report(groups[control],values,resamples)
         buckets=set(r['bucket'] for r in records)
         output[arm]['buckets']={}

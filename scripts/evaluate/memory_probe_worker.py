@@ -17,7 +17,7 @@ def main():
     records,run=load_manifests(args.manifests)
     if sha256(args.benchmark)!=run['benchmark_sha256']:raise ValueError('benchmark changed')
     data=read_jsonl(args.benchmark)
-    alljobs=sorted([r for r in records if r['arm']=='MEMORY_DYNAMIC'],key=identity)
+    alljobs=sorted([r for r in records if r['arm']=='MEMORY_LOOP'],key=identity)
     jobs=[r for i,r in enumerate(alljobs) if i%args.num_shards==args.shard_index]
     out=Path(args.output_dir);out.mkdir(parents=True,exist_ok=True)
     from qwen_latent_cot.bagel.backbone import load_native

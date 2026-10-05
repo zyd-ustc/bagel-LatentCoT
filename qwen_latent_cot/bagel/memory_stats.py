@@ -31,3 +31,15 @@ def sampled_read_mass(q,k,glen,klen,plen,mlen,read,maximum_queries=32):
             results.append(float(probabilities[:,:,p:p+m].sum(-1).mean()))
         qi+=g;ki+=kl
     return results
+
+
+def project_memory(layer, hidden, rope, query=False):
+    """Native UND layer-input KV for offline snapshots only."""
+    from .modeling.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+    a=layer.self_attn
+    h=layer.input_layernorm(hidden)
+    k=a.k_norm(a.k_proj(h).view(-1,a.num_key_value_heads,a.head_dim))
+    v=a.v_proj(h).view(-1,a.num_key_value_heads,a.head_dim)
+    q=a.q_norm(a.q_proj(h).view(-1,a.num_heads,a.head_dim)) if query else torch.zeros_like(k)
+    q,k=apply_rotary_pos_emb(q,k,*rope,unsqueeze_dim=1)
+    return q.to(torch.bfloat16) if query else None,k.to(torch.bfloat16),v.to(torch.bfloat16)

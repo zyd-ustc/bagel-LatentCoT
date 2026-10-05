@@ -19,11 +19,11 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model-path',required=True);p.add_argument('--prompts',required=True)
     p.add_argument('--output',required=True);p.add_argument('--device',default='cuda:0')
-    p.add_argument('--evaluations',type=int,default=2)
+    p.add_argument('--loop-rounds',type=int,default=1)
     p.add_argument('--start-layer',type=int,default=0);p.add_argument('--end-layer',type=int,default=8)
-    p.add_argument('--memory-slots',type=int,default=16)
-    p.add_argument('--progress-start',type=float,default=0.);p.add_argument('--progress-end',type=float,default=.5)
-    p.add_argument('--arms',default='BASE,GEN_LAYERWISE,MEMORY_DYNAMIC')
+    p.add_argument('--memory-slots',type=int,default=8)
+    p.add_argument('--progress-start',type=float,default=0.);p.add_argument('--progress-end',type=float,default=1.)
+    p.add_argument('--arms',default='BASE,MEMORY_LOOP')
     p.add_argument('--warmups',type=int,default=3);p.add_argument('--repeats',type=int,default=20)
     p.add_argument('--image-size',type=int,default=512);p.add_argument('--num-timesteps',type=int,default=50)
     p.add_argument('--matched-base-timesteps',type=int);args=p.parse_args()
@@ -33,7 +33,7 @@ def main():
     arms=args.arms.split(',')
     if 'BASE' not in arms:raise ValueError('budget measurement requires native Base')
     for arm in arms:
-        cfg=LoopConfig(mode='BASE' if arm=='BASE_MATCHED_LATENCY' else arm,evaluations=args.evaluations,
+        cfg=LoopConfig(mode='BASE' if arm=='BASE_MATCHED_LATENCY' else arm,extra_rounds=args.loop_rounds,
             start_layer=args.start_layer,end_layer=args.end_layer,memory_slots=args.memory_slots,
             progress_start=args.progress_start,progress_end=args.progress_end)
         runtime=InternalLoopRuntime(bundle.model,cfg)

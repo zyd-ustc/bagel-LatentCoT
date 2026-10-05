@@ -34,14 +34,8 @@ class T2IGenerator:
         cache = NaiveCache(self.model.config.llm_config.num_hidden_layers)
         inputs, lengths, ropes = self.model.prepare_prompts([0]*n, [0]*n, prompts, self.bundle.tokenizer, self.bundle.token_ids)
         inputs = to_device(inputs, self.device)
-        if self.runtime:
-            special = set(self.bundle.tokenizer.all_special_ids) | set(self.bundle.token_ids.values())
-            self.runtime.begin_prefill(cache, inputs['packed_text_ids'], inputs['text_token_lens'].tolist(), special)
-        try:
-            with self.autocast():
-                cache = self.model.forward_cache_update_text(cache, **inputs)
-        finally:
-            if self.runtime: self.runtime.end_prefill()
+        with self.autocast():
+            cache = self.model.forward_cache_update_text(cache, **inputs)
         flow = to_device(self.model.prepare_vae_latent(lengths, ropes, shapes, self.bundle.token_ids), self.device)
         noises, hashes = [], []
         for shape, seed in zip(shapes, seeds):
@@ -89,7 +83,6 @@ class T2IGenerator:
             raise
         finally:
             self.model._forward_flow = original
-            if self.runtime: self.runtime.banks.clear()
         return images, hashes
 
     def decode(self, latent, shape):

@@ -1,0 +1,11 @@
+{
+  "parent_revision": "6f936b7068272b999c0a9b7ec0a1434dbcd9161e",
+  "frozen_oracle_sha256": "8e4e29e3c3df2fff115d547dafd779915be37c8dd260223400ec31e23f608f1d",
+  "original_kernel_sha256": "4e3e44db9f494641f8c6279bd47066b4ae6428ed3a8ca57bd7313e6ad5230c9c",
+  "scope": "training-free hidden-state Memory recurrence; test oracle is never imported by generation",
+  "differences": [
+    "R=0 is an explicit native bypass",
+    "per-sample boundary initialization fixes the compatibility wrapper batch indexing",
+    "native decoder updates reused; strict Read attention retains parent SDPA mask"
+  ]
+}
