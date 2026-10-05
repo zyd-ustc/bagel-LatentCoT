@@ -86,6 +86,14 @@
     "qwen_latent_cot/bagel/modeling/cache_utils/taylorseer.py": {
       "source": "modeling/cache_utils/taylorseer.py",
       "sha256": "353a560c7b3164766f797020322a8e40d329ee3c3cc09c656dbe8d5522068dae"
+    },
+    "qwen_latent_cot/bagel/modeling/native_image_transform.py": {
+      "source": "data/transforms.py",
+      "slice_end_line": 115,
+      "removed_unused_imports": [
+        "cv2"
+      ],
+      "sha256": "feb03811157a54c41c3d031b9cf841a7dbc9adae59f0720adc069fa9ee29ded4"
     }
   }
 }

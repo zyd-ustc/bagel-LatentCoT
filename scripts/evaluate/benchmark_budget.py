@@ -20,7 +20,7 @@ def main():
     p.add_argument('--model-path',required=True);p.add_argument('--prompts',required=True)
     p.add_argument('--output',required=True);p.add_argument('--device',default='cuda:0')
     p.add_argument('--evaluations',type=int,default=2)
-    p.add_argument('--start-layer',type=int,default=16);p.add_argument('--end-layer',type=int,default=24)
+    p.add_argument('--start-layer',type=int,default=0);p.add_argument('--end-layer',type=int,default=8)
     p.add_argument('--memory-slots',type=int,default=16)
     p.add_argument('--progress-start',type=float,default=0.);p.add_argument('--progress-end',type=float,default=.5)
     p.add_argument('--arms',default='BASE,GEN_LAYERWISE,MEMORY_DYNAMIC')

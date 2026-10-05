@@ -15,8 +15,8 @@ MODES = ('BASE', 'GEN_LAYERWISE', 'MEMORY_DYNAMIC', 'MEMORY_STATIC', 'MEMORY_NO_
 class LoopConfig:
     mode: str = 'MEMORY_DYNAMIC'
     evaluations: int = 2
-    start_layer: int = 16
-    end_layer: int = 24
+    start_layer: int = 0
+    end_layer: int = 8
     memory_slots: int = 16
     progress_start: float = 0.0
     progress_end: float = 0.5
@@ -120,7 +120,7 @@ def _attend(q, k, v, qlens, klens):
         cu_seqlens_k=cumulative(klens), max_seqlen_q=max(qlens), max_seqlen_k=max(klens), causal=False)
 
 
-def recurrent_layer(layer, kwargs, seed, config, diagnostics=None):
+def recurrent_layer(layer, kwargs, seed, config, diagnostics=None, snapshot=None):
     """Two attention calls share one projection of each pre-update G/M state."""
     hidden = kwargs['packed_query_sequence']
     glen = kwargs['query_lens'].tolist()
@@ -144,6 +144,12 @@ def recurrent_layer(layer, kwargs, seed, config, diagnostics=None):
             mq, mk, mv = _project(layer, memory, seed.rope, query=write)
         else:
             mq = None; mk, mv = gk[:0], gv[:0]
+        if snapshot is not None and r == 0:
+            initial_k, initial_v = mk.detach().clone(), mv.detach().clone()
+        if snapshot is not None and r == config.evaluations-1:
+            snapshot({'dynamic_k':mk, 'dynamic_v':mv, 'seed_k':initial_k, 'seed_v':initial_v,
+                      'lengths':mlen, 'question_position_start':max(plen),
+                      'source_indexes':seed.source_indexes if seed is not None else image[:0]})
         read = has_memory and r > 0 and config.mode != 'MEMORY_NO_READ'
         rk, rlen = _overlay(pk, mk, gk, plen, mlen, glen, read)
         rv, _ = _overlay(pv, mv, gv, plen, mlen, glen, read)
@@ -172,9 +178,11 @@ def recurrent_layer(layer, kwargs, seed, config, diagnostics=None):
 
 class InternalLoopRuntime:
     """Install instance methods only; model state_dict and native weights stay intact."""
-    def __init__(self, model, config=LoopConfig(), diagnostics=False):
+    def __init__(self, model, config=LoopConfig(), diagnostics=False, probe_capture=None):
         self.model, self.config = model, config
         self.progress = 0.0
+        self.step_index = 0
+        self.probe_capture = probe_capture
         self.capture = None
         self.diagnostics_enabled = diagnostics
         self.diagnostics = []
@@ -229,7 +237,11 @@ class InternalLoopRuntime:
         else:
             seed = bank[1][index]
         details = [] if self.diagnostics_enabled else None
-        result = recurrent_layer(layer, kwargs, seed, cfg, details)
+        callback = None
+        if self.probe_capture is not None and int(kwargs['key_values_lens'].sum())>0 and self.step_index in self.probe_capture.steps:
+            if len(kwargs['query_lens'])!=1:raise ValueError('probe export is batch=1; ordinary runtime still supports packed batches')
+            callback = lambda payload: self.probe_capture.record(self.step_index,index,payload)
+        result = recurrent_layer(layer, kwargs, seed, cfg, details, callback)
         if details is not None:
             self.diagnostics.extend({'layer':index, 'progress':self.progress,
                 'branch':'conditional' if int(kwargs['key_values_lens'].sum()) else 'text_removed', **d} for d in details)

@@ -15,13 +15,17 @@ def main():
     p.add_argument('--judge-model',required=True);p.add_argument('--geneval2-source',required=True)
     p.add_argument('--device',default='cuda:0');p.add_argument('--output-dir',required=True)
     p.add_argument('--bootstrap-replicates',type=int,default=10000)
+    p.add_argument('--num-shards',type=int,default=1);p.add_argument('--shard-index',type=int,default=0)
     args=p.parse_args()
+    if not 0<=args.shard_index<args.num_shards:raise ValueError('invalid scoring shard')
     records,run=load_manifests(args.manifests)
     if run['benchmark_sha256']!=sha256(args.benchmark):raise ValueError('benchmark differs from generation')
     data=read_jsonl(args.benchmark)
     output=Path(args.output_dir);output.mkdir(parents=True,exist_ok=True)
+    work={key:i for i,key in enumerate(sorted({identity(r) for r in records}))}
+    records=[r for r in records if work[identity(r)]%args.num_shards==args.shard_index]
     scorer=LocalScorer(args.judge_model,args.geneval2_source,args.device)
-    provenance={'run':run,'scorer':scorer.provenance}
+    provenance={'run':run,'scorer':scorer.provenance,'scoring_shard':[args.shard_index,args.num_shards]}
     binding=output/'scorer.json'
     if binding.exists() and json.loads(binding.read_text())!=provenance:raise ValueError('scorer binding changed')
     binding.write_text(json.dumps(provenance,indent=2)+'\n')
@@ -42,11 +46,18 @@ def main():
             result=scorer.score(row,benchmark)
             with scorefile.open('a') as f:f.write(json.dumps(result)+'\n');f.flush()
         scored.append(result);print(f"scored {row['arm']} {row['prompt_id']} seed={row['seed']}",flush=True)
+    if args.num_shards>1:
+        print(f'Completed scoring shard: {scorefile}',flush=True)
+        return
+    write_summary(scored,run,output,args.bootstrap_replicates)
+
+
+def write_summary(scored,run,output,resamples=10000):
     summary={'status':'engineering_scored' if run['stage']=='engineering' else 'paired_scored',
-        'training_admitted':False,'training_admission_status':'requires independent confirmation, E0/E4, budget and blind review evidence',
+        'training_admitted':False,'training_admission_status':'not_assessed_here; assess_image_gain_and_memory_content_evidence',
         'stage':run['stage'],'source_sha256':run['source_sha256'],'model_sha256':run['model_sha256'],
         'quality_is_proxy':True,'blind_review':'pending','statistics_unit':'prompt_cluster_all_seeds_and_atoms',
-        'arms':summarize(scored,args.bootstrap_replicates)}
+        'arms':summarize(scored,resamples)}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
     lines=['# Frozen BAGEL denoiser loop evaluation','','Quality is a VLM proxy; blind review is pending. Engineering timing does not establish budget compliance.','',
         '|Arm|Semantic GM|Quality proxy|Invalid|Net Repair vs Base (95% CI)|Repair / Damage|',

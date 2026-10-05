@@ -1,8 +1,6 @@
-> 实现状态（2026-10-05）：`main` 已实现免训练算子、对照、原生一致性测试和离线语义/质量评测。以下研究协议保留原设计口径。工程结果不等于独立确认；训练与 E4 原生语义 probe 尚未实现。执行入口及证据见 README 和本次工程报告。
-
 # Denoiser 内部语义循环：机制、测试、训练与证据方案
 
-日期：2026-10-05。状态：研究与实施方案；新算子尚未实现，本方案的实验尚未执行。
+日期：2026-10-05。状态：原生循环、质量评测和离线 UND Memory QA probe 已实现。当前窗口 `[0,8)`；正式评测由用户运行。早期 loop 已有效是用户提供的实验前提；本轮不重复要求固定规模确认集。
 
 本文件承接用户最新约束，重新定义下一阶段研究路线。它不把旧 Anchored adapter 的结果视为新方案的验证，也不修改旧实验记录。配套文件：DENOISER_INTERNAL_MEMORY_PROTOCOL.yaml 和 DENOISER_INTERNAL_MEMORY_CHECKLIST.md。
 
@@ -46,7 +44,7 @@ SLVR 的语义投影和 UNO 的 metaqueries 不是本方案默认组件。只借
 | H1 | 冻结 BAGEL 的内部重复计算存在有效语义编辑区间。 | 同 prompt、噪声下，最终图像的语义修复超过破坏，且开销合格。 | velocity 改变、单张好图、loss 降低。 |
 | H2 | UND Memory 能获得与当前生成状态有关的内容。 | 同 prompt 不同生成状态下，对实际可见属性的判断随证据变化；在 prompt 与实际图像不一致的案例中不能只复述 prompt。 | Memory 范数、注意力质量、有效秩非零。 |
 | H3 | GEN 会利用 Memory 的更新内容。 | 动态 Memory 比静态 Memory、关闭 Memory 读取更有效，比较保持其余计算与位置约定一致。 | Memory 读入后图片发生变化。 |
-| H4 | 内容更新带来的收益超过纯 GEN 循环及等时延原生采样。 | 独立确认集上的配对语义和质量结果、真实延迟。 | 不同 FLOPs 或不同 CFG 下的总分比较。 |
+| H4 | 内容更新带来的收益超过纯 GEN 循环及等时延原生采样。 | 同 prompt/seed 的配对语义和质量结果、真实延迟。 | 不同 FLOPs 或不同 CFG 下的总分比较。 |
 | H5 | 理解侧适配改善接口稳定性，而非改变生成主干能力。 | GEN/原始 prompt 路径权重不变；训练后有效编辑率或预算效率提高，R0 保持原生行为。 | 理解 QA 更准或监督 loss 更低。 |
 
 先验证 H1，再验证 H2/H3，最后验证 H4。H5 仅在训练准入成立后研究。若只有 H1 成立，应将结果称为 GEN 内部细化，不能宣称 Memory 方法成功。
@@ -59,7 +57,7 @@ SLVR 的语义投影和 UNO 的 metaqueries 不是本方案默认组件。只借
 
 - t：原生 flow 时间；一次内部循环期间 x_t 与 t 固定。
 - s=i/(S-1)：从噪声到图像的采样进度。s 不能直接替代 BAGEL 的 shifted timestep。
-- l：模型层号。初始候选层区间为 [16,24)，左闭右开，共 8 层。
+- l：模型层号。初始候选层区间为 [0,8)，左闭右开，共 8 层。
 - N：每个选中层的总 GEN 计算次数；N=1 为原生路径。额外次数 R=N-1。禁止复用旧 runner 的 R 而不转换语义。
 - G_l^r：当前图像查询序列在第 l 层的第 r 次状态；包含原生 SOI/EOI 边界，保持原生 UND/GEN 路由。
 - M_l^r：第 l 层的局部 Memory 状态。按层保存，仅在该层的内部迭代中更新。
@@ -132,7 +130,7 @@ NaViT 保持 packed token 表示和 per-sample offsets；不能要求 batch 内�
 
 ### 4.5 开销控制
 
-首个候选只在 s∈[0,0.5]、[16,24) 层运行，N=2，K≤16。前期最多扩展到 N=3；N=4 属于通过后才做的边界测试。
+首个候选只在 s∈[0,0.5]、[0,8) 层运行，N=2，K≤16。前期最多扩展到 N=3；N=4 属于通过后才做的边界测试。
 
 以 32 层、8 层循环、约一半采样步为例，忽略 Memory 与不同层成本，N=2 的层计算比约为 1+0.5×8/32=1.125。这只是估算；writer、额外 attention、kernel 调度与缓存成本必须实测。
 
@@ -142,16 +140,16 @@ NaViT 保持 packed token 表示和 per-sample offsets；不能要求 batch 内�
 
 ## 5. 免训练测试顺序与停止条件
 
-所有新 arm 名称都是协议 ID，尚不是现有脚本已支持的 CLI mode。
+下列 arm 已由当前 CLI 实现。正式评测均由用户启动；代理只执行代码和接口检查。
 
 | ID | 测试 | 改变的唯一核心因素 | 输出与决策 |
 | --- | --- | --- | --- |
 | E0 | 原生接口正确性 | 新 runner 的 bypass 与 N=1 | 与 refs/Bagel 的同权重同输入 velocity 对齐；先排除实现差异。 |
-| E1 | 纯 GEN 同层细化 | 原生层改为 N=2，Memory 为空 | 是否存在免训练有效编辑信号；没有则只允许预定的一次窗口调整。 |
+| E1 | 纯 GEN 同层细化 | 原生层改为 N=2，Memory 为空 | 用户已确认早期循环有效；本轮重点比较 Memory 的增量，不重复设定固定规模确认任务。 |
 | E2 | 动态 Memory | 在 E1 上加入上述 UND writer 与 KV read | 是否修复更多语义错误；最终图像必须优于 Base，不能只优于较差的 E1。 |
 | E3 | 内容用途 | 与 E2 比较静态 Memory及关闭读取 | 区分动态内容、条件重复、额外计算；不默认做跨样本 shuffle。 |
 | E4 | 内容是否来自实际状态 | 同 prompt 不同初始噪声的状态诊断 | Memory 对实际计数/关系的判断能否区分不同状态；只作诊断，不将探针准确率当生成收益。 |
-| E5 | 独立确认与预算 | 固定唯一候选，扩大到未使用 prompts 和 seeds | 判定准入、失败或证据不足；含等时延原生采样比较。 |
+| E5 | 图像收益与预算汇总 | 依据已有早期证据和本轮配对结果，记录证据范围 | 核查质量保留、Memory 增量及成本；不要求固定 384×3 数据集。 |
 | E6 | 边界 | 通过 E5 后，N=3/4、长宽比及较高分辨率 | 有效深度、失效区间、成本边界；不得反向用于选择 E5 最佳配置。 |
 
 E0 必测：N=1、Memory 写但 GEN 不读、单样本/packed 多样本、不同长宽、CFG 分支隔离、每层缓存长度、缓存无污染。BF16 parity 阈值需按原生重复运行与 kernel 差异校准，另用小规模高精度 attention 验证 mask；不能为迁就错误而任意放宽。
@@ -160,22 +158,28 @@ E3 的 static-M 固定为 M_l^0，后续读取时序与动态版相同；writer 
 
 E4 的重点是 prompt 要求与实际生成不一致的样本。标签写“实际有两个对象”，不能因为 prompt 要求三个就标成三个。对高噪声时刻无法可靠判断的内容标 unknown。辅助 native UND 问答读取 Memory 的探针只能离线运行；探针自身若无法通过有已知内容的 native KV 校准，就不能用其失败否定 Memory。
 
-### 5.1 数据与预算
+### 5.1 原生 UND Memory 问答与数据安排
 
-| 阶段 | 拟定规模 | 用途 |
-| --- | --- | --- |
-| 工程检查 | 8 prompts×1 seed，覆盖不同长宽 | 正确性，不报告质量结论。 |
-| 开发筛选 | 64 structural + 32 ordinary/easy，seeds 0、1 | 选择一个候选；历史 hard128/easy16 只能作为开发资料。 |
-| 独立确认 | 256 structural + 128 ordinary/easy，seeds 11、23、37 | 配对确认；与开发、历史评测、训练数据去重。 |
-| 证据不足的唯一扩展 | 追加独立 256 structural + 128 ordinary/easy，同 3 seeds | 配置不变；到此仍不确定则不进入训练。 |
+默认窗口为 `[0,8)`，N=2、K≤16、采样进度 `[0,0.5]`。早期 loop 的有效性采用用户已有证据。本轮不再以旧晚期窗口筛查为全局停止条件，也不设置固定 384×3 确认集及扩展任务。
 
-使用实际可取得的 GenEval2 与 spatial 题目及 ordinary prompts，保留原题、答案和来源 ID。数据尚未绑定；冻结实际 manifest 后才能执行。未获得独立确认集时，不得用历史数据重命名成 holdout。
+本轮可复用 hard128 和 easy16，去重后保存 manifest。默认 seeds 为 0、1；实际题数由文件决定。这些数据保留历史开发来源，不声称独立 holdout。运行前绑定源码、模型、数据和 scorer 哈希。
 
-开发阶段预定最多 4 个算法配置：默认 E1/E2；若无信号，追加同样 N=2、s 窗口但层区间改为 [12,20) 的 E1/E2。禁止扩展成窗口×深度×slot×CFG 的无界搜索。E3 只对最有希望的动态 Memory 候选执行。E5 比较 Base、胜出 E1、胜出 E2、static-M 和等时延原生采样；no-read 的接口等价性在 E0/E3 留证。
+在第 8、16、24 次 denoiser 调用导出选中层最后一次 GEN 读取的 Memory KV，同时保存初始 Memory KV。源 RoPE 不变，不导出 prompt KV。每份快照由原生完整 UND decoder 和 LM head 做离线问答；未选中层的 Memory KV 为空，选中层在原深度读取相应 KV。不将 layer-local Memory 重新解释为生成时跨层或跨步状态。
 
-E5 首批为 384 prompts×3 seeds×5 arms=5760 张图；若执行一次等规模扩展，总计最多 11520 张确认图，不含开发和边界实验。运行前用真实单图时延估算 GPU 小时；本文不虚构耗时。等时延 Base 的采样步数只在开发集标定，确认阶段误差目标为±5%；无法满足时报告实际差值，不称严格等预算。
+必要读出对照为：
 
-训练准入需要 E2 的正向收益及 E3 对动态内容的支持。仅 E1 有效时，保留纯 GEN 结果，停止 Memory 的训练分支。
+- DYNAMIC：读取 UND 更新后、GEN 实际消费的 Memory KV。
+- SEED：读取初始 Memory KV，检查是否只保留 prompt 意图。
+- EMPTY：无 Memory，检查问答先验。
+- VIT_IMAGE：原生 ViT 将同一时刻的图像估计写入完整 UND KV，检查原生问答格式和读出能力。这条路径只离线运行。
+
+题目来自原有计数、属性、空间关系等约束，按 skill 确定性选取至多 4 题。固定候选用原生语言头的答案 token 平均 log-likelihood 评分。候选 softmax 只是相对分数，不称校准概率。完整 UND 层在原深度执行；没有新增投影、分类 head 或 adapter。
+
+标签来自同次调用 `x_t-t·v_guided` 的 VAE 图像估计。离线 judge 只见图像、问题和候选，不见完整 prompt、要求答案或 Memory 输出。它报告实际可见内容；难以判断或置信不足记 unknown。这是当前状态的代理观察，不是 noisy GEN token 的直接真值，也不是最终图像标签。
+
+报告分开统计：实际内容准确率、DYNAMIC 对 SEED 的配对增量、prompt/实际不一致时的 prompt 复述率、同 prompt 不同 seed 的状态区分、各 step/skill 的 unknown 比例。VIT_IMAGE 读出不可靠时，Memory probe 的负结果不能解释为内容不存在。DYNAMIC 即使答对，也必须结合 static/no-read 和最终 T2I 图像收益，才能讨论信息是否被 GEN 有效利用。
+
+生成与离线评测均使用 8 卡独立 shard。probe 产生额外 VAE 与读出开销，必须与正常推理预算分开。运行命令见 EARLY_MEMORY_PROBE_RUNBOOK.md。
 
 ### 5.2 指标与统计
 
@@ -187,10 +191,10 @@ E5 首批为 384 prompts×3 seeds×5 arms=5760 张图；若执行一次等规模
 - 同时报 Repair/Base失败数、Damage/Base成功数；两者分母不同，不能直接相减代替 Net repair。
 - prompt 全约束通过率、官方 soft-TIFA/GM 单独报告；不混用 atom 与 prompt 口径。
 - 质量：固定 judge 的独立画面质量代理、invalid、普通/easy 保留率；与语义问题分开。
-- bootstrap 按 prompt 聚类重采样，保留同 prompt 的全部 seeds 与 atoms；确认集报告 95% CI。
+- bootstrap 按 prompt 聚类重采样，保留同 prompt 的全部 seeds 与 atoms；配对结果报告 95% CI。
 - 解码损坏按预注册规则计失败；scorer 崩溃/缺结果属于评测故障，修复后重评，不能偷偷丢样本。
 
-训练 teacher 与确认 scorer 尽量采用独立来源；同源时明确记录风险。确认结果另以固定随机种子抽取 128 对图像，隐藏 arm 名称做语义及质量核查，覆盖成功、失败和无变化，保留抽样规则。未完成独立核查时，结论只能称“自动评测支持”，不能直接等同于人工质量偏好。核查结果不能反过来挑选确认集配置。
+训练 teacher 与评测 scorer 尽量采用独立来源；同源时明确记录风险。结果另以固定随机种子抽取最多 128 对图像，隐藏 arm 名称做语义及质量核查，覆盖成功、失败和无变化，保留抽样规则。未完成独立核查时，结论只能称“自动评测支持”，不能直接等同于人工质量偏好。核查结果不能反过来挑选评测配置。
 
 E5 的拟定门槛：
 
@@ -200,7 +204,7 @@ E5 的拟定门槛：
 4. invalid 增量的 95% CI 上界≤1 个百分点；成本满足 §4.5。
 5. 与等时延原生采样比较不出现明确劣势。若等时延 Base 已更好，则不宣称循环有预算优势。
 
-这些是 go/no-go 阈值，不是现有效果。CI 跨界属于证据不足，不属于通过；仅允许一次预定扩展。数值门槛若因业务需求调整，必须在确认集运行前记录新版本。
+这些是 go/no-go 阈值，不是现有效果。CI 跨界属于证据不足，不属于通过。本轮不强制追加固定规模确认集；阈值改变必须在运行前记录。
 
 目标不是每个样本随 N 单调改善。报告修复、破坏及深度边界；不以“某一深度最好”替代跨样本证据。
 
@@ -275,7 +279,7 @@ N=1 无 Memory 参数梯度，只用于原生对照。训练深度从已通过�
 
 起始优化设定：AdamW、writer learning rate 1e-5、weight decay 0、20-step warmup、grad clip 1、global batch 32。这些是拟定试验起点，必须检查显存和每步 token 数，不复制 UNO 的完整训练配方。
 
-试验通过后，最多 1000 steps，最多 8192 条去重且监督可信的配对记录，维持 40/40/20 桶配比；每 200 steps 在开发集检查。与 200-step 试验合计上限 1200 steps，不自动延长。使用全新独立确认 prompts 评价训练后结果，避免反复查看 E5 的确认集调参。
+试验通过后，最多 1000 steps，最多 8192 条去重且监督可信的配对记录，维持 40/40/20 桶配比；每 200 steps 在开发集检查。与 200-step 试验合计上限 1200 steps，不自动延长。训练后评测的题目和证据范围由用户确定；不预设额外确认集待办。
 
 训练通过标准仍是图像级语义/质量/成本，而非 loss。训练后若只能改善辅助 QA 或视觉特征回归，而图像修复没有提高、开销也没有降低，停止此适配路线。若质量受损或 writer 对 prompt 复制捷径加重，回退到免训练版本。
 
@@ -314,9 +318,9 @@ Memory 诊断记录 effective rank、mean pairwise cosine、slot std、每轮 up
 | 工作包 | 拟实施位置/产物 | 验收 |
 | --- | --- | --- |
 | W0 | 绑定 native 权重、prompt manifests、scorer 与环境 | provenance 完整，独立数据可用。 |
-| W1 | 新增 layerwise 内部循环；扩展 navit_loop.py 的临时 KV overlay | E0；packed、RoPE、专家分流与缓存正确。 |
-| W2 | 扩展 scripts/evaluate/t2i_loop_matrix.py，新增独立 mode | N/K/窗口/统计独立；无旧 α、gate 污染。 |
-| W3 | 复用并核对 evaluation/loop_results.py 的评分与配对逻辑 | prompt-cluster CI、Repair/Damage、质量/成本一致。 |
+| W1 | 新增 layerwise 内部循环；使用 internal_loop.py 的临时 KV overlay | E0；packed、RoPE、专家分流与缓存正确。 |
+| W2 | scripts/evaluate/training_free.py 与八卡 launcher | N/K/窗口/统计独立；无旧 α、gate 污染。 |
+| W3 | evaluation/report.py 与 quality_report.py 的评分与配对逻辑 | prompt-cluster CI、Repair/Damage、质量/成本一致。 |
 | W4 | 完成 E1–E5 与决策报告 | 明确 go / stop / inconclusive。 |
 | W5 | 仅准入后，新增理解侧 writer 训练入口 | 冻结参数证明、teacher 掩码、正确多深度计算图。 |
 | W6 | 条件性训练与最终独立验证 | 模型收益与成本证据齐全。 |
@@ -325,7 +329,7 @@ H200 的预期执行方式为 8 卡各一个独立生成 worker，按 prompt/see
 
 生成完成并释放模型后再运行 scorer/teacher，避免显存竞争。计时固定硬件、分辨率、batch、精度与 CFG；先 warmup 3 次，再测至少 20 次，包含最终 VAE decode，不含模型加载和磁盘写图。另报纯 denoiser 时间与吞吐。普通计时关闭 probes、save-readouts 与逐轮 suffix。
 
-这里没有提供新算子的执行命令，因为对应 mode/训练入口尚未实现。配套 YAML 是待实现 runner 的实验合同，不是可以交给现有脚本直接运行的配置。不得用当前 anchored 模式的命令声称已经执行本方案。
+免训练生成、质量评测与 Memory probe 已有八卡命令，见 EARLY_MEMORY_PROBE_RUNBOOK.md。YAML 是研究合同，CLI 将实际参数写入不可变 run.json。训练入口仍未实现。
 
 ## 9. 来源索引
 
@@ -351,6 +355,8 @@ H200 的预期执行方式为 8 卡各一个独立生成 worker，按 prompt/see
 
 ## 10. 当前完成状态
 
-已完成：来源核对、机制与掩码定义、免训练测试次序、数据/统计/成本协议、训练准入与退出条件、实施清单。
+已实现：冻结原生 BAGEL、内部 GEN/UND Memory 循环、parity/no-read 检查、质量与语义统计、早期 `[0,8)` 默认窗口、原生 UND Memory QA、实际图像标签与八卡流程。
 
-尚未完成：新算子实现、H200 parity、任何本方案质量评测、任何本方案训练。当前不能宣称该内部 Memory 循环已产生语义增益。
+已知证据：旧窗口工程结果保留；用户确认早期 loop 已有效。当前 probe 的代码检查不等于正式结果。
+
+待用户执行：本轮 Memory 内容问答、最终图像语义/质量比较。固定 384×3 确认集已取消。没有启动训练，没有自动执行正式评测。

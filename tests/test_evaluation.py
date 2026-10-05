@@ -4,7 +4,6 @@ import pytest
 from qwen_latent_cot.evaluation.scoring import normalize_atoms
 from qwen_latent_cot.evaluation.report import paired_report, summarize
 from qwen_latent_cot.evaluation.io import load_manifests,sha256
-from qwen_latent_cot.evaluation.protocol import validate_confirmation
 
 
 def row(prompt='p0',seed=0,arm='BASE',atoms=(0.,1.),**extra):
@@ -55,10 +54,6 @@ def test_manifest_requires_complete_shards(tmp_path):
     with pytest.raises(ValueError,match='incomplete'):load_manifests([tmp_path/'manifest.jsonl'])
 
 
-def test_confirmation_cannot_use_historical_small_set():
-    with pytest.raises(ValueError):validate_confirmation([{'prompt':'x'}],[0],['BASE'],None,'missing')
-
-
 def test_cluster_ci_does_not_depend_on_shard_record_order():
     reference={(p,0):row(prompt=p,atoms=(0.,)) for p in ('c','b','a')}
     candidate={(p,0):row(prompt=p,arm='MEMORY_DYNAMIC',atoms=(float(p=='a'),)) for p in ('c','b','a')}
@@ -66,3 +61,35 @@ def test_cluster_ci_does_not_depend_on_shard_record_order():
     reverse_reference=dict(reversed(list(reference.items())))
     reverse_candidate=dict(reversed(list(candidate.items())))
     assert result==paired_report(reverse_reference,reverse_candidate,resamples=200)
+
+
+def test_quality_shard_merge_checks_complete_generation_binding(tmp_path,monkeypatch):
+    import importlib.util,sys
+    from PIL import Image
+    root=Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root/'scripts/evaluate'))
+    spec=importlib.util.spec_from_file_location('merge_quality_test',root/'scripts/evaluate/merge_quality.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    run={'source_sha256':'test','model_sha256':{},'benchmark_sha256':'b','sampling':{},'loop':{},
+         'seeds':[0,1],'arms':['BASE','MEMORY_DYNAMIC'],'prompt_ids':['p0'],'stage':'evaluation'}
+    image=tmp_path/'image.png';Image.new('RGB',(28,28)).save(image)
+    manifests=[];dirs=[]
+    for seed in range(2):
+        worker=tmp_path/f'worker_{seed}';worker.mkdir()
+        values=[{**row(seed=seed,arm=arm,atoms=(float(arm!='BASE'),)),
+                 'path':str(image),'image_sha256':sha256(image),'valid_file':True} for arm in run['arms']]
+        (worker/'run.json').write_text(json.dumps(run))
+        manifest=worker/'manifest.jsonl';manifest.write_text(''.join(json.dumps(r)+'\n' for r in values))
+        (worker/'scorer.json').write_text(json.dumps({'run':run,'scorer':{'test':'synthetic'},'scoring_shard':[seed,2]}))
+        (worker/'scores.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in reversed(values)))
+        manifests.append(str(manifest));dirs.append(str(worker))
+    args=['merge_quality.py','--manifests',*manifests,'--score-dirs',*dirs,'--output-dir',str(tmp_path/'report'),'--bootstrap-replicates','20']
+    monkeypatch.setattr(sys,'argv',args);module.main()
+    summary=json.loads((tmp_path/'report/summary.json').read_text())
+    assert summary['arms']['MEMORY_DYNAMIC']['vs_BASE']['repair_count']==2
+    assert not summary['training_admitted']
+    bad=Path(dirs[0])/'scorer.json';binding=json.loads(bad.read_text());binding['run']['source_sha256']='other';bad.write_text(json.dumps(binding))
+    with pytest.raises(ValueError,match='differs from generation'):module.main()
+    binding['run']=run;bad.write_text(json.dumps(binding))
+    (Path(dirs[0])/'scores.jsonl').write_text('')
+    with pytest.raises(ValueError,match='incomplete scoring'):module.main()

@@ -1,9 +1,11 @@
 # Research contract; execution uses CLI arguments and immutable run.json bindings.
-schema_version: 1
-protocol_id: denoiser_internal_memory_20261005
-status: runtime_implemented_engineering_validation
+schema_version: 2
+protocol_id: early_native_memory_probe_20261005
+status: early_window_and_probe_implemented_formal_run_user_owned
 runner_implemented: true
-experiments_executed: true
+current_formal_experiments_executed: false
+historical_experiments_preserved: true
+early_loop_effectiveness: user_reported_established
 theory_sources: [bagel_native, hidden_state_refinement_2608_29160, looped_dit_2609_40305, slvr, uno]
 
 task:
@@ -28,10 +30,7 @@ binding:
   native_training_config: null
   native_condition_dropout_config: null
   native_timestep_shift: null
-  development_manifest: null
-  confirmation_manifest: null
-  confirmation_extension_manifest: null
-  post_training_confirmation_manifest: null
+  evaluation_manifest: bound_by_CLI
   training_manifest: null
   output_root: null
   missing_bindings_block_execution: true
@@ -39,10 +38,9 @@ binding:
 algorithm:
   name: proposed_layerwise_memory_kv
   repeat_unit: individual_native_layer
-  layer_window_half_open: [16, 24]
-  layer_window_fallback_half_open: [12, 20]
+  layer_window_half_open: [0, 8]
   active_sampling_progress: [0.0, 0.5]
-  progress_definition: "i/(S-1), noise_to_data"
+  progress_definition: "i/(num_timesteps-2), noise_to_data; num_timesteps-1 denoiser calls"
   initial_total_gen_evaluations_per_layer: 2
   baseline_total_gen_evaluations_per_layer: 1
   extra_iterations_definition: "R=N-1"
@@ -75,7 +73,7 @@ algorithm:
 
 generation:
   image_size_screening: [512, 512]
-  aspect_ratio_confirmation: native_variable_resolution
+  aspect_ratio_evaluation: native_variable_resolution
   outer_sampling_steps: 50
   inference_timestep_shift: 3.0
   cfg_text_scale: 4.0
@@ -106,28 +104,40 @@ arms:
     allowed_latency_mismatch_fraction: 0.05
 
 datasets:
-  engineering:
-    prompts: 8
-    seeds: [0]
-  development:
-    structural_prompts: 64
-    ordinary_easy_prompts: 32
+  evaluation:
+    manifest_builder_sources: [hard128, easy16]
+    actual_count: report_after_prompt_deduplication
     seeds: [0, 1]
     historical_prompts_allowed: true
-    maximum_algorithm_configs: 4
-  confirmation:
-    structural_prompts: 256
-    ordinary_easy_prompts: 128
-    seeds: [11, 23, 37]
-    arms: [BASE, GEN_LAYERWISE, MEMORY_DYNAMIC, MEMORY_STATIC, BASE_MATCHED_LATENCY]
-    disjoint_from: [historical_evaluation, development, training]
-  confirmation_extension:
-    maximum_extensions: 1
-    structural_prompts: 256
-    ordinary_easy_prompts: 128
-    seeds: [11, 23, 37]
-    change_algorithm: false
-  unresolved_confirmation_result: no_training
+    claim_independent_holdout: false
+  fixed_confirmation_required: false
+  fixed_384_prompt_3_seed_task: canceled_by_user
+
+memory_qa_probe:
+  generation_capture_steps: [8, 16, 24]
+  sources: [DYNAMIC, SEED, EMPTY, VIT_IMAGE]
+  reader: complete_native_UND_decoder_and_LM_head
+  prompt_kv_read: false
+  question_format: native_BOS_question_EOS_BOS_answer
+  memory_layers: read_at_original_depth_empty_elsewhere
+  memory_rope: preserve_source
+  seed_dynamic_empty_question_rope: after_original_prompt_position
+  answer_protocol: fixed_candidates_mean_token_log_likelihood
+  candidate_softmax_is_calibrated: false
+  maximum_questions_per_prompt: 4
+  count_candidates: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, unknown]
+  question_selection: deterministic_skill_stratification
+  observed_image: guided_x0_proxy_xt_minus_t_v
+  observed_labeler_sees: [image, question, candidates]
+  observed_labeler_does_not_see: [full_prompt, desired_answer, memory_QA_answer]
+  uncertain_label: unknown
+  minimum_judge_self_reported_confidence: 0.8
+  confidence_is_calibrated: false
+  report: [actual_accuracy, prompt_echo_on_mismatch, dynamic_vs_seed, same_prompt_different_seed, unknown_by_step_and_skill]
+  VIT_IMAGE_role: offline_native_reader_calibration
+  failure_interpretation_requires_reliable_reader: true
+  final_image_quality_claim_from_probe: false
+  diagnostic_timing_is_deployable_budget: false
 
 statistics:
   primary: [net_constraint_repair, official_semantic_gm]
@@ -139,16 +149,16 @@ statistics:
   preserve_seeds_and_atoms_in_cluster: true
   bootstrap_replicates: 10000
   bootstrap_seed: 20261005
-  confirmation_ci: 0.95
+  paired_ci: 0.95
   blind_audit_pairs: 128
   blind_audit_sampling_seed: 20261005
-  training_teacher_and_confirmation_scorer: prefer_independent_record_if_shared
+  training_teacher_and_evaluation_scorer: prefer_independent_record_if_shared
   decode_invalid: failure_with_reason
   scorer_failure: incomplete_repair_then_rescore
   silently_drop_pairs: false
 
 training_admission:
-  requires: [E0_pass, E5_pass, dynamic_memory_content_evidence, budget_pass]
+  requires: [E0_pass, training_free_image_gain, dynamic_memory_content_evidence, quality_retention, budget_pass]
   against_base:
     net_repair_point_estimate_min: 0.02
     net_repair_ci_lower_strictly_above: 0.0
@@ -223,7 +233,7 @@ training:
   velocity_target: epsilon_minus_x0
   conditioning_dropout: bind_native_config
   early_stop: no_image_level_gain_or_quality_damage_or_shortcut
-  final_evaluation: new_disjoint_confirmation_set
+  final_evaluation: user_selected_manifest_with_declared_evidence_scope
 
 execution:
   expected_hardware: 8_H200
@@ -231,15 +241,18 @@ execution:
   one_process_per_gpu: true
   noise_seed_depends_on_worker_id: false
   generation_and_scoring_concurrent_on_same_gpu: false
-  commands_available: false
+  commands_available: true
+  formal_execution_owner: user
+  agent_formal_execution: prohibited
+  offline_scoring_parallelism: independent_identity_shards
 
 results:
-  E0: not_run
-  E1: not_run
+  E0: historical_native_parity_passed
+  E1: early_effectiveness_user_reported
   E2: not_run
   E3: not_run
-  E4: not_run
-  E5: not_run
+  E4: implemented_waiting_for_user_run
+  E5: fixed_confirmation_canceled_image_and_budget_evidence_separate
   E6: not_run
   training_admitted: false
   semantic_gain_demonstrated: false
