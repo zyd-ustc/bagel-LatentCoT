@@ -44,6 +44,7 @@ def main():
     from qwen_latent_cot.bagel.internal_loop import LoopConfig, InternalLoopRuntime, MODES
     from qwen_latent_cot.evaluation.loop_depth import parse_depths,expand_arms
     if args.num_timesteps<2: raise ValueError('native schedule needs at least two time points')
+    if args.max_prompts is not None and args.max_prompts<1:raise ValueError('max prompts must be positive')
     if not 0 <= args.shard_index < args.num_shards: raise ValueError('invalid worker shard')
     if args.device.startswith('cuda'): torch.cuda.set_device(torch.device(args.device))
     seeds = [int(s) for s in args.seeds.split(',')]
@@ -73,7 +74,7 @@ def main():
     model_files = sorted(weights.glob('*.safetensors')) if not (weights/'ema.safetensors').exists() else [weights/'ema.safetensors', weights/'ae.safetensors']
     model_files += [weights/f for f in ('llm_config.json','vit_config.json','tokenizer.json','tokenizer_config.json','vocab.json','merges.txt') if (weights/f).exists()]
     print('Hashing native weights and source...', flush=True)
-    provenance = {'schema':4, 'architecture':'native_layerwise_input_kv_v2_with_prompt_replacement', 'source_sha256':source_hash(ROOT),
+    provenance = {'schema':5, 'architecture':'native_layerwise_input_kv_v3_with_full_prompt_replacement', 'source_sha256':source_hash(ROOT),
         'model_sha256':{p.name:sha256(p) for p in model_files}, 'model_path':str(weights.resolve()),
         'benchmark_sha256':sha256(args.prompts), 'benchmark':str(Path(args.prompts).resolve()),
         'sampling':{'num_timesteps':args.num_timesteps,'actual_denoiser_calls':args.num_timesteps-1,
@@ -96,7 +97,20 @@ def main():
             'null_or_no_content':'native_bypass','prefix':'native_once'},
             'LAYERWISE_SEED_REPLACE':{'gen_read_policy':'same_as_dynamic_replacement',
             'memory':'static_selected_native_prompt_kv_each_layer','writer_passes':0,
-            'null_or_no_content':'native_bypass','prefix':'native_once'}},
+            'null_or_no_content':'native_bypass','prefix':'native_once'},
+            'LAYERWISE_FULL_MEMORY_REPLACE':{'seed':'all_native_prompt_tokens_including_special_tokens',
+            'capacity':'exact_native_prompt_length_per_sample; memory_slots_ignored',
+            'special_token_kv':'pinned_to_native_prompt_each_layer',
+            'carry':'native_layer_input_kv','gen_round0':'native_prompt_body',
+            'gen_extra_rounds':'memory_only_body','suffix':'memory_only_same_layer',
+            'first_body_layer':'static_full_prompt_kv',
+            'writer_reads':'prompt_plus_previous_memory_plus_current_gen_body_kv',
+            'final_writer':'extends_through_suffix_without_suffix_gen_kv',
+            'null_cfg':'native_bypass','prefix':'native_once'},
+            'LAYERWISE_FULL_SEED_REPLACE':{'seed':'all_native_prompt_tokens_including_special_tokens',
+            'capacity':'exact_native_prompt_length_per_sample; memory_slots_ignored',
+            'memory':'exact_native_prompt_kv_each_layer','writer_passes':0,
+            'gen_read_policy':'same_as_full_dynamic_replacement','null_cfg':'native_bypass','prefix':'native_once'}},
         'probe_steps':probe_steps, 'probe_arm':probe_arm if probe_steps else None, 'diagnostics':args.diagnostics, 'stage':args.stage, 'shard':[args.shard_index,args.num_shards],
         'gpu':torch.cuda.get_device_name(), 'precision':'bfloat16', 'kernel':'native_flash_attention_and_legacy_masked_sdpa',
         'torch':torch.__version__, 'training':False, 'quality_status':'pending'}
@@ -115,7 +129,8 @@ def main():
     bundle = load_native(args.model_path,args.device,args.timestep_shift)
     jobs = [(i,s) for i in range(len(data)) for s in seeds]
     for arm,mode,rounds in arm_specs:
-        runtime = InternalLoopRuntime(bundle.model, replace(cfg,mode=mode,extra_rounds=rounds),diagnostics=args.diagnostics)
+        arm_cfg=replace(cfg,mode=mode,extra_rounds=rounds)
+        runtime = InternalLoopRuntime(bundle.model, arm_cfg,diagnostics=args.diagnostics)
         generator = T2IGenerator(bundle,runtime)
         try:
             for ordinal,(i,seed) in enumerate(jobs):
@@ -149,11 +164,14 @@ def main():
                     'path':str(imagepath),'image_sha256':sha256(imagepath) if images is not None else None,'noise_sha256':hashes[0],
                     'valid_file':images is not None,'decode_error':invalid_error,'generation_seconds':elapsed,'peak_allocated_bytes':peak,
                     'timing_scope':'diagnostic_unwarmed' if probe_steps or args.diagnostics else 'engineering_single_generation_no_warmups', 'extra_rounds':rounds,
-                    'body_pass_count_scope':'configured_active_branch; layerwise requires prompt content',
-                    'writer_body_passes':rounds if mode.startswith('LAYERWISE') and mode!='LAYERWISE_SEED_REPLACE' and cfg.memory_slots else 0,
-                    'writer_suffix_passes':int(mode=='LAYERWISE_MEMORY_REPLACE' and rounds>0 and cfg.memory_slots>0
+                    'body_pass_count_scope':'configured_active_branch; full Memory requires nonempty prompt cache',
+                    'native_prompt_lengths':list(generator.prompt_lengths),
+                    'memory_capacity_policy':'full_prompt' if arm_cfg.full_prompt_memory else 'configured_slots',
+                    'full_memory_lengths':list(generator.prompt_lengths) if arm_cfg.full_prompt_memory else None,
+                    'writer_body_passes':rounds if mode.startswith('LAYERWISE') and mode not in ('LAYERWISE_SEED_REPLACE','LAYERWISE_FULL_SEED_REPLACE') and arm_cfg.memory_enabled else 0,
+                    'writer_suffix_passes':int(mode in ('LAYERWISE_MEMORY_REPLACE','LAYERWISE_FULL_MEMORY_REPLACE') and rounds>0 and arm_cfg.memory_enabled
                                                and cfg.end_layer<len(bundle.model.language_model.model.layers)),
-                    'body_passes':1 if mode=='BASE' or rounds==0 or cfg.memory_slots==0 else 1+rounds,
+                    'body_passes':1 if mode=='BASE' or rounds==0 or not arm_cfg.memory_enabled else 1+rounds,
                     'num_timesteps':steps}
                 if runtime.probe_capture is not None:
                     if images is None:raise ValueError('probe export failed: invalid generated image')

@@ -41,6 +41,32 @@ def test_replacement_depth_report_compares_dynamic_with_static_and_append():
     assert 'vs_LAYERWISE_MEMORY_KV_R1' not in second
 
 
+def test_full_replacement_seven_arms_and_matching_depth_controls():
+    modes=['BASE','LAYERWISE_FULL_SEED_REPLACE','LAYERWISE_FULL_MEMORY_REPLACE']
+    specs=expand_arms(modes,(1,2,3),1)
+    assert len(specs)==7 and sum(mode=='BASE' for _,mode,_ in specs)==1
+    rows=[row(arm=label,atoms=(.7,.6,.8)) for label,_,_ in specs]
+    result=summarize(rows,resamples=20)
+    for r in [1,2,3]:
+        value=result[f'LAYERWISE_FULL_MEMORY_REPLACE_R{r}']
+        assert f'vs_LAYERWISE_FULL_SEED_REPLACE_R{r}' in value
+        for shallower in range(1,r):assert f'vs_LAYERWISE_FULL_MEMORY_REPLACE_R{shallower}' in value
+
+
+def test_full_static_image_parity_checks_content_and_inputs():
+    script=Path(__file__).resolve().parents[1]/'scripts/evaluate/validate_full_static_images.py'
+    spec=importlib.util.spec_from_file_location('full_static_images',script)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    arms=['BASE']+[f'LAYERWISE_FULL_SEED_REPLACE_R{r}' for r in [1,2,3]]
+    rows=[{**row(arm=arm),'image_sha256':'identical','valid_file':True} for arm in arms]
+    assert module.validate(rows,arms)['passed']
+    rows[2]['image_sha256']='different'
+    failed=module.validate(rows,arms)
+    assert not failed['passed'] and failed['arms'][arms[2]]['mismatches']==[['p0',0]]
+    rows[2]['image_sha256']='identical';rows[2]['noise_sha256']='different'
+    assert not module.validate(rows,arms)['passed']
+
+
 def test_portable_depth_gallery_validates_coverage_and_image_hashes(tmp_path):
     script=Path(__file__).resolve().parents[1]/'scripts/evaluate/export_comparison_html.py'
     spec=importlib.util.spec_from_file_location('gallery',script)

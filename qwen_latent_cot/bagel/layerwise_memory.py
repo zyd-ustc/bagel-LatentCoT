@@ -12,8 +12,11 @@ import torch
 from .modeling.bagel.qwen2_navit import NaiveCache, BaseNavitOutputWithPast
 
 LAYERWISE_MODES = ('LAYERWISE_MEMORY_KV', 'LAYERWISE_KV_NO_READ',
-                   'LAYERWISE_MEMORY_REPLACE', 'LAYERWISE_SEED_REPLACE')
-REPLACE_MODES = ('LAYERWISE_MEMORY_REPLACE', 'LAYERWISE_SEED_REPLACE')
+                   'LAYERWISE_MEMORY_REPLACE', 'LAYERWISE_SEED_REPLACE',
+                   'LAYERWISE_FULL_MEMORY_REPLACE', 'LAYERWISE_FULL_SEED_REPLACE')
+REPLACE_MODES = ('LAYERWISE_MEMORY_REPLACE', 'LAYERWISE_SEED_REPLACE',
+                 'LAYERWISE_FULL_MEMORY_REPLACE', 'LAYERWISE_FULL_SEED_REPLACE')
+STATIC_MODES = ('LAYERWISE_SEED_REPLACE','LAYERWISE_FULL_SEED_REPLACE')
 
 
 @dataclass
@@ -24,6 +27,8 @@ class PromptMemorySeed:
     source_indexes: torch.Tensor
     start_layer: int
     maximum_slots: int
+    full_prompt: bool = False
+    special_mask: torch.Tensor = None
 
 
 @dataclass
@@ -112,21 +117,29 @@ class LayerwiseMemoryLoop:
         self.prefill = None
 
     def begin_prefill(self, cache, token_ids, lengths, special_ids, config):
-        indexes, counts = select_content_indexes(token_ids, lengths, special_ids, config.memory_slots)
-        self.prefill = (cache, indexes, counts)
+        if config.full_prompt_memory:
+            counts = tuple(int(n) for n in lengths)
+            if sum(counts)!=len(token_ids):
+                raise ValueError('packed prompt lengths do not cover token IDs')
+            indexes = torch.arange(len(token_ids),device=token_ids.device)
+            special_mask = torch.isin(token_ids, token_ids.new_tensor(sorted(special_ids)))
+        else:
+            indexes, counts = select_content_indexes(token_ids, lengths, special_ids, config.memory_slots)
+            special_mask = None
+        self.prefill = (cache, indexes, counts, config.full_prompt_memory, special_mask)
 
     def end_prefill(self):
         self.prefill = None
 
     def capture_prefill(self, original, kwargs, config):
-        cache, indexes, counts = self.prefill
+        cache, indexes, counts, full_prompt, special_mask = self.prefill
         if kwargs['past_key_values'] is not cache:
             raise RuntimeError('prompt seed capture must use its own CFG branch cache')
         positions = kwargs['packed_query_position_ids'][indexes].detach().clone()
         def capture(layer, args, layer_kwargs):
             hidden = layer_kwargs['packed_query_sequence'][indexes].detach().clone()
             self.seeds[cache] = PromptMemorySeed(hidden, positions, counts, indexes.clone(),
-                                                config.start_layer, config.memory_slots)
+                                                config.start_layer, config.memory_slots,full_prompt,special_mask)
         handle = self.decoder.layers[config.start_layer].register_forward_pre_hook(capture, with_kwargs=True)
         try:
             return original(**kwargs)
@@ -148,11 +161,14 @@ class LayerwiseMemoryLoop:
             return runtime.original(**kwargs)
         if not len(seed.hidden):
             return runtime.original(**kwargs)
-        if cfg.start_layer!=seed.start_layer or cfg.memory_slots!=seed.maximum_slots:
-            raise ValueError('changing Memory entrance or slot count requires a fresh prompt prefill')
+        if (cfg.start_layer!=seed.start_layer or cfg.full_prompt_memory!=seed.full_prompt
+                or not seed.full_prompt and cfg.memory_slots!=seed.maximum_slots):
+            raise ValueError('changing Memory entrance, seed policy or slot count requires a fresh prompt prefill')
         if len(seed.lengths) != len(kwargs['query_lens']):
             raise ValueError('Memory seed and GEN packed sample counts differ')
         prompt_lengths = tuple(kwargs['key_values_lens'].tolist())
+        if seed.full_prompt and seed.lengths!=prompt_lengths:
+            raise ValueError('full Memory must preserve every native prompt slot')
         gen_lengths = tuple(kwargs['query_lens'].tolist())
         hidden = kwargs['packed_query_sequence']
         cos, sin = decoder.rotary_emb(hidden, kwargs['packed_query_position_ids'].unsqueeze(0))
@@ -167,7 +183,7 @@ class LayerwiseMemoryLoop:
         entrance = hidden.clone()
         bank = {}
         replacement = cfg.mode in REPLACE_MODES
-        dynamic = cfg.mode != 'LAYERWISE_SEED_REPLACE'
+        dynamic = cfg.mode not in STATIC_MODES
         reads_enabled = cfg.mode != 'LAYERWISE_KV_NO_READ'
         seed_bank = {i:LayerKV(i, cache.key_cache[i][seed.source_indexes],
                               cache.value_cache[i][seed.source_indexes], seed.lengths)
@@ -242,6 +258,13 @@ class LayerwiseMemoryLoop:
                     additions += [gen_kv[index]]
                 writer_input = writer
                 writer, current = run_native(index, writer, seed.lengths, memory_rope, additions, 'und')
+                if seed.full_prompt:
+                    # GEN retains native structure tokens. Content KV remains
+                    # a full-length, one-to-one, GEN-dependent replacement.
+                    mask = seed.special_mask[:,None,None]
+                    reference = seed_bank[index]
+                    current = LayerKV(index,torch.where(mask,reference.keys,current.keys),
+                                      torch.where(mask,reference.values,current.values),seed.lengths)
                 if index > cfg.start_layer:
                     # At the first body layer, input KV is only the fixed seed;
                     # it has not observed GEN. Do not expose that duplicate as feedback.

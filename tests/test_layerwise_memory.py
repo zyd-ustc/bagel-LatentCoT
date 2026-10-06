@@ -7,7 +7,7 @@ from qwen_latent_cot.bagel.layerwise_memory import LayerKV, native_context, sele
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache
 
 
-def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_MEMORY_KV', device='cpu', slots=3, start=1):
+def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_MEMORY_KV', device='cpu', slots=3, start=1, special_tokens=False):
     model, kwargs = fixture(batch=batch,device=device)
     decoder = model.language_model.model
     runtime = InternalLoopRuntime(model, LoopConfig(mode=mode, extra_rounds=rounds,
@@ -15,6 +15,10 @@ def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_MEMORY_KV', d
     lengths = kwargs['key_values_lens'].tolist()
     tokens = torch.tensor([5,6,7,8,9] if batch==2 else [5,6,7],device=device)
     if empty_first: tokens[:lengths[0]]=0
+    if special_tokens:
+        offset=0
+        for n in lengths:
+            tokens[offset]=0;tokens[offset+n-1]=1;offset+=n
     cache = NaiveCache(4)
     positions = torch.tensor([j for n in lengths for j in range(n)],device=device)
     runtime.begin_prefill(cache, tokens, lengths, {0,1})
@@ -27,6 +31,97 @@ def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_MEMORY_KV', d
             update_past_key_values=True, is_causal=True, mode='und')
     finally: runtime.end_prefill()
     return model, {**kwargs,'past_key_values':cache}, runtime
+
+
+@pytest.mark.parametrize('rounds',[1,2,3])
+@pytest.mark.parametrize('slots',[0,1])
+def test_full_static_replacement_exact_native_without_token_compression(rounds,slots):
+    model,kwargs,runtime=prepared(mode='LAYERWISE_FULL_SEED_REPLACE',rounds=rounds,
+                                  slots=slots,start=0,special_tokens=True)
+    try:
+        decoder=model.language_model.model;cache=kwargs['past_key_values']
+        seed=runtime.layerwise.seeds[cache]
+        assert seed.full_prompt and seed.lengths==(2,3)
+        assert seed.source_indexes.tolist()==list(range(5))
+        assert seed.positions.tolist()==[0,1,0,1,2]
+        assert seed.special_mask.tolist()==[True,True,True,False,True]
+        weights={k:v.clone() for k,v in model.language_model.state_dict().items()}
+        native=runtime.original(**kwargs).packed_query_sequence
+        before={i:(cache.key_cache[i],cache.key_cache[i].clone(),cache.value_cache[i].clone()) for i in range(4)}
+        actual=decoder.forward_inference(**kwargs).packed_query_sequence
+        assert torch.equal(actual,native)
+        for i,(obj,k,v) in before.items():
+            assert cache.key_cache[i] is obj and torch.equal(obj,k) and torch.equal(cache.value_cache[i],v)
+        assert all(torch.equal(v,weights[k]) for k,v in model.language_model.state_dict().items())
+        assert not any(row['phase']=='writer' for row in runtime.diagnostics)
+        reads=[row for row in runtime.diagnostics if row['phase']=='gen' and row['round']>0]
+        assert reads and all(row['memory_slots_per_sample']==[2,3] for row in reads)
+        assert all(row['prompt_read_per_sample']==[False,False] for row in reads)
+    finally:runtime.close()
+
+
+@pytest.mark.parametrize('rounds',[1,2,3])
+def test_full_dynamic_same_length_special_kv_pinned_and_content_changes(rounds):
+    model,kwargs,runtime=prepared(mode='LAYERWISE_FULL_MEMORY_REPLACE',rounds=rounds,
+                                  slots=0,start=0,special_tokens=True)
+    decoder=model.language_model.model;cache=kwargs['past_key_values'];seed=runtime.layerwise.seeds[cache]
+    originals=[layer.forward_inference for layer in decoder.layers];reads=[]
+    def wrap(i):
+        def observed(**kw):
+            context=kw['past_key_values'].key_cache[i]
+            if kw['mode']=='gen':
+                reads.append((i,context.clone(),kw['past_key_values'].value_cache[i].clone(),kw['key_values_lens'].tolist()))
+            return originals[i](**kw)
+        return observed
+    for i,layer in enumerate(decoder.layers):layer.forward_inference=wrap(i)
+    try:
+        native=runtime.original(**kwargs).packed_query_sequence;reads.clear()
+        output=decoder.forward_inference(**kwargs).packed_query_sequence
+        assert torch.isfinite(output).all() and not torch.equal(output,native)
+        assert torch.equal(output[:4],native[:4])  # The special-only prompt stays native.
+        body=[r for r in reads if r[0]==2];suffix=[r for r in reads if r[0]==3]
+        assert len(body)==rounds+1 and len(suffix)==1
+        for i,k,v,lengths in body[1:]+suffix:
+            assert lengths==[2,3] and len(k)==5  # No P+M concatenation on GEN reads.
+            assert torch.equal(k[seed.special_mask],cache.key_cache[i][seed.special_mask])
+            assert torch.equal(v[seed.special_mask],cache.value_cache[i][seed.special_mask])
+            assert not torch.equal(k[~seed.special_mask],cache.key_cache[i][~seed.special_mask])
+        assert torch.equal(output,decoder.forward_inference(**kwargs).packed_query_sequence)
+        runtime.config=replace(runtime.config,extra_rounds=0)
+        assert torch.equal(decoder.forward_inference(**kwargs).packed_query_sequence,native)
+    finally:
+        for layer,fn in zip(decoder.layers,originals):layer.forward_inference=fn
+        runtime.close()
+
+
+def test_full_dynamic_sample_isolation_null_cfg_and_current_gen_dependence():
+    model,kwargs,runtime=prepared(mode='LAYERWISE_FULL_MEMORY_REPLACE',rounds=3,slots=0,start=0)
+    try:
+        decoder=model.language_model.model
+        a=decoder.forward_inference(**kwargs).packed_query_sequence
+        changed=kwargs['packed_query_sequence'].clone();changed[4:]+=torch.linspace(-3,3,changed.shape[-1])
+        b=decoder.forward_inference(**{**kwargs,'packed_query_sequence':changed}).packed_query_sequence
+        assert torch.equal(a[:4],b[:4]) and not torch.equal(a[4:],b[4:])
+        null={**kwargs,'past_key_values':NaiveCache(4),'key_values_lens':torch.zeros(2,dtype=torch.int32),
+              'packed_key_value_indexes':torch.empty(0,dtype=torch.long),'packed_query_indexes':torch.arange(11)}
+        assert torch.equal(decoder.forward_inference(**null).packed_query_sequence,
+                           runtime.original(**null).packed_query_sequence)
+        runtime.config=replace(runtime.config,mode='LAYERWISE_MEMORY_REPLACE',memory_slots=3)
+        with pytest.raises(ValueError,match='seed policy'):decoder.forward_inference(**kwargs)
+    finally:runtime.close()
+
+
+@pytest.mark.parametrize('mode',['LAYERWISE_FULL_MEMORY_REPLACE','LAYERWISE_FULL_SEED_REPLACE'])
+def test_cuda_full_prompt_replacement_contract(mode):
+    if not torch.cuda.is_available():pytest.skip('user-run full replacement CUDA contract')
+    model,kwargs,runtime=prepared(mode=mode,device='cuda',rounds=3,slots=0,start=0,special_tokens=True)
+    try:
+        native=runtime.original(**kwargs).packed_query_sequence
+        output=model.language_model.model.forward_inference(**kwargs).packed_query_sequence
+        assert torch.isfinite(output).all()
+        if mode=='LAYERWISE_FULL_SEED_REPLACE':assert torch.equal(output,native)
+        else:assert torch.equal(output[:4],native[:4]) and not torch.equal(output,native)
+    finally:runtime.close()
 
 
 def test_distinct_content_positions_and_layer_alignment_validation():

@@ -33,6 +33,7 @@ class T2IGenerator:
         n = len(prompts)
         cache = NaiveCache(self.model.config.llm_config.num_hidden_layers)
         inputs, lengths, ropes = self.model.prepare_prompts([0]*n, [0]*n, prompts, self.bundle.tokenizer, self.bundle.token_ids)
+        self.prompt_lengths = tuple(int(length) for length in lengths)
         inputs = to_device(inputs, self.device)
         if self.runtime:
             self.runtime.begin_prefill(cache, inputs['packed_text_ids'], inputs['text_token_lens'].tolist(),

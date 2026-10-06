@@ -20,6 +20,7 @@ if [[ -z ${PROMPTS:-} ]]; then
 fi
 export OUTDIR=$RUN/generation
 extra=()
+[[ -n ${MAX_PROMPTS:-} ]] && extra+=(--max-prompts "$MAX_PROMPTS")
 [[ -n ${LOOP_DEPTHS:-} ]] && extra+=(--loop-depths "$LOOP_DEPTHS")
 [[ ${DIAGNOSTICS:-0} == 1 ]] && extra+=(--diagnostics)
 [[ -n ${PROBE_STEPS:-} ]] && extra+=(--probe-steps "$PROBE_STEPS")
@@ -30,6 +31,10 @@ bash "$ROOT/scripts/evaluate/launch_training_free_8gpu.sh" \
     --seeds "${SEEDS:-0,1}" --loop-rounds "${LOOP_ROUNDS:-1}" --memory-slots "${MEMORY_SLOTS:-8}" \
     --progress-start "${PROGRESS_START:-0}" --progress-end "${PROGRESS_END:-1}" \
     --arms "${ARMS:-BASE,MEMORY_LOOP}" "${extra[@]}"
+if [[ ${FULL_STATIC_CHECK:-0} == 1 ]]; then
+    "$MODEL_PYTHON" "$ROOT/scripts/evaluate/validate_full_static_images.py" \
+        --manifests "$RUN"/generation/worker_*/manifest.jsonl --output "$RUN/full_static_image_parity.json"
+fi
 printf '%s\n' '2/3: paired final-image semantic and quality scoring'
 export OUTDIR=$RUN/quality
 bash "$ROOT/scripts/evaluate/launch_offline_8gpu.sh" quality \

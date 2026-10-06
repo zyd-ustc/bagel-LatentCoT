@@ -64,7 +64,8 @@ def summarize(rows,resamples=10000):
             'vs_BASE':paired_report(groups['BASE'],values,resamples)}
         controls={'MEMORY_LOOP':('MEMORY_NO_READ',),
                   'LAYERWISE_MEMORY_KV':('MEMORY_LOOP','LAYERWISE_KV_NO_READ'),
-                  'LAYERWISE_MEMORY_REPLACE':('LAYERWISE_SEED_REPLACE','LAYERWISE_MEMORY_KV')}
+                  'LAYERWISE_MEMORY_REPLACE':('LAYERWISE_SEED_REPLACE','LAYERWISE_MEMORY_KV'),
+                  'LAYERWISE_FULL_MEMORY_REPLACE':('LAYERWISE_FULL_SEED_REPLACE',)}
         comparators=list(controls.get(arm,()))
         current_depth=depth_of(arm)
         if current_depth is not None:

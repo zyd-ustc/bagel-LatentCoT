@@ -8,11 +8,13 @@
 
 Memory slot 取自原生 prompt 的不同内容 token，保留它们在 body 入口的 hidden 和原 RoPE 位置。UND writer 读取原 prompt KV、当前 GEN 的原生层输入 KV，以及上一轮的同层 Memory KV。在正常层序上计算时，保存原生 attention 实际写出的层输入 KV。writer 的最终 hidden 不回传。
 
-第一层 Memory 输入尚未观察 GEN，因此反馈读取从窗口第二层开始。默认窗口 `[0,8)`，有效读取层为 1–7，K≤8，R=1，全部采样步启用。R 表示额外 GEN body 轮数；R=0/K=0 完全绕过循环。Memory 不跨采样步、样本或 CFG 分支传递。无 prompt 的 text-removed CFG 分支走原生计算。packed 输入支持不同图像 token 数。
+第一层 Memory 输入尚未观察 GEN，因此反馈读取从窗口第二层开始。默认窗口 `[0,8)`，有效读取层为 1–7，R=1，全部采样步启用。R 表示额外 GEN body 轮数；R=0 完全绕过循环。旧子集模式使用 K≤8，K=0 绕过循环；全量模式的容量等于完整 prompt 长度，忽略 K。Memory 不跨采样步、样本或 CFG 分支传递。无 prompt 的 text-removed CFG 分支走原生计算。packed 输入支持不同图像 token 数。
 
 `MEMORY_LOOP` 保留已有的 hidden recurrence，作为明确的旧对照：边界 embedding + slot noise、body 末端 M hidden 回传、suffix 读取 M、null CFG 自建 M。两条路径的差异不应归因于 KV 格式这一项。
 
 `LAYERWISE_MEMORY_REPLACE` 保留第 0 轮原生 body 启动，随后 GEN body 和最终 suffix 只读取同层 Memory，移除完整 prompt 的直接读取。UND writer 仍读取完整 prompt；最后一次 writer 走过 suffix，提供对应层的 KV。第一层 Memory 是固定 prompt seed，其他层可随 GEN 和前轮 Memory 改变。`LAYERWISE_SEED_REPLACE` 使用相同位置和长度的静态 prompt 子集，检查反馈与条件压缩的区别。细节和小规模八卡命令见 [prompt 替换方案](docs/MEMORY_PROMPT_REPLACEMENT.md)。
+
+`LAYERWISE_FULL_SEED_REPLACE` / `LAYERWISE_FULL_MEMORY_REPLACE` 恢复全部 prompt token、原始位置和完整缓存长度。静态版本原样复制每层 P；动态版本只更新内容 token KV，特殊 token KV 保持原生值。七路 R1/R2/R3 对比先验证静态 velocity 与图片 hash parity，再评分。见 [全量对比说明](docs/FULL_MEMORY_DEPTH_COMPARE.md)。
 
 ## 运行与证据
 
