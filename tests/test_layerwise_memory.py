@@ -7,11 +7,11 @@ from qwen_latent_cot.bagel.layerwise_memory import LayerKV, native_context, sele
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache
 
 
-def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_MEMORY_KV', device='cpu'):
+def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_MEMORY_KV', device='cpu', slots=3, start=1):
     model, kwargs = fixture(batch=batch,device=device)
     decoder = model.language_model.model
     runtime = InternalLoopRuntime(model, LoopConfig(mode=mode, extra_rounds=rounds,
-        start_layer=1, end_layer=3, memory_slots=3), diagnostics=True)
+        start_layer=start, end_layer=3, memory_slots=slots), diagnostics=True)
     lengths = kwargs['key_values_lens'].tolist()
     tokens = torch.tensor([5,6,7,8,9] if batch==2 else [5,6,7],device=device)
     if empty_first: tokens[:lengths[0]]=0
@@ -118,8 +118,9 @@ def test_fixed_entrances_actual_native_input_kv_same_layer_and_suffix_once():
 
 
 @pytest.mark.parametrize('empty_first',[False,True])
-def test_sample_isolation_local_round_state_and_null_cfg(empty_first):
-    model,kwargs,runtime=prepared(empty_first=empty_first)
+@pytest.mark.parametrize('mode',['LAYERWISE_MEMORY_KV','LAYERWISE_MEMORY_REPLACE','LAYERWISE_SEED_REPLACE'])
+def test_sample_isolation_local_round_state_and_null_cfg(empty_first,mode):
+    model,kwargs,runtime=prepared(empty_first=empty_first,mode=mode)
     try:
         decoder=model.language_model.model
         a=decoder.forward_inference(**kwargs).packed_query_sequence
@@ -191,3 +192,121 @@ def test_cpu_gradient_reaches_writer_seed_through_native_layer_kv(rounds):
         assert torch.isfinite(seed.hidden.grad).all() and seed.hidden.grad.float().norm()>0
         assert all(parameter.grad is None for parameter in model.language_model.parameters())
     finally:runtime.close()
+
+
+@pytest.mark.parametrize('rounds',[1,2])
+@pytest.mark.parametrize('mode',['LAYERWISE_MEMORY_REPLACE','LAYERWISE_SEED_REPLACE'])
+def test_replacement_removes_prompt_reads_and_uses_exact_same_layer_bank(mode,rounds):
+    model,kwargs,runtime=prepared(mode=mode,rounds=rounds,slots=1)
+    decoder=model.language_model.model;cache=kwargs['past_key_values']
+    seed=runtime.layerwise.seeds[cache]
+    original=[layer.forward_inference for layer in decoder.layers]
+    weights={k:v.clone() for k,v in model.language_model.state_dict().items()}
+    prompt={i:(cache.key_cache[i],cache.key_cache[i].clone(),cache.value_cache[i].clone()) for i in range(4)}
+    calls=[]
+    def wrap(i):
+        def observed(**kw):
+            context=kw['past_key_values'].key_cache[i].clone()
+            out,temporary=original[i](**kw)
+            current=temporary.key_cache[i][kw['packed_query_indexes']].clone() if kw['update_past_key_values'] else None
+            calls.append((i,kw['mode'],context,current,kw['key_values_lens'].tolist(),
+                          kw['packed_query_position_embeddings']))
+            return out,temporary
+        return observed
+    for i,layer in enumerate(decoder.layers):layer.forward_inference=wrap(i)
+    try:
+        result=decoder.forward_inference(**kwargs).packed_query_sequence
+        assert torch.isfinite(result).all()
+        for i in [1,2]:
+            gens=[c for c in calls if c[0]==i and c[1]=='gen']
+            assert len(gens)==rounds+1 and gens[0][4]==[2,3]
+            for c in gens[1:]:
+                assert c[4]==[1,1]  # Only K slots, no original P, no bank accumulation.
+                assert all(torch.equal(a,b) for a,b in zip(c[5],gens[0][5]))
+                if mode=='LAYERWISE_SEED_REPLACE' or i==1:
+                    assert torch.equal(c[2],cache.key_cache[i][seed.source_indexes])
+            if mode=='LAYERWISE_MEMORY_REPLACE' and i==2:
+                writes=[c for c in calls if c[0]==i and c[1]=='und']
+                assert len(writes)==rounds
+                for writer,gen in zip(writes,gens[1:]):
+                    assert torch.equal(gen[2],writer[3])
+                assert writes[0][4]==[6,10]  # P + current GEN; writer still sees P.
+                if rounds==2:assert writes[1][4]==[7,11]  # P + previous M + current GEN.
+        suffix=[c for c in calls if c[0]==3 and c[1]=='gen']
+        assert len(suffix)==1 and suffix[0][4]==[1,1]
+        suffix_writes=[c for c in calls if c[0]==3 and c[1]=='und']
+        if mode=='LAYERWISE_MEMORY_REPLACE':
+            assert len(suffix_writes)==1 and suffix_writes[0][4]==[2,3]
+            assert torch.equal(suffix[0][2],suffix_writes[0][3])
+        else:
+            assert not any(c[1]=='und' for c in calls)
+            assert torch.equal(suffix[0][2],cache.key_cache[3][seed.source_indexes])
+        assert len([c for c in calls if c[0]==0])==1
+        for i,(obj,k,v) in prompt.items():
+            assert cache.key_cache[i] is obj and torch.equal(obj,k) and torch.equal(cache.value_cache[i],v)
+        assert all(torch.equal(v,weights[k]) for k,v in model.language_model.state_dict().items())
+        runtime.config=replace(runtime.config,extra_rounds=0)
+        assert torch.equal(decoder.forward_inference(**kwargs).packed_query_sequence,
+                           runtime.original(**kwargs).packed_query_sequence)
+    finally:
+        for layer,fn in zip(decoder.layers,original):layer.forward_inference=fn
+        runtime.close()
+
+
+@pytest.mark.parametrize('mode',['LAYERWISE_MEMORY_REPLACE','LAYERWISE_SEED_REPLACE'])
+def test_replacement_empty_sample_fallback_and_local_state(mode):
+    model,kwargs,runtime=prepared(mode=mode,rounds=2,empty_first=True,slots=1)
+    try:
+        decoder=model.language_model.model
+        a=decoder.forward_inference(**kwargs).packed_query_sequence
+        assert torch.equal(a[:4],runtime.original(**kwargs).packed_query_sequence[:4])
+        changed=kwargs['packed_query_sequence'].clone();changed[4:]+=3
+        b=decoder.forward_inference(**{**kwargs,'packed_query_sequence':changed}).packed_query_sequence
+        assert torch.equal(a[:4],b[:4]) and not torch.equal(a[4:],b[4:])
+        assert torch.equal(a,decoder.forward_inference(**kwargs).packed_query_sequence)
+    finally:runtime.close()
+
+
+def test_replacement_feedback_dependence_and_cpu_gradient():
+    model,kwargs,runtime=prepared(batch=1,mode='LAYERWISE_MEMORY_REPLACE',rounds=2,slots=1)
+    try:
+        decoder=model.language_model.model;seed=runtime.layerwise.seeds[kwargs['past_key_values']]
+        seed.hidden.requires_grad_(True)
+        result=decoder.forward_inference(**kwargs).packed_query_sequence
+        (result[kwargs['packed_vae_token_indexes']].float()*torch.linspace(-1,1,result.shape[-1])).sum().backward()
+        assert torch.isfinite(seed.hidden.grad).all() and seed.hidden.grad.norm()>0
+        assert all(p.grad is None for p in model.language_model.parameters())
+        runtime.config=replace(runtime.config,mode='LAYERWISE_SEED_REPLACE')
+        static=decoder.forward_inference(**kwargs).packed_query_sequence
+        with torch.no_grad():seed.hidden.add_(torch.linspace(-2,2,seed.hidden.shape[-1]))
+        assert torch.equal(static,decoder.forward_inference(**kwargs).packed_query_sequence)
+        runtime.config=replace(runtime.config,mode='LAYERWISE_MEMORY_REPLACE')
+        dynamic=decoder.forward_inference(**kwargs).packed_query_sequence
+        assert not torch.equal(result,dynamic) and not torch.equal(dynamic,static)
+    finally:runtime.close()
+
+
+@pytest.mark.parametrize('start',[0,1])
+def test_replacement_body_and_suffix_bank_depend_on_current_gen(start):
+    model,kwargs,runtime=prepared(batch=1,mode='LAYERWISE_MEMORY_REPLACE',slots=1,start=start)
+    decoder=model.language_model.model;captured={}
+    originals=[layer.forward_inference for layer in decoder.layers]
+    def wrap(i):
+        def observed(**kw):
+            out,cache=originals[i](**kw)
+            if kw['mode']=='und':captured[i]=cache.key_cache[i][kw['packed_query_indexes']].clone()
+            return out,cache
+        return observed
+    for i,layer in enumerate(decoder.layers):layer.forward_inference=wrap(i)
+    try:
+        decoder.forward_inference(**kwargs)
+        initial={i:t.clone() for i,t in captured.items()}
+        changed=kwargs['packed_query_sequence'].clone()
+        changed[kwargs['packed_vae_token_indexes']]+=torch.linspace(-3,3,changed.shape[-1])
+        decoder.forward_inference(**{**kwargs,'packed_query_sequence':changed})
+        assert torch.equal(initial[start],captured[start])  # Native fixed entrance.
+        assert not torch.equal(initial[2],captured[2])
+        assert not torch.equal(initial[3],captured[3])  # Feedback propagates through UND to suffix.
+    finally:
+        for layer,fn in zip(decoder.layers,originals):layer.forward_inference=fn
+        runtime.close()

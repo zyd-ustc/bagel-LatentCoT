@@ -65,7 +65,7 @@ def main():
     arm_specs=expand_arms(arms,depths,args.loop_rounds)
     if probe_steps and (probe_arm not in arms or args.loop_rounds<1 or args.memory_slots<1):raise ValueError('probe export requires Memory loop and R>=1')
     if any(i<0 or i>=args.num_timesteps-1 or not args.progress_start<=i/max(args.num_timesteps-2,1)<=args.progress_end for i in probe_steps):raise ValueError('probe steps outside active schedule')
-    cfg = LoopConfig(mode='LAYERWISE_MEMORY_KV' if any(a.startswith('LAYERWISE') for a in arms) else 'MEMORY_LOOP',
+    cfg = LoopConfig(mode=next((a for a in arms if a.startswith('LAYERWISE')),'MEMORY_LOOP'),
         extra_rounds=max(depths) if depths else args.loop_rounds, start_layer=args.start_layer, end_layer=args.end_layer,
         memory_slots=args.memory_slots, progress_start=args.progress_start, progress_end=args.progress_end, memory_seed=args.memory_seed)
     output = Path(args.output_dir).resolve(); output.mkdir(parents=True, exist_ok=True)
@@ -73,7 +73,7 @@ def main():
     model_files = sorted(weights.glob('*.safetensors')) if not (weights/'ema.safetensors').exists() else [weights/'ema.safetensors', weights/'ae.safetensors']
     model_files += [weights/f for f in ('llm_config.json','vit_config.json','tokenizer.json','tokenizer_config.json','vocab.json','merges.txt') if (weights/f).exists()]
     print('Hashing native weights and source...', flush=True)
-    provenance = {'schema':3, 'architecture':'native_layerwise_input_kv_v1_with_legacy_control', 'source_sha256':source_hash(ROOT),
+    provenance = {'schema':4, 'architecture':'native_layerwise_input_kv_v2_with_prompt_replacement', 'source_sha256':source_hash(ROOT),
         'model_sha256':{p.name:sha256(p) for p in model_files}, 'model_path':str(weights.resolve()),
         'benchmark_sha256':sha256(args.prompts), 'benchmark':str(Path(args.prompts).resolve()),
         'sampling':{'num_timesteps':args.num_timesteps,'actual_denoiser_calls':args.num_timesteps-1,
@@ -87,7 +87,16 @@ def main():
             'carry':'body_end_hidden','suffix_reads_memory':True,'null_cfg':'branch_local_boundary_memory'},
             'LAYERWISE_MEMORY_KV':{'seed':'distinct_native_prompt_content_at_original_positions',
             'carry':'native_layer_input_kv','read_layers':list(range(cfg.start_layer+1,cfg.end_layer)),
-            'suffix_reads_memory':False,'null_cfg':'native_bypass'}},
+            'suffix_reads_memory':False,'null_cfg':'native_bypass'},
+            'LAYERWISE_MEMORY_REPLACE':{'seed':'distinct_native_prompt_content_at_original_positions',
+            'carry':'native_layer_input_kv','gen_round0':'native_prompt_body',
+            'gen_extra_rounds':'memory_only_body','suffix':'memory_only_same_layer',
+            'first_body_layer':'static_seed_kv','writer_reads':'prompt_plus_previous_memory_plus_current_gen_body_kv',
+            'final_writer':'extends_through_suffix_without_suffix_gen_kv',
+            'null_or_no_content':'native_bypass','prefix':'native_once'},
+            'LAYERWISE_SEED_REPLACE':{'gen_read_policy':'same_as_dynamic_replacement',
+            'memory':'static_selected_native_prompt_kv_each_layer','writer_passes':0,
+            'null_or_no_content':'native_bypass','prefix':'native_once'}},
         'probe_steps':probe_steps, 'probe_arm':probe_arm if probe_steps else None, 'diagnostics':args.diagnostics, 'stage':args.stage, 'shard':[args.shard_index,args.num_shards],
         'gpu':torch.cuda.get_device_name(), 'precision':'bfloat16', 'kernel':'native_flash_attention_and_legacy_masked_sdpa',
         'torch':torch.__version__, 'training':False, 'quality_status':'pending'}
@@ -141,7 +150,9 @@ def main():
                     'valid_file':images is not None,'decode_error':invalid_error,'generation_seconds':elapsed,'peak_allocated_bytes':peak,
                     'timing_scope':'diagnostic_unwarmed' if probe_steps or args.diagnostics else 'engineering_single_generation_no_warmups', 'extra_rounds':rounds,
                     'body_pass_count_scope':'configured_active_branch; layerwise requires prompt content',
-                    'writer_body_passes':rounds if mode.startswith('LAYERWISE') and cfg.memory_slots else 0,
+                    'writer_body_passes':rounds if mode.startswith('LAYERWISE') and mode!='LAYERWISE_SEED_REPLACE' and cfg.memory_slots else 0,
+                    'writer_suffix_passes':int(mode=='LAYERWISE_MEMORY_REPLACE' and rounds>0 and cfg.memory_slots>0
+                                               and cfg.end_layer<len(bundle.model.language_model.model.layers)),
                     'body_passes':1 if mode=='BASE' or rounds==0 or cfg.memory_slots==0 else 1+rounds,
                     'num_timesteps':steps}
                 if runtime.probe_capture is not None:

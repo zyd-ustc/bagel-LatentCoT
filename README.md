@@ -12,10 +12,12 @@ Memory slot 取自原生 prompt 的不同内容 token，保留它们在 body 入
 
 `MEMORY_LOOP` 保留已有的 hidden recurrence，作为明确的旧对照：边界 embedding + slot noise、body 末端 M hidden 回传、suffix 读取 M、null CFG 自建 M。两条路径的差异不应归因于 KV 格式这一项。
 
+`LAYERWISE_MEMORY_REPLACE` 保留第 0 轮原生 body 启动，随后 GEN body 和最终 suffix 只读取同层 Memory，移除完整 prompt 的直接读取。UND writer 仍读取完整 prompt；最后一次 writer 走过 suffix，提供对应层的 KV。第一层 Memory 是固定 prompt seed，其他层可随 GEN 和前轮 Memory 改变。`LAYERWISE_SEED_REPLACE` 使用相同位置和长度的静态 prompt 子集，检查反馈与条件压缩的区别。细节和小规模八卡命令见 [prompt 替换方案](docs/MEMORY_PROMPT_REPLACEMENT.md)。
+
 ## 运行与证据
 
 正式生成、评分、Memory QA 和真实权重检查由用户启动。见 [新路径运行说明](docs/LAYERWISE_MEMORY_RUNBOOK.md)。八卡入口也支持通过 `GPUS` 选择四张卡。默认比较 `BASE / MEMORY_LOOP / LAYERWISE_MEMORY_KV`，使用同 prompt、同 noise seed。
 
-CPU 小模型测试验证同层 KV、固定入口、原生绕过、缓存不变、样本隔离与旧实现数值 parity。这些检查不能证明真实图像语义改善或质量保持。新路径尚无真实权重评测结论。原生 UND 读取 noisy GEN 的语义能力仍是待检验的假设。
+CPU 小模型测试验证同层 KV、固定入口、原生绕过、缓存不变、样本隔离与旧实现数值 parity。这些检查不能证明真实图像语义改善或质量保持。append 路径的 hard16 / seed0 / R1–3 已完成配对评测，均未显示语义净收益；prompt 替换路径尚未做真实权重生图评测。原生 UND 读取 noisy GEN 的语义能力仍是待检验的假设。
 
 实现依据与边界见 [当前方案](docs/DENOISER_INTERNAL_MEMORY_PLAN.md) 和 [来源记录](docs/LAYERWISE_MEMORY_SOURCE.json)。借鉴 Looped-DiT 官方代码的循环控制流程；它的训练结果不能作为 BAGEL training-free 有效的证据。BAGEL vendor 文件没有新增架构改动。旧路径运行说明保留在 [MEMORY_LOOP_RUNBOOK.md](docs/MEMORY_LOOP_RUNBOOK.md)。

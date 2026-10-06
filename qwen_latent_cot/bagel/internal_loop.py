@@ -10,7 +10,8 @@ import torch
 from .memory_attention import blocked_memory_attention
 from .modeling.bagel.qwen2_navit import BaseNavitOutputWithPast
 
-MODES = ('BASE', 'MEMORY_LOOP', 'MEMORY_NO_READ', 'LAYERWISE_MEMORY_KV', 'LAYERWISE_KV_NO_READ')
+MODES = ('BASE', 'MEMORY_LOOP', 'MEMORY_NO_READ', 'LAYERWISE_MEMORY_KV', 'LAYERWISE_KV_NO_READ',
+         'LAYERWISE_MEMORY_REPLACE', 'LAYERWISE_SEED_REPLACE')
 
 
 @dataclass(frozen=True)

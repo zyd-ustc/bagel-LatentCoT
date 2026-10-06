@@ -11,7 +11,9 @@ from weakref import WeakKeyDictionary
 import torch
 from .modeling.bagel.qwen2_navit import NaiveCache, BaseNavitOutputWithPast
 
-LAYERWISE_MODES = ('LAYERWISE_MEMORY_KV', 'LAYERWISE_KV_NO_READ')
+LAYERWISE_MODES = ('LAYERWISE_MEMORY_KV', 'LAYERWISE_KV_NO_READ',
+                   'LAYERWISE_MEMORY_REPLACE', 'LAYERWISE_SEED_REPLACE')
+REPLACE_MODES = ('LAYERWISE_MEMORY_REPLACE', 'LAYERWISE_SEED_REPLACE')
 
 
 @dataclass
@@ -59,7 +61,8 @@ def _packed_indexes(query_lengths, context_lengths, device):
             torch.tensor(past, device=device, dtype=torch.long))
 
 
-def native_context(cache, layer, prompt_lengths, additions, query_lengths, device):
+def native_context(cache, layer, prompt_lengths, additions, query_lengths, device,
+                   include_prompt=True):
     """New temporary cache; original P and every supplied KV remain read-only."""
     if len(prompt_lengths) != len(query_lengths):
         raise ValueError('packed prompt/query sample counts differ')
@@ -68,6 +71,12 @@ def native_context(cache, layer, prompt_lengths, additions, query_lengths, devic
             raise ValueError('a layer may only read KV from the same native layer')
         if len(kv.lengths) != len(prompt_lengths):
             raise ValueError('KV sample count differs from query sample count')
+    # Replacing P is a read policy, never a mutation of the native prompt cache.
+    # A sample with no content seed keeps its native P, even in a mixed batch.
+    retained = ([bool(include_prompt)]*len(prompt_lengths) if isinstance(include_prompt, bool)
+                else list(include_prompt))
+    if len(retained) != len(prompt_lengths):
+        raise ValueError('prompt read policy sample counts differ')
     pk, pv = cache.key_cache[layer], cache.value_cache[layer]
     if sum(prompt_lengths) and (pk is None or len(pk) != sum(prompt_lengths)):
         raise ValueError('prompt KV lengths do not cover this layer')
@@ -75,11 +84,11 @@ def native_context(cache, layer, prompt_lengths, additions, query_lengths, devic
     offsets = [0]*(1+len(additions))
     for sample, plen in enumerate(prompt_lengths):
         pieces_k, pieces_v = [], []
-        if plen:
+        if plen and retained[sample]:
             pieces_k.append(pk[offsets[0]:offsets[0]+plen])
             pieces_v.append(pv[offsets[0]:offsets[0]+plen])
         offsets[0] += plen
-        length = plen
+        length = plen if retained[sample] else 0
         for j, kv in enumerate(additions, 1):
             n = kv.lengths[sample]
             pieces_k.append(kv.keys[offsets[j]:offsets[j]+n])
@@ -157,14 +166,22 @@ class LayerwiseMemoryLoop:
             hidden, _ = decoder.layers[index].forward_inference(packed_query_sequence=hidden, **layer_kwargs)
         entrance = hidden.clone()
         bank = {}
-        reads_enabled = cfg.mode == 'LAYERWISE_MEMORY_KV'
+        replacement = cfg.mode in REPLACE_MODES
+        dynamic = cfg.mode != 'LAYERWISE_SEED_REPLACE'
+        reads_enabled = cfg.mode != 'LAYERWISE_KV_NO_READ'
+        seed_bank = {i:LayerKV(i, cache.key_cache[i][seed.source_indexes],
+                              cache.value_cache[i][seed.source_indexes], seed.lengths)
+                     for i in range(cfg.start_layer, len(decoder.layers))} if replacement else {}
         capturing = runtime.probe_capture is not None and runtime.step_index in runtime.probe_capture.steps
+        if capturing and replacement:
+            raise ValueError('replacement probe export is not implemented; use a separate append probe run')
         if capturing and len(seed.lengths) != 1:
             raise ValueError('probe export is batch=1; ordinary generation supports packed batches')
 
-        def run_native(layer_index, state, lengths, rope, additions, mode, store_input=True):
+        def run_native(layer_index, state, lengths, rope, additions, mode, store_input=True,
+                       include_prompt=True):
             temporary, klens, query, past = native_context(cache, layer_index, prompt_lengths,
-                                                           additions, lengths, hidden.device)
+                                                           additions, lengths, hidden.device, include_prompt)
             call = dict(packed_query_sequence=state,
                         query_lens=torch.tensor(lengths, device=hidden.device, dtype=torch.int32),
                         packed_query_position_embeddings=rope, packed_query_indexes=query,
@@ -185,7 +202,9 @@ class LayerwiseMemoryLoop:
             hidden = entrance.clone()
             gen_kv = {}
             for index in range(cfg.start_layer, cfg.end_layer):
-                memory = bank.get(index) if reads_enabled else None
+                replacing = replacement and round_index > 0
+                memory = ((seed_bank[index] if index==cfg.start_layer or not dynamic else bank[index])
+                          if replacing else bank.get(index) if reads_enabled else None)
                 if capturing and reads_enabled and round_index == cfg.extra_rounds and index > cfg.start_layer:
                     used = bank[index]
                     runtime.probe_capture.record(runtime.step_index, index, {
@@ -197,22 +216,30 @@ class LayerwiseMemoryLoop:
                         'read_round':round_index})
                 hidden, current = run_native(index, hidden, gen_lengths, gen_rope,
                                              [memory] if memory is not None else [], 'gen',
-                                             store_input=round_index<cfg.extra_rounds)
+                                             store_input=dynamic and round_index<cfg.extra_rounds,
+                                             include_prompt=[n==0 for n in seed.lengths] if replacing else True)
                 if round_index < cfg.extra_rounds:
                     gen_kv[index] = current
                 if runtime.diagnostics_enabled:
                     runtime.diagnostics.append({'phase':'gen', 'layer':index, 'round':round_index,
                         'gen_reads_memory':memory is not None, 'memory_slots_per_sample':list(seed.lengths),
+                        'prompt_read_per_sample':[n==0 for n in seed.lengths] if replacing else [True]*len(seed.lengths),
+                        'memory_read_kind':('seed' if index==cfg.start_layer or not dynamic else 'dynamic') if replacing else 'append',
                         'progress':runtime.progress, 'branch':'conditional'})
             if round_index == cfg.extra_rounds:
                 break  # No unused final writer or intermediate suffix/readout.
+            if not dynamic:
+                continue  # Static compression control: no GEN-dependent writer.
             # Fresh native-depth writer entrance every round. The old body-end
             # hidden is never recycled. Historical information enters as KV only.
             writer = seed.hidden.clone()
             next_bank = {}
-            for index in range(cfg.start_layer, cfg.end_layer):
+            writer_end = len(decoder.layers) if replacement and round_index==cfg.extra_rounds-1 else cfg.end_layer
+            for index in range(cfg.start_layer, writer_end):
                 previous = bank.get(index)
-                additions = ([previous] if previous is not None else []) + [gen_kv[index]]
+                additions = ([previous] if previous is not None else [])
+                if index in gen_kv:
+                    additions += [gen_kv[index]]
                 writer_input = writer
                 writer, current = run_native(index, writer, seed.lengths, memory_rope, additions, 'und')
                 if index > cfg.start_layer:
@@ -229,9 +256,19 @@ class LayerwiseMemoryLoop:
                             'kv_update_ratio':float((b-a).float().norm()/a.float().norm().clamp_min(1e-12)),
                             'feedback_stored':index>cfg.start_layer, **memory_slot_stats(h)})
             bank = next_bank
-        # Native suffix and final routing, once. Memory is confined to the body.
+        # GEN suffix and final routing run once. Append mode uses native P;
+        # replacement modes use same-layer M without P (except empty seeds).
         for index in range(cfg.end_layer, len(decoder.layers)):
-            hidden, _ = decoder.layers[index].forward_inference(packed_query_sequence=hidden, **layer_kwargs)
+            if replacement:
+                memory = bank[index] if dynamic else seed_bank[index]
+                hidden, _ = run_native(index, hidden, gen_lengths, gen_rope, [memory], 'gen',
+                                       store_input=False, include_prompt=[n==0 for n in seed.lengths])
+                if runtime.diagnostics_enabled:
+                    runtime.diagnostics.append({'phase':'suffix','layer':index,'round':cfg.extra_rounds,
+                        'gen_reads_memory':True,'prompt_read_per_sample':[n==0 for n in seed.lengths],
+                        'progress':runtime.progress,'branch':'conditional'})
+            else:
+                hidden, _ = decoder.layers[index].forward_inference(packed_query_sequence=hidden, **layer_kwargs)
         normalized = torch.zeros_like(hidden)
         text, image = kwargs['packed_text_indexes'], kwargs['packed_vae_token_indexes']
         normalized[text] = decoder.norm(hidden[text])

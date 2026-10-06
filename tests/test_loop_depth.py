@@ -28,6 +28,19 @@ def test_depth_report_has_paired_preceding_depth_comparators():
     assert result['LAYERWISE_MEMORY_KV_R3']['vs_BASE']['repair_count']==3
 
 
+def test_replacement_depth_report_compares_dynamic_with_static_and_append():
+    modes=['BASE','LAYERWISE_SEED_REPLACE','LAYERWISE_MEMORY_REPLACE','LAYERWISE_MEMORY_KV']
+    specs=expand_arms(modes,(1,2),1)
+    assert len(specs)==7
+    rows=[row(arm=label,atoms=(.7,.6,.8)) for label,_,_ in specs]
+    result=summarize(rows,resamples=20)
+    second=result['LAYERWISE_MEMORY_REPLACE_R2']
+    assert 'vs_LAYERWISE_MEMORY_REPLACE_R1' in second
+    assert 'vs_LAYERWISE_SEED_REPLACE_R2' in second
+    assert 'vs_LAYERWISE_MEMORY_KV_R2' in second
+    assert 'vs_LAYERWISE_MEMORY_KV_R1' not in second
+
+
 def test_portable_depth_gallery_validates_coverage_and_image_hashes(tmp_path):
     script=Path(__file__).resolve().parents[1]/'scripts/evaluate/export_comparison_html.py'
     spec=importlib.util.spec_from_file_location('gallery',script)
