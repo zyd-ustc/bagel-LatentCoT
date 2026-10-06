@@ -34,8 +34,14 @@ class T2IGenerator:
         cache = NaiveCache(self.model.config.llm_config.num_hidden_layers)
         inputs, lengths, ropes = self.model.prepare_prompts([0]*n, [0]*n, prompts, self.bundle.tokenizer, self.bundle.token_ids)
         inputs = to_device(inputs, self.device)
-        with self.autocast():
-            cache = self.model.forward_cache_update_text(cache, **inputs)
+        if self.runtime:
+            self.runtime.begin_prefill(cache, inputs['packed_text_ids'], inputs['text_token_lens'].tolist(),
+                set(self.bundle.tokenizer.all_special_ids) | set(self.bundle.token_ids.values()))
+        try:
+            with self.autocast():
+                cache = self.model.forward_cache_update_text(cache, **inputs)
+        finally:
+            if self.runtime: self.runtime.end_prefill()
         flow = to_device(self.model.prepare_vae_latent(lengths, ropes, shapes, self.bundle.token_ids), self.device)
         noises, hashes = [], []
         for shape, seed in zip(shapes, seeds):
@@ -55,7 +61,11 @@ class T2IGenerator:
     def generate(self, prompts, shapes, seeds, num_timesteps=50, **sampler):
         if num_timesteps < 2: raise ValueError('native schedule needs at least two time points')
         if self.runtime: self.runtime.diagnostics.clear()
-        flow, hashes = self.prepare(prompts, shapes, seeds)
+        try:
+            flow, hashes = self.prepare(prompts, shapes, seeds)
+        except Exception:
+            if self.runtime and hasattr(self.runtime,'clear_prompt_state'): self.runtime.clear_prompt_state()
+            raise
         original = self.model._forward_flow
         step = 0
         def forward(this, **kwargs):
@@ -83,6 +93,7 @@ class T2IGenerator:
             raise
         finally:
             self.model._forward_flow = original
+            if self.runtime and hasattr(self.runtime,'clear_prompt_state'): self.runtime.clear_prompt_state()
         return images, hashes
 
     def decode(self, latent, shape):

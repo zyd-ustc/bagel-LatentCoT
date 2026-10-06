@@ -22,7 +22,8 @@ export OUTDIR=$RUN/generation
 extra=()
 [[ ${DIAGNOSTICS:-0} == 1 ]] && extra+=(--diagnostics)
 [[ -n ${PROBE_STEPS:-} ]] && extra+=(--probe-steps "$PROBE_STEPS")
-printf '%s\n' '1/3: paired native Base / hidden-state Memory loop generation'
+[[ -n ${PROBE_ARM:-} ]] && extra+=(--probe-arm "$PROBE_ARM")
+printf '%s\n' '1/3: paired T2I generation for selected arms'
 bash "$ROOT/scripts/evaluate/launch_training_free_8gpu.sh" \
     --stage evaluation --start-layer "${START_LAYER:-0}" --end-layer "${END_LAYER:-8}" \
     --seeds "${SEEDS:-0,1}" --loop-rounds "${LOOP_ROUNDS:-1}" --memory-slots "${MEMORY_SLOTS:-8}" \

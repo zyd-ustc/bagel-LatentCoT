@@ -59,7 +59,7 @@ def main():
         decoder.forward_inference=MethodType(parent,decoder)
         try:legacy=bundle.model._forward_flow(**kwargs)
         finally:decoder.forward_inference=original
-        runtime=InternalLoopRuntime(bundle.model,LoopConfig(extra_rounds=args.loop_rounds,
+        runtime=InternalLoopRuntime(bundle.model,LoopConfig(mode='MEMORY_LOOP',extra_rounds=args.loop_rounds,
             start_layer=args.start_layer,end_layer=args.end_layer,memory_slots=args.memory_slots))
         try:actual=bundle.model._forward_flow(**kwargs)
         finally:runtime.close()

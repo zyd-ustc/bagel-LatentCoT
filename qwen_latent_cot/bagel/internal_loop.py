@@ -1,8 +1,8 @@
-"""Frozen BAGEL body recurrence: recycle Memory hidden, reset native GEN.
+"""Frozen denoiser loops: native layerwise KV feedback and legacy hidden control.
 
-R counts extra body passes after one strict Read pass. Memory traverses prefix,
-body and suffix through native UND. Only Memory carries between body passes;
-all state is local to one denoiser call and one CFG branch.
+R counts extra body passes. State is local to a denoiser call and CFG branch.
+Layerwise feedback preserves native layer depth and resets GEN to its entrance.
+The explicit MEMORY_LOOP mode retains the frozen parent hidden recurrence.
 """
 from dataclasses import dataclass
 from types import MethodType
@@ -10,12 +10,12 @@ import torch
 from .memory_attention import blocked_memory_attention
 from .modeling.bagel.qwen2_navit import BaseNavitOutputWithPast
 
-MODES = ('BASE', 'MEMORY_LOOP', 'MEMORY_NO_READ')
+MODES = ('BASE', 'MEMORY_LOOP', 'MEMORY_NO_READ', 'LAYERWISE_MEMORY_KV', 'LAYERWISE_KV_NO_READ')
 
 
 @dataclass(frozen=True)
 class LoopConfig:
-    mode: str = 'MEMORY_LOOP'
+    mode: str = 'LAYERWISE_MEMORY_KV'
     extra_rounds: int = 1
     start_layer: int = 0
     end_layer: int = 8
@@ -29,6 +29,8 @@ class LoopConfig:
             raise ValueError('invalid mode, extra round count or memory slot count')
         if not 0 <= self.start_layer < self.end_layer:
             raise ValueError('layer window must be nonempty and half-open')
+        if self.mode.startswith('LAYERWISE') and self.extra_rounds>0 and self.memory_slots>0 and self.end_layer-self.start_layer<2:
+            raise ValueError('layerwise feedback needs at least two body layers')
         if not 0 <= self.progress_start <= self.progress_end <= 1:
             raise ValueError('sampling progress must be in [0,1]')
 
@@ -109,14 +111,28 @@ class InternalLoopRuntime:
         self.probe_capture = probe_capture
         self.diagnostics_enabled = diagnostics
         self.diagnostics = []
+        from .layerwise_memory import LayerwiseMemoryLoop
+        self.layerwise = LayerwiseMemoryLoop(self.decoder)
         self.original = self.decoder.forward_inference
         self.decoder._memory_loop_runtime = self
         def wrapped(this, **kwargs):
             return self._forward(kwargs)
         self.decoder.forward_inference = MethodType(wrapped, self.decoder)
 
+    def begin_prefill(self, cache, token_ids, lengths, special_ids):
+        if self.config.mode.startswith('LAYERWISE') and self.config.extra_rounds>0 and self.config.memory_slots>0:
+            self.layerwise.begin_prefill(cache, token_ids, lengths, special_ids, self.config)
+
+    def end_prefill(self):
+        self.layerwise.end_prefill()
+
+    def clear_prompt_state(self):
+        self.layerwise.clear()
+
     def _forward(self, kwargs):
         cfg = self.config
+        if kwargs.get('mode','und')=='und' and self.layerwise.prefill is not None:
+            return self.layerwise.capture_prefill(self.original, kwargs, cfg)
         active = (kwargs.get('mode', 'und') == 'gen' and cfg.mode != 'BASE'
                   and cfg.extra_rounds > 0 and cfg.memory_slots > 0
                   and cfg.progress_start <= self.progress <= cfg.progress_end)
@@ -124,6 +140,8 @@ class InternalLoopRuntime:
             return self.original(**kwargs)
         if kwargs.get('update_past_key_values', True) or kwargs.get('is_causal', True):
             raise ValueError('GEN loop requires immutable prompt KV and noncausal attention')
+        if cfg.mode.startswith('LAYERWISE'):
+            return self.layerwise.run(kwargs, self)
         return self._memory_forward(kwargs)
 
     def _memory_forward(self, kwargs):
@@ -221,3 +239,4 @@ class InternalLoopRuntime:
             self.decoder.forward_inference = self.original
             del self.decoder._memory_loop_runtime
             self.original = None
+            self.layerwise.clear()

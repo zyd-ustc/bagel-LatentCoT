@@ -65,6 +65,16 @@ def write_summary(scored,run,output,resamples=10000):
     for arm,s in summary['arms'].items():
         delta=s['vs_BASE']['net_repair'];lo,hi=delta['ci95']
         lines.append(f"|{arm}|{s['semantic_gm']:.4f}|{s['quality_proxy']:.4f}|{s['invalid_rate']:.4f}|{delta['mean']:.4f} [{lo:.4f}, {hi:.4f}]|{s['vs_BASE']['repair_count']} / {s['vs_BASE']['damage_count']}|")
+    controls=[(arm,key[3:],value) for arm,s in summary['arms'].items()
+              for key,value in s.items() if key.startswith('vs_') and key!='vs_BASE']
+    if controls:
+        lines+=['','|Candidate / Reference|Semantic GM delta (95% CI)|Quality proxy delta (95% CI)|Repair / Damage|',
+                '|---|---|---|---:|']
+        def interval(value):
+            lo,hi=value['ci95']
+            return f"{value['mean']:.4f} [{lo:.4f}, {hi:.4f}]"
+        for arm,reference,value in controls:
+            lines.append(f"|{arm} / {reference}|{interval(value['semantic_gm_delta'])}|{interval(value['quality_proxy_delta'])}|{value['repair_count']} / {value['damage_count']}|")
     (output/'summary.md').write_text('\n'.join(lines)+'\n')
     from qwen_latent_cot.evaluation.blind_review import make_blind_pack
     make_blind_pack(scored,output/'blind_review')

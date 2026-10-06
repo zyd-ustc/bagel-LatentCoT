@@ -23,7 +23,7 @@ def main():
     p.add_argument('--start-layer',type=int,default=0);p.add_argument('--end-layer',type=int,default=8)
     p.add_argument('--memory-slots',type=int,default=8)
     p.add_argument('--progress-start',type=float,default=0.);p.add_argument('--progress-end',type=float,default=1.)
-    p.add_argument('--arms',default='BASE,MEMORY_LOOP')
+    p.add_argument('--arms',default='BASE,MEMORY_LOOP,LAYERWISE_MEMORY_KV')
     p.add_argument('--warmups',type=int,default=3);p.add_argument('--repeats',type=int,default=20)
     p.add_argument('--image-size',type=int,default=512);p.add_argument('--num-timesteps',type=int,default=50)
     p.add_argument('--matched-base-timesteps',type=int);args=p.parse_args()

@@ -11,6 +11,10 @@ from oracles.legacy_memory_kernels import legacy_forward_inference
 from oracles.parent_runner import legacy_kwargs
 
 
+def legacy_config(**kwargs):
+    return LoopConfig(mode='MEMORY_LOOP',**kwargs)
+
+
 def fixture(device='cpu', batch=2):
     torch.manual_seed(123)
     cfg = Qwen2Config(vocab_size=32, hidden_size=32, intermediate_size=64,
@@ -82,7 +86,7 @@ def test_frozen_parent_hidden_and_velocity_parity(batch,rounds):
     oldkw,native=legacy_kwargs(kwargs)
     expected=legacy_forward_inference(decoder,**oldkw,memory_loop_repeat=rounds+1,
         memory_loop_start=1,memory_loop_end=3,block_gen_reads_memory=True).packed_query_sequence[native]
-    actual,_=run(model,kwargs,LoopConfig(extra_rounds=rounds,start_layer=1,end_layer=3,memory_slots=3))
+    actual,_=run(model,kwargs,legacy_config(extra_rounds=rounds,start_layer=1,end_layer=3,memory_slots=3))
     assert torch.equal(actual,expected), (actual-expected).abs().max().item()
     torch.manual_seed(41)
     head=torch.nn.Linear(32,7).to(device=actual.device,dtype=actual.dtype).requires_grad_(False)
@@ -96,7 +100,7 @@ def test_body_resets_gen_and_boundary_and_only_recycles_memory():
         calls.append(kw['packed_query_sequence'].clone())
         return original(**kw)
     decoder.layers[1].forward_inference=observe
-    cfg=LoopConfig(extra_rounds=2,start_layer=1,end_layer=3,memory_slots=3)
+    cfg=legacy_config(extra_rounds=2,start_layer=1,end_layer=3,memory_slots=3)
     run(model,kwargs,cfg)
     layout=memory_layout(kwargs,3)
     assert len(calls)==3
@@ -112,12 +116,12 @@ def test_prefix_suffix_execute_once_body_executes_r_plus_one():
         def wrapped(_i=i,_original=original,**kw):
             counts[_i]+=1;return _original(**kw)
         layer.forward_inference=wrapped
-    run(model,kwargs,LoopConfig(extra_rounds=3,start_layer=1,end_layer=3))
+    run(model,kwargs,legacy_config(extra_rounds=3,start_layer=1,end_layer=3))
     assert counts==[1,4,4,1]
 
 
 def test_memory_is_ephemeral_and_cfg_branches_do_not_share_state():
-    model,kwargs=fixture();cfg=LoopConfig(end_layer=3)
+    model,kwargs=fixture();cfg=legacy_config(end_layer=3)
     runtime=InternalLoopRuntime(model,cfg)
     try:
         a=model.language_model.model.forward_inference(**kwargs).packed_query_sequence
@@ -130,7 +134,7 @@ def test_memory_is_ephemeral_and_cfg_branches_do_not_share_state():
 
 
 def test_packed_samples_do_not_cross_talk():
-    model,kwargs=fixture();cfg=LoopConfig(end_layer=3)
+    model,kwargs=fixture();cfg=legacy_config(end_layer=3)
     a,_=run(model,kwargs,cfg)
     h=kwargs['packed_query_sequence'].clone();h[4:]+=2
     b,_=run(model,{**kwargs,'packed_query_sequence':h},cfg)
@@ -151,7 +155,7 @@ def test_positions_boundary_initialization_and_slot_noise():
 def test_progress_bypass_and_exception_restore_attention():
     model,kwargs=fixture();decoder=model.language_model.model
     native=decoder.forward_inference(**kwargs).packed_query_sequence
-    runtime=InternalLoopRuntime(model,LoopConfig(end_layer=3,progress_end=.5))
+    runtime=InternalLoopRuntime(model,legacy_config(end_layer=3,progress_end=.5))
     original=decoder.layers[0].self_attn.forward_inference
     try:
         runtime.progress=.51
@@ -161,13 +165,13 @@ def test_progress_bypass_and_exception_restore_attention():
             decoder.forward_inference(**{**kwargs,'update_past_key_values':True})
         assert decoder.layers[0].self_attn.forward_inference==original
         with pytest.raises(ValueError,match='already installed'):
-            InternalLoopRuntime(model,LoopConfig(end_layer=3,progress_end=.5))
+            InternalLoopRuntime(model,legacy_config(end_layer=3,progress_end=.5))
     finally:runtime.close()
 
 
 def test_diagnostics_and_capture_do_not_change_generation():
     from qwen_latent_cot.bagel.memory_probe import ProbeCapture
-    model,kwargs=fixture(batch=1);cfg=LoopConfig(start_layer=1,end_layer=3)
+    model,kwargs=fixture(batch=1);cfg=legacy_config(start_layer=1,end_layer=3)
     expected,_=run(model,kwargs,cfg)
     capture=ProbeCapture([0]);actual,details=run(model,kwargs,cfg,diagnostics=True,probe_capture=capture)
     assert torch.equal(actual,expected) and set(capture.layers[0])=={1,2}
@@ -206,7 +210,7 @@ def test_exception_inside_masked_layer_restores_native_attention():
     layer=decoder.layers[0];original=layer.self_attn.forward_inference
     def fail(*args,**kwargs):raise RuntimeError('injected MLP failure')
     layer.mlp_moe_gen.forward=fail
-    runtime=InternalLoopRuntime(model,LoopConfig(end_layer=3))
+    runtime=InternalLoopRuntime(model,legacy_config(end_layer=3))
     try:
         with pytest.raises(RuntimeError,match='injected'):
             decoder.forward_inference(**kwargs)
@@ -233,5 +237,5 @@ def test_cuda_legacy_velocity_parity():
     oldkw,native=legacy_kwargs(kwargs)
     expected=legacy_forward_inference(decoder,**oldkw,memory_loop_repeat=2,memory_loop_start=1,
         memory_loop_end=3,block_gen_reads_memory=True).packed_query_sequence[native]
-    actual,_=run(model,kwargs,LoopConfig(start_layer=1,end_layer=3,memory_slots=3))
+    actual,_=run(model,kwargs,legacy_config(start_layer=1,end_layer=3,memory_slots=3))
     assert torch.equal(actual,expected),(actual-expected).abs().max().item()

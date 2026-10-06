@@ -24,7 +24,7 @@ class ProbeCapture:
         output=Path(outdir);output.mkdir(parents=True,exist_ok=True)
         if set(self.layers)!=self.steps or set(self.images)!=self.steps:
             raise ValueError('probe steps not captured; steps must fall inside active loop progress')
-        expected=set(range(metadata['start_layer'],metadata['end_layer']))
+        expected=set(metadata.get('read_layers',range(metadata['start_layer'],metadata['end_layer'])))
         snapshots=[]
         for step in sorted(self.steps):
             layers=self.layers[step]
@@ -38,9 +38,12 @@ class ProbeCapture:
                 'tensor_path':str(path.resolve()),'image_path':str(imagepath.resolve()),
                 'question_position_start':max(s['question_position_start'] for s in layers.values()),
                 'layers':sorted(layers),'observed_image_kind':'guided_one_step_x0_proxy'})
-        record={**metadata,'snapshots':snapshots,'prompt_kv_exported':False,
-                'memory_carries_across_layers_in_generation':True,
-                'memory_state':'body_end_hidden', 'seed_reference':'strict_read_layer_input_kv'}
+        selected_prompt_seed=metadata.get('seed_reference')=='selected_native_prompt_layer_input_kv'
+        record={**metadata,'snapshots':snapshots,'prompt_kv_exported':selected_prompt_seed,
+                'full_prompt_kv_exported':False,'selected_prompt_seed_kv_exported':selected_prompt_seed,
+                'memory_carries_across_layers_in_generation':metadata.get('memory_carries_across_layers_in_generation',True),
+                'memory_state':metadata.get('memory_state','body_end_hidden'),
+                'seed_reference':metadata.get('seed_reference','strict_read_layer_input_kv')}
         (output/'capture.json').write_text(json.dumps(record,indent=2)+'\n')
         return record
 
@@ -176,7 +179,11 @@ def validate_capture(path,expected_hash):
     from ..evaluation.io import sha256
     if sha256(path)!=expected_hash:raise ValueError('Memory capture changed')
     value=json.loads(Path(path).read_text())
-    if value.get('prompt_kv_exported') is not False:raise ValueError('prompt KV must not enter Memory QA')
+    if value.get('prompt_kv_exported') is not False:
+        if (value.get('full_prompt_kv_exported') is not False or
+            value.get('seed_reference')!='selected_native_prompt_layer_input_kv' or
+            value.get('selected_prompt_seed_kv_exported') is not True):
+            raise ValueError('only the explicit selected-prompt SEED reference may enter QA')
     for snapshot in value['snapshots']:
         if sha256(snapshot['tensor_path'])!=snapshot['tensor_sha256'] or sha256(snapshot['image_path'])!=snapshot['image_sha256']:
             raise ValueError('snapshot tensor/image changed')

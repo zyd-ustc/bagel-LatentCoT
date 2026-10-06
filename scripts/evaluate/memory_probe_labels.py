@@ -24,8 +24,8 @@ def main():
             if key in values:raise ValueError('duplicate QA identity')
             values[key]=r
     for b in bindings:
-        for key in ('run','qa_source_sha256','max_questions','max_count','sources','expected_question_ids'):
-            if b[key]!=bindings[0][key]:raise ValueError('incompatible QA provenance')
+        for key in ('run','qa_source_sha256','max_questions','max_count','sources','expected_question_ids','memory_arm','full_prompt_kv_read','seed_reads_selected_prompt_kv'):
+            if b.get(key)!=bindings[0].get(key):raise ValueError('incompatible QA provenance')
     qa=bindings[0];run=qa['run']
     expected={(p,s,step,q) for p,qs in qa['expected_question_ids'].items() for q in qs for s in run['seeds'] for step in run['probe_steps']}
     if set(values)!=expected:raise ValueError('incomplete native QA coverage')

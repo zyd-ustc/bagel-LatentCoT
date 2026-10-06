@@ -1,32 +1,36 @@
-version: 2
-architecture: legacy_hidden_memory_body_v1
-source: native_BAGEL_UND_GEN_shared_attention_and_frozen_legacy_memory_loop
+version: 3
+architecture: native_layerwise_input_kv_v1
+source: native_BAGEL_UND_GEN_cache_interfaces_and_LoopedDiT_control_flow
 final_task: text_to_image
 training: false
 formal_runs_executed_by: user
 state:
   prompt_kv: immutable
-  feedback: body_end_memory_hidden
+  feedback: native_UND_layer_input_KV_at_same_layer
   gen: reset_to_fixed_body_entry_each_round
   boundaries: reset_with_gen
+  writer: reset_to_native_prompt_body_entry_each_round
+  carry_hidden_across_rounds: false
   carry_across_sampler_steps: false
   carry_across_cfg_branches: false
-  memory_initialization: per_sample_boundary_mean_plus_1e-4_slot_noise
-  memory_rope: native_SOI_position
+  memory_initialization: distinct_native_prompt_content_tokens
+  memory_rope: original_selected_prompt_positions
   gen_rope: unchanged
 computation:
   prefix_passes: 1
-  body_passes: R_plus_1_when_R_positive
+  gen_body_passes: R_plus_1_when_active
+  writer_body_passes: R_when_active
   suffix_passes: 1
-  round_zero: strict_read_no_non_memory_query_reads_M
-  extra_rounds: full_native_decoder_body
+  round_zero: exact_native_GEN_body_without_memory
+  effective_memory_read_layers: s_plus_1_through_e_minus_1
+  extra_rounds: full_native_decoder_body_from_fixed_entrance
   residual_scaling: none
-  final_velocity: native_suffix_norm_llm2vae
+  final_velocity: native_suffix_without_memory_overlay_then_norm_llm2vae
   zero_rounds: exact_native_bypass_without_memory
-  cfg: branch_local_memory_for_conditional_and_text_removed
+  cfg: conditional_memory_and_native_text_removed_branch
 initial_configuration:
   R: 1
-  memory_slots: 8
+  maximum_memory_slots: 8
   start_layer: 0
   end_layer_exclusive: 8
   active_sampling_progress: [0.0, 1.0]
@@ -35,15 +39,26 @@ initial_configuration:
   cfg_text_scale: 4.0
   timestep_shift: 3.0
 arms:
-  default: [BASE, MEMORY_LOOP]
-  optional_implementation_diagnostic: MEMORY_NO_READ
+  default: [BASE, MEMORY_LOOP, LAYERWISE_MEMORY_KV]
+  optional_implementation_diagnostic: LAYERWISE_KV_NO_READ
+  legacy_control: original_hidden_recurrence_including_old_suffix_and_null_CFG
 checks:
   - real_weight_native_R0_velocity_parity
   - real_weight_native_no_read_velocity_parity
-  - same_weight_seed_legacy_velocity_parity
+  - conditional_and_CFG_velocity_difference_finite
+  - unchanged_native_vendor_and_model_parameters
   - immutable_prompt_KV
-  - reset_GEN_and_boundary_states
+  - fixed_GEN_and_writer_entrances
+  - same_layer_actual_native_input_KV
   - packed_variable_resolution_isolation
+  - independent_legacy_velocity_parity
 metrics: [semantic_atoms, semantic_GM, quality_proxy, invalid, Repair, Damage]
-not_implemented: [training, layer_indexed_feedback_KV, separate_UND_writer_pass]
+probe:
+  dynamic: exact_KV_read_by_final_GEN_round
+  seed: explicit_selected_native_prompt_KV_reference
+  export_full_prompt_KV: false
+  observer_image: guided_one_step_x0_proxy
+  sources: [DYNAMIC, SEED, EMPTY, VIT_IMAGE]
+not_implemented: [training]
+unverified: [real_weight_layerwise_image_quality, semantic_gain, noisy_GEN_understanding]
 prohibited_default_mechanisms: [adapter, gate, alpha, shuffle, deployed_ViT_feedback]

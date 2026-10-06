@@ -46,6 +46,13 @@ def test_scorer_failure_cannot_be_reported_as_zero():
     with pytest.raises(ValueError):summarize([a,b],resamples=20)
 
 
+def test_layerwise_report_compares_base_and_explicit_legacy_control():
+    result=summarize([row(),row(arm='MEMORY_LOOP',atoms=(1.,0.)),
+                      row(arm='LAYERWISE_MEMORY_KV',atoms=(1.,1.))],resamples=20)
+    assert result['LAYERWISE_MEMORY_KV']['vs_MEMORY_LOOP']['repair_count']==1
+    assert result['LAYERWISE_MEMORY_KV']['vs_BASE']['damage_count']==0
+
+
 def test_manifest_requires_complete_shards(tmp_path):
     run={'source_sha256':'s','model_sha256':{},'benchmark_sha256':'b','sampling':{},'loop':{},
          'seeds':[0,1],'arms':['BASE'],'prompt_ids':['p0']}

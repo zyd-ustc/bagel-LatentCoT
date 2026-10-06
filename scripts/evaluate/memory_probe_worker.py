@@ -12,12 +12,15 @@ def main():
     p.add_argument('--model-path',required=True);p.add_argument('--output-dir',required=True)
     p.add_argument('--num-shards',type=int,default=1);p.add_argument('--shard-index',type=int,default=0)
     p.add_argument('--max-questions',type=int,default=4);p.add_argument('--max-count',type=int,default=12)
+    p.add_argument('--memory-arm',choices=['MEMORY_LOOP','LAYERWISE_MEMORY_KV'],help='Default: exported probe arm; otherwise layerwise if present, else legacy')
     p.add_argument('--device',default='cuda:0');args=p.parse_args()
     if not 0<=args.shard_index<args.num_shards:raise ValueError('invalid shard')
     records,run=load_manifests(args.manifests)
+    args.memory_arm=args.memory_arm or run.get('probe_arm') or ('LAYERWISE_MEMORY_KV' if 'LAYERWISE_MEMORY_KV' in run['arms'] else 'MEMORY_LOOP')
     if sha256(args.benchmark)!=run['benchmark_sha256']:raise ValueError('benchmark changed')
     data=read_jsonl(args.benchmark)
-    alljobs=sorted([r for r in records if r['arm']=='MEMORY_LOOP'],key=identity)
+    alljobs=sorted([r for r in records if r['arm']==args.memory_arm],key=identity)
+    if not alljobs:raise ValueError('selected Memory arm has no generated records')
     jobs=[r for i,r in enumerate(alljobs) if i%args.num_shards==args.shard_index]
     out=Path(args.output_dir);out.mkdir(parents=True,exist_ok=True)
     from qwen_latent_cot.bagel.backbone import load_native
@@ -28,9 +31,10 @@ def main():
         if sha256(Path(args.model_path)/name)!=digest:raise ValueError('QA checkpoint differs from generation')
     reader=NativeMemoryQA(bundle)
     binding={'run':run,'qa_source_sha256':source_hash(ROOT),'max_questions':args.max_questions,
-             'max_count':args.max_count,'shard':[args.shard_index,args.num_shards],
+             'max_count':args.max_count,'memory_arm':args.memory_arm,'shard':[args.shard_index,args.num_shards],
              'expected_question_ids':{r['prompt_id']:[q['question_id'] for q in probe_questions(data[r['index']],args.max_questions,args.max_count)] for r in alljobs},
-             'sources':['DYNAMIC','SEED','EMPTY','VIT_IMAGE'],'prompt_kv_read':False,
+             'sources':['DYNAMIC','SEED','EMPTY','VIT_IMAGE'],'full_prompt_kv_read':False,
+             'seed_reads_selected_prompt_kv':args.memory_arm=='LAYERWISE_MEMORY_KV',
              'question_format':'native_BOS_question_EOS_BOS_answer','answer_score':'mean_token_log_likelihood'}
     runfile=out/'qa_run.json'
     if runfile.exists() and json.loads(runfile.read_text())!=binding:raise ValueError('QA run binding changed')
@@ -60,7 +64,8 @@ def main():
                         'step':snapshot['step'],'progress':snapshot['sampling_progress'],'timestep':snapshot['timestep'],
                         'source':source,'image_path':snapshot['image_path'],'image_sha256':snapshot['image_sha256'],
                         'noise_sha256':row['noise_sha256'],'capture_sha256':row['probe_capture_sha256'],
-                        'image_kind':snapshot['observed_image_kind'],'prompt_kv_read':False}
+                        'image_kind':snapshot['observed_image_kind'],'full_prompt_kv_read':False,
+                        'selected_prompt_seed_kv_read':source=='SEED' and args.memory_arm=='LAYERWISE_MEMORY_KV'}
                     with resultfile.open('a') as f:f.write(json.dumps(record)+'\n');f.flush()
                 print(f"QA prompt={row['prompt_id']} seed={row['seed']} step={snapshot['step']} question={question['question_id']}",flush=True)
 

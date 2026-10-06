@@ -60,7 +60,7 @@ def test_native_qa_full_depth_sparse_kv_causal_packing_and_no_cache_write(device
 
 
 def test_snapshot_noninterference_and_dynamic_vs_seed():
-    model,kwargs=fixture(batch=1);cfg=LoopConfig(start_layer=1,end_layer=3)
+    model,kwargs=fixture(batch=1);cfg=LoopConfig(mode='MEMORY_LOOP',start_layer=1,end_layer=3)
     runtime=InternalLoopRuntime(model,cfg)
     try:
         expected=model.language_model.model.forward_inference(**kwargs).packed_query_sequence
@@ -104,6 +104,24 @@ def test_questions_and_unknown_labels():
     assert label_answer({'answer':'two','confidence':.9},q[0]['candidates'])['observed_answer']=='2'
     with pytest.raises(ValueError):label_answer({'answer':'13','confidence':.9},q[0]['candidates'])
     with pytest.raises(ValueError):label_answer({'answer':'2','confidence':float('nan')},q[0]['candidates'])
+
+
+def test_layerwise_snapshot_has_only_effective_read_layers_and_explicit_prompt_seed(tmp_path):
+    from test_layerwise_memory import prepared
+    model,kwargs,runtime=prepared(batch=1)
+    try:
+        capture=ProbeCapture([0]);runtime.probe_capture=capture
+        model.language_model.model.forward_inference(**kwargs)
+        capture.images[0]=Image.new('RGB',(28,28));capture.timesteps[0]=.7
+        metadata={'start_layer':1,'end_layer':3,'read_layers':[2],'num_timesteps':50,
+                  'memory_state':'native_layer_input_kv','memory_carries_across_layers_in_generation':False,
+                  'seed_reference':'selected_native_prompt_layer_input_kv'}
+        capture.save(tmp_path,metadata);path=tmp_path/'capture.json';finalize_capture(path)
+        result=validate_capture(path,sha256(path))
+        assert result['prompt_kv_exported'] and not result['full_prompt_kv_exported']
+        assert result['snapshots'][0]['layers']==[2]
+        assert not result['memory_carries_across_layers_in_generation']
+    finally:runtime.close()
 
 
 def test_probe_uses_observed_content_separates_prompt_echo_and_unknown():
