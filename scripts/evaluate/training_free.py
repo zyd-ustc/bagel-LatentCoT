@@ -16,6 +16,7 @@ def parser():
     p.add_argument('--model-path', required=True); p.add_argument('--prompts', required=True)
     p.add_argument('--output-dir', required=True); p.add_argument('--device', default='cuda:0')
     p.add_argument('--arms', default='BASE,MEMORY_LOOP,LAYERWISE_MEMORY_KV')
+    p.add_argument('--loop-depths', help='Paired layerwise depths, e.g. 1,2,3; BASE generated once')
     p.add_argument('--loop-rounds', type=int, default=1, help='R: extra whole-body passes; R=0 is native bypass')
     p.add_argument('--start-layer', type=int, default=0); p.add_argument('--end-layer', type=int, default=8)
     p.add_argument('--memory-slots', type=int, default=8)
@@ -41,6 +42,7 @@ def main():
     from qwen_latent_cot.bagel.backbone import load_native
     from qwen_latent_cot.bagel.inferencer import T2IGenerator, InvalidGeneratedImage
     from qwen_latent_cot.bagel.internal_loop import LoopConfig, InternalLoopRuntime, MODES
+    from qwen_latent_cot.evaluation.loop_depth import parse_depths,expand_arms
     if args.num_timesteps<2: raise ValueError('native schedule needs at least two time points')
     if not 0 <= args.shard_index < args.num_shards: raise ValueError('invalid worker shard')
     if args.device.startswith('cuda'): torch.cuda.set_device(torch.device(args.device))
@@ -58,10 +60,13 @@ def main():
     if not data or len(set(ids)) != len(ids): raise ValueError('empty/duplicate prompt IDs')
     probe_steps = sorted(set(int(x) for x in args.probe_steps.split(','))) if args.probe_steps else []
     probe_arm = args.probe_arm or ('LAYERWISE_MEMORY_KV' if 'LAYERWISE_MEMORY_KV' in arms else 'MEMORY_LOOP')
+    depths=parse_depths(args.loop_depths)
+    if depths and probe_steps:raise ValueError('depth comparison and probe export require separate runs')
+    arm_specs=expand_arms(arms,depths,args.loop_rounds)
     if probe_steps and (probe_arm not in arms or args.loop_rounds<1 or args.memory_slots<1):raise ValueError('probe export requires Memory loop and R>=1')
     if any(i<0 or i>=args.num_timesteps-1 or not args.progress_start<=i/max(args.num_timesteps-2,1)<=args.progress_end for i in probe_steps):raise ValueError('probe steps outside active schedule')
     cfg = LoopConfig(mode='LAYERWISE_MEMORY_KV' if any(a.startswith('LAYERWISE') for a in arms) else 'MEMORY_LOOP',
-        extra_rounds=args.loop_rounds, start_layer=args.start_layer, end_layer=args.end_layer,
+        extra_rounds=max(depths) if depths else args.loop_rounds, start_layer=args.start_layer, end_layer=args.end_layer,
         memory_slots=args.memory_slots, progress_start=args.progress_start, progress_end=args.progress_end, memory_seed=args.memory_seed)
     output = Path(args.output_dir).resolve(); output.mkdir(parents=True, exist_ok=True)
     weights = Path(args.model_path)
@@ -75,7 +80,9 @@ def main():
                     'timestep_shift':args.timestep_shift,'cfg_text_scale':args.cfg_text_scale,
                     'cfg_renorm_type':args.cfg_renorm_type,'matched_base_timesteps':args.matched_base_timesteps,
                     'image_size':args.image_size},
-        'loop':asdict(cfg), 'arms':arms, 'seeds':seeds, 'prompt_ids':ids,
+        'loop':asdict(cfg), 'loop_depths':list(depths),
+        'arm_configs':{label:asdict(replace(cfg,mode=mode,extra_rounds=rounds)) for label,mode,rounds in arm_specs},
+        'arms':[label for label,_,_ in arm_specs], 'seeds':seeds, 'prompt_ids':ids,
         'memory_topologies':{'MEMORY_LOOP':{'seed':'boundary_mean_plus_1e-4_noise',
             'carry':'body_end_hidden','suffix_reads_memory':True,'null_cfg':'branch_local_boundary_memory'},
             'LAYERWISE_MEMORY_KV':{'seed':'distinct_native_prompt_content_at_original_positions',
@@ -98,8 +105,8 @@ def main():
             completed[key]=r
     bundle = load_native(args.model_path,args.device,args.timestep_shift)
     jobs = [(i,s) for i in range(len(data)) for s in seeds]
-    for arm in arms:
-        runtime = InternalLoopRuntime(bundle.model, replace(cfg,mode='BASE' if arm=='BASE_MATCHED_LATENCY' else arm),diagnostics=args.diagnostics)
+    for arm,mode,rounds in arm_specs:
+        runtime = InternalLoopRuntime(bundle.model, replace(cfg,mode=mode,extra_rounds=rounds),diagnostics=args.diagnostics)
         generator = T2IGenerator(bundle,runtime)
         try:
             for ordinal,(i,seed) in enumerate(jobs):
@@ -132,10 +139,10 @@ def main():
                     'bucket':row.get('bucket','unclassified'),'height':shape[0],'width':shape[1],
                     'path':str(imagepath),'image_sha256':sha256(imagepath) if images is not None else None,'noise_sha256':hashes[0],
                     'valid_file':images is not None,'decode_error':invalid_error,'generation_seconds':elapsed,'peak_allocated_bytes':peak,
-                    'timing_scope':'diagnostic_unwarmed' if probe_steps or args.diagnostics else 'engineering_single_generation_no_warmups', 'extra_rounds':0 if arm.startswith('BASE') else cfg.extra_rounds,
+                    'timing_scope':'diagnostic_unwarmed' if probe_steps or args.diagnostics else 'engineering_single_generation_no_warmups', 'extra_rounds':rounds,
                     'body_pass_count_scope':'configured_active_branch; layerwise requires prompt content',
-                    'writer_body_passes':cfg.extra_rounds if arm.startswith('LAYERWISE') and cfg.memory_slots else 0,
-                    'body_passes':1 if arm.startswith('BASE') or cfg.extra_rounds==0 or cfg.memory_slots==0 else 1+cfg.extra_rounds,
+                    'writer_body_passes':rounds if mode.startswith('LAYERWISE') and cfg.memory_slots else 0,
+                    'body_passes':1 if mode=='BASE' or rounds==0 or cfg.memory_slots==0 else 1+rounds,
                     'num_timesteps':steps}
                 if runtime.probe_capture is not None:
                     if images is None:raise ValueError('probe export failed: invalid generated image')

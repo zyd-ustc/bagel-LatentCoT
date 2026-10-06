@@ -174,3 +174,20 @@ def test_cuda_native_packed_writer_contract(empty_first):
         runtime.config=replace(runtime.config,mode='LAYERWISE_KV_NO_READ')
         assert torch.equal(model.language_model.model.forward_inference(**kwargs).packed_query_sequence,native)
     finally:runtime.close()
+
+
+@pytest.mark.parametrize('rounds',[1,2])
+def test_cpu_gradient_reaches_writer_seed_through_native_layer_kv(rounds):
+    # This tests representation differentiability, not a supported training API.
+    # Native weights stay frozen; no optimizer, update or training checkpoint.
+    model,kwargs,runtime=prepared(batch=1,rounds=rounds)
+    try:
+        seed=runtime.layerwise.seeds[kwargs['past_key_values']]
+        seed.hidden.requires_grad_(True)
+        output=model.language_model.model.forward_inference(**kwargs).packed_query_sequence
+        head=torch.linspace(-1,1,output.shape[-1])
+        (output[kwargs['packed_vae_token_indexes']].float()*head).sum().backward()
+        assert seed.hidden.grad is not None
+        assert torch.isfinite(seed.hidden.grad).all() and seed.hidden.grad.float().norm()>0
+        assert all(parameter.grad is None for parameter in model.language_model.parameters())
+    finally:runtime.close()

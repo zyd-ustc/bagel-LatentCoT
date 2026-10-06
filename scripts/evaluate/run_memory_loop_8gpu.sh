@@ -20,6 +20,7 @@ if [[ -z ${PROMPTS:-} ]]; then
 fi
 export OUTDIR=$RUN/generation
 extra=()
+[[ -n ${LOOP_DEPTHS:-} ]] && extra+=(--loop-depths "$LOOP_DEPTHS")
 [[ ${DIAGNOSTICS:-0} == 1 ]] && extra+=(--diagnostics)
 [[ -n ${PROBE_STEPS:-} ]] && extra+=(--probe-steps "$PROBE_STEPS")
 [[ -n ${PROBE_ARM:-} ]] && extra+=(--probe-arm "$PROBE_ARM")

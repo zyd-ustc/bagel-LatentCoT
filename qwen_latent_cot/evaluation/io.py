@@ -36,7 +36,7 @@ def load_manifests(paths):
             if key in seen: raise ValueError('duplicate arm/prompt/seed record')
             seen.add(key); records.append(row)
     if not records: raise ValueError('empty manifests')
-    for key in ('schema', 'architecture', 'source_sha256', 'model_sha256', 'benchmark_sha256', 'sampling', 'loop', 'seeds', 'arms', 'prompt_ids', 'stage', 'diagnostics', 'probe_steps', 'probe_arm', 'memory_topologies'):
+    for key in ('schema', 'architecture', 'source_sha256', 'model_sha256', 'benchmark_sha256', 'sampling', 'loop', 'seeds', 'arms', 'prompt_ids', 'stage', 'diagnostics', 'probe_steps', 'probe_arm', 'memory_topologies', 'loop_depths', 'arm_configs'):
         if any(run.get(key) != provenance[0].get(key) for run in provenance):
             raise ValueError(f'incompatible shard provenance: {key}')
     expected = {(p, s) for p in provenance[0]['prompt_ids'] for s in provenance[0]['seeds']}
