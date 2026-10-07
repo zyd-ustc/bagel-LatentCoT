@@ -2,7 +2,7 @@
 
 目标：在冻结 BAGEL 权重、增加有限推理计算的条件下，通过 Memory 反馈修复文生图的数量、属性和空间关系。
 
-`main` 只保留 **持续 UND state＋全量动态 KV 替换**。默认 **R2、body `[0,8)`**。唯一模型对照为原生 Base。R1/R3 仅用于同一架构的深度诊断，没有其他生成架构、adapter、gate、压缩或训练模块。
+`main` 只保留 **持续 UND state＋全量动态 KV 替换**。默认 **R2**。当前比较早／中／晚位置的6个层窗口，另加原生 Base。没有其他生成架构、adapter、gate、压缩或训练模块。
 
 ## 架构
 
@@ -39,7 +39,7 @@ flowchart LR
 
 ## 已有证据
 
-下面是清理前目标路径的历史结果，并非本次重新生成。32个 structural prompts、seed0、512px、50个时间点、shift3、CFG4，共297条语义约束。
+下面是清理前目标路径的历史结果，并非本次重新生成。历史窗口为 `[0,8)`。32个 structural prompts、seed0、512px、50个时间点、shift3、CFG4，共297条语义约束。
 
 | 路径 | Semantic GM | 质量代理分 | Repair / Damage vs Base |
 |---|---:|---:|---:|
@@ -62,49 +62,67 @@ flowchart LR
 
 原始图片的 source、noise 和 image hashes 见 [证据来源](assets/evidence.json)。完整历史代码、文档、日志和结果已移至工作区 `older/und-memory-main-before-cleanup-20261007_121406/`；不混入当前展示目录。
 
+## 六个层窗口
+
+真实 BAGEL checkpoint 有28层。层索引从0开始；窗口右端不包含。六组均为R2、8层 body，Memory 更新与动态 suffix 语义保持一致。
+
+| 组名 | body 窗口 | UND writer suffix 层数 |
+|---|---|---:|
+| early_1 | [0,8) | 20 |
+| early_2 | [4,12) | 16 |
+| middle_1 | [8,16) | 12 |
+| middle_2 | [12,20) | 8 |
+| late_1 | [16,24) | 4 |
+| late_2 | [20,28) | 0 |
+
+另生成一个共享 Base。32 prompts × seed0 × 7组，共224张图。各组使用同 prompt、同初始噪声、同采样参数；所有去噪步都启用所选窗口。**body 等宽不代表总计算量相同**：writer suffix 长度随窗口变化。报告同时记录实际耗时和显存；耗时仅为未预热的工程日志。
+
+[window_comparison.json](configs/window_comparison.json)由脚本实际读取。该配置同时固定R2、6个窗口、32 prompts、seed0、512px、50个时间点、shift3、CFG4与global CFG renormalization。模型层数不符、窗口越界或数值检查失败时停止。
+
 ## 代码结构
 
 ```text
-configs/internal_loop.yaml        唯一默认配置：R2 / [0,8)
-data/prompts32.jsonl              当前32个评测 prompt
+configs/window_comparison.json   唯一窗口比较配置
+data/prompts32.jsonl            32个评测 prompt
 qwen_latent_cot/bagel/
-  internal_loop.py                唯一运行时与 Base 旁路
-  layerwise_memory.py             完整 prompt capture / packed KV
-  und_state_loop.py               持续 UND hidden / 动态 body 与 suffix
-  native_und.py                   原生 UND KV 投影
-  modeling/                      原生 BAGEL；native_source.json 记录来源
-qwen_latent_cot/evaluation/       配对指标与只读张量诊断
-scripts/evaluate/                原生检查、生成、评分与 HTML 导出
-tests/                          目标路径回归与冻结旧实现的 parity oracle
-assets/                         两组已有图像证据
+  internal_loop.py               唯一运行时与 Base 旁路
+  layerwise_memory.py            完整 prompt capture / packed KV
+  und_state_loop.py              持续 UND hidden / 动态 body 与 suffix
+  native_und.py                  原生 UND KV 投影
+  modeling/                     原生 BAGEL；native_source.json 记录来源
+qwen_latent_cot/evaluation/      配对指标、评分与数值检查工具
+scripts/compare_windows.py      数值检查、生成、评分、汇总与 HTML 对比
+scripts/compare_windows_8gpu.sh  多卡启动；每卡分配独立 prompt
+tests/test_numerics.py          必要数值测试
+tests/helpers.py               小模型 fixture
+tests/oracles/                 清理前选定路径的冻结数值参照
+assets/                         两组历史图像证据
 ```
+
+旧脚本和其他测试已删除；历史完整副本在工作区 `older/und-memory-before-window-compare-20261007_132531/`。冻结参照只用于数值测试，不是可运行的生成支线。
 
 ## 在 H200 上运行
 
-正式 GPU 检查、生成、评分及预算测量均由用户启动。下面使用新输出目录；每张卡负责独立 prompt，不是模型并行。
+正式 GPU 检查、生成和评分均由用户启动。先使用分配给本任务的8张卡，再在远端运行：
 
 ```bash
-cd /private/yida_workspace/bagel-LatentCoT-main-und-memory-r2-20261007
+cd /private/yida_workspace/bagel-LatentCoT-main-window-compare-20261007
 export GPUS=0,1,2,3,4,5,6,7
-export LOOP_DEPTHS=2 START_LAYER=0 END_LAYER=8
-export RUN=/private/yida_workspace/outputs/und_memory_r2_$(date +%Y%m%d_%H%M%S)
+export RUN=/private/yida_workspace/outputs/und_windows6_r2_$(date +%Y%m%d_%H%M%S)
 set -o pipefail
-bash scripts/evaluate/run_und_state_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
+bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
 ```
 
-脚本先执行真实权重 E0。检查失败就停止。通过后，默认生成 Base/R2 各32张，再评分并导出 `quality_report/summary.md` 和 `comparison.html`。卡必须是分配给本任务的卡；四卡可将 `GPUS` 改为四个卡号。
+需要4卡时，只修改 `GPUS` 的4个卡号。模型 Python、judge、权重与 GenEval2 路径保留远端已有默认值，也可通过环境变量设置。
 
-可选只读诊断：同一 Base 轨迹的 step0/24/48，比较本架构 R1/R2/R3 的 hidden、实际 Memory KV 和速度，不生成或评分最终图片。
+脚本依次执行：绑定源代码／权重／prompt hashes → 六个窗口真实权重数值检查 → 生成224张图 → 配对语义与质量代理评分 → 汇总和离线 HTML。权重仅在准备阶段完整计算一次hash，后续检查文件大小和修改时间。每个窗口独立执行原生 prompt prefill，避免复用错误层位置的 Memory seed。
 
-```bash
-export RUN=/private/yida_workspace/outputs/und_memory_diag_$(date +%Y%m%d_%H%M%S)
-bash scripts/evaluate/run_memory_round_diagnostic_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
-```
+进度记录在 `e0.log`、`generation/worker_*.log` 与 `quality/worker_*.log`。结果为 `quality_report/summary.md`、`quality_report/summary.json` 与 `comparison.html`。统计包含 Semantic GM、质量代理、Invalid、Repair/Damage、prompt-cluster置信区间、耗时和显存。Repair/Damage 仍需人工审查。
 
-[默认配置](configs/internal_loop.yaml)是配置说明。实际运行参数由上述脚本和 CLI 提供，不自动读取 YAML。普通生成耗时仅为工程日志；正式预算由 `scripts/evaluate/benchmark_budget.py` 单独测量。
+## 验证范围
 
-## 清理后的验证
+只保留必要数值检查：六个窗口R2的 hidden／velocity 与冻结选定 runner 精确一致；原生 hidden→KV 投影、R0旁路、轮间 UND hidden 更新、固定 GEN 入口、完整 prompt、特殊 token、动态 suffix、样本／调用隔离以及 cache／权重不变。
 
-远端隐藏 CUDA 后，CPU 回归 **36 passed / 1 skipped**。跳过项为 CUDA 检查。覆盖清理前目标 runner 与新主路径的 hidden／velocity 精确 parity（R1/R2/R3、窗口起点0/1），完整 prompt 容量、原生投影、动态 suffix、特殊 token、样本／调用隔离、cache／权重不变，以及 Base/R2 生成续跑、固定输入诊断和报告合并。
+远端隐藏CUDA后，CPU数值测试 **12 passed**。六个窗口都通过冻结路径的精确 parity，包括 `[20,28)` 的空 suffix 边界。另用CPU模拟任务检查了两份 prompt 分片、七组配对、评分合并、窗口排序、HTML导出及缺失配对拒绝。所有Python语法、shell语法和 `git diff --check` 通过。此次 BAGEL 核心架构代码和证据图片未改动。
 
-全部 Python 文件语法检查、shell 入口语法检查和 `git diff --check` 通过。原生 vendor 来源检查通过。正式 GPU 评测没有重跑；以上工程检查不证明语义或质量收益。
+CPU 检查使用小模型；任务流程检查使用模拟生成和评分，不证明真实权重的语义增益或质量。真实权重检查和正式图像评测由上面的用户命令完成。

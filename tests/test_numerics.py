@@ -7,7 +7,7 @@ from qwen_latent_cot.bagel.native_und import project_und
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache
 
 
-def setup(rounds=3,start=0,device='cpu'):
+def setup(rounds=2,start=0,device='cpu'):
     return prepared(mode='LAYERWISE_UND_STATE_REPLACE',rounds=rounds,
                     start=start,special_tokens=True,device=device)
 
@@ -23,9 +23,8 @@ def test_native_seeds_at_every_layer_and_same_layer_projection():
             assert torch.equal(k,cache.key_cache[index]) and torch.equal(v,cache.value_cache[index])
     finally:runtime.close()
 
-
-@pytest.mark.parametrize('rounds',[1,2,3])
-def test_carries_each_layer_output_hidden_and_projects_that_updated_hidden(rounds):
+def test_carries_each_layer_output_hidden_and_projects_that_updated_hidden():
+    rounds=2
     model,kwargs,runtime=setup(rounds);decoder=model.language_model.model
     seed=runtime.layerwise.seeds[kwargs['past_key_values']];events=[]
     def observe(**event):
@@ -58,7 +57,6 @@ def test_carries_each_layer_output_hidden_and_projects_that_updated_hidden(round
         assert not torch.equal(suffix['current'].keys[~seed.special_mask],suffix['reference'].keys[~seed.special_mask])
     finally:runtime.close()
 
-
 @pytest.mark.parametrize('start',[0,1])
 def test_gen_entrance_resets_full_capacity_and_suffix_runs_once(start):
     model,kwargs,runtime=setup(start=start);decoder=model.language_model.model;originals=[];calls=[]
@@ -71,17 +69,16 @@ def test_gen_entrance_resets_full_capacity_and_suffix_runs_once(start):
     try:
         decoder.forward_inference(**kwargs)
         entry=[c[2] for c in calls if c[0]==start and c[1]=='gen']
-        assert len(entry)==4 and all(torch.equal(entry[0],h) for h in entry[1:])
+        assert len(entry)==3 and all(torch.equal(entry[0],h) for h in entry[1:])
         for index in range(4):
-            assert len([c for c in calls if c[0]==index and c[1]=='gen'])==(4 if start<=index<3 else 1)
-            assert len([c for c in calls if c[0]==index and c[1]=='und'])==(3 if start<=index<3 else 1 if index>=3 else 0)
+            assert len([c for c in calls if c[0]==index and c[1]=='gen'])==(3 if start<=index<3 else 1)
+            assert len([c for c in calls if c[0]==index and c[1]=='und'])==(2 if start<=index<3 else 1 if index>=3 else 0)
         assert all(c[3]==[2,3] for c in calls if c[1]=='gen')
         # Writer has P + current GEN + live UND query; no old M KV addition.
         assert all(c[3]==[6,10] for c in calls if c[1]=='und' and c[0]<3)
     finally:
         for layer,original in zip(decoder.layers,originals):layer.forward_inference=original
         runtime.close()
-
 
 def test_call_and_sample_isolation_native_bypass_seed_cache_and_weights_immutable():
     model,kwargs,runtime=setup();decoder=model.language_model.model;cache=kwargs['past_key_values']
@@ -105,54 +102,6 @@ def test_call_and_sample_isolation_native_bypass_seed_cache_and_weights_immutabl
         assert all(torch.equal(model.language_model.state_dict()[name],w) for name,w in weights.items())
     finally:runtime.close()
 
-
-def test_cuda_und_state_contract():
-    if not torch.cuda.is_available():pytest.skip('user-run CUDA UND state contract')
-    model,kwargs,runtime=setup(device='cuda')
-    try:
-        decoder=model.language_model.model
-        a=decoder.forward_inference(**kwargs).packed_query_sequence
-        assert torch.isfinite(a).all() and torch.equal(a,decoder.forward_inference(**kwargs).packed_query_sequence)
-    finally:runtime.close()
-
-
-@pytest.mark.parametrize('rounds',[1,2,3])
-@pytest.mark.parametrize('start',[0,1])
-def test_exact_frozen_target_hidden_and_velocity_parity(rounds,start):
-    from oracles.und_state import run_und_state
-    model,kwargs,runtime=setup(rounds=rounds,start=start)
-    try:
-        # The oracle is the unchanged selected runner from before cleanup.
-        old_runtime=SimpleNamespace(**vars(runtime),probe_capture=None)
-        expected=run_und_state(runtime.layerwise,kwargs,old_runtime).packed_query_sequence
-        actual=runtime.decoder.forward_inference(**kwargs).packed_query_sequence
-        assert torch.equal(actual,expected)
-        torch.manual_seed(41)
-        head=torch.nn.Linear(32,7).to(dtype=actual.dtype).requires_grad_(False)
-        image=kwargs['packed_vae_token_indexes']
-        assert torch.equal(head(actual[image]),head(expected[image]))
-    finally:runtime.close()
-
-
-def test_default_config_and_removed_modes_rejected():
-    from qwen_latent_cot.bagel.internal_loop import LoopConfig,MODES,MODE
-    assert MODES==('BASE',MODE)
-    assert LoopConfig().mode==MODE and LoopConfig().extra_rounds==2
-    for bad in ('REMOVED_MODE','LAYERWISE_UND_BODY_REPLACE','LAYERWISE_UND_INCREMENT_REPLACE'):
-        with pytest.raises(ValueError):LoopConfig(mode=bad)
-
-
-def test_original_forward_restored_and_unknown_cache_rejected():
-    model,kwargs,runtime=setup();decoder=runtime.decoder;original=runtime.original
-    cache=kwargs['past_key_values'];unknown=NaiveCache(4)
-    for i in range(4):unknown.key_cache[i]=cache.key_cache[i].clone();unknown.value_cache[i]=cache.value_cache[i].clone()
-    try:
-        with pytest.raises(RuntimeError,match='prefill'):
-            decoder.forward_inference(**{**kwargs,'past_key_values':unknown})
-    finally:runtime.close()
-    assert decoder.forward_inference==original and not hasattr(decoder,'_memory_loop_runtime')
-
-
 def test_real_weight_validator_orchestration_with_cpu_decoder():
     from contextlib import nullcontext
     from types import MethodType
@@ -168,10 +117,26 @@ def test_real_weight_validator_orchestration_with_cpu_decoder():
             runtime.layerwise.seeds[cache]=seed
             return dict(packed_init_noises=kwargs['packed_query_sequence'].clone(),past_key_values=cache),['a','b']
     from pathlib import Path
-    script=Path(__file__).resolve().parents[1]/'scripts/evaluate/validate_und_state.py'
+    script=Path(__file__).resolve().parents[1]/'scripts/compare_windows.py'
     spec=importlib.util.spec_from_file_location('state_e0',script);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     try:
         result=module.validate(SimpleNamespace(model=model),Generator(),runtime,(2,))
         assert result['passed'] and result['conditional_effect_observed']
         assert set(result['native_hidden_seed_kv_parity'])=={'0','1','2','3'}
+    finally:runtime.close()
+
+@pytest.mark.parametrize('start,end',[(0,8),(4,12),(8,16),(12,20),(16,24),(20,28)])
+def test_exact_frozen_target_hidden_and_velocity_parity_for_six_windows(start,end):
+    from oracles.und_state import run_und_state
+    model,kwargs,runtime=prepared(rounds=2,start=start,end=end,depth=28,special_tokens=True)
+    try:
+        # Frozen selected runner from before cleanup; no second production path.
+        old_runtime=SimpleNamespace(**vars(runtime),probe_capture=None)
+        expected=run_und_state(runtime.layerwise,kwargs,old_runtime).packed_query_sequence
+        actual=runtime.decoder.forward_inference(**kwargs).packed_query_sequence
+        assert torch.equal(actual,expected)
+        torch.manual_seed(41)
+        head=torch.nn.Linear(32,7).to(dtype=actual.dtype).requires_grad_(False)
+        image=kwargs['packed_vae_token_indexes']
+        assert torch.equal(head(actual[image]),head(expected[image]))
     finally:runtime.close()

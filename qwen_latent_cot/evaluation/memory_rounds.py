@@ -1,5 +1,4 @@
 """Read-only, same-input comparisons of layer KV and denoiser velocity."""
-import hashlib
 import torch
 
 
@@ -14,10 +13,6 @@ def tensor_metrics(reference, candidate):
         reference_norm=float(an), candidate_norm=float(bn), delta_norm=float(dn),
         relative_l2=float(dn/an.clamp_min(1e-12)), max_abs=float(delta.abs().max()),
         cosine=float((a.flatten()*b.flatten()).sum()/(an*bn).clamp_min(1e-12)))
-
-
-def tensor_hash(tensor):
-    return hashlib.sha256(tensor.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()
 
 
 def kv_metrics(reference, candidate, special_mask, **labels):
@@ -73,29 +68,3 @@ class MemoryRoundCapture:
                     if bool(selected.any()):
                         self.hidden_rows.append(dict(layer=layer,phase=phase,subset=subset,
                             from_round=from_round,to_round=to_round,**tensor_metrics(a[selected],b[selected])))
-
-    def comparisons(self, depths):
-        layers=set(self.native)
-        if not layers or any(set(self.reads.get(r,{}))!=layers for r in depths):
-            raise ValueError('incomplete final Memory read coverage')
-        rows=list(self.writer_rows)
-        previous=0
-        for depth in depths:
-            reference=self.native if previous==0 else self.reads[previous]
-            for layer in sorted(layers):
-                rows.extend(kv_metrics(reference[layer],self.reads[depth][layer],self.masks[layer],
-                    scope='independent_depth_final_read',layer=layer,phase=self.phases[layer],
-                    read_kind=self.read_kinds[layer],
-                    from_round=previous,to_round=depth))
-            previous=depth
-        return rows
-
-
-def velocity_comparisons(velocities, branch):
-    rows=[]
-    first=(velocities[1].float()-velocities[0].float()).norm()
-    for previous,depth in [(0,1),(1,2),(2,3),(0,2),(0,3)]:
-        metrics=tensor_metrics(velocities[previous],velocities[depth])
-        metrics['delta_over_first_effect']=metrics['delta_norm']/max(float(first),1e-12)
-        rows.append(dict(branch=branch,from_round=previous,to_round=depth,**metrics))
-    return rows

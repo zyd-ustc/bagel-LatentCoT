@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "extra_rounds": 2,
+  "expected_num_hidden_layers": 28,
+  "windows": [
+    {
+      "name": "early_1",
+      "phase": "early",
+      "start_layer": 0,
+      "end_layer": 8
+    },
+    {
+      "name": "early_2",
+      "phase": "early",
+      "start_layer": 4,
+      "end_layer": 12
+    },
+    {
+      "name": "middle_1",
+      "phase": "middle",
+      "start_layer": 8,
+      "end_layer": 16
+    },
+    {
+      "name": "middle_2",
+      "phase": "middle",
+      "start_layer": 12,
+      "end_layer": 20
+    },
+    {
+      "name": "late_1",
+      "phase": "late",
+      "start_layer": 16,
+      "end_layer": 24
+    },
+    {
+      "name": "late_2",
+      "phase": "late",
+      "start_layer": 20,
+      "end_layer": 28
+    }
+  ],
+  "sampling": {
+    "image_size": 512,
+    "num_timesteps": 50,
+    "timestep_shift": 3.0,
+    "cfg_text_scale": 4.0,
+    "cfg_renorm_type": "global"
+  },
+  "seeds": [
+    0
+  ],
+  "max_prompts": 32
+}

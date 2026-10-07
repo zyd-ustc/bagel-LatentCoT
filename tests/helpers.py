@@ -4,16 +4,16 @@ from qwen_latent_cot.bagel.internal_loop import LoopConfig, InternalLoopRuntime
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Config, Qwen2ForCausalLM, NaiveCache
 
 
-def fixture(device='cpu', batch=2):
+def fixture(device='cpu', batch=2, depth=4):
     torch.manual_seed(123)
     cfg = Qwen2Config(vocab_size=32, hidden_size=32, intermediate_size=64,
-        num_attention_heads=4, num_key_value_heads=2, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2, num_hidden_layers=depth,
         layer_module='Qwen2MoTDecoderLayer', pad_token_id=0)
     llm = Qwen2ForCausalLM(cfg).eval().requires_grad_(False).to(device=device, dtype=torch.bfloat16)
     model = SimpleNamespace(language_model=llm)
-    cache = NaiveCache(4)
+    cache = NaiveCache(depth)
     glen, plen = ([4, 7], [2, 3]) if batch == 2 else ([6], [3])
-    for index in range(4):
+    for index in range(depth):
         cache.key_cache[index] = torch.randn(sum(plen), 2, 8, device=device, dtype=torch.bfloat16)
         cache.value_cache[index] = torch.randn_like(cache.key_cache[index])
     positions, text, image, queries, cached = [], [], [], [], []
@@ -31,11 +31,11 @@ def fixture(device='cpu', batch=2):
         mode='gen', packed_text_indexes=ids(text), packed_vae_token_indexes=ids(image))
     return model, kwargs
 
-def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_UND_STATE_REPLACE', device='cpu', start=1, special_tokens=False):
-    model, kwargs = fixture(batch=batch,device=device)
+def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_UND_STATE_REPLACE', device='cpu', start=1, special_tokens=False, depth=4, end=3):
+    model, kwargs = fixture(batch=batch,device=device,depth=depth)
     decoder = model.language_model.model
     runtime = InternalLoopRuntime(model, LoopConfig(mode=mode, extra_rounds=rounds,
-        start_layer=start, end_layer=3), diagnostics=True)
+        start_layer=start, end_layer=end), diagnostics=True)
     lengths = kwargs['key_values_lens'].tolist()
     tokens = torch.tensor([5,6,7,8,9] if batch==2 else [5,6,7],device=device)
     if empty_first: tokens[:lengths[0]]=0
@@ -43,7 +43,7 @@ def prepared(batch=2, empty_first=False, rounds=1, mode='LAYERWISE_UND_STATE_REP
         offset=0
         for n in lengths:
             tokens[offset]=0;tokens[offset+n-1]=1;offset+=n
-    cache = NaiveCache(4)
+    cache = NaiveCache(depth)
     positions = torch.tensor([j for n in lengths for j in range(n)],device=device)
     runtime.begin_prefill(cache, tokens, lengths, {0,1})
     try:

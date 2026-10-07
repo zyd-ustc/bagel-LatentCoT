@@ -3,7 +3,6 @@ from collections import defaultdict
 import math
 import numpy as np
 from .io import identity
-from .loop_depth import depth_of,mode_of
 
 
 def gm(atoms):
@@ -62,13 +61,6 @@ def summarize(rows,resamples=10000):
             'peak_allocated_bytes':max(r['peak_allocated_bytes'] for r in records),
             'timing_is_engineering_only':True,
             'vs_BASE':paired_report(groups['BASE'],values,resamples)}
-        current_depth=depth_of(arm)
-        comparators = sorted((other for other in groups
-            if mode_of(other)==mode_of(arm) and depth_of(other) is not None
-            and current_depth is not None and depth_of(other)<current_depth), key=depth_of)
-        for control in comparators:
-            if control in groups:
-                output[arm]['vs_'+control]=paired_report(groups[control],values,resamples)
         buckets=set(r['bucket'] for r in records)
         output[arm]['buckets']={}
         for bucket in buckets:
