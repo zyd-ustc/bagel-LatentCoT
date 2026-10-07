@@ -8,13 +8,13 @@ from qwen_latent_cot.evaluation.io import sha256
 
 def test_blind_pack_hides_arms_and_preserves_hashes(tmp_path):
     rows=[]
-    for arm,color in [('BASE','red'),('MEMORY_LOOP','blue')]:
+    for arm,color in [('BASE','red'),('LAYERWISE_UND_STATE_REPLACE_R2','blue')]:
         path=tmp_path/f'{arm}.png';Image.new('RGB',(16,16),color).save(path)
         rows.append({'arm':arm,'prompt_id':'p0','seed':0,'path':str(path),'prompt':'a cube',
             'semantic_questions':[['Is there a cube?','Yes']]})
     out=tmp_path/'blind';make_blind_pack(rows,out)
     table=list(csv.DictReader((out/'review.csv').open()))
-    assert 'MEMORY_LOOP' not in (out/'review.csv').read_text()
+    assert 'LAYERWISE_UND_STATE_REPLACE_R2' not in (out/'review.csv').read_text()
     assert (out/'semantic_review.json').exists()
     table[0].update(preference_A_B_tie='A',A_invalid='false',B_invalid='false')
     with (out/'review.csv').open('w',newline='') as f:

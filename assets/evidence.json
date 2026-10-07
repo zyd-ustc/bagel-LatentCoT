@@ -1,0 +1,54 @@
+{
+  "scope": "two_selected_historical_pairs_not_new_inference",
+  "run": "und_state_images_20261006_140428",
+  "source_sha256": "0fa7935fa5565d7e3e6c17391f6d73c913fc7144dbac33a0f1f7fb9867189eb6",
+  "evaluation": {
+    "prompts": 32,
+    "seed": 0,
+    "semantic_atoms": 297,
+    "base_gm": 0.0925,
+    "r2_gm": 0.1361,
+    "repair": 20,
+    "damage": 24,
+    "gm_delta_ci95": [
+      -0.0173,
+      0.12027
+    ],
+    "quality_is_proxy": true,
+    "net_gain_verified": false
+  },
+  "pairs": [
+    {
+      "index": 6,
+      "arm": "BASE",
+      "prompt": "three yellow rabbits in front of two purple mushrooms, and three brown monkeys",
+      "seed": 0,
+      "image_sha256": "07bb32641cbd73bdae5fd4ec813fb3fec15c8a5b9b4697d3754060395a59e22f",
+      "noise_sha256": "33e5e1492edd7110d7f1a65492cbc485924cb2dc9343099bd01121af5e47a0e7"
+    },
+    {
+      "index": 24,
+      "arm": "BASE",
+      "prompt": "four white bicycles in front of three plastic cows",
+      "seed": 0,
+      "image_sha256": "757673709bcf3491a68d8a06213dbf437dfe3b65afddc08bc6a476feadb82046",
+      "noise_sha256": "33e5e1492edd7110d7f1a65492cbc485924cb2dc9343099bd01121af5e47a0e7"
+    },
+    {
+      "index": 6,
+      "arm": "LAYERWISE_UND_STATE_REPLACE_R2",
+      "prompt": "three yellow rabbits in front of two purple mushrooms, and three brown monkeys",
+      "seed": 0,
+      "image_sha256": "0dde320954d64483e61fbefb4f71616ca23af7060c0d9c7d0347e701d495e96c",
+      "noise_sha256": "33e5e1492edd7110d7f1a65492cbc485924cb2dc9343099bd01121af5e47a0e7"
+    },
+    {
+      "index": 24,
+      "arm": "LAYERWISE_UND_STATE_REPLACE_R2",
+      "prompt": "four white bicycles in front of three plastic cows",
+      "seed": 0,
+      "image_sha256": "eaa3ec1025ed15acdc4dcfe3cd657454cf78bcda587d3b893a90e6f5eb4c7507",
+      "noise_sha256": "33e5e1492edd7110d7f1a65492cbc485924cb2dc9343099bd01121af5e47a0e7"
+    }
+  ]
+}

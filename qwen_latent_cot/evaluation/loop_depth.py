@@ -1,7 +1,6 @@
-"""Explicit depth labels keep paired generation and resume identities distinct."""
-DEPTH_PREFIX='LAYERWISE_MEMORY_KV_R'
-DEPTH_MODES=('LAYERWISE_MEMORY_KV','LAYERWISE_MEMORY_REPLACE','LAYERWISE_SEED_REPLACE',
-             'LAYERWISE_FULL_MEMORY_REPLACE','LAYERWISE_FULL_SEED_REPLACE')
+"""Explicit depth identities for one architecture and its native Base control."""
+from ..bagel.internal_loop import MODE
+DEPTH_MODES = (MODE,)
 
 
 def parse_depths(value):
@@ -11,21 +10,19 @@ def parse_depths(value):
         raise ValueError('loop depths must be distinct positive integers; BASE represents R0')
     return tuple(sorted(depths))
 
-
-def expand_arms(arms,depths,default_rounds):
-    if depths:
-        if 'BASE' not in arms or len(arms)<2 or any(a not in ('BASE',*DEPTH_MODES) for a in arms):
-            raise ValueError('multi-depth comparison requires BASE and supported layerwise modes')
-        return [('BASE','BASE',0)]+[(f'{mode}_R{r}',mode,r) for mode in arms if mode!='BASE' for r in depths]
-    return [(arm,'BASE' if arm=='BASE_MATCHED_LATENCY' else arm,
-             0 if arm.startswith('BASE') else default_rounds) for arm in arms]
-
-
 def depth_of(arm):
     for mode in DEPTH_MODES:
         if arm.startswith(mode+'_R'):return int(arm[len(mode)+2:])
     return None
 
-
 def mode_of(arm):
     return arm.rsplit('_R',1)[0] if depth_of(arm) is not None else arm
+
+
+def expand_arms(arms, depths, default_rounds):
+    if len(set(arms)) != len(arms) or 'BASE' not in arms or any(a not in ('BASE', MODE) for a in arms):
+        raise ValueError('evaluation supports only Base and persistent UND Memory loop')
+    rounds = depths or (default_rounds,)
+    if any(r < 1 for r in rounds):
+        raise ValueError('positive loop depth required; BASE represents R0')
+    return [('BASE', 'BASE', 0)] + [(f'{MODE}_R{r}', MODE, r) for r in rounds if MODE in arms]

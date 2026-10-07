@@ -62,17 +62,10 @@ def summarize(rows,resamples=10000):
             'peak_allocated_bytes':max(r['peak_allocated_bytes'] for r in records),
             'timing_is_engineering_only':True,
             'vs_BASE':paired_report(groups['BASE'],values,resamples)}
-        controls={'MEMORY_LOOP':('MEMORY_NO_READ',),
-                  'LAYERWISE_MEMORY_KV':('MEMORY_LOOP','LAYERWISE_KV_NO_READ'),
-                  'LAYERWISE_MEMORY_REPLACE':('LAYERWISE_SEED_REPLACE','LAYERWISE_MEMORY_KV'),
-                  'LAYERWISE_FULL_MEMORY_REPLACE':('LAYERWISE_FULL_SEED_REPLACE',)}
-        comparators=list(controls.get(arm,()))
         current_depth=depth_of(arm)
-        if current_depth is not None:
-            comparators += sorted((other for other in groups
-                if mode_of(other)==mode_of(arm) and depth_of(other) is not None
-                and depth_of(other)<current_depth),key=depth_of)
-            comparators += [f'{other}_R{current_depth}' for other in controls.get(mode_of(arm),())]
+        comparators = sorted((other for other in groups
+            if mode_of(other)==mode_of(arm) and depth_of(other) is not None
+            and current_depth is not None and depth_of(other)<current_depth), key=depth_of)
         for control in comparators:
             if control in groups:
                 output[arm]['vs_'+control]=paired_report(groups[control],values,resamples)

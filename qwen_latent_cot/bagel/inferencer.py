@@ -75,12 +75,6 @@ class T2IGenerator:
                 self.runtime.progress = step/max(num_timesteps-2, 1)
                 self.runtime.step_index = step
             result = original(**kwargs)
-            capture = self.runtime.probe_capture if self.runtime else None
-            if capture is not None and step in capture.steps:
-                if len(shapes)!=1:raise ValueError('probe images require batch=1')
-                t = float(kwargs['timestep'][0])
-                capture.images[step] = self.decode(kwargs['x_t']-t*result,shapes[0])
-                capture.timesteps[step] = t
             step += 1
             return result
         self.model._forward_flow = MethodType(forward, self.model)

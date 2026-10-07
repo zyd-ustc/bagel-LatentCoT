@@ -37,6 +37,8 @@ def export(root,output):
             if any(row[k]!=base[k] for k in ('prompt','noise_sha256','height','width')):
                 raise ValueError('paired inputs differ')
             parts.append(f'<div><div class="label">{esc(arm)} · quality {row["quality_proxy"]:.2f}</div>')
+            if row.get('origin_generation'):
+                parts.append('<small>历史图片及评分（复用）</small>')
             if row['valid_file']:
                 raw=Path(row['path']).read_bytes()
                 if hashlib.sha256(raw).hexdigest()!=row['image_sha256']:raise ValueError('image hash changed')

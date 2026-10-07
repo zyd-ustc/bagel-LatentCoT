@@ -1,1 +1,1 @@
-"""Frozen native BAGEL with layer-local denoiser recurrence."""
+"""Frozen BAGEL with persistent UND state and full dynamic prompt-KV replacement."""

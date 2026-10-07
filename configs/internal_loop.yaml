@@ -1,16 +1,11 @@
-# R counts extra fixed-entrance GEN body passes after native round zero.
-architecture: native_layerwise_input_kv_v1
-mode: LAYERWISE_MEMORY_KV
-extra_rounds: 1
+# One architecture; R counts extra GEN body passes after native round zero.
+mode: LAYERWISE_UND_STATE_REPLACE
+extra_rounds: 2
 start_layer: 0
 end_layer: 8
-memory_slots: 8
-memory_initialization: selected_native_prompt_content_and_original_rope
-effective_read_layers: [1, 2, 3, 4, 5, 6, 7]
 progress_start: 0.0
 progress_end: 1.0
 num_timesteps: 50
-actual_denoiser_calls: 49
 timestep_shift: 3.0
 cfg_text_scale: 4.0
 image_size: 512

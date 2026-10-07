@@ -5,7 +5,7 @@ from pathlib import Path
 
 def test_native_vendor_changes_are_only_namespace_and_attention_dispatch():
     root=Path(__file__).resolve().parents[1]
-    ledger=json.loads((root/'docs/NATIVE_SOURCE.json').read_text())
+    ledger=json.loads((root/'qwen_latent_cot/bagel/modeling/native_source.json').read_text())
     reference=root.parent/'refs/Bagel'
     for destination,entry in ledger['files'].items():
         vendored=(root/destination).read_text()

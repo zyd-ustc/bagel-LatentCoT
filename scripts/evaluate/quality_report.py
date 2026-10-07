@@ -57,6 +57,7 @@ def write_summary(scored,run,output,resamples=10000):
         'training_admitted':False,'training_admission_status':'not_assessed_here; assess_image_gain_and_memory_content_evidence',
         'stage':run['stage'],'source_sha256':run['source_sha256'],'model_sha256':run['model_sha256'],
         'quality_is_proxy':True,'blind_review':'pending','statistics_unit':'prompt_cluster_all_seeds_and_atoms',
+        'generation_provenance_scope':'single_source',
         'arms':summarize(scored,resamples)}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
     lines=['# Frozen BAGEL denoiser loop evaluation','','Quality is a VLM proxy; blind review is pending. Engineering timing does not establish budget compliance.','',
