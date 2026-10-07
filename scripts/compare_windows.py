@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""User-run six-window comparison: prepare, validate, generate, score, report."""
+"""User-run six-arm denoising-time comparison: prepare, validate, generate, score, report."""
 import argparse
 import base64
 import hashlib
@@ -12,11 +12,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from qwen_latent_cot.evaluation.io import read_jsonl, sha256, source_hash, load_manifests, identity
-from qwen_latent_cot.evaluation.windows import load_comparison, validate_config, arm_configs
+from qwen_latent_cot.evaluation.windows import load_comparison, validate_config, arm_configs, window_metadata
 
 
 def prepare_main():
-    p = argparse.ArgumentParser(description='Bind six windows, prompts, weights and source before workers')
+    p = argparse.ArgumentParser(description='Bind denoising windows, prompts, weights and source before workers')
     p.add_argument('--model-path', required=True)
     p.add_argument('--prompts', default=str(ROOT/'data/prompts32.jsonl'))
     p.add_argument('--config', default=str(ROOT/'configs/window_comparison.json'))
@@ -35,24 +35,24 @@ def prepare_main():
     model_files += [weights/n for n in ('llm_config.json','vit_config.json','tokenizer.json',
         'tokenizer_config.json','vocab.json','merges.txt') if (weights/n).is_file()]
     print('Hashing native weights once for all workers...', flush=True)
-    plan = {'schema':10, 'architecture':'persistent_und_full_prompt_kv_v1',
+    plan = {'schema':11, 'architecture':'persistent_und_full_prompt_kv_v1',
         'source_sha256':source_hash(ROOT), 'config_sha256':sha256(a.config), 'config':config,
         'model_path':str(weights), 'model_sha256':{f.name:sha256(f) for f in model_files},
         'model_stat':{f.name:[f.stat().st_size,f.stat().st_mtime_ns] for f in model_files},
         'benchmark':str(Path(a.prompts).resolve()),'benchmark_sha256':sha256(a.prompts),
         'prompt_ids':ids, 'seeds':config['seeds'], 'arms':list(arm_configs(config)),
-        'arm_configs':arm_configs(config), 'sampling':dict(config['sampling'],
+        'arm_configs':arm_configs(config), 'time_windows':window_metadata(config), 'sampling':dict(config['sampling'],
             actual_denoiser_calls=config['sampling']['num_timesteps']-1),
         'native_depth':depth, 'stage':'evaluation', 'diagnostics':False,
         'memory_topologies':{'mode':'persistent_und_full_prompt_dynamic_kv',
             'suffix':'dynamic_final_writer_continuation', 'capacity':'full_prompt',
             'special_hidden_and_kv':'pinned_native', 'null_cfg':'native_bypass'},
-        'loop':{'extra_rounds':2,'progress_start':0.,'progress_end':1.}}
+        'loop':{'extra_rounds':2,'layer_window':config['layer_window'],'time_windows':'per_arm'}}
     output=Path(a.plan)
     if output.exists():raise ValueError('use a fresh plan file')
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(plan,indent=2)+'\n')
-    print(f"Prepared {len(ids)*len(plan['seeds'])*len(plan['arms'])} images, Base + six R2 windows",flush=True)
+    print(f"Prepared {len(ids)*len(plan['seeds'])*len(plan['arms'])} images, Base + five R2 time windows",flush=True)
 
 
 def read_plan(path):
@@ -65,11 +65,13 @@ def read_plan(path):
     depth=json.loads((Path(plan['model_path'])/'llm_config.json').read_text())['num_hidden_layers']
     if arm_configs(validate_config(plan['config'],depth)) != plan['arm_configs']:
         raise ValueError('inconsistent arm configuration')
+    if window_metadata(plan['config']) != plan['time_windows']:
+        raise ValueError('inconsistent recorded loop-step counts')
     return plan
 
 
 def generate_main():
-    p=argparse.ArgumentParser(description='Generate Base + six fixed R2 windows on a prompt shard')
+    p=argparse.ArgumentParser(description='Generate Base + five R2 time windows at layers [0,8) on a prompt shard')
     p.add_argument('--plan',required=True);p.add_argument('--output-dir',required=True)
     p.add_argument('--device',default='cuda:0');p.add_argument('--shard-index',type=int,default=0)
     p.add_argument('--num-shards',type=int,default=1)
@@ -127,11 +129,15 @@ def generate_main():
                     'native_prompt_lengths':list(generator.prompt_lengths),
                     'memory_capacity_policy':'full_prompt',
                     'full_memory_lengths':list(generator.prompt_lengths) if mode!='BASE' else None,
-                    'writer_body_passes':rounds if mode!='BASE' else 0,
-                    'writer_suffix_passes':int(mode!='BASE' and rounds>0 and cfg.end_layer<len(bundle.model.language_model.model.layers)),
-                    'body_passes':1+rounds,
+                    'writer_body_passes_per_active_call':rounds if mode!='BASE' else 0,
+                    'writer_suffix_passes_per_active_call':int(mode!='BASE' and rounds>0 and cfg.end_layer<len(bundle.model.language_model.model.layers)),
+                    'gen_body_passes_per_active_call':1+rounds,
                     'num_timesteps':steps}
-                record.update(start_layer=cfg.start_layer,end_layer=cfg.end_layer,
+                record.update(loop_step_indexes=plan['time_windows'][arm]['loop_step_indexes'],
+                    configured_loop_calls=plan['time_windows'][arm]['loop_calls'],
+                    configured_native_calls=steps-1-plan['time_windows'][arm]['loop_calls'],
+                    total_configured_gen_body_passes=(steps-1)+rounds*plan['time_windows'][arm]['loop_calls'],
+                    start_layer=cfg.start_layer,end_layer=cfg.end_layer,
                     writer_suffix_layers=(plan['native_depth']-cfg.end_layer if mode!='BASE' else 0))
                 with manifest.open('a') as f: f.write(json.dumps(record)+'\n'); f.flush()
                 print(f'{arm} prompt={ids[i]} seed={seed} {elapsed:.2f}s peak={peak/2**30:.2f}GiB',flush=True)
@@ -148,6 +154,8 @@ def validate(bundle,generator,runtime,depths):
     from qwen_latent_cot.bagel.native_und import project_und
     from qwen_latent_cot.evaluation.memory_rounds import MemoryRoundCapture
     cfg=runtime.config
+    saved_progress=runtime.progress
+    runtime.progress=cfg.progress_start
     device=next(bundle.model.language_model.parameters()).device
     results=dict(depths=list(depths),input_scope='seeded_gaussian_test_input_not_sampled_trajectory',
         timesteps={},state_contracts={},semantic_gain_verified=False,quality_retention_verified=False)
@@ -183,6 +191,11 @@ def validate(bundle,generator,runtime,depths):
                 runtime.kv_observer=None
                 checks[f'cfg_R{r}']=comparison(native,bundle.model._forward_flow(**kwargs))
             results['timesteps'][str(t)]=checks
+            runtime.kv_observer=None
+            if cfg.progress_start>0 or cfg.progress_end<1:
+                runtime.progress=(cfg.progress_start/2 if cfg.progress_start>0 else (cfg.progress_end+1)/2)
+                checks['outside_window']=comparison(native,bundle.model._forward_flow(**kwargs))
+                runtime.progress=cfg.progress_start
             mask=seed.special_mask.cpu()
             results['state_contracts'][str(t)]={
                 'all_read_layers_present':all(set(capture.reads[r])==set(range(cfg.start_layer,len(runtime.decoder.layers))) for r in depths),
@@ -196,16 +209,16 @@ def validate(bundle,generator,runtime,depths):
             torch.equal(k,kcopy) and torch.equal(v,vcopy) for i,(k,kcopy,v,vcopy) in before.items())
         results['native_hidden_seeds_unchanged']=all(torch.equal(seed.layer_hidden[i],h) for i,h in hidden_before.items())
         results['noise_sha256']=hashes
-    runtime.config=cfg;runtime.kv_observer=None
+    runtime.config=cfg;runtime.kv_observer=None;runtime.progress=saved_progress
     results['passed']=(results['all_prompt_slots_preserved'] and results['prompt_cache_unchanged'] and results['native_hidden_seeds_unchanged']
         and all(v['equal'] and v['finite'] for c in results['native_hidden_seed_kv_parity'].values() for v in c.values())
         and all(all(c.values()) for c in results['state_contracts'].values())
-        and all(v['finite'] and (v['equal'] if name.startswith('R0') else True) for c in results['timesteps'].values() for name,v in c.items()))
+        and all(v['finite'] and (v['equal'] if name.startswith('R0') or name=='outside_window' else True) for c in results['timesteps'].values() for name,v in c.items()))
     results['conditional_effect_observed']=any(not c[f'conditional_R{r}']['equal'] for c in results['timesteps'].values() for r in depths)
     return results
 
 def validate_main():
-    p=argparse.ArgumentParser(description='Real-weight numerical contracts for all six windows')
+    p=argparse.ArgumentParser(description='Real-weight contracts and inactive-window native parity for five loop arms')
     p.add_argument('--plan',required=True);p.add_argument('--output',required=True)
     p.add_argument('--device',default='cuda:0');a=p.parse_args()
     import torch
@@ -273,26 +286,40 @@ def score_main():
 def write_summary(scored,run,output,resamples=10000):
     from qwen_latent_cot.evaluation.report import summarize
     summary={'status':'engineering_scored' if run['stage']=='engineering' else 'paired_scored',
-        'comparison':'six_layer_windows_R2', 'arm_configs':run['arm_configs'],
+        'comparison':'early_denoising_R2_layers_0_8', 'arm_configs':run['arm_configs'],
+        'time_windows':run['time_windows'],
         'stage':run['stage'],'source_sha256':run['source_sha256'],'model_sha256':run['model_sha256'],
         'quality_is_proxy':True,'manual_review':'pending','statistics_unit':'prompt_cluster_all_seeds_and_atoms',
         'generation_provenance_scope':'single_source',
         'arms':summarize(scored,resamples)}
     summary['arms']={arm:summary['arms'][arm] for arm in run['arms']}
+    from qwen_latent_cot.evaluation.report import paired_report, repair_retention
+    grouped={arm:{identity(r):r for r in scored if r['arm']==arm} for arm in run['arms']}
+    summary['comparisons']={candidate+'_vs_'+reference:paired_report(grouped[reference],grouped[candidate],resamples)
+        for candidate,reference in (('EARLY_20','LATE_20'),('EARLY_05','FULL'),('EARLY_10','FULL'),('EARLY_20','FULL'))}
+    summary['repair_retention']={arm:repair_retention(grouped['BASE'],grouped['FULL'],grouped[arm])
+        for arm in ('EARLY_05','EARLY_10','EARLY_20','LATE_20')}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
-    lines=['# Frozen BAGEL: six layer windows at R2','','Quality is a VLM proxy; manual review is pending. Equal body width does not equal total compute; writer suffix lengths differ. Engineering timing does not establish budget compliance.','',
+    lines=['# Frozen BAGEL: early denoising loops at layers [0,8), R2','','Quality is a VLM proxy; manual review is pending. All loop arms use layers [0,8) and R2. Early20 and Late20 have equal loop-call counts. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing does not establish budget compliance.','',
         '|Arm|Semantic GM|Quality proxy|Invalid|Net Repair vs Base (95% CI)|Repair / Damage|',
         '|---|---:|---:|---:|---|---:|']
     for arm,s in summary['arms'].items():
         delta=s['vs_BASE']['net_repair'];lo,hi=delta['ci95']
         lines.append(f"|{arm}|{s['semantic_gm']:.4f}|{s['quality_proxy']:.4f}|{s['invalid_rate']:.4f}|{delta['mean']:.4f} [{lo:.4f}, {hi:.4f}]|{s['vs_BASE']['repair_count']} / {s['vs_BASE']['damage_count']}|")
-    lines+=['','|Arm|Window [start,end)|Writer suffix layers|Median seconds|Peak allocated GiB|',
-        '|---|---|---:|---:|---:|']
-    for arm,s in summary['arms'].items():
-        cfg=run['arm_configs'][arm]
-        window='native' if arm=='BASE' else f"[{cfg['start_layer']},{cfg['end_layer']})"
-        suffix=0 if arm=='BASE' else run['native_depth']-cfg['end_layer']
-        lines.append(f"|{arm}|{window}|{suffix}|{s['latency_median_seconds']:.2f}|{s['peak_allocated_bytes']/2**30:.2f}|")
+    lines+=['','|Arm|Active steps [start,end)|Loop calls / 49|First / last active t|Median seconds|Peak GiB|',
+        '|---|---|---:|---|---:|---:|']
+    for arm,stats in summary['arms'].items():
+        w=run['time_windows'][arm]
+        bounds='none' if arm=='BASE' else f"[{w['step_start']},{w['step_end']})"
+        ts='none' if arm=='BASE' else f"{w['t_first']:.4f} / {w['t_last']:.4f}"
+        lines.append(f"|{arm}|{bounds}|{w['loop_calls']} / 49|{ts}|{stats['latency_median_seconds']:.2f}|{stats['peak_allocated_bytes']/2**30:.2f}|")
+    for candidate,reference in (('EARLY_20','LATE_20'),('EARLY_05','FULL'),('EARLY_10','FULL'),('EARLY_20','FULL')):
+        pair=summary['comparisons'][candidate+'_vs_'+reference]
+        lines+=['',f"{candidate} vs {reference}: Repair / Damage {pair['repair_count']} / {pair['damage_count']}; "
+            f"net Repair {pair['net_repair']['mean']:.4f}, 95% CI {pair['net_repair']['ci95']}."]
+    lines+=['','|Arm|Full repairs retained|Full damage avoided|', '|---|---:|---:|']
+    for arm,stats in summary['repair_retention'].items():
+        lines.append(f"|{arm}|{stats['retained_full_repair_atoms']} / {stats['full_repair_atoms']}|{stats['avoided_full_damage_atoms']} / {stats['full_damage_atoms']}|")
     (output/'summary.md').write_text('\n'.join(lines)+'\n')
     print(output/'summary.md',flush=True)
 
@@ -333,7 +360,7 @@ def export(root,output):
     esc=lambda value:html.escape(str(value),quote=True)
     parts=['''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BAGEL · 配对图片</title><style>
     :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#141819;color:#ecf0ea;font:16px/1.5 system-ui,-apple-system,sans-serif}main{max-width:1720px;margin:auto;padding:28px 20px}h1{font-size:30px}h2{font-size:18px;font-weight:500}p,small,details{color:#b8c4bc}.meta{font:12px ui-monospace,monospace;overflow-wrap:anywhere}.grid{display:grid;gap:12px}.label{font:13px ui-monospace,monospace;color:#d4e6b4;padding:8px 0;overflow-wrap:anywhere}img{width:100%;height:auto;display:block;cursor:zoom-in}.pair{border-top:1px solid #435047;margin:30px 0;padding:14px 0}table{border-collapse:collapse;margin:20px 0;font-size:14px}th,td{padding:8px 14px;text-align:left;border-bottom:1px solid #435047}li{margin:8px 0}details{margin-top:12px}dialog{background:#141819;border:1px solid #687864;padding:10px;max-width:98vw;max-height:98vh}dialog img{width:auto;max-width:92vw;max-height:84vh;cursor:default}button{margin-bottom:8px}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}main{padding:20px 10px}}
-    </style><main><h1>BAGEL：六个层窗口 · R2</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。六个窗口的 body 均为8层；UND writer suffix 长度不同。生成时间为工程日志。</p>''']
+    </style><main><h1>BAGEL：早期去噪 loop · [0,8) R2</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。各组固定模型层[0,8)、R2；比较 loop 的去噪时间窗口。Early20／Late20 的 loop 步数相同。生成时间为工程日志。</p>''']
     parts.append(f'<p class="meta">RUN {esc(root.name)}<br>SOURCE {esc(summary["source_sha256"])}</p>')
     parts.append('<table><tr><th>Arm</th><th>Semantic GM</th><th>Quality proxy</th><th>Repair / Damage vs Base</th><th>Median seconds</th></tr>')
     for arm in arms:
@@ -348,8 +375,8 @@ def export(root,output):
             row=group[arm]
             if any(row[k]!=base[k] for k in ('prompt','noise_sha256','height','width')):
                 raise ValueError('paired inputs differ')
-            cfg=summary['arm_configs'][arm]
-            label=arm if arm=='BASE' else f"{arm} [{cfg['start_layer']},{cfg['end_layer']}) R2"
+            w=summary['time_windows'][arm]
+            label=arm if arm=='BASE' else f"{arm} · step [{w['step_start']},{w['step_end']}) · {w['loop_calls']} calls"
             parts.append(f'<div><div class="label">{esc(label)} · quality {row["quality_proxy"]:.2f}</div>')
             if row['valid_file']:
                 raw=Path(row['path']).read_bytes()

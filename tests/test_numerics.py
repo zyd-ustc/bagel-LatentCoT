@@ -120,13 +120,19 @@ def test_real_weight_validator_orchestration_with_cpu_decoder():
     script=Path(__file__).resolve().parents[1]/'scripts/compare_windows.py'
     spec=importlib.util.spec_from_file_location('state_e0',script);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     try:
-        result=module.validate(SimpleNamespace(model=model),Generator(),runtime,(2,))
-        assert result['passed'] and result['conditional_effect_observed']
-        assert set(result['native_hidden_seed_kv_parity'])=={'0','1','2','3'}
+        for first,last in ((0.,1.),(0.,4/48),(29/48,1.)):
+            runtime.config=replace(runtime.config,progress_start=first,progress_end=last)
+            runtime.progress=.25
+            result=module.validate(SimpleNamespace(model=model),Generator(),runtime,(2,))
+            assert result['passed'] and result['conditional_effect_observed']
+            assert set(result['native_hidden_seed_kv_parity'])=={'0','1','2','3'}
+            assert runtime.progress==.25
+            if first>0 or last<1:
+                assert all(v['outside_window']['equal'] for v in result['timesteps'].values())
     finally:runtime.close()
 
-@pytest.mark.parametrize('start,end',[(0,8),(4,12),(8,16),(12,20),(16,24),(20,28)])
-def test_exact_frozen_target_hidden_and_velocity_parity_for_six_windows(start,end):
+def test_exact_frozen_target_hidden_and_velocity_parity_for_selected_window():
+    start,end=0,8
     from oracles.und_state import run_und_state
     model,kwargs,runtime=prepared(rounds=2,start=start,end=end,depth=28,special_tokens=True)
     try:
@@ -139,4 +145,34 @@ def test_exact_frozen_target_hidden_and_velocity_parity_for_six_windows(start,en
         head=torch.nn.Linear(32,7).to(dtype=actual.dtype).requires_grad_(False)
         image=kwargs['packed_vae_token_indexes']
         assert torch.equal(head(actual[image]),head(expected[image]))
+    finally:runtime.close()
+
+
+@pytest.mark.parametrize('name',['EARLY_05','EARLY_10','EARLY_20','LATE_20'])
+def test_time_window_boundaries_match_full_loop_or_native_numerically(name):
+    import json
+    from pathlib import Path
+    from qwen_latent_cot.evaluation.windows import validate_config,arm_configs,window_metadata
+    config=json.loads((Path(__file__).resolve().parents[1]/'configs/window_comparison.json').read_text())
+    validate_config(config,28)
+    cfg=arm_configs(config)[name];metadata=window_metadata(config)[name]
+    model,kwargs,runtime=setup()
+    try:
+        native=runtime.original(**kwargs).packed_query_sequence
+        full=runtime.decoder.forward_inference(**kwargs).packed_query_sequence
+        runtime.config=replace(runtime.config,progress_start=cfg['progress_start'],progress_end=cfg['progress_end'])
+        active=[step for step in range(49) if cfg['progress_start']<=step/48<=cfg['progress_end']]
+        assert active==metadata['loop_step_indexes'] and len(active)==metadata['loop_calls']
+        first,last=active[0],active[-1]
+        probes={0,first,last,48}
+        if first>0:probes.add(first-1)
+        if last<48:probes.add(last+1)
+        for step in sorted(probes):
+            runtime.progress=step/48;runtime.step_index=step
+            actual=runtime.decoder.forward_inference(**kwargs).packed_query_sequence
+            assert torch.equal(actual,full if step in active else native)
+            torch.manual_seed(41)
+            head=torch.nn.Linear(32,7).to(dtype=actual.dtype).requires_grad_(False)
+            indexes=kwargs['packed_vae_token_indexes']
+            assert torch.equal(head(actual[indexes]),head((full if step in active else native)[indexes]))
     finally:runtime.close()

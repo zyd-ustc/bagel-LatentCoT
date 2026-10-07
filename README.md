@@ -2,7 +2,7 @@
 
 目标：在冻结 BAGEL 权重、增加有限推理计算的条件下，通过 Memory 反馈修复文生图的数量、属性和空间关系。
 
-`main` 只保留 **持续 UND state＋全量动态 KV 替换**。默认 **R2**。当前比较早／中／晚位置的6个层窗口，另加原生 Base。没有其他生成架构、adapter、gate、压缩或训练模块。
+`main` 只保留 **持续 UND state＋全量动态 KV 替换**。默认 **R2**。当前固定层窗口 `[0,8)`，比较早期去噪 loop、同样执行20步的晚期 loop，以及全程 loop，另加原生 Base。没有其他生成架构、adapter、gate、压缩或训练模块。
 
 ## 架构
 
@@ -62,67 +62,73 @@ flowchart LR
 
 原始图片的 source、noise 和 image hashes 见 [证据来源](assets/evidence.json)。完整历史代码、文档、日志和结果已移至工作区 `older/und-memory-main-before-cleanup-20261007_121406/`；不混入当前展示目录。
 
-## 六个层窗口
+## 早期去噪时间窗口
 
-真实 BAGEL checkpoint 有28层。层索引从0开始；窗口右端不包含。六组均为R2、8层 body，Memory 更新与动态 suffix 语义保持一致。
+六个模型层位置的32-prompt对比已完成。`[0,8)` 的 Semantic GM 最高，因此本轮固定该层窗口和R2。它的Repair/Damage为20/24，尚未证明平均净收益；选择它是为了检验已有局部语义编辑能否在更低开销下保留。
 
-| 组名 | body 窗口 | UND writer suffix 层数 |
-|---|---|---:|
-| early_1 | [0,8) | 20 |
-| early_2 | [4,12) | 16 |
-| middle_1 | [8,16) | 12 |
-| middle_2 | [12,20) | 8 |
-| late_1 | [16,24) | 4 |
-| late_2 | [20,28) | 0 |
+本轮只改变 loop 的时间窗口。每张图仍使用原生49次 denoiser 调用。step从0开始，窗口右端不包含。关闭loop后，当前 `x_t` 继续走原生 BAGEL 路径；不会恢复Base轨迹的 `x_t`。Memory 仍只在当前denoiser调用内持续更新，不跨去噪步传递。
 
-另生成一个共享 Base。32 prompts × seed0 × 7组，共224张图。各组使用同 prompt、同初始噪声、同采样参数；所有去噪步都启用所选窗口。**body 等宽不代表总计算量相同**：writer suffix 长度随窗口变化。报告同时记录实际耗时和显存；耗时仅为未预热的工程日志。
+| 组名 | 启用 loop 的step | loop调用数 | 首／末次启用的t |
+|---|---|---:|---|
+| BASE | 不启用 | 0 | — |
+| EARLY_05 | [0,5) | 5 | 1.000 / 0.971 |
+| EARLY_10 | [0,10) | 10 | 1.000 / 0.930 |
+| EARLY_20 | [0,20) | 20 | 1.000 / 0.826 |
+| LATE_20 | [29,49) | 20 | 0.674 / 0.059 |
+| FULL | [0,49) | 49 | 1.000 / 0.059 |
 
-[window_comparison.json](configs/window_comparison.json)由脚本实际读取。该配置同时固定R2、6个窗口、32 prompts、seed0、512px、50个时间点、shift3、CFG4与global CFG renormalization。模型层数不符、窗口越界或数值检查失败时停止。
+`t=1` 为纯噪声，`t=0` 为干净图像。这里使用原生shift3调度；早期按执行顺序定义，实际t同时记录。前20步覆盖高噪声区，最后一次loop更新后进入 `t≈0.813`，随后使用原生路径。Early20／Late20执行同样数量的loop调用，但沿不同噪声状态运行；实测耗时仍需单独比较。
+
+固定32个prompt、seed0、512px、50个时间点、shift3、CFG4和global CFG renormalization，共 **192张图**。各组重新生成Base／Full以形成完整同权重、同prompt、同噪声配对，不复用历史评分。
+
+待验证的假设：早期loop形成数量或布局修复，关闭后由原生路径完成后续生成，可能减少全程loop的额外损伤。早期更有效尚未得到证据。
+
+主要比较：
+
+- Early5／10／20对Base：语义GM、Repair/Damage、质量代理、Invalid与开销。
+- Early5／10／20对Full：是否保留Full已有的Repair，并避免Full造成的Damage。
+- Early20对Late20：在loop调用数相同的条件下，效果是否与时间位置有关。
+- 人工审查全部32个prompt，重点复查#06、#24；不凭单个样本的增益选择结论。
+
+脚本输出上述配对统计与prompt-cluster置信区间。置信区间未经多重比较校正，不能作为多组筛选后的确认性证据。质量和语义评分仍是VLM代理，需人工审查。
 
 ## 代码结构
 
 ```text
-configs/window_comparison.json   唯一窗口比较配置
-data/prompts32.jsonl            32个评测 prompt
-qwen_latent_cot/bagel/
-  internal_loop.py               唯一运行时与 Base 旁路
-  layerwise_memory.py            完整 prompt capture / packed KV
-  und_state_loop.py              持续 UND hidden / 动态 body 与 suffix
-  native_und.py                  原生 UND KV 投影
-  modeling/                     原生 BAGEL；native_source.json 记录来源
-qwen_latent_cot/evaluation/      配对指标、评分与数值检查工具
-scripts/compare_windows.py      数值检查、生成、评分、汇总与 HTML 对比
-scripts/compare_windows_8gpu.sh  多卡启动；每卡分配独立 prompt
+configs/window_comparison.json   唯一比较配置：固定[0,8)、R2，改变时间窗口
+data/prompts32.jsonl            32个评测prompt
+qwen_latent_cot/bagel/           持续UND state、全量动态body／suffix KV与原生Base
+qwen_latent_cot/evaluation/      配对评分、Repair保留／Damage避免、数值检查
+scripts/compare_windows.py      准备、数值检查、生成、评分、报告与HTML
+scripts/compare_windows_8gpu.sh  唯一多卡启动脚本
 tests/test_numerics.py          必要数值测试
-tests/helpers.py               小模型 fixture
-tests/oracles/                 清理前选定路径的冻结数值参照
-assets/                         两组历史图像证据
+tests/helpers.py               小模型fixture
+tests/oracles/                 冻结目标runner的数值参照
+assets/                         已有历史图像证据
 ```
 
-旧脚本和其他测试已删除；历史完整副本在工作区 `older/und-memory-before-window-compare-20261007_132531/`。冻结参照只用于数值测试，不是可运行的生成支线。
+配置由脚本实际读取。时间窗通过已有 `progress_start / progress_end` 控制；使用 `step/48` 和含两端的progress区间，精确对应表中的半开step窗口。不会改动BAGEL层、权重或Memory更新公式，也没有新增adapter或训练模块。窗口外直接调用原生decoder。
 
 ## 在 H200 上运行
 
-正式 GPU 检查、生成和评分均由用户启动。先使用分配给本任务的8张卡，再在远端运行：
+正式GPU数值检查、生成和评分由用户启动。在远端使用分配给本任务的8张卡运行：
 
 ```bash
-cd /private/yida_workspace/bagel-LatentCoT-main-window-compare-20261007
+cd /private/yida_workspace/bagel-LatentCoT-main-early-time-compare-20261007
 export GPUS=0,1,2,3,4,5,6,7
-export RUN=/private/yida_workspace/outputs/und_windows6_r2_$(date +%Y%m%d_%H%M%S)
+export RUN=/private/yida_workspace/outputs/und_early_time_r2_$(date +%Y%m%d_%H%M%S)
 set -o pipefail
 bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
 ```
 
-需要4卡时，只修改 `GPUS` 的4个卡号。模型 Python、judge、权重与 GenEval2 路径保留远端已有默认值，也可通过环境变量设置。
+四卡只需修改 `GPUS`。脚本依次执行：绑定源代码／权重／prompt hashes → 五个loop组的真实权重数值检查 → 生成192张图 → 配对评分 → 报告和离线HTML。数值检查包含窗口外与原生路径的velocity精确一致；检查失败就停止。
 
-脚本依次执行：绑定源代码／权重／prompt hashes → 六个窗口真实权重数值检查 → 生成224张图 → 配对语义与质量代理评分 → 汇总和离线 HTML。权重仅在准备阶段完整计算一次hash，后续检查文件大小和修改时间。每个窗口独立执行原生 prompt prefill，避免复用错误层位置的 Memory seed。
-
-进度记录在 `e0.log`、`generation/worker_*.log` 与 `quality/worker_*.log`。结果为 `quality_report/summary.md`、`quality_report/summary.json` 与 `comparison.html`。统计包含 Semantic GM、质量代理、Invalid、Repair/Damage、prompt-cluster置信区间、耗时和显存。Repair/Damage 仍需人工审查。
+进度见 `e0.log`、`generation/worker_*.log` 和 `quality/worker_*.log`。结果见 `quality_report/summary.md`、`quality_report/summary.json` 与 `comparison.html`。配置同时记录各组的准确loop步数、t范围与GEN body总执行次数；耗时仅为未预热的工程日志。
 
 ## 验证范围
 
-只保留必要数值检查：六个窗口R2的 hidden／velocity 与冻结选定 runner 精确一致；原生 hidden→KV 投影、R0旁路、轮间 UND hidden 更新、固定 GEN 入口、完整 prompt、特殊 token、动态 suffix、样本／调用隔离以及 cache／权重不变。
+CPU数值检查使用小模型：固定 `[0,8)` 的Full R2与冻结选定runner精确一致；时间窗内与Full精确一致；时间窗外与原生decoder精确一致；检查首步、末步和切换边界，防止少算或多算一个loop步。此外保留原生hidden→KV投影、完整prompt、UND hidden更新、动态suffix、特殊token、样本／调用隔离与cache／权重不变的检查。
 
-远端隐藏CUDA后，CPU数值测试 **12 passed**。六个窗口都通过冻结路径的精确 parity，包括 `[20,28)` 的空 suffix 边界。另用CPU模拟任务检查了两份 prompt 分片、七组配对、评分合并、窗口排序、HTML导出及缺失配对拒绝。所有Python语法、shell语法和 `git diff --check` 通过。此次 BAGEL 核心架构代码和证据图片未改动。
+远端隐藏CUDA后，必要数值测试 **11 passed**。CPU模拟流程检查通过：两份prompt分片、六组配对、准确窗口配置、报告合并、Repair保留／Damage避免统计、HTML导出和缺失配对拒绝。Python语法、shell语法与 `git diff --check` 通过。
 
-CPU 检查使用小模型；任务流程检查使用模拟生成和评分，不证明真实权重的语义增益或质量。真实权重检查和正式图像评测由上面的用户命令完成。
+CPU与模拟任务流程检查不能证明真实权重下的质量或语义收益。正式GPU评测尚未启动。此前六个层窗口的配置、脚本和文档已完整备份到工作区 `older/und-memory-before-early-time-compare-20261007_215020/`，此前远端结果目录保留。

@@ -35,14 +35,14 @@ wait_workers() {
     done
     pids=()
 }
-printf '%s\n' '1/5: bind six windows, native weights, source, prompts and sampling'
+printf '%s\n' '1/5: bind denoising windows, native weights, source, prompts and sampling'
 CUDA_VISIBLE_DEVICES= "$MODEL_PYTHON" "$CLI" prepare --model-path "$MODEL_PATH" \
     --prompts "$PROMPTS" --config "$CONFIG" --plan "$PLAN"
 NUM_SHARDS=$("$MODEL_PYTHON" -c 'import json,sys; p=json.load(open(sys.argv[1])); print(min(int(sys.argv[2]),len(p["prompt_ids"])*len(p["seeds"])))' "$PLAN" "${#devices[@]}")
-printf '%s\n' '2/5: real-weight numerical checks for all six windows; stop on failure'
+printf '%s\n' '2/5: real-weight numerical checks for five loop arms and inactive-window parity; stop on failure'
 CUDA_VISIBLE_DEVICES="${devices[0]}" "$MODEL_PYTHON" "$CLI" validate \
     --plan "$PLAN" --output "$RUN/e0.json" > "$RUN/e0.log" 2>&1
-printf '%s\n' '3/5: generate Base + six R2 windows; progress in generation/worker_*.log'
+printf '%s\n' '3/5: generate Base + five R2 time windows; progress in generation/worker_*.log'
 mkdir -p "$RUN/generation" "$RUN/quality"
 for ((shard=0; shard<NUM_SHARDS; shard++)); do
     CUDA_VISIBLE_DEVICES="${devices[$shard]}" "$MODEL_PYTHON" "$CLI" generate \

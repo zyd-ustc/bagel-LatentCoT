@@ -68,3 +68,24 @@ def summarize(rows,resamples=10000):
             base={k:r for k,r in groups['BASE'].items() if r['bucket']==bucket}
             output[arm]['buckets'][bucket]=paired_report(base,own,resamples)
     return output
+
+
+def repair_retention(base, full, candidate):
+    """Keep Full's repairs and avoid its damage, using Base as the atom anchor."""
+    if set(base)!=set(full) or set(base)!=set(candidate):
+        raise ValueError('retention requires complete three-arm pairs')
+    repairs=retained=damages=avoided=0
+    for key,a in base.items():
+        aa=np.array(a['semantic_atoms'])>=.5
+        ff=np.array(full[key]['semantic_atoms'])>=.5
+        cc=np.array(candidate[key]['semantic_atoms'])>=.5
+        if aa.shape!=ff.shape or aa.shape!=cc.shape:
+            raise ValueError('retention constraints differ')
+        repaired=~aa & ff;damaged=aa & ~ff
+        repairs+=int(repaired.sum());retained+=int((repaired & cc).sum())
+        damages+=int(damaged.sum());avoided+=int((damaged & cc).sum())
+    return {'full_repair_atoms':repairs,'retained_full_repair_atoms':retained,
+        'retained_full_repair_fraction':retained/repairs if repairs else None,
+        'full_damage_atoms':damages,'avoided_full_damage_atoms':avoided,
+        'avoided_full_damage_fraction':avoided/damages if damages else None,
+        'threshold':.5,'status':'VLM_proxy_pending_manual_review'}
