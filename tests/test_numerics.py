@@ -103,7 +103,6 @@ def test_call_and_sample_isolation_native_bypass_seed_cache_and_weights_immutabl
     finally:runtime.close()
 
 def test_real_weight_validator_orchestration_with_cpu_decoder():
-    from contextlib import nullcontext
     from types import MethodType
     import importlib.util
     model,kwargs,runtime=setup();cache=kwargs['past_key_values'];seed=runtime.layerwise.seeds[cache]
@@ -131,10 +130,11 @@ def test_real_weight_validator_orchestration_with_cpu_decoder():
                 assert all(v['outside_window']['equal'] for v in result['timesteps'].values())
     finally:runtime.close()
 
-def test_exact_frozen_target_hidden_and_velocity_parity_for_selected_window():
+@pytest.mark.parametrize('rounds',[1,2,3,4])
+def test_exact_frozen_target_hidden_and_velocity_parity_for_selected_window(rounds):
     start,end=0,8
     from oracles.und_state import run_und_state
-    model,kwargs,runtime=prepared(rounds=2,start=start,end=end,depth=28,special_tokens=True)
+    model,kwargs,runtime=prepared(rounds=rounds,start=start,end=end,depth=28,special_tokens=True)
     try:
         # Frozen selected runner from before cleanup; no second production path.
         old_runtime=SimpleNamespace(**vars(runtime),probe_capture=None)
@@ -148,7 +148,7 @@ def test_exact_frozen_target_hidden_and_velocity_parity_for_selected_window():
     finally:runtime.close()
 
 
-@pytest.mark.parametrize('name',['EARLY_05','EARLY_10','EARLY_20','LATE_20'])
+@pytest.mark.parametrize('name',[f'EARLY_{n}_R{r}' for n in (10,20) for r in (1,2,3,4)])
 def test_time_window_boundaries_match_full_loop_or_native_numerically(name):
     import json
     from pathlib import Path
@@ -156,7 +156,7 @@ def test_time_window_boundaries_match_full_loop_or_native_numerically(name):
     config=json.loads((Path(__file__).resolve().parents[1]/'configs/window_comparison.json').read_text())
     validate_config(config,28)
     cfg=arm_configs(config)[name];metadata=window_metadata(config)[name]
-    model,kwargs,runtime=setup()
+    model,kwargs,runtime=setup(rounds=cfg['extra_rounds'])
     try:
         native=runtime.original(**kwargs).packed_query_sequence
         full=runtime.decoder.forward_inference(**kwargs).packed_query_sequence
@@ -176,3 +176,44 @@ def test_time_window_boundaries_match_full_loop_or_native_numerically(name):
             indexes=kwargs['packed_vae_token_indexes']
             assert torch.equal(head(actual[indexes]),head((full if step in active else native)[indexes]))
     finally:runtime.close()
+
+
+def test_native_feedback_full_context_and_cfg_isolation():
+    """Exercise native API ordering, full feedback, CFG contexts and paired noise."""
+    from types import SimpleNamespace
+    from PIL import Image
+    from qwen_latent_cot.bagel.feedback import NativeFeedback, parse_feedback
+    from qwen_latent_cot.bagel.inferencer import T2IGenerator
+    import hashlib
+    class Model(torch.nn.Module):
+        latent_downsample=16
+        patch_latent_dim=4
+        def __init__(self):
+            super().__init__();self.weight=torch.nn.Parameter(torch.zeros(1))
+            self.config=SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=1))
+        def prepare_prompts(self,lens,ropes,texts,*args):
+            return {'text':texts[0]},[lens[0]+len(texts[0])+2],[ropes[0]+len(texts[0])+2]
+        def forward_cache_update_text(self,cache,text):
+            cache.trace=getattr(cache,'trace',[])+[('text',text)];return cache
+        def prepare_vae_images(self,lens,ropes,*args):return {},[lens[0]+7],[ropes[0]+1]
+        def forward_cache_update_vae(self,vae,cache):cache.trace=[('vae','all')];return cache
+        def prepare_vit_images(self,lens,ropes,*args):return {},[lens[0]+11],[ropes[0]+1]
+        def forward_cache_update_vit(self,cache):cache.trace=getattr(cache,'trace',[])+[('vit','all')];return cache
+        def prepare_vae_latent(self,lens,ropes,*args):return {'packed_init_noises':torch.empty(1)}
+        def prepare_vae_latent_cfg(self,lens,ropes,*args):return {'cfg_key_values_lens':torch.tensor(lens)}
+    model=Model();bundle=SimpleNamespace(model=model,vae=None,tokenizer=SimpleNamespace(encode=lambda s:list(s)),token_ids={})
+    engine=NativeFeedback.__new__(NativeFeedback);engine.model=model;engine.bundle=bundle
+    engine.decoder=T2IGenerator(bundle);engine.device=torch.device('cpu')
+    engine.vae_transform=SimpleNamespace(resize_transform=lambda image:image);engine.vit_transform=None
+    instruction='full feedback: '+('preserve every correct object; '*40)
+    flow,noise_hash,meta=engine.prepare_edit(Image.new('RGB',(512,512)),instruction,19)
+    assert flow['past_key_values'].trace==[('vae','all'),('vit','all'),('text',instruction)]
+    assert flow['cfg_text_past_key_values'].trace==[('vae','all'),('vit','all')]
+    assert flow['cfg_img_past_key_values'].trace==[('text',instruction)]
+    assert meta['instruction_token_ids']==list(instruction)
+    assert meta['conditional_lengths']==[18+len(instruction)+2]
+    noise=torch.randn(1024,4,generator=torch.Generator().manual_seed(19),dtype=torch.float32)
+    assert noise_hash==hashlib.sha256(noise.numpy().tobytes()).hexdigest()
+    assert torch.equal(flow['packed_init_noises'],noise)
+    assert parse_feedback('{"observed":"two cubes","discrepancies":[],"preserve":["both cubes"],"uncertain":[],"edit":"preserve"}')['edit']=='preserve'
+    with pytest.raises(ValueError):parse_feedback('{"edit":"invented fallback"}')

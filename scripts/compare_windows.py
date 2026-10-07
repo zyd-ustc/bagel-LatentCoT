@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""User-run six-arm denoising-time comparison: prepare, validate, generate, score, report."""
+"""User-run native loop and feedback comparisons: prepare, validate, generate, score, report."""
 import argparse
 import base64
 import hashlib
@@ -12,20 +12,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from qwen_latent_cot.evaluation.io import read_jsonl, sha256, source_hash, load_manifests, identity
-from qwen_latent_cot.evaluation.windows import load_comparison, validate_config, arm_configs, window_metadata
+from qwen_latent_cot.evaluation.windows import load_comparison, validate_config, arm_configs, window_metadata, comparison_pairs, reference_arm
 
 
 def prepare_main():
     p = argparse.ArgumentParser(description='Bind denoising windows, prompts, weights and source before workers')
     p.add_argument('--model-path', required=True)
-    p.add_argument('--prompts', default=str(ROOT/'data/prompts32.jsonl'))
+    p.add_argument('--prompts')
     p.add_argument('--config', default=str(ROOT/'configs/window_comparison.json'))
     p.add_argument('--plan', required=True)
     a = p.parse_args()
     weights = Path(a.model_path).resolve()
     depth = json.loads((weights/'llm_config.json').read_text())['num_hidden_layers']
     config = load_comparison(a.config, depth)
+    a.prompts=a.prompts or str(ROOT/config['benchmark'])
     data = read_jsonl(a.prompts)[:config['max_prompts']]
+    if len(data)!=config['expected_prompts']:raise ValueError('benchmark coverage differs from config')
     ids = [str(r.get('prompt_id', r.get('id', i))) for i,r in enumerate(data)]
     if not data or len(set(ids)) != len(ids) or any(not r['prompt'].strip() for r in data):
         raise ValueError('require nonempty, uniquely identified prompts')
@@ -35,7 +37,7 @@ def prepare_main():
     model_files += [weights/n for n in ('llm_config.json','vit_config.json','tokenizer.json',
         'tokenizer_config.json','vocab.json','merges.txt') if (weights/n).is_file()]
     print('Hashing native weights once for all workers...', flush=True)
-    plan = {'schema':11, 'architecture':'persistent_und_full_prompt_kv_v1',
+    plan = {'schema':12, 'architecture':config['experiment'],
         'source_sha256':source_hash(ROOT), 'config_sha256':sha256(a.config), 'config':config,
         'model_path':str(weights), 'model_sha256':{f.name:sha256(f) for f in model_files},
         'model_stat':{f.name:[f.stat().st_size,f.stat().st_mtime_ns] for f in model_files},
@@ -47,12 +49,18 @@ def prepare_main():
         'memory_topologies':{'mode':'persistent_und_full_prompt_dynamic_kv',
             'suffix':'dynamic_final_writer_continuation', 'capacity':'full_prompt',
             'special_hidden_and_kv':'pinned_native', 'null_cfg':'native_bypass'},
-        'loop':{'extra_rounds':2,'layer_window':config['layer_window'],'time_windows':'per_arm'}}
+        'loop':{'layer_window':config['layer_window'],'depth_and_time':'per_arm'}}
+    if config['experiment']=='feedback_pilot':
+        plan['memory_topologies']={'mode':'native_full_interleaved_image_text_edit','implicit_loop':False,
+            'capacity':'all_native_image_and_text_tokens','feedback':'full_text_reprefill_at_native_positions'}
     output=Path(a.plan)
-    if output.exists():raise ValueError('use a fresh plan file')
+    if output.exists():
+        if read_plan(output)!=plan:raise ValueError('resume plan differs; preserve original config/source/model/benchmark')
+        print('Existing plan verified; resume enabled',flush=True)
+        return
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(plan,indent=2)+'\n')
-    print(f"Prepared {len(ids)*len(plan['seeds'])*len(plan['arms'])} images, Base + five R2 time windows",flush=True)
+    print(f"Prepared {len(ids)*len(plan['seeds'])*len(plan['arms'])} images across {len(plan['arms'])} paired arms",flush=True)
 
 
 def read_plan(path):
@@ -71,7 +79,7 @@ def read_plan(path):
 
 
 def generate_main():
-    p=argparse.ArgumentParser(description='Generate Base + five R2 time windows at layers [0,8) on a prompt shard')
+    p=argparse.ArgumentParser(description='Generate the configured paired comparison on a prompt shard')
     p.add_argument('--plan',required=True);p.add_argument('--output-dir',required=True)
     p.add_argument('--device',default='cuda:0');p.add_argument('--shard-index',type=int,default=0)
     p.add_argument('--num-shards',type=int,default=1)
@@ -92,10 +100,20 @@ def generate_main():
     provenance=dict(plan,plan_sha256=sha256(args.plan),shard=[args.shard_index,args.num_shards],
         gpu=torch.cuda.get_device_name(),precision='bfloat16',kernel='native_flash_attention',torch=torch.__version__,training=False)
     runfile=output/'run.json'
-    if runfile.exists():raise ValueError('generation worker requires a fresh output directory')
+    if runfile.exists() and json.loads(runfile.read_text())!=provenance:
+        raise ValueError('generation resume provenance differs')
     runfile.write_text(json.dumps(provenance,indent=2)+'\n')
     manifest=output/'manifest.jsonl';manifest.touch()
+    completed={}
+    for row in read_jsonl(manifest):
+        key=(row['arm'],row['prompt_id'],row['seed'])
+        if key in completed:raise ValueError('duplicate resume record')
+        if row['valid_file'] and sha256(row['path'])!=row['image_sha256']:raise ValueError('resume image changed')
+        completed[key]=row
     bundle = load_native(args.model_path,args.device,args.timestep_shift)
+    if plan['config']['experiment']=='feedback_pilot':
+        from qwen_latent_cot.evaluation.feedback_runner import generate_feedback
+        return generate_feedback(bundle,plan,args,completed,output,manifest)
     jobs = [(i,s) for i in range(len(data)) for s in seeds]
     if len(bundle.model.language_model.model.layers)!=plan['native_depth']:
         raise ValueError('loaded decoder depth differs from plan')
@@ -106,6 +124,7 @@ def generate_main():
         try:
             for ordinal,(i,seed) in enumerate(jobs):
                 if ordinal%args.num_shards != args.shard_index: continue
+                if (arm,ids[i],seed) in completed:continue
                 row=data[i]; shape=(int(row.get('height',args.image_size)),int(row.get('width',args.image_size)))
                 name=f'{i:05d}_s{seed}.png'; imagepath=output/arm/name; imagepath.parent.mkdir(exist_ok=True)
                 steps=args.num_timesteps
@@ -228,11 +247,17 @@ def validate_main():
     plan=read_plan(a.plan);torch.cuda.set_device(torch.device(a.device))
     bundle=load_native(plan['model_path'],a.device,plan['sampling']['timestep_shift'])
     results={}
+    if plan['config']['experiment']=='feedback_pilot':
+        from qwen_latent_cot.bagel.feedback import validate_native_edit
+        results['native_edit']=validate_native_edit(bundle,plan['config'])
+        Path(a.output).write_text(json.dumps({'plan_sha256':sha256(a.plan),'checks':results},indent=2)+'\n')
+        if not results['native_edit']['passed']:raise SystemExit(1)
+        return
     for arm,config in plan['arm_configs'].items():
         if arm=='BASE':continue
         runtime=InternalLoopRuntime(bundle.model,LoopConfig(**config))
         try:
-            results[arm]=validate(bundle,T2IGenerator(bundle,runtime),runtime,(2,))
+            results[arm]=validate(bundle,T2IGenerator(bundle,runtime),runtime,(config['extra_rounds'],))
             print(f"Numerical contracts {arm}: {results[arm]['passed']}",flush=True)
         finally:runtime.close()
     output=Path(a.output);output.parent.mkdir(parents=True,exist_ok=True)
@@ -286,7 +311,7 @@ def score_main():
 def write_summary(scored,run,output,resamples=10000):
     from qwen_latent_cot.evaluation.report import summarize
     summary={'status':'engineering_scored' if run['stage']=='engineering' else 'paired_scored',
-        'comparison':'early_denoising_R2_layers_0_8', 'arm_configs':run['arm_configs'],
+        'comparison':run['config']['experiment'], 'arm_configs':run['arm_configs'],
         'time_windows':run['time_windows'],
         'stage':run['stage'],'source_sha256':run['source_sha256'],'model_sha256':run['model_sha256'],
         'quality_is_proxy':True,'manual_review':'pending','statistics_unit':'prompt_cluster_all_seeds_and_atoms',
@@ -296,30 +321,38 @@ def write_summary(scored,run,output,resamples=10000):
     from qwen_latent_cot.evaluation.report import paired_report, repair_retention
     grouped={arm:{identity(r):r for r in scored if r['arm']==arm} for arm in run['arms']}
     summary['comparisons']={candidate+'_vs_'+reference:paired_report(grouped[reference],grouped[candidate],resamples)
-        for candidate,reference in (('EARLY_20','LATE_20'),('EARLY_05','FULL'),('EARLY_10','FULL'),('EARLY_20','FULL'))}
-    summary['repair_retention']={arm:repair_retention(grouped['BASE'],grouped['FULL'],grouped[arm])
-        for arm in ('EARLY_05','EARLY_10','EARLY_20','LATE_20')}
+        for candidate,reference in comparison_pairs(run['config'])}
+    anchor=reference_arm(run['config']);summary['retention_reference']=anchor
+    summary['repair_retention']={arm:repair_retention(grouped['BASE'],grouped[anchor],grouped[arm])
+        for arm in run['arms'] if arm not in ('BASE',anchor)}
+    if run['config']['experiment']=='feedback_pilot':
+        feedback=[r for r in scored if r['arm']=='FEEDBACK_EDIT']
+        summary['feedback_format']={'valid':sum(r.get('feedback_format_valid') is True for r in feedback),'total':len(feedback),'visual_correctness':'not_verified_by_format_check'}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
-    lines=['# Frozen BAGEL: early denoising loops at layers [0,8), R2','','Quality is a VLM proxy; manual review is pending. All loop arms use layers [0,8) and R2. Early20 and Late20 have equal loop-call counts. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing does not establish budget compliance.','',
+    lines=['# Frozen BAGEL: '+run['config']['experiment'],'','Quality is a VLM proxy; manual review is pending. All implicit loop arms use layers [0,8). Native feedback arms use the original image-editing path. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing does not establish budget compliance.','',
         '|Arm|Semantic GM|Quality proxy|Invalid|Net Repair vs Base (95% CI)|Repair / Damage|',
         '|---|---:|---:|---:|---|---:|']
     for arm,s in summary['arms'].items():
         delta=s['vs_BASE']['net_repair'];lo,hi=delta['ci95']
         lines.append(f"|{arm}|{s['semantic_gm']:.4f}|{s['quality_proxy']:.4f}|{s['invalid_rate']:.4f}|{delta['mean']:.4f} [{lo:.4f}, {hi:.4f}]|{s['vs_BASE']['repair_count']} / {s['vs_BASE']['damage_count']}|")
+    for arm,stats in summary['arms'].items():
+        for bucket,pair in stats['buckets'].items():
+            lines.append(f"\n{arm} / {bucket}: {pair['paired_images']} images; Repair / Damage {pair['repair_count']} / {pair['damage_count']}.")
+    if 'feedback_format' in summary:lines+=['',str(summary['feedback_format'])]
     lines+=['','|Arm|Active steps [start,end)|Loop calls / 49|First / last active t|Median seconds|Peak GiB|',
         '|---|---|---:|---|---:|---:|']
     for arm,stats in summary['arms'].items():
         w=run['time_windows'][arm]
-        bounds='none' if arm=='BASE' else f"[{w['step_start']},{w['step_end']})"
-        ts='none' if arm=='BASE' else f"{w['t_first']:.4f} / {w['t_last']:.4f}"
+        bounds='none' if not w['loop_calls'] else f"[{w['step_start']},{w['step_end']})"
+        ts='none' if not w['loop_calls'] else f"{w['t_first']:.4f} / {w['t_last']:.4f}"
         lines.append(f"|{arm}|{bounds}|{w['loop_calls']} / 49|{ts}|{stats['latency_median_seconds']:.2f}|{stats['peak_allocated_bytes']/2**30:.2f}|")
-    for candidate,reference in (('EARLY_20','LATE_20'),('EARLY_05','FULL'),('EARLY_10','FULL'),('EARLY_20','FULL')):
+    for candidate,reference in comparison_pairs(run['config']):
         pair=summary['comparisons'][candidate+'_vs_'+reference]
         lines+=['',f"{candidate} vs {reference}: Repair / Damage {pair['repair_count']} / {pair['damage_count']}; "
             f"net Repair {pair['net_repair']['mean']:.4f}, 95% CI {pair['net_repair']['ci95']}."]
-    lines+=['','|Arm|Full repairs retained|Full damage avoided|', '|---|---:|---:|']
+    lines+=['',f'Retention reference: {anchor}', '|Arm|Reference repairs retained|Reference damage avoided|', '|---|---:|---:|']
     for arm,stats in summary['repair_retention'].items():
-        lines.append(f"|{arm}|{stats['retained_full_repair_atoms']} / {stats['full_repair_atoms']}|{stats['avoided_full_damage_atoms']} / {stats['full_damage_atoms']}|")
+        lines.append(f"|{arm}|{stats['retained_reference_repair_atoms']} / {stats['reference_repair_atoms']}|{stats['avoided_reference_damage_atoms']} / {stats['reference_damage_atoms']}|")
     (output/'summary.md').write_text('\n'.join(lines)+'\n')
     print(output/'summary.md',flush=True)
 
@@ -347,8 +380,9 @@ def report_main():
     write_summary(values,run,output,a.bootstrap_replicates)
     print(json.dumps(export(Path(a.run_dir),Path(a.run_dir)/'comparison.html')))
 
-def export(root,output):
+def _export_page(root,output,selected=None):
     rows=[json.loads(x) for x in (root/'quality_report/scores.jsonl').read_text().splitlines() if x.strip()]
+    if selected is not None:rows=selected
     summary=json.loads((root/'quality_report/summary.json').read_text())
     arms=list(summary['arms'])
     arms=['BASE']+[a for a in arms if a!='BASE']
@@ -360,7 +394,7 @@ def export(root,output):
     esc=lambda value:html.escape(str(value),quote=True)
     parts=['''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BAGEL · 配对图片</title><style>
     :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#141819;color:#ecf0ea;font:16px/1.5 system-ui,-apple-system,sans-serif}main{max-width:1720px;margin:auto;padding:28px 20px}h1{font-size:30px}h2{font-size:18px;font-weight:500}p,small,details{color:#b8c4bc}.meta{font:12px ui-monospace,monospace;overflow-wrap:anywhere}.grid{display:grid;gap:12px}.label{font:13px ui-monospace,monospace;color:#d4e6b4;padding:8px 0;overflow-wrap:anywhere}img{width:100%;height:auto;display:block;cursor:zoom-in}.pair{border-top:1px solid #435047;margin:30px 0;padding:14px 0}table{border-collapse:collapse;margin:20px 0;font-size:14px}th,td{padding:8px 14px;text-align:left;border-bottom:1px solid #435047}li{margin:8px 0}details{margin-top:12px}dialog{background:#141819;border:1px solid #687864;padding:10px;max-width:98vw;max-height:98vh}dialog img{width:auto;max-width:92vw;max-height:84vh;cursor:default}button{margin-bottom:8px}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}main{padding:20px 10px}}
-    </style><main><h1>BAGEL：早期去噪 loop · [0,8) R2</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。各组固定模型层[0,8)、R2；比较 loop 的去噪时间窗口。Early20／Late20 的 loop 步数相同。生成时间为工程日志。</p>''']
+    </style><main><h1>BAGEL：配对对比实验</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。隐式loop固定模型层[0,8)，比较Early10／20与R1–R4；显式反馈另用原生编辑路径。生成时间为工程日志。</p>''']
     parts.append(f'<p class="meta">RUN {esc(root.name)}<br>SOURCE {esc(summary["source_sha256"])}</p>')
     parts.append('<table><tr><th>Arm</th><th>Semantic GM</th><th>Quality proxy</th><th>Repair / Damage vs Base</th><th>Median seconds</th></tr>')
     for arm in arms:
@@ -376,7 +410,7 @@ def export(root,output):
             if any(row[k]!=base[k] for k in ('prompt','noise_sha256','height','width')):
                 raise ValueError('paired inputs differ')
             w=summary['time_windows'][arm]
-            label=arm if arm=='BASE' else f"{arm} · step [{w['step_start']},{w['step_end']}) · {w['loop_calls']} calls"
+            label=arm if w['loop_calls']==0 else f"{arm} · step [{w['step_start']},{w['step_end']}) · R{w['extra_rounds']}"
             parts.append(f'<div><div class="label">{esc(label)} · quality {row["quality_proxy"]:.2f}</div>')
             if row['valid_file']:
                 raw=Path(row['path']).read_bytes()
@@ -384,6 +418,8 @@ def export(root,output):
                 encoded=base64.b64encode(raw).decode('ascii')
                 parts.append(f'<img loading="lazy" src="data:image/png;base64,{encoded}" alt="{esc(arm)}" onclick="showImage(this)">')
             else:parts.append('<p>Invalid generated image</p>')
+            if row.get('feedback_text'):
+                parts.append('<details><summary>BAGEL feedback</summary><pre style="white-space:pre-wrap">'+esc(row['feedback_text'])+'</pre></details>')
             if arm!='BASE':
                 changes=[];questions=row.get('semantic_questions') or []
                 for i,(a,b) in enumerate(zip(base['semantic_atoms'],row['semantic_atoms'])):
@@ -400,6 +436,21 @@ def export(root,output):
     output.write_text(''.join(parts))
     return {'html':str(output),'prompt_seed_groups':len(groups),'images':len(rows),'bytes':output.stat().st_size}
 
+
+
+def export(root,output):
+    rows=read_jsonl(root/'quality_report/scores.jsonl')
+    keys=sorted({(r['index'],r['seed']) for r in rows})
+    if len(keys)<=16:return _export_page(root,output,rows)
+    gallery=root/'gallery';gallery.mkdir(exist_ok=True);links=[]
+    for start in range(0,len(keys),16):
+        selected=set(keys[start:start+16]);page=gallery/f'page_{start//16+1:03d}.html'
+        _export_page(root,page,[r for r in rows if (r['index'],r['seed']) in selected])
+        links.append(f'<li><a href="gallery/{page.name}">Pairs {start+1}–{min(start+16,len(keys))}</a></li>')
+    summary=html.escape((root/'quality_report/summary.md').read_text())
+    output.write_text('<!doctype html><meta charset="utf-8"><title>BAGEL comparisons</title><h1>BAGEL comparisons</h1>'
+        '<p>Download this file together with the gallery directory. Each page embeds its images.</p><ul>'+''.join(links)+'</ul><pre>'+summary+'</pre>')
+    return {'html':str(output),'pages':len(links),'images':len(rows),'download_with':'gallery/'}
 
 def main():
     commands={'prepare':prepare_main,'validate':validate_main,'generate':generate_main,

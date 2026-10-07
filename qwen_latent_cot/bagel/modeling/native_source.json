@@ -94,6 +94,15 @@
         "cv2"
       ],
       "sha256": "feb03811157a54c41c3d031b9cf841a7dbc9adae59f0720adc069fa9ee29ded4"
+    },
+    "qwen_latent_cot/bagel/modeling/image_transforms.py": {
+      "source": "data/transforms.py",
+      "sha256": "39b215df50a2eefd920a65886925e7d933161d55f4bcb51fb04e5921dc763ce4",
+      "vendored_sha256": "904e68a8ec7649df42bff25e52d4136ce2780be891a7200437ff2c023af0267f",
+      "selection": [
+        "MaxLongEdgeMinShortEdgeResize",
+        "ImageTransform"
+      ]
     }
   }
 }

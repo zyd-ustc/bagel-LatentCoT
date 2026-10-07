@@ -71,7 +71,7 @@ def summarize(rows,resamples=10000):
 
 
 def repair_retention(base, full, candidate):
-    """Keep Full's repairs and avoid its damage, using Base as the atom anchor."""
+    """Keep the reference arm's repairs and avoid its damage, using Base as the atom anchor."""
     if set(base)!=set(full) or set(base)!=set(candidate):
         raise ValueError('retention requires complete three-arm pairs')
     repairs=retained=damages=avoided=0
@@ -84,8 +84,8 @@ def repair_retention(base, full, candidate):
         repaired=~aa & ff;damaged=aa & ~ff
         repairs+=int(repaired.sum());retained+=int((repaired & cc).sum())
         damages+=int(damaged.sum());avoided+=int((damaged & cc).sum())
-    return {'full_repair_atoms':repairs,'retained_full_repair_atoms':retained,
-        'retained_full_repair_fraction':retained/repairs if repairs else None,
-        'full_damage_atoms':damages,'avoided_full_damage_atoms':avoided,
-        'avoided_full_damage_fraction':avoided/damages if damages else None,
+    return {'reference_repair_atoms':repairs,'retained_reference_repair_atoms':retained,
+        'retained_reference_repair_fraction':retained/repairs if repairs else None,
+        'reference_damage_atoms':damages,'avoided_reference_damage_atoms':avoided,
+        'avoided_reference_damage_fraction':avoided/damages if damages else None,
         'threshold':.5,'status':'VLM_proxy_pending_manual_review'}

@@ -3,11 +3,11 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 RUN=${1:?usage: compare_windows_8gpu.sh fresh_output_directory}
-[[ ! -e "$RUN" ]] || { echo 'Use a fresh output directory' >&2; exit 1; }
+[[ ! -e "$RUN" || ${RESUME:-0} == 1 ]] || { echo 'Use a fresh output directory or RESUME=1 for the identical run' >&2; exit 1; }
 MODEL_PYTHON=${MODEL_PYTHON:-/private/software/conda/envs/lcot/bin/python}
 SCORER_PYTHON=${SCORER_PYTHON:-/private/yida_workspace/umm-anchored-eval-tools-d126833/venv/bin/python}
 MODEL_PATH=${MODEL_PATH:-/private/yida_workspace/models/BAGEL-7B-MoT}
-PROMPTS=${PROMPTS:-$ROOT/data/prompts32.jsonl}
+PROMPTS=${PROMPTS:-}
 CONFIG=${CONFIG:-$ROOT/configs/window_comparison.json}
 JUDGE=${JUDGE_MODEL:-/private/yida_workspace/models/Qwen3-VL-8B-Instruct}
 OFFICIAL=${GENEVAL2_SOURCE:-/private/yida_workspace/umm-anchored-eval-tools-d126833/GenEval2/evaluation.py}
@@ -23,6 +23,9 @@ mkdir -p "$RUN"
 RUN=$(cd "$RUN" && pwd)
 PLAN=$RUN/plan.json
 CLI=$ROOT/scripts/compare_windows.py
+if [[ -z "$PROMPTS" ]]; then
+    PROMPTS=$ROOT/$("$MODEL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["benchmark"])' "$CONFIG")
+fi
 pids=()
 cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; }
 trap cleanup INT TERM EXIT
@@ -39,10 +42,10 @@ printf '%s\n' '1/5: bind denoising windows, native weights, source, prompts and 
 CUDA_VISIBLE_DEVICES= "$MODEL_PYTHON" "$CLI" prepare --model-path "$MODEL_PATH" \
     --prompts "$PROMPTS" --config "$CONFIG" --plan "$PLAN"
 NUM_SHARDS=$("$MODEL_PYTHON" -c 'import json,sys; p=json.load(open(sys.argv[1])); print(min(int(sys.argv[2]),len(p["prompt_ids"])*len(p["seeds"])))' "$PLAN" "${#devices[@]}")
-printf '%s\n' '2/5: real-weight numerical checks for five loop arms and inactive-window parity; stop on failure'
+printf '%s\n' '2/5: real-weight numerical checks for configured arms and native-path numerical checks; stop on failure'
 CUDA_VISIBLE_DEVICES="${devices[0]}" "$MODEL_PYTHON" "$CLI" validate \
     --plan "$PLAN" --output "$RUN/e0.json" > "$RUN/e0.log" 2>&1
-printf '%s\n' '3/5: generate Base + five R2 time windows; progress in generation/worker_*.log'
+printf '%s\n' '3/5: generate all configured paired arms; progress in generation/worker_*.log'
 mkdir -p "$RUN/generation" "$RUN/quality"
 for ((shard=0; shard<NUM_SHARDS; shard++)); do
     CUDA_VISIBLE_DEVICES="${devices[$shard]}" "$MODEL_PYTHON" "$CLI" generate \

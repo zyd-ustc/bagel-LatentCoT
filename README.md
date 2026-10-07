@@ -2,7 +2,7 @@
 
 目标：在冻结 BAGEL 权重、增加有限推理计算的条件下，通过 Memory 反馈修复文生图的数量、属性和空间关系。
 
-`main` 只保留 **持续 UND state＋全量动态 KV 替换**。默认 **R2**。当前固定层窗口 `[0,8)`，比较早期去噪 loop、同样执行20步的晚期 loop，以及全程 loop，另加原生 Base。没有其他生成架构、adapter、gate、压缩或训练模块。
+`main` 只保留 **持续 UND state＋全量动态 KV 替换**。固定层窗口 `[0,8)`，比较 Early10／Early20 × R1–R4。另提供原生 BAGEL 显式反馈编辑的小规模教师参照。没有 adapter、gate、压缩或训练模块。
 
 ## 架构
 
@@ -56,79 +56,89 @@ flowchart LR
 
 ![牛数量编辑](assets/edit_24.png)
 
-证据范围：冻结模型可产生具体语义 Repair；还没有证明平均净收益。R2 的 GM 增量95%区间为 `[-0.01730, +0.12027]`，跨零；约71%的 GM 净增量来自 #06。代理 Repair/Damage 为20/24。R3 会丢失部分修复并增加损伤，不作为默认深度。质量分为 VLM 代理，不能替代人工质量判断。原生 UND 对 noisy GEN 的语义理解能力尚未建立。
+证据范围：冻结模型可产生具体语义 Repair；还没有证明平均净收益。R2 的 GM 增量95%区间为 `[-0.01730, +0.12027]`，跨零；约71%的 GM 净增量来自 #06。代理 Repair/Damage 为20/24。此前 R3 会丢失部分修复并增加损伤；本轮扩大样本，重新检验深度效应。质量分为 VLM 代理，不能替代人工质量判断。原生 UND 对 noisy GEN 的语义理解能力尚未建立。
 
 现阶段研究问题：**保留已出现的数量／属性修复，同时减少物体丢失和关系损伤。** 本仓库只提供 training-free 推理与验证；没有启动训练。
 
 原始图片的 source、noise 和 image hashes 见 [证据来源](assets/evidence.json)。完整历史代码、文档、日志和结果已移至工作区 `older/und-memory-main-before-cleanup-20261007_121406/`；不混入当前展示目录。
 
-## 早期去噪时间窗口
+## 当前判断与实验边界
 
-六个模型层位置的32-prompt对比已完成。`[0,8)` 的 Semantic GM 最高，因此本轮固定该层窗口和R2。它的Repair/Damage为20/24，尚未证明平均净收益；选择它是为了检验已有局部语义编辑能否在更低开销下保留。
+固定相同初始噪声，loop 仍会改变 velocity，随后轨迹会分叉。这不是字面上的重新采样噪声，但视觉效果可能类似重采样。已有结果只能证明局部语义发生变化，不能证明 Memory 识别了错误并定向修复。
 
-本轮只改变 loop 的时间窗口。每张图仍使用原生49次 denoiser 调用。step从0开始，窗口右端不包含。关闭loop后，当前 `x_t` 继续走原生 BAGEL 路径；不会恢复Base轨迹的 `x_t`。Memory 仍只在当前denoiser调用内持续更新，不跨去噪步传递。
+此前32题的早期时间对比：Early10 R2 的 GM 为0.1333、质量代理0.7188、Repair/Damage为19/22；Early20 R2 为0.1329、0.6953、24/30。Base 为0.0925、0.7422。它们不足以证明平均净收益，不能据此启动训练。
 
-| 组名 | 启用 loop 的step | loop调用数 | 首／末次启用的t |
-|---|---|---:|---|
-| BASE | 不启用 | 0 | — |
-| EARLY_05 | [0,5) | 5 | 1.000 / 0.971 |
-| EARLY_10 | [0,10) | 10 | 1.000 / 0.930 |
-| EARLY_20 | [0,20) | 20 | 1.000 / 0.826 |
-| LATE_20 | [29,49) | 20 | 0.674 / 0.059 |
-| FULL | [0,49) | 49 | 1.000 / 0.059 |
+### A：固定架构的大规模时间 × 深度比较
 
-`t=1` 为纯噪声，`t=0` 为干净图像。这里使用原生shift3调度；早期按执行顺序定义，实际t同时记录。前20步覆盖高噪声区，最后一次loop更新后进入 `t≈0.813`，随后使用原生路径。Early20／Late20执行同样数量的loop调用，但沿不同噪声状态运行；实测耗时仍需单独比较。
+完整 GenEval2 **800 prompts × seed0 × 9组 = 7200张图**。共享同一组 Base；其余为 Early10 R1–R4、Early20 R1–R4。同 prompt 各组严格共享初始噪声。先扩大 prompt 覆盖，尚不检验多 seed 稳定性。
 
-固定32个prompt、seed0、512px、50个时间点、shift3、CFG4和global CFG renormalization，共 **192张图**。各组重新生成Base／Full以形成完整同权重、同prompt、同噪声配对，不复用历史评分。
+- 模型层：`[0,8)`，即第0–7层，右端不包含。
+- Early10：49次原生 denoiser 调用中的 step `[0,10)`；Early20：`[0,20)`。
+- 原生50个时间点、shift3、512px、CFG4、global renormalization。精确 t 范围写入 plan。
+- R 是额外轮数。R4 在启用 loop 的一次调用中执行5次 GEN body、4次 UND writer body。最终 GEN suffix 和读出只执行一次。
+- Memory 不跨去噪步。关闭 loop 后沿当前轨迹继续原生生成，不跳回 Base 的轨迹。
+- 报告全部800题，并分开报告此前用过的32题与新增768题。数据来自工作区 `refs/GenEval2/geneval2_data.jsonl`，完整保留 prompt、语义问题和技能标签；校验值与许可在 data/。
 
-待验证的假设：早期loop形成数量或布局修复，关闭后由原生路径完成后续生成，可能减少全程loop的额外损伤。早期更有效尚未得到证据。
+比较每组相对 Base 的语义 GM、Repair/Damage、质量代理、Invalid、耗时与显存；另外比较同 R 的 Early20 对 Early10，以及各时间窗内相邻 R。提供 prompt-cluster bootstrap 区间，未做多重比较校正。VLM 分数不是人工质量判断。不能只报告最好的一组或少数成功图片。
 
-主要比较：
+### B：先验证信息，再考虑蒸馏
 
-- Early5／10／20对Base：语义GM、Repair/Damage、质量代理、Invalid与开销。
-- Early5／10／20对Full：是否保留Full已有的Repair，并避免Full造成的Damage。
-- Early20对Late20：在loop调用数相同的条件下，效果是否与时间位置有关。
-- 人工审查全部32个prompt，重点复查#06、#24；不凭单个样本的增益选择结论。
+prompt KV 是文本编码，不自带对当前生成错误的观察。新增一个昂贵但原生的 training-free 参照：
 
-脚本输出上述配对统计与prompt-cluster置信区间。置信区间未经多重比较校正，不能作为多组筛选后的确认性证据。质量和语义评分仍是VLM代理，需人工审查。
+1. 原生 BAGEL 从 prompt 生成 Base 图像。
+2. BAGEL UND 通过原生 ViT 输入观察这张干净图像，生成结构化文字：可见事实、明确差错、应保留内容、不确定项、最小编辑指令。
+3. 通过 BAGEL 原生图像编辑接口，把**完整源图像的 VAE＋ViT 上下文、原始请求和完整反馈文字**重新编码成条件 KV。
+4. 原生 GEN 完成编辑；不启用隐式 loop，不向 noisy GEN 强行接入另一段位置不匹配的 KV。
 
-## 代码结构
+全量保留原生上下文；不池化、不筛选 prompt token、不压缩 slot。使用 BAGEL 自带图像预处理。文字反馈使用原生位置重新 prefill，不能直接移植观察阶段的缓存，因为其上下文、位置和模态布局不同。文本达到生成上限或 JSON 格式错误时记录失败，不静默截断，不删除失败配对。
 
-```text
-configs/window_comparison.json   唯一比较配置：固定[0,8)、R2，改变时间窗口
-data/prompts32.jsonl            32个评测prompt
-qwen_latent_cot/bagel/           持续UND state、全量动态body／suffix KV与原生Base
-qwen_latent_cot/evaluation/      配对评分、Repair保留／Damage避免、数值检查
-scripts/compare_windows.py      准备、数值检查、生成、评分、报告与HTML
-scripts/compare_windows_8gpu.sh  唯一多卡启动脚本
-tests/test_numerics.py          必要数值测试
-tests/helpers.py               小模型fixture
-tests/oracles/                 冻结目标runner的数值参照
-assets/                         已有历史图像证据
-```
+先跑此前32题、seed0，三组共96张图：
 
-配置由脚本实际读取。时间窗通过已有 `progress_start / progress_end` 控制；使用 `step/48` 和含两端的progress区间，精确对应表中的半开step窗口。不会改动BAGEL层、权重或Memory更新公式，也没有新增adapter或训练模块。窗口外直接调用原生decoder。
+| 组 | 输入与作用 |
+|---|---|
+| BASE | 原生文生图，作为共同源图像 |
+| GENERIC_EDIT | 源图像＋原始请求＋通用最小编辑指令 |
+| FEEDBACK_EDIT | 同一源图像＋同一请求＋针对该图像的完整文字反馈 |
 
-## 在 H200 上运行
+两种编辑使用相同初始噪声、原生编辑 CFG（text3、image1.5、interval 0.4–1），共享相同源图像。主要因果比较是 FEEDBACK_EDIT 对 GENERIC_EDIT；两者对 Base 的变化不能单独归因于文字反馈。记录反馈原文、token IDs、源图像与噪声 hashes、上下文长度、各阶段耗时。没有保存原始 KV 张量，缓存可由绑定模型与输入重建。评分仍由独立的 Qwen3-VL＋GenEval2 评估器完成。
 
-正式GPU数值检查、生成和评分由用户启动。在远端使用分配给本任务的8张卡运行：
+**是否继续的依据**：人工核验反馈事实正确；具体差错得到修复；正确内容与质量得到保留；相对通用编辑确有增益。JSON 合法、velocity 变化、图片差异或单个成功案例都不能替代这些证据。
+
+这一步是显式教师参照，不是已实现的 denoiser 内部语义反馈。若原生理解或编辑仍失败，先定位反馈事实、指令遵循和保真中的问题，不进入蒸馏。若成功，下一步才研究在固定 x_t/t 下获得可见预测、生成反馈并回到同一 denoiser 状态；目前未实现这个桥接。
+
+Monet 的借鉴限于“图像观察提供可检查的信息，再通过阶段训练迁移到隐式状态”。依据工作区 `refs/Monet/README.md`、`src/task.py`、`src/trainer.py` 与论文方法部分；Monet 本身经过训练，不是冻结 BAGEL 编辑可行的证据。这里没有引入其 latent token、adapter 或损失。后续可先训练 UND 的观察／反馈格式，保持 GEN 冻结；只有有效教师和位置、token 对应关系成立后，才讨论隐式 Memory 蒸馏，不能直接对不同上下文 KV 做逐项回归。当前没有训练代码或训练任务。
+
+BAGEL 接口依据工作区 `refs/Bagel/inferencer.py` 的原生理解、交错上下文与编辑顺序；图像变换取自 `data/transforms.py`，来源 hashes 记录在 `qwen_latent_cot/bagel/modeling/native_source.json`。
+
+## 运行（用户在 H200 上执行）
+
+使用分配给本任务的8张卡。先运行大规模矩阵：
 
 ```bash
-cd /private/yida_workspace/bagel-LatentCoT-main-early-time-compare-20261007
+cd /private/yida_workspace/bagel-LatentCoT-main-depth-feedback-20261008
 export GPUS=0,1,2,3,4,5,6,7
-export RUN=/private/yida_workspace/outputs/und_early_time_r2_$(date +%Y%m%d_%H%M%S)
+export CONFIG="$PWD/configs/window_comparison.json"
+export RUN=/private/yida_workspace/outputs/und_depth_grid_$(date +%Y%m%d_%H%M%S)
 set -o pipefail
 bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
 ```
 
-四卡只需修改 `GPUS`。脚本依次执行：绑定源代码／权重／prompt hashes → 五个loop组的真实权重数值检查 → 生成192张图 → 配对评分 → 报告和离线HTML。数值检查包含窗口外与原生路径的velocity精确一致；检查失败就停止。
+上一个任务完成后，再运行独立的32题反馈试验：
 
-进度见 `e0.log`、`generation/worker_*.log` 和 `quality/worker_*.log`。结果见 `quality_report/summary.md`、`quality_report/summary.json` 与 `comparison.html`。配置同时记录各组的准确loop步数、t范围与GEN body总执行次数；耗时仅为未预热的工程日志。
+```bash
+export CONFIG="$PWD/configs/feedback_comparison.json"
+export RUN=/private/yida_workspace/outputs/und_feedback_native_$(date +%Y%m%d_%H%M%S)
+bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
+```
 
-## 验证范围
+脚本绑定源代码、配置、权重与数据，然后依次运行真实权重数值检查、生成、评分和报告。数值检查失败则停止。支持 `RESUME=1 bash scripts/compare_windows_8gpu.sh "$RUN"`，必须保留原 RUN、CONFIG、代码、权重和分片数量。不要在同一批卡上同时启动两个任务。
 
-CPU数值检查使用小模型：固定 `[0,8)` 的Full R2与冻结选定runner精确一致；时间窗内与Full精确一致；时间窗外与原生decoder精确一致；检查首步、末步和切换边界，防止少算或多算一个loop步。此外保留原生hidden→KV投影、完整prompt、UND hidden更新、动态suffix、特殊token、样本／调用隔离与cache／权重不变的检查。
+结果为 `quality_report/summary.md`、`summary.json`、`comparison.html` 与 `gallery/`。HTML 每页16个 prompt/seed，下载时同时保留 comparison.html 与 gallery/。反馈原文也嵌入对应图片页面。进度见 e0.log、generation/worker_*.log、quality/worker_*.log。
 
-远端隐藏CUDA后，必要数值测试 **11 passed**。CPU模拟流程检查通过：两份prompt分片、六组配对、准确窗口配置、报告合并、Repair保留／Damage避免统计、HTML导出和缺失配对拒绝。Python语法、shell语法与 `git diff --check` 通过。
+## 代码与验证范围
 
-CPU与模拟任务流程检查不能证明真实权重下的质量或语义收益。正式GPU评测尚未启动。此前六个层窗口的配置、脚本和文档已完整备份到工作区 `older/und-memory-before-early-time-compare-20261007_215020/`，此前远端结果目录保留。
+仅保留两个比较入口：`scripts/compare_windows.py` 与 `scripts/compare_windows_8gpu.sh`。两个配置分别描述大规模矩阵与反馈试验。必要数值测试仍集中在 tests/，没有旧实验脚本。
+
+19项 CPU 检查通过：R1–R4 与冻结目标路径一致；Early10／Early20 边界正确；窗口外与原生路径一致；原生 hidden→KV 投影、持续 UND state、动态 suffix、特殊 token 和缓存隔离保持正确。另已通过 CPU 模拟流程：17题×9组的分片、断点续跑、10项比较、分页 HTML 和缺失配对拒绝；3题×3组反馈流程的共享源图像／噪声、完整反馈、评分和报告。新增上下文检查覆盖原生图像→文字的顺序及两条 CFG 缓存隔离。真实权重检查与正式评测由用户运行，CPU 测试不证明语义或质量收益。
+
+本次变更前的完整代码、文档及 Git bundle 位于工作区 `older/before-depth-feedback-20261008_001707/`。旧结果和远端旧快照保留。

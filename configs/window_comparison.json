@@ -1,13 +1,7 @@
 {
-  "schema": 2,
-  "extra_rounds": 2,
+  "schema": 3,
   "expected_num_hidden_layers": 28,
   "windows": [
-    {
-      "name": "EARLY_05",
-      "step_start": 0,
-      "step_end": 5
-    },
     {
       "name": "EARLY_10",
       "step_start": 0,
@@ -17,16 +11,6 @@
       "name": "EARLY_20",
       "step_start": 0,
       "step_end": 20
-    },
-    {
-      "name": "LATE_20",
-      "step_start": 29,
-      "step_end": 49
-    },
-    {
-      "name": "FULL",
-      "step_start": 0,
-      "step_end": 49
     }
   ],
   "sampling": {
@@ -39,10 +23,19 @@
   "seeds": [
     0
   ],
-  "max_prompts": 32,
-  "comparison_axis": "denoising_steps",
+  "max_prompts": 800,
+  "comparison_axis": "time_and_depth",
   "layer_window": {
     "start_layer": 0,
     "end_layer": 8
-  }
+  },
+  "experiment": "loop_grid",
+  "depths": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "expected_prompts": 800,
+  "benchmark": "data/geneval2_800.jsonl"
 }

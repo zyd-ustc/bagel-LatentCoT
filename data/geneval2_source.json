@@ -1,0 +1,8 @@
+{
+  "source": "refs/GenEval2/geneval2_data.jsonl",
+  "source_sha256": "09233adbc9f877fba205f1a20efa4a8640e7e62a91dfd55893562bed8a928e43",
+  "packaged_sha256": "8ec7f3bce1491df27aa51ea979594b15b27aa02142ab9392eb8e2acc6325e715",
+  "count": 800,
+  "prior_pilot_overlap": 32,
+  "notes": "All upstream prompts and VQA constraints retained; only identity/split metadata added."
+}

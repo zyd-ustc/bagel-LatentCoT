@@ -1,0 +1,32 @@
+{
+  "schema": 3,
+  "expected_num_hidden_layers": 28,
+  "sampling": {
+    "image_size": 512,
+    "num_timesteps": 50,
+    "timestep_shift": 3.0,
+    "cfg_text_scale": 4.0,
+    "cfg_renorm_type": "global"
+  },
+  "seeds": [
+    0
+  ],
+  "max_prompts": 32,
+  "comparison_axis": "native_feedback",
+  "layer_window": {
+    "start_layer": 0,
+    "end_layer": 8
+  },
+  "experiment": "feedback_pilot",
+  "expected_prompts": 32,
+  "benchmark": "data/prompts32.jsonl",
+  "feedback_max_tokens": 1024,
+  "edit_sampling": {
+    "cfg_text_scale": 3.0,
+    "cfg_img_scale": 1.5,
+    "cfg_interval": [
+      0.4,
+      1.0
+    ]
+  }
+}
