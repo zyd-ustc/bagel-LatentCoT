@@ -131,7 +131,7 @@ export RUN=/private/yida_workspace/outputs/und_feedback_native_$(date +%Y%m%d_%H
 bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
 ```
 
-脚本绑定源代码、配置、权重与数据，然后依次运行真实权重数值检查、生成、评分和报告。数值检查失败则停止。支持 `RESUME=1 bash scripts/compare_windows_8gpu.sh "$RUN"`，必须保留原 RUN、CONFIG、代码、权重和分片数量。不要在同一批卡上同时启动两个任务。
+默认数据严格取自 CONFIG 的 benchmark，不读取通用 PROMPTS 环境变量；自定义数据须显式设置 COMPARISON_PROMPTS。脚本绑定源代码、配置、权重与数据，然后依次运行真实权重数值检查、生成、评分和报告。数值检查失败则停止。支持 `RESUME=1 bash scripts/compare_windows_8gpu.sh "$RUN"`，必须保留原 RUN、CONFIG、代码、权重和分片数量。不要在同一批卡上同时启动两个任务。
 
 结果为 `quality_report/summary.md`、`summary.json`、`comparison.html` 与 `gallery/`。HTML 每页16个 prompt/seed，下载时同时保留 comparison.html 与 gallery/。反馈原文也嵌入对应图片页面。进度见 e0.log、generation/worker_*.log、quality/worker_*.log。
 

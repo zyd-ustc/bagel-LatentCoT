@@ -21,16 +21,25 @@ def prepare_main():
     p.add_argument('--prompts')
     p.add_argument('--config', default=str(ROOT/'configs/window_comparison.json'))
     p.add_argument('--plan', required=True)
+    p.add_argument('--check-inputs-only', action='store_true', help='Validate benchmark without hashing weights or launching inference')
     a = p.parse_args()
     weights = Path(a.model_path).resolve()
     depth = json.loads((weights/'llm_config.json').read_text())['num_hidden_layers']
     config = load_comparison(a.config, depth)
     a.prompts=a.prompts or str(ROOT/config['benchmark'])
-    data = read_jsonl(a.prompts)[:config['max_prompts']]
-    if len(data)!=config['expected_prompts']:raise ValueError('benchmark coverage differs from config')
+    source_data = read_jsonl(a.prompts)
+    data = source_data[:config['max_prompts']]
+    coverage = (f'config={Path(a.config).resolve()} benchmark={Path(a.prompts).resolve()} '
+        f'file_rows={len(source_data)} selected={len(data)} expected={config["expected_prompts"]}')
+    print('Benchmark: '+coverage, flush=True)
+    if len(data)!=config['expected_prompts']:
+        raise ValueError('benchmark coverage differs from config: '+coverage)
     ids = [str(r.get('prompt_id', r.get('id', i))) for i,r in enumerate(data)]
     if not data or len(set(ids)) != len(ids) or any(not r['prompt'].strip() for r in data):
         raise ValueError('require nonempty, uniquely identified prompts')
+    if a.check_inputs_only:
+        print('Input validation passed; no inference launched', flush=True)
+        return
     model_files = [weights/n for n in ('ema.safetensors','ae.safetensors')]
     if not all(f.is_file() for f in model_files):
         raise ValueError('require native ema.safetensors and ae.safetensors')

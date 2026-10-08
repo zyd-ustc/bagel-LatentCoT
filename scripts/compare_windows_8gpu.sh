@@ -7,7 +7,8 @@ RUN=${1:?usage: compare_windows_8gpu.sh fresh_output_directory}
 MODEL_PYTHON=${MODEL_PYTHON:-/private/software/conda/envs/lcot/bin/python}
 SCORER_PYTHON=${SCORER_PYTHON:-/private/yida_workspace/umm-anchored-eval-tools-d126833/venv/bin/python}
 MODEL_PATH=${MODEL_PATH:-/private/yida_workspace/models/BAGEL-7B-MoT}
-PROMPTS=${PROMPTS:-}
+# Do not inherit generic PROMPTS from an unrelated experiment.
+PROMPTS=${COMPARISON_PROMPTS:-}
 CONFIG=${CONFIG:-$ROOT/configs/window_comparison.json}
 JUDGE=${JUDGE_MODEL:-/private/yida_workspace/models/Qwen3-VL-8B-Instruct}
 OFFICIAL=${GENEVAL2_SOURCE:-/private/yida_workspace/umm-anchored-eval-tools-d126833/GenEval2/evaluation.py}
@@ -24,7 +25,7 @@ RUN=$(cd "$RUN" && pwd)
 PLAN=$RUN/plan.json
 CLI=$ROOT/scripts/compare_windows.py
 if [[ -z "$PROMPTS" ]]; then
-    PROMPTS=$ROOT/$("$MODEL_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["benchmark"])' "$CONFIG")
+    PROMPTS=$("$MODEL_PYTHON" -c 'import json,pathlib,sys; p=pathlib.Path(json.load(open(sys.argv[1]))["benchmark"]); print(p if p.is_absolute() else pathlib.Path(sys.argv[2])/p)' "$CONFIG" "$ROOT")
 fi
 pids=()
 cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; }
