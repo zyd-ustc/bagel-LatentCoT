@@ -1,4 +1,5 @@
 from dataclasses import replace
+from contextlib import nullcontext
 from types import SimpleNamespace
 import pytest
 import torch
@@ -217,3 +218,100 @@ def test_native_feedback_full_context_and_cfg_isolation():
     assert torch.equal(flow['packed_init_noises'],noise)
     assert parse_feedback('{"observed":"two cubes","discrepancies":[],"preserve":["both cubes"],"uncertain":[],"edit":"preserve"}')['edit']=='preserve'
     with pytest.raises(ValueError):parse_feedback('{"edit":"invented fallback"}')
+
+
+def test_full_und_observation_matches_native_prefill_and_static_read_control():
+    from copy import deepcopy
+    from PIL import Image
+    from types import MethodType
+    from helpers import fixture
+    from qwen_latent_cot.bagel.modeling.bagel.bagel import Bagel
+    from qwen_latent_cot.bagel.observation_memory import ObservationConditions,memory_context
+    model,_=fixture(batch=1,depth=4)
+    class Wrapper(torch.nn.Module):
+        prepare_prompts=Bagel.prepare_prompts
+        forward_cache_update_text=Bagel.forward_cache_update_text
+        prepare_start_tokens=Bagel.prepare_start_tokens
+        generate_text=Bagel.generate_text
+        use_moe=True
+        def __init__(self,llm):
+            super().__init__();self.language_model=llm;self.config=SimpleNamespace(llm_config=llm.config)
+        def prepare_vae_latent(self,*args):return {'packed_init_noises':torch.zeros(4,2)}
+        def prepare_vae_latent_cfg(self,lens,ropes,*args):return {'cfg_key_values_lens':torch.tensor(lens)}
+    wrapper=Wrapper(model.language_model)
+    wrapper.language_model.model.enable_taylorseer=False
+    tokenizer=SimpleNamespace(encode=lambda text:[5,6,7],decode=lambda ids:' '.join(map(str,ids)))
+    bundle=SimpleNamespace(model=wrapper,vae=None,tokenizer=tokenizer,token_ids={'bos_token_id':0,'eos_token_id':1})
+    engine=ObservationConditions(bundle)
+    torch.manual_seed(14)
+    prefix=NaiveCache(4)
+    hidden=torch.randn(4,32,dtype=torch.bfloat16)
+    wrapper.language_model.forward_inference(packed_query_sequence=hidden,query_lens=torch.tensor([4],dtype=torch.int32),
+        packed_query_position_ids=torch.zeros(4,dtype=torch.long),packed_query_indexes=torch.arange(4),
+        past_key_values=prefix,key_values_lens=torch.zeros(1,dtype=torch.int32),packed_key_value_indexes=torch.empty(0,dtype=torch.long),
+        update_past_key_values=True,is_causal=False,mode='und')
+    def image(this,image,context,vae=True):
+        return dict(past_key_values=deepcopy(prefix),kv_lens=[4],ropes=[2])
+    engine.image=MethodType(image,engine)
+    image_input=Image.new('RGB',(512,512))
+    observed,context,visual,meta=engine.prepare_conditions(image_input,'prompt',True)
+    static,static_context,_,static_meta=engine.prepare_conditions(image_input,'prompt',False)
+    reference=engine.text('prompt',image(engine,image_input,engine.context()))
+    assert meta['text_ids']==static_meta['text_ids']==[0,5,6,7,1]
+    assert meta['text_positions']==static_meta['text_positions']==list(range(2,7))
+    assert meta['memory_length']==5 and meta['conditional_lengths']==[9]
+    for i in range(4):
+        assert torch.equal(context['past_key_values'].key_cache[i],reference['past_key_values'].key_cache[i])
+        assert torch.equal(context['past_key_values'].key_cache[i][:4],static_context['past_key_values'].key_cache[i][:4])
+    assert any(not torch.equal(context['past_key_values'].key_cache[i][4:],static_context['past_key_values'].key_cache[i][4:]) for i in range(1,4))
+    static_memory=memory_context(static_context,4)
+    # Alter image evidence: observed Memory changes, static Memory does not.
+    for i in range(4):prefix.value_cache[i]+=2
+    _,context2,_,_=engine.prepare_conditions(image_input,'prompt',True)
+    _,static2,_,_=engine.prepare_conditions(image_input,'prompt',False)
+    assert any(not torch.equal(context['past_key_values'].key_cache[i][4:],context2['past_key_values'].key_cache[i][4:]) for i in range(1,4))
+    assert all(torch.equal(static_memory['past_key_values'].key_cache[i],static2['past_key_values'].key_cache[i][4:]) for i in range(4))
+    before={i:(k.clone(),context['past_key_values'].value_cache[i].clone()) for i,k in context['past_key_values'].key_cache.items()}
+    engine.answer_context(context,'How many objects?',2)
+    assert all(torch.equal(context['past_key_values'].key_cache[i],k) and torch.equal(context['past_key_values'].value_cache[i],v) for i,(k,v) in before.items())
+
+
+@pytest.mark.parametrize('step_index',[9,19])
+def test_observation_recomputes_velocity_once_at_fixed_noise_time_and_restores_hook(tmp_path,step_index):
+    from PIL import Image
+    from qwen_latent_cot.bagel.observation_memory import ObservationMemoryGenerator,tensor_hash
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__();self.p=torch.nn.Parameter(torch.zeros(1));self.calls=[]
+            self.language_model=SimpleNamespace(model=SimpleNamespace())
+        def _forward_flow(self,x_t,timestep,past_key_values,**kwargs):
+            self.calls.append((x_t.clone(),timestep.clone(),past_key_values))
+            return torch.full_like(x_t,.2 if past_key_values=='native' else .3)
+        def generate_image(self,packed_init_noises,num_timesteps,**kwargs):
+            x=packed_init_noises;ts=torch.linspace(1,0,num_timesteps);ts=3*ts/(1+2*ts)
+            for i,t in enumerate(ts[:-1]):
+                v=self._forward_flow(x_t=x,timestep=torch.full((len(x),),t),past_key_values='native')
+                x=x-v*(ts[i]-ts[i+1])
+            return [x]
+    model=Model();original=model._forward_flow
+    gen=ObservationMemoryGenerator.__new__(ObservationMemoryGenerator)
+    gen.model=model;gen.device=torch.device('cpu');gen.runtime=None;gen.observation_step=step_index;gen.observe=True
+    gen.questions=['How many objects?'];gen.probe_max_tokens=2;gen.trace_dir=tmp_path;gen.edit_sampling={'cfg_text_scale':3.,'cfg_img_scale':1.5,'cfg_interval':[.4,1.]}
+    def conditions(*args):
+        cache=NaiveCache(1);cache.key_cache[0]=torch.ones(3,1,2);cache.value_cache[0]=torch.ones(3,1,2)
+        return {'past_key_values':'updated'},dict(past_key_values=cache),{},dict(visual_prefix_length=1)
+    gen.engine=SimpleNamespace(prepare_conditions=conditions,probe=lambda *args:{'fake_probe':'never reaches GEN'})
+    gen.prepare=lambda *args:({'packed_init_noises':torch.ones(2,3)},['common_noise'])
+    gen.decode=lambda *args:Image.new('RGB',(512,512),'gray')
+    images,hashes=gen.generate(['prompt'],[(512,512)],[0])
+    assert len(model.calls)==50 and hashes==['common_noise'] and len(gen.events)==1
+    a,b=model.calls[step_index:step_index+2]
+    assert torch.equal(a[0],b[0]) and torch.equal(a[1],b[1])
+    assert a[2]=='native' and b[2]=='updated'
+    assert gen.events[0]['step_index']==step_index and gen.events[0]['updates']==1
+    assert gen.events[0]['x_t_sha256']==tensor_hash(a[0])
+    assert model._forward_flow==original and (tmp_path/'state.pt').exists()
+    # Failure must also restore the original denoiser method.
+    gen.decode=lambda *args:(_ for _ in ()).throw(RuntimeError('diagnostic failure'))
+    with pytest.raises(RuntimeError,match='diagnostic failure'):gen.generate(['prompt'],[(512,512)],[0])
+    assert model._forward_flow==original

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bagel-latent-cot"
 version = "0.5.0"
-description = "Frozen BAGEL with persistent UND Memory and full dynamic prompt-KV replacement"
+description = "Frozen BAGEL with native early-image observation and full-depth UND Memory"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

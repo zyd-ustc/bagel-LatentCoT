@@ -26,6 +26,33 @@ def identity(row):
     return row['prompt_id'], row['seed']
 
 
+def validate_observation_record(row):
+    events=row['observation_events']
+    if row['arm']=='BASE':
+        if events:raise ValueError('Base has an observation update')
+        return
+    # A failed decode can stop before the selected step. Invalid arms remain in
+    # quality/invalid-rate reporting, without inventing a successful update.
+    if row['valid_file'] and len(events)!=1:raise ValueError('expected one observation event')
+    for event in events:
+        if event['step_index']!=row['observation_step'] or event['updates']!=1:
+            raise ValueError('observation step/update count differs')
+        if not event['x_t_unchanged'] or not event['timestep_unchanged']:
+            raise ValueError('observation changed sampler state')
+        for path,digest in (('source_preview','preview_sha256'),('saved_state','state_sha256')):
+            if sha256(event[path])!=event[digest]:raise ValueError('observation artifact changed: '+path)
+
+
+def validate_observation_pair(row,other):
+    if row['noise_sha256']!=other['noise_sha256']:raise ValueError('paired initial noise differs')
+    if not row['observation_events'] or not other['observation_events']:return
+    a=row['observation_events'][0];b=other['observation_events'][0]
+    for field in ('step_index','x_t_sha256','timestep_sha256','preview_sha256','active_edit_cfg'):
+        if a[field]!=b[field]:raise ValueError('static/observed pre-update conditions differ: '+field)
+    for field in ('text_ids','text_positions','memory_length','visual_prefix_length','conditional_lengths','conditional_rope','text_removed_lengths','image_removed_lengths'):
+        if a['contexts'][field]!=b['contexts'][field]:raise ValueError('static/observed context contract differs: '+field)
+
+
 def load_manifests(paths):
     records, provenance, seen = [], [], set()
     for path in paths:
@@ -47,4 +74,10 @@ def load_manifests(paths):
         if row['arm'] not in provenance[0]['arms']: raise ValueError('unknown arm')
         if row['valid_file'] and sha256(row['path']) != row['image_sha256']:
             raise ValueError('image changed after generation')
+    if provenance[0]['architecture']=='observation_memory':
+        indexed={(r['arm'],*identity(r)):r for r in records}
+        for row in records:
+            validate_observation_record(row)
+            if row['arm'].endswith('_OBSERVED'):
+                validate_observation_pair(row,indexed[(row['arm'].replace('_OBSERVED','_STATIC'),*identity(row))])
     return records, provenance[0]

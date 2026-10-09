@@ -19,7 +19,7 @@ def prepare_main():
     p = argparse.ArgumentParser(description='Bind denoising windows, prompts, weights and source before workers')
     p.add_argument('--model-path', required=True)
     p.add_argument('--prompts')
-    p.add_argument('--config', default=str(ROOT/'configs/window_comparison.json'))
+    p.add_argument('--config', default=str(ROOT/'configs/observation_comparison.json'))
     p.add_argument('--plan', required=True)
     p.add_argument('--check-inputs-only', action='store_true', help='Validate benchmark without hashing weights or launching inference')
     a = p.parse_args()
@@ -62,6 +62,10 @@ def prepare_main():
     if config['experiment']=='feedback_pilot':
         plan['memory_topologies']={'mode':'native_full_interleaved_image_text_edit','implicit_loop':False,
             'capacity':'all_native_image_and_text_tokens','feedback':'full_text_reprefill_at_native_positions'}
+    if config['experiment']=='observation_memory':
+        plan['memory_topologies']={'mode':'native_early_image_full_UND_observation','capacity':'all_original_prompt_tokens',
+            'visual_context':'full_native_VAE_plus_ViT','writer':'continuous_all_native_layers',
+            'updates_per_arm':1,'lifecycle':'one_selected_denoiser_call','probe':'diagnostics_only'}
     output=Path(a.plan)
     if output.exists():
         if read_plan(output)!=plan:raise ValueError('resume plan differs; preserve original config/source/model/benchmark')
@@ -123,6 +127,9 @@ def generate_main():
     if plan['config']['experiment']=='feedback_pilot':
         from qwen_latent_cot.evaluation.feedback_runner import generate_feedback
         return generate_feedback(bundle,plan,args,completed,output,manifest)
+    if plan['config']['experiment']=='observation_memory':
+        from qwen_latent_cot.evaluation.observation_runner import generate_observation
+        return generate_observation(bundle,plan,args,completed,output,manifest)
     jobs = [(i,s) for i in range(len(data)) for s in seeds]
     if len(bundle.model.language_model.model.layers)!=plan['native_depth']:
         raise ValueError('loaded decoder depth differs from plan')
@@ -256,6 +263,12 @@ def validate_main():
     plan=read_plan(a.plan);torch.cuda.set_device(torch.device(a.device))
     bundle=load_native(plan['model_path'],a.device,plan['sampling']['timestep_shift'])
     results={}
+    if plan['config']['experiment']=='observation_memory':
+        from qwen_latent_cot.bagel.observation_memory_checks import validate_observation
+        results=validate_observation(bundle,plan['config'])
+        Path(a.output).write_text(json.dumps({'plan_sha256':sha256(a.plan),'checks':results},indent=2)+'\n')
+        if not results['passed']:raise SystemExit(1)
+        return
     if plan['config']['experiment']=='feedback_pilot':
         from qwen_latent_cot.bagel.feedback import validate_native_edit
         results['native_edit']=validate_native_edit(bundle,plan['config'])
@@ -338,7 +351,7 @@ def write_summary(scored,run,output,resamples=10000):
         feedback=[r for r in scored if r['arm']=='FEEDBACK_EDIT']
         summary['feedback_format']={'valid':sum(r.get('feedback_format_valid') is True for r in feedback),'total':len(feedback),'visual_correctness':'not_verified_by_format_check'}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
-    lines=['# Frozen BAGEL: '+run['config']['experiment'],'','Quality is a VLM proxy; manual review is pending. All implicit loop arms use layers [0,8). Native feedback arms use the original image-editing path. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing does not establish budget compliance.','',
+    lines=['# Frozen BAGEL: '+run['config']['experiment'],'','Quality is a VLM proxy; manual review is pending. Historical implicit arms use layers [0,8). Observation Memory uses full-depth UND prefill and native GEN; probes are diagnostic, not observed-image ground truth. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing does not establish budget compliance.','',
         '|Arm|Semantic GM|Quality proxy|Invalid|Net Repair vs Base (95% CI)|Repair / Damage|',
         '|---|---:|---:|---:|---|---:|']
     for arm,s in summary['arms'].items():
@@ -403,7 +416,7 @@ def _export_page(root,output,selected=None):
     esc=lambda value:html.escape(str(value),quote=True)
     parts=['''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BAGEL · 配对图片</title><style>
     :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#141819;color:#ecf0ea;font:16px/1.5 system-ui,-apple-system,sans-serif}main{max-width:1720px;margin:auto;padding:28px 20px}h1{font-size:30px}h2{font-size:18px;font-weight:500}p,small,details{color:#b8c4bc}.meta{font:12px ui-monospace,monospace;overflow-wrap:anywhere}.grid{display:grid;gap:12px}.label{font:13px ui-monospace,monospace;color:#d4e6b4;padding:8px 0;overflow-wrap:anywhere}img{width:100%;height:auto;display:block;cursor:zoom-in}.pair{border-top:1px solid #435047;margin:30px 0;padding:14px 0}table{border-collapse:collapse;margin:20px 0;font-size:14px}th,td{padding:8px 14px;text-align:left;border-bottom:1px solid #435047}li{margin:8px 0}details{margin-top:12px}dialog{background:#141819;border:1px solid #687864;padding:10px;max-width:98vw;max-height:98vh}dialog img{width:auto;max-width:92vw;max-height:84vh;cursor:default}button{margin-bottom:8px}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}main{padding:20px 10px}}
-    </style><main><h1>BAGEL：配对对比实验</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。隐式loop固定模型层[0,8)，比较Early10／20与R1–R4；显式反馈另用原生编辑路径。生成时间为工程日志。</p>''']
+    </style><main><h1>BAGEL：配对对比实验</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。历史隐式loop使用[0,8)；新观察方案在一个指定步执行完整UND编码，再固定x_t/t重算GEN。问答probe仅作诊断，尚无人工观察标签。生成时间为工程日志。</p>''']
     parts.append(f'<p class="meta">RUN {esc(root.name)}<br>SOURCE {esc(summary["source_sha256"])}</p>')
     parts.append('<table><tr><th>Arm</th><th>Semantic GM</th><th>Quality proxy</th><th>Repair / Damage vs Base</th><th>Median seconds</th></tr>')
     for arm in arms:
@@ -429,6 +442,14 @@ def _export_page(root,output,selected=None):
             else:parts.append('<p>Invalid generated image</p>')
             if row.get('feedback_text'):
                 parts.append('<details><summary>BAGEL feedback</summary><pre style="white-space:pre-wrap">'+esc(row['feedback_text'])+'</pre></details>')
+            for event in row.get('observation_events',[]):
+                preview=Path(event['source_preview'])
+                if hashlib.sha256(preview.read_bytes()).hexdigest()!=event['preview_sha256']:raise ValueError('early preview changed')
+                image64=base64.b64encode(preview.read_bytes()).decode('ascii')
+                parts.append('<details><summary>早期观察图与问答 probe（未标注）</summary>'+
+                    f'<p>step {event["step_index"]}, t={event["timestep"]:.4f}; 该图是早期预测，不是最终结果。</p>'+
+                    f'<img loading="lazy" src="data:image/png;base64,{image64}" alt="early prediction" onclick="showImage(this)">'+
+                    '<pre style="white-space:pre-wrap">'+esc(json.dumps(event['probes'],ensure_ascii=False,indent=2))+'</pre></details>')
             if arm!='BASE':
                 changes=[];questions=row.get('semantic_questions') or []
                 for i,(a,b) in enumerate(zip(base['semantic_atoms'],row['semantic_atoms'])):

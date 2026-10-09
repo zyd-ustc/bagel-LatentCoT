@@ -9,7 +9,7 @@ SCORER_PYTHON=${SCORER_PYTHON:-/private/yida_workspace/umm-anchored-eval-tools-d
 MODEL_PATH=${MODEL_PATH:-/private/yida_workspace/models/BAGEL-7B-MoT}
 # Do not inherit generic PROMPTS from an unrelated experiment.
 PROMPTS=${COMPARISON_PROMPTS:-}
-CONFIG=${CONFIG:-$ROOT/configs/window_comparison.json}
+CONFIG=${CONFIG:-$ROOT/configs/observation_comparison.json}
 JUDGE=${JUDGE_MODEL:-/private/yida_workspace/models/Qwen3-VL-8B-Instruct}
 OFFICIAL=${GENEVAL2_SOURCE:-/private/yida_workspace/umm-anchored-eval-tools-d126833/GenEval2/evaluation.py}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
