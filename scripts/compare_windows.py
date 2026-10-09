@@ -19,7 +19,7 @@ def prepare_main():
     p = argparse.ArgumentParser(description='Bind denoising windows, prompts, weights and source before workers')
     p.add_argument('--model-path', required=True)
     p.add_argument('--prompts')
-    p.add_argument('--config', default=str(ROOT/'configs/observation_comparison.json'))
+    p.add_argument('--config', default=str(ROOT/'configs/window_comparison.json'))
     p.add_argument('--plan', required=True)
     p.add_argument('--check-inputs-only', action='store_true', help='Validate benchmark without hashing weights or launching inference')
     a = p.parse_args()

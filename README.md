@@ -1,46 +1,9 @@
-# BAGEL：原生观察驱动的 denoiser 内部 Memory
+# BAGEL：分层 UND Memory loop（NPU）
 
-**本页对应 NPU 分支。** 运行后端与检查状态见 [NPU_RUNTIME.md](docs/NPU_RUNTIME.md)。
+本页对应 `loop-layer-NPU` 分支，从 NPU 提取已存在的旧循环。运行入口默认选择旧 `loop_grid`，不启用图像观察、文字反馈或固定 observation cache。旧循环实现和 Ascend 运行后端没有改动。
 
-当前方案是 **一次早期图像预测→完整原生 UND 更新→使用固定缓存重算 GEN**。没有完整文字反馈解码、adapter、gate、压缩或训练。原始单步pilot已完成，尚未显示稳定语义收益。
+架构与执行命令见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。默认正式配置为 `configs/window_comparison.json`：800 prompts、seed0、Base＋Early10/Early20×R1/2/3/4，共7200张图。小规模配置为 `configs/loop_layer_npu_pilot.json`：32 prompts，同样9组，共288张图。两者均为模型层窗口 `[0,8)`、512px、50点原生采样。
 
-最新对比延长缓存作用时间：step9写入一次，分别持续1/5/10/20步，同时保留旧Early20 R2。32题、10组、320张图，16个NPU芯片命令见[OBSERVATION_DURATION_COMPARISON.md](docs/OBSERVATION_DURATION_COMPARISON.md)。配置为`configs/observation_duration_comparison.json`。33项CPU/NPU数值测试通过，新正式评测待用户执行。
+正式生成和评分由用户执行。脚本先检查真实权重数值，再生成、评分并导出 comparison.html。旧评测目录不可用新分支源码续跑。
 
-原main的22项CPU数值测试保留。NPU分支增加设备、attention和RNG隔离检查，真实权重数值检查与正式效果的状态分别记录在NPU_RUNTIME.md。
-
-完整实现方案见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。这份文档对应当前代码；10月5日旧同层1/N方案不再代表实现。
-
-首轮默认8题、seed0、5组，共40张图：Base，step9／step19分别各一个STATIC和OBSERVED。每张非Base图只更新一次。两个组保留相同视觉条件、文字token、位置、容量和GEN CFG，区别只在文本Memory编码时是否读取图像。
-
-文本Memory经过全部28层UND连续计算，KV从各层attention输入自然写入。GEN使用完整图像VAE＋ViT上下文和文本Memory；原生准备接口重建位置和CFG。每次重算沿用该步当前噪声和t，随后原始采样器只推进一次。原始pilot缓存只用一步；最新对比在配置窗口内跨步保持缓存。
-
-每次更新保存早期预测图、x_t/t、前后velocity、全部文本Memory KV及四类短问答probe。问答通过缓存副本执行，仅供诊断，不回流到生成。问答正确性待人工标注；memory-only读取明确为非原生诊断。
-
-## 用户运行
-
-正式生成与评分由用户启动。脚本先绑定源码／权重／数据，再执行真实权重数值检查，通过后生成40张图、评分并导出HTML。默认配置为configs/observation_comparison.json。
-
-```bash
-cd /root/bagel-LatentCoT-NPU
-export BACKEND=npu
-export NPUS=0,2,4,6,8,10,12,14
-export OMP_NUM_THREADS=4
-export CONFIG="$PWD/configs/observation_comparison.json"
-unset COMPARISON_PROMPTS
-mkdir -p /root/outputs
-export RUN=/root/outputs/und_native_observation_npu_$(date +%Y%m%d_%H%M%S)
-set -o pipefail
-bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
-```
-
-在modelarts-job上执行。当前8张物理卡各有2个设备；上述命令每张卡选择一个Phy-ID。NPUS控制ASCEND_RT_VISIBLE_DEVICES，每个进程内部使用npu:0。运行前用npu-smi info确认分配和占用。仅保留上述两个比较脚本，不新增独立启动入口。结果在comparison.html、quality_report/和generation/worker_*/traces/；HTML内嵌早期图和probe。generation_seconds包含诊断，probe_seconds单独记录，不能作严格预算比较。
-
-支持原配置／源码／权重／分片数量不变时RESUME=1续跑。通用PROMPTS环境变量不会影响数据；自定义数据须显式设置COMPARISON_PROMPTS。
-
-## 历史路径与证据
-
-此前完整800题、seed0的7200张评测已完成。浅层独立UND循环在R1／R2有小幅正趋势，但净Repair区间跨零；R3／R4明确增加Damage。Early20 R4为412 Repair／1064 Damage。历史结果不是新完整UND观察方案的验证。
-
-旧runner和两份旧配置保留用于复现与数值参照，须显式指定window_comparison.json或feedback_comparison.json。当前默认路径不调用它们。旧冻结远端目录与结果保持原样。
-
-本次修改前的完整tracked源码和Git bundle已备份到工作区older/before-native-observation-memory-20261009_151938/。
+NPU 环境为 ModelArts 主机 `/root/bagel-LatentCoT-loop-layer-NPU`，Python 为 `/root/venvs/bagel-NPU/bin/python`。main 与 NPU 分支保持各自实现。本分支保留来源中的其他模块和数值测试作为参考，但默认入口只选择旧循环。
