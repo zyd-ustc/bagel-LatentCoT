@@ -59,6 +59,10 @@ def prepare_main():
             'suffix':'dynamic_final_writer_continuation', 'capacity':'full_prompt',
             'special_hidden_and_kv':'pinned_native', 'null_cfg':'native_bypass'},
         'loop':{'layer_window':config['layer_window'],'depth_and_time':'per_arm'}}
+    if config.get('memory_update')=='full_depth':
+        plan['memory_topologies'].update(writer='continuous_all_layers_every_round',
+            suffix='included_in_every_writer',recycle='last_UND_hidden_to_first_UND_layer',
+            gen_feedback_layers=config['layer_window'],kv_readout='same_layer_updated_hidden_projection')
     if config['experiment']=='feedback_pilot':
         plan['memory_topologies']={'mode':'native_full_interleaved_image_text_edit','implicit_loop':False,
             'capacity':'all_native_image_and_text_tokens','feedback':'full_text_reprefill_at_native_positions'}
@@ -170,7 +174,8 @@ def generate_main():
                     'memory_capacity_policy':'full_prompt',
                     'full_memory_lengths':list(generator.prompt_lengths) if mode!='BASE' else None,
                     'writer_body_passes_per_active_call':rounds if mode!='BASE' else 0,
-                    'writer_suffix_passes_per_active_call':int(mode!='BASE' and rounds>0 and cfg.end_layer<len(bundle.model.language_model.model.layers)),
+                    'writer_suffix_passes_per_active_call':(rounds if cfg.memory_update=='full_depth' else 1) * int(mode!='BASE' and rounds>0 and cfg.end_layer<len(bundle.model.language_model.model.layers)),
+                    'memory_update':cfg.memory_update,
                     'gen_body_passes_per_active_call':1+rounds,
                     'num_timesteps':steps}
                 record.update(loop_step_indexes=plan['time_windows'][arm]['loop_step_indexes'],
@@ -239,9 +244,9 @@ def validate(bundle,generator,runtime,depths):
             mask=seed.special_mask.cpu()
             results['state_contracts'][str(t)]={
                 'all_read_layers_present':all(set(capture.reads[r])==set(range(cfg.start_layer,len(runtime.decoder.layers))) for r in depths),
-                'writer_suffix_once_per_depth':capture.suffix_writer_count==len(depths)*(len(runtime.decoder.layers)-cfg.end_layer),
+                'writer_suffix_count_matches_topology':capture.suffix_writer_count==(0 if cfg.memory_update=='full_depth' else len(depths)*(len(runtime.decoder.layers)-cfg.end_layer)),
                 'all_hidden_updates_finite':all(row['finite'] for row in capture.hidden_rows),
-                'hidden_update_count':len([row for row in capture.hidden_rows if row['subset']=='all'])==max(depths)*(cfg.end_layer-cfg.start_layer),
+                'hidden_update_count':len([row for row in capture.hidden_rows if row['subset']=='all'])==max(depths)*((len(runtime.decoder.layers) if cfg.memory_update=='full_depth' else cfg.end_layer)-cfg.start_layer),
                 'special_hidden_pinned':all(row['equal'] for row in capture.hidden_rows if row['subset']=='special'),
                 'special_kv_pinned':all(torch.equal(kv[0][mask],capture.native[i][0][mask]) and
                     torch.equal(kv[1][mask],capture.native[i][1][mask]) for reads in capture.reads.values() for i,kv in reads.items())}

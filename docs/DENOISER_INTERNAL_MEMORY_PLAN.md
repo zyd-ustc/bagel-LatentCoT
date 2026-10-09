@@ -2,22 +2,22 @@
 
 ## 固定语义
 
-从 NPU 提交 13622854dcc9fb0a44532a337c7dce036060b1e9 提取旧路径。核心代码是 qwen_latent_cot/bagel/und_state_loop.py。本次分支不修改其计算。
+基于旧loop提交a87fa44实现连续完整UND更新。旧实现保留为数值参照，默认评测配置memory_update=full_depth，核心实现full_depth_memory.py。
 
-- BAGEL 保持原生 28 层 MoT、UND/GEN 专家、归一化、投影、RoPE 和 flow sampler，权重冻结。
-- 每个活跃去噪步，从原 prompt 的各层输入 hidden 初始化独立 Memory；容量为完整 prompt，不压缩。Memory 不跨去噪步保存。
-- 窗口 `[0,8)` 内，每层独立更新：H_l^(r+1) = UND_l(H_l^r; P_l, GEN_l^r KV, live self KV)。原 P_l 固定；特殊 token hidden/KV 固定为原生值。
-- Round0 GEN 读取原 prompt KV；后续 GEN 读取 Memory KV，替换原 prompt KV。每轮 GEN 从同一窗口入口 hidden 重算，不递推上轮 GEN 输出；各轮使用相同 x_t/t。
-- 更新后的 H_l 经过同一层原生 UND norm/K/V/RoPE 投影，供下一轮同层 GEN 读取。保存的 GEN KV 只用于 UND 更新，不直接供下一轮 GEN 读取。
-- 最后一次 writer 从窗口末层状态继续经过 UND 8–27 层一次，写入各层原生 attention 输入 KV。这一段不读取 GEN KV，也不回送前8层。
-- 最终 GEN 经过8–27层一次，读取更新后的 Memory KV。null-text CFG 走原生路径。没有 adapter、gate、输出 alpha、视觉理解回灌或文本解码。
-- R2 表示前8层执行3轮 GEN、2次 Memory 更新；每个活跃去噪步仅推进一次原生采样。
+- 每个活跃去噪步，单份H从原prompt的第0层输入hidden初始化。Memory容量、位置和特殊token固定规则不变，不跨去噪步保存。
+- 每轮writer从0到27层连续运行；第l层输出进入第l+1层，最后一层输出进入下一轮第0层。特殊token在各层恢复为该层原生prompt参考值。此次明确不处理深度错配。
+- 每层读取固定原prompt P_l和当前Memory self KV；0–7层另读取当前轮GEN_l KV。8–27层没有GEN KV，保持原GEN窗口及suffix计算量，不额外完成草稿或加入ViT。
+- 每层更新后的hidden用同一层原生UND norm/K/V/RoPE投影，生成供下一轮GEN读取的Memory KV。与旧body readout保持一致；不使用末层投影复制到所有层。
+- GEN每轮仍从同一个窗口入口重算0–7层：round0读取P，后续读取M并替换P。最后GEN只经过8–27层一次，读取最后一轮完整writer产生的对应层M。
+- R2为3次GEN body、2次完整28层UND writer。原prompt cache不可变，null-text CFG和非活跃时间步保持原生路径，每个去噪步仅推进一次sampler。
+- 保留BAGEL原生MoT、专家参数、归一化、投影、RoPE、全量prompt、BF16和原采样，不训练，不新增adapter、gate或alpha。完整UND遍历不是原生ViT图像理解等价路径。
+- config.memory_update=legacy_layerwise选择旧路径；full_depth选择上述新路径。两个32题配置除该字段外完全相同，支持配对同seed比较。
 
 ## ModelArts 执行
 
 SSH 为 modelarts-job。代码目录 `/root/bagel-LatentCoT-loop-layer-NPU`，分支 loop-layer-NPU。继承已有 Ascend SDPA、packed 变长 attention 和 BF16 适配，不承诺跨 CUDA/NPU 逐位一致。
 
-正式评测由用户启动。下面默认32题、9组、288张图，使用16个逻辑芯片。完整800题将 CONFIG 改为 configs/window_comparison.json。
+正式评测由用户启动。下面默认32题、9组、288张图，使用16个逻辑芯片。完整800题将 CONFIG 改为 configs/window_comparison.json。旧路径参照使用 configs/loop_layer_npu_legacy_pilot.json。
 
 ```bash
 cd /root/bagel-LatentCoT-loop-layer-NPU

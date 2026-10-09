@@ -66,6 +66,7 @@ def arm_configs(c):
     for w in c['windows']:
         for r in c['depths']:
             arms[f"{w['name']}_R{r}"]=asdict(LoopConfig(mode=MODE,extra_rounds=r,**c['layer_window'],
+                memory_update=c.get('memory_update','legacy_layerwise'),
                 progress_start=w['step_start']/48,progress_end=(w['step_end']-1)/48))
     return arms
 
@@ -83,7 +84,7 @@ def window_metadata(c):
         out[arm]={'step_start':min(steps) if steps else 0,'step_end':max(steps)+1 if steps else 0,
             'loop_calls':len(steps),'loop_step_indexes':steps,'extra_rounds':1 if observed else cfg['extra_rounds'],
             'memory_writer_calls':1 if observed else len(steps)*cfg['extra_rounds'],
-            'conditioning_kind':'fixed_observation_cache' if observed else 'legacy_local_loop' if steps else 'base',
+            'conditioning_kind':'fixed_observation_cache' if observed else cfg.get('memory_update','legacy_layerwise') if steps else 'base',
             'covered_delta_t':t(steps[0])-t(steps[-1]+1) if steps else 0.,
             't_first':t(steps[0]) if steps else None,'t_last':t(steps[-1]) if steps else None,
             't_after_window':t(steps[-1]+1) if steps else None}

@@ -1,9 +1,7 @@
-# BAGEL：分层 UND Memory loop（NPU）
+# BAGEL：连续完整 UND Memory loop（NPU）
 
-本页对应 `loop-layer-NPU` 分支，从 NPU 提取已存在的旧循环。运行入口默认选择旧 `loop_grid`，不启用图像观察、文字反馈或固定 observation cache。旧循环实现和 Ascend 运行后端没有改动。
+本页对应 `loop-layer-NPU` 分支。Memory 每轮从0层连续经过全部28层 UND，末层输出回送下一轮0层。GEN仍在 `[0,8)` 重算，suffix只执行一次。原生权重、全量prompt容量、特殊token固定、同层UND投影、CFG和采样不变。不处理出口回送的深度错配，不添加adapter/gate/alpha。
 
-架构与执行命令见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。默认正式配置为 `configs/window_comparison.json`：800 prompts、seed0、Base＋Early10/Early20×R1/2/3/4，共7200张图。小规模配置为 `configs/loop_layer_npu_pilot.json`：32 prompts，同样9组，共288张图。两者均为模型层窗口 `[0,8)`、512px、50点原生采样。
+架构与命令见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。默认正式配置 `configs/window_comparison.json`：800题、seed0、Base＋Early10/Early20×R1/2/3/4，共7200图。小规模配置 `configs/loop_layer_npu_pilot.json`：32题，同样9组，共288图。全部设置 `memory_update=full_depth`。历史各层独立更新实现保留在und_state_loop.py，配置memory_update=legacy_layerwise可明确选择旧路径。
 
-正式生成和评分由用户执行。脚本先检查真实权重数值，再生成、评分并导出 comparison.html。旧评测目录不可用新分支源码续跑。
-
-NPU 环境为 ModelArts 主机 `/root/bagel-LatentCoT-loop-layer-NPU`，Python 为 `/root/venvs/bagel-NPU/bin/python`。main 与 NPU 分支保持各自实现。本分支保留来源中的其他模块和数值测试作为参考，但默认入口只选择旧循环。
+代码目录 `/root/bagel-LatentCoT-loop-layer-NPU`，Python `/root/venvs/bagel-NPU/bin/python`。正式评测由用户执行，脚本先检查真实权重数值，再生成、评分并导出comparison.html。必须使用新目录，不能续跑旧分支源码绑定的plan。数值检查不证明语义增益或质量保持。

@@ -38,5 +38,5 @@
   ],
   "expected_prompts": 32,
   "benchmark": "data/prompts32.jsonl",
-  "memory_update": "full_depth"
+  "memory_update": "legacy_layerwise"
 }

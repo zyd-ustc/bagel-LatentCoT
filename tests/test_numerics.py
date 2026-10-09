@@ -103,10 +103,12 @@ def test_call_and_sample_isolation_native_bypass_seed_cache_and_weights_immutabl
         assert all(torch.equal(model.language_model.state_dict()[name],w) for name,w in weights.items())
     finally:runtime.close()
 
-def test_real_weight_validator_orchestration_with_cpu_decoder():
+@pytest.mark.parametrize("memory_update",["legacy_layerwise","full_depth"])
+def test_real_weight_validator_orchestration_with_cpu_decoder(memory_update):
     from types import MethodType
     import importlib.util
     model,kwargs,runtime=setup();cache=kwargs['past_key_values'];seed=runtime.layerwise.seeds[cache]
+    runtime.config=replace(runtime.config,memory_update=memory_update)
     def flow(this,*,x_t,cfg_text_scale=1.,**unused):
         return runtime.decoder.forward_inference(**{**kwargs,'packed_query_sequence':x_t}).packed_query_sequence*cfg_text_scale
     model._forward_flow=MethodType(flow,model)

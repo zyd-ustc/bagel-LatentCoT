@@ -30,8 +30,8 @@ def kv_metrics(reference, candidate, special_mask, **labels):
 class MemoryRoundCapture:
     """Copy final GEN reads and body updates; never mutate observed tensors.
 
-    UND suffix continuation runs once after the final body writer. Only body
-    updates are compared across rounds. All complete prompt slots are retained.
+    Legacy suffix continuation runs once; full-depth writers report all layers
+    as recurrent body updates. All complete prompt slots are retained.
     """
     def __init__(self, deepest):
         self.deepest=deepest

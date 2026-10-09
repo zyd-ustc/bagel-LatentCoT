@@ -37,5 +37,6 @@
     4
   ],
   "expected_prompts": 800,
-  "benchmark": "data/geneval2_800.jsonl"
+  "benchmark": "data/geneval2_800.jsonl",
+  "memory_update": "full_depth"
 }
