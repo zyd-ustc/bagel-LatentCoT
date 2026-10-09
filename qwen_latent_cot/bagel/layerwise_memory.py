@@ -125,7 +125,7 @@ class LayerwiseMemoryLoop:
         self.seeds.clear()
 
     def run(self, kwargs, runtime):
-        if runtime.config.memory_update == 'full_depth':
+        if runtime.config.memory_update in ('full_depth','full_depth_restart'):
             from .full_depth_memory import run_und_state
         else:
             from .und_state_loop import run_und_state

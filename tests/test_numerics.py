@@ -103,7 +103,7 @@ def test_call_and_sample_isolation_native_bypass_seed_cache_and_weights_immutabl
         assert all(torch.equal(model.language_model.state_dict()[name],w) for name,w in weights.items())
     finally:runtime.close()
 
-@pytest.mark.parametrize("memory_update",["legacy_layerwise","full_depth"])
+@pytest.mark.parametrize("memory_update",["legacy_layerwise","full_depth","full_depth_restart"])
 def test_real_weight_validator_orchestration_with_cpu_decoder(memory_update):
     from types import MethodType
     import importlib.util

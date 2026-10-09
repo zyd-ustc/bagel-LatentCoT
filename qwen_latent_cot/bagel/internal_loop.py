@@ -19,7 +19,7 @@ class LoopConfig:
     def __post_init__(self):
         if self.mode not in MODES or self.extra_rounds < 0:
             raise ValueError('only Base and persistent UND Memory loop are supported')
-        if self.memory_update not in ('legacy_layerwise','full_depth'):
+        if self.memory_update not in ('legacy_layerwise','full_depth','full_depth_restart'):
             raise ValueError('unknown Memory update topology')
         if not 0 <= self.start_layer < self.end_layer:
             raise ValueError('layer window must be nonempty and half-open')

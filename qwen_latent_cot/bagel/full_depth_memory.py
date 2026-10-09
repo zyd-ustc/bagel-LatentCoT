@@ -1,4 +1,4 @@
-"""Continuous full-depth UND Memory, with final hidden recycled between rounds.
+"""Continuous full-depth UND Memory, with recycled or native-restarted entrance.
 
 GEN computation and conditioning layout remain identical to the legacy path.
 Only body layers have current GEN KV. All UND layers read fixed native P and
@@ -41,6 +41,7 @@ def run_und_state(loop,kwargs,runtime):
     # These are local to this call. Initial prefill tensors remain immutable.
     writer=seed.layer_hidden[cfg.start_layer].clone()
     bank=dict(native)
+    restart=cfg.memory_update=='full_depth_restart'
 
     def pin_hidden(index,state):
         return torch.where(seed.special_mask[:,None],seed.layer_hidden[index],state)
@@ -79,9 +80,13 @@ def run_und_state(loop,kwargs,runtime):
                 runtime.diagnostics.append(dict(phase='gen',layer=index,round=round_index,
                     gen_reads_memory=replacing,memory_slots_per_sample=list(seed.lengths),
                     prompt_read_per_sample=[not replacing]*len(seed.lengths),
-                    memory_read_kind='continuous_full_depth_und_state' if replacing else 'native_prompt',
+                    memory_read_kind=cfg.memory_update if replacing else 'native_prompt',
                     progress=runtime.progress,branch='conditional'))
         if round_index==cfg.extra_rounds:break
+        if restart:
+            # Repeat R1's native entrance. Previous Memory affects this writer
+            # through the freshly recomputed GEN KV, not through final hidden.
+            writer=seed.layer_hidden[cfg.start_layer].clone()
         for index in layers:
             before=pin_hidden(index,writer);old_kv=bank[index]
             additions=[gen_kv[index]] if index in gen_kv else []
@@ -104,7 +109,7 @@ def run_und_state(loop,kwargs,runtime):
                 for sample,(a,b) in enumerate(zip(before.split(seed.lengths),writer.split(seed.lengths))):
                     runtime.diagnostics.append(dict(phase='writer',layer=index,round=round_index,sample=sample,
                         progress=runtime.progress,branch='conditional',feedback_stored=index in gen_kv,
-                        memory_update='full_depth',hidden_update_ratio=float((b-a).float().norm()/a.float().norm().clamp_min(1e-12)),
+                        memory_update=cfg.memory_update,hidden_update_ratio=float((b-a).float().norm()/a.float().norm().clamp_min(1e-12)),
                         **memory_slot_stats(b)))
     for index in range(cfg.end_layer,len(decoder.layers)):
         observe_read(index,'suffix')

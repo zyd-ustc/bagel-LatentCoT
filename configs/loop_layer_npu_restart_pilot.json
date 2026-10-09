@@ -1,0 +1,42 @@
+{
+  "schema": 3,
+  "expected_num_hidden_layers": 28,
+  "windows": [
+    {
+      "name": "EARLY_10",
+      "step_start": 0,
+      "step_end": 10
+    },
+    {
+      "name": "EARLY_20",
+      "step_start": 0,
+      "step_end": 20
+    }
+  ],
+  "sampling": {
+    "image_size": 512,
+    "num_timesteps": 50,
+    "timestep_shift": 3.0,
+    "cfg_text_scale": 4.0,
+    "cfg_renorm_type": "global"
+  },
+  "seeds": [
+    0
+  ],
+  "max_prompts": 32,
+  "comparison_axis": "time_and_depth",
+  "layer_window": {
+    "start_layer": 0,
+    "end_layer": 8
+  },
+  "experiment": "loop_grid",
+  "depths": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "expected_prompts": 32,
+  "benchmark": "data/prompts32.jsonl",
+  "memory_update": "full_depth_restart"
+}
