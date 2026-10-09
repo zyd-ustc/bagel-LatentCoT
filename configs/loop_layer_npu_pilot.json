@@ -23,7 +23,7 @@
   "seeds": [
     0
   ],
-  "max_prompts": 800,
+  "max_prompts": 32,
   "comparison_axis": "time_and_depth",
   "layer_window": {
     "start_layer": 0,
@@ -36,7 +36,7 @@
     3,
     4
   ],
-  "expected_prompts": 800,
-  "benchmark": "data/geneval2_800.jsonl",
-  "memory_update": "full_depth_restart"
+  "expected_prompts": 32,
+  "benchmark": "data/prompts32.jsonl",
+  "memory_update": "full_depth"
 }

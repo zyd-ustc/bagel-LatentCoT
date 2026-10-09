@@ -1,10 +1,10 @@
 """Native T2I preparation, deterministic per-prompt noise and one final readout."""
-from contextlib import nullcontext
 from types import MethodType
 import hashlib
 import torch
 from PIL import Image
 from .modeling.bagel.qwen2_navit import NaiveCache
+from .accelerator import autocast_for
 
 
 def to_device(values, device):
@@ -22,7 +22,7 @@ class T2IGenerator:
         self.device = next(self.model.parameters()).device
 
     def autocast(self):
-        return torch.autocast('cuda', dtype=torch.bfloat16) if self.device.type == 'cuda' else nullcontext()
+        return autocast_for(self.device)
 
     @torch.no_grad()
     def prepare(self, prompts, shapes, seeds):

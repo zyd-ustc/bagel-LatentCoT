@@ -1,69 +1,69 @@
-# 原生早期图像观察＋完整 UND Memory 更新
+# 连续 UND Memory loop：main / loop-layer-NPU
 
-日期：2026-10-09。状态：代码已实现；22项CPU数值测试通过。CPU模拟流程通过分片生成／评分／HTML、续跑和配对／文件完整性检查。真实权重数值检查及正式质量评测未执行。此文件描述当前实现，不沿用10月5日旧方案的同层1/N循环、压缩或训练安排。
+## 固定语义
 
-目标是在固定 x_t/t 下，通过可检查的早期视觉证据更新条件，然后重算 GEN。先只更新一次，冻结 BAGEL 全部参数，不引入 adapter、gate、alpha、压缩或训练模块。
+基于旧loop提交a87fa44实现连续完整UND更新。旧实现保留为数值参照，原完整回送评测配置memory_update=full_depth，核心实现full_depth_memory.py。
 
-## 执行路径
+- 每个活跃去噪步，单份H从原prompt的第0层输入hidden初始化。Memory容量、位置和特殊token固定规则不变，不跨去噪步保存。
+- 每轮writer从0到27层连续运行；第l层输出进入第l+1层，最后一层输出进入下一轮第0层。特殊token在各层恢复为该层原生prompt参考值。此次明确不处理深度错配。
+- 每层读取固定原prompt P_l和当前Memory self KV；0–7层另读取当前轮GEN_l KV。8–27层没有GEN KV，保持原GEN窗口及suffix计算量，不额外完成草稿或加入ViT。
+- 0–7层更新后的hidden用同一层原生UND norm/K/V/RoPE投影，保持旧body readout。8–27层从原生attention自然保存block输入KV，恢复旧suffix读出。UND输出继续进入下一层并回送下一轮；不使用末层投影复制到所有层。
+- GEN每轮仍从同一个窗口入口重算0–7层：round0读取P，后续读取M并替换P。最后GEN只经过8–27层一次，读取最后一轮完整writer产生的对应层M。
+- R2为3次GEN body、2次完整28层UND writer。原prompt cache不可变，null-text CFG和非活跃时间步保持原生路径，每个去噪步仅推进一次sampler。
+- 保留BAGEL原生MoT、专家参数、归一化、投影、RoPE、全量prompt、BF16和原采样，不训练，不新增adapter、gate或alpha。完整UND遍历不是原生ViT图像理解等价路径。
+- config.memory_update=legacy_layerwise选择旧路径；full_depth选择上述新路径。两个32题配置除该字段外完全相同，支持配对同seed比较。
 
-1. 按原生50点、shift3采样走到预定 step。先求原生速度 v0。
-2. 依 BAGEL 的 x_t=(1-t)x0+tε、v=ε-x0，构造 x0_hat=x_t-t*v0。
-3. 用原生 VAE decode 得到早期预测图。保存原始预测 latent；图像仅作原生显示范围裁剪。它不是最终图像，也不是已知正确的观察。
-4. 调用原生图像接口：VAE＋ViT，完整保留图像 token，构建编辑用视觉上下文。
-5. 原始 prompt 通过原生 tokenizer／embedding，从第0层连续经过全部28层 UND，以因果 attention 读取视觉上下文。保留完整 prompt、BOS/EOS、token顺序和原生追加位置。每层 KV 在 attention 输入处原生写入，禁止把 block 输出重新投影回同一层。
-6. 条件使用完整视觉上下文＋文本 Memory。通过原生 prepare_vae_latent 和两个 CFG 准备接口重建 query 位置／索引；丢弃准备接口生成的随机噪声，始终使用同一个当前 x_t/t。
-7. 原生 GEN 重算得到 v1，仅用 v1推进一次 Euler 更新。
-8. 观察缓存在该调用结束后释放，下一采样步恢复原始文生图条件。不跨时间步缓存，不回送 H28 到第0层，不执行第二次 writer。
+## 重复 R1 的连续 writer：full_depth_restart
 
-文本 Memory 容量和 hidden 维度不变，但完整视觉上下文增加了 token 和开销。新方案不声称对当前浅层循环等计算。
+人工审查显示 full_depth 的 R1 保留画风，R2 发生画风和语义跳变，R3/4 后续变化较小。恢复 8–27 层原生输入 KV 后该现象仍存在。末层 hidden 回送首层是待验证原因，不是已确认原因。
 
-基线采样 CFG text4；本次重算使用 BAGEL 原生编辑 CFG text3、image1.5、interval(0.4,1]、global renormalization。静态／观察两组使用相同 CFG。相对 Base 的变化包含图像条件及 CFG 改变，不能全部归因于 Memory。
+main 小规模配置 `configs/repeat_r1_pilot.json` 和 NPU 配置 `configs/loop_layer_npu_restart_pilot.json`，只将 `memory_update` 改为 `full_depth_restart`。保留既有配置，便于复现。
 
-## 静态／观察对照
+- 每轮都从原生第0层入口 hidden 出发，连续经过 UND 0–27 层。各层输出进入下一层，不恢复旧的独立层状态。
+- 不将第27层输出回送第0层。每轮 writer 的计算规则与当前 full_depth 的 R1 完全相同。
+- 轮间反馈为 `M1 → GEN1 → GEN1 KV → writer2 → M2`。R1 更新通过 Memory 改变下一轮 GEN 的隐藏状态和 KV，再被下一轮 UND writer 读取。不显式累加 `H1−H0`，不新增残差、adapter、gate、alpha或压缩。
+- 0–7层读取当前 GEN KV；8–27层没有 GEN KV。body 读出更新后 hidden 的 KV，suffix 读出原生 attention 输入 KV。原 prompt 锚点、special 固定、GEN 入口重置与最终 GEN suffix 一次执行均不变。
+- R1 与原 full_depth 的 R1 应数值一致。R2 的第二轮 UND 入口应等于原生入口，而第二轮 writer 的结果应依赖 GEN1 KV。这些是数值合同，不代表语义或质量提升。
+- R2 仍是3次 GEN body和2次完整 UND writer。计算量不因重置入口而减少。状态不跨去噪步保存。
 
-- STATIC：相同早期预测图，保留全部 GEN 图像上下文。prompt 从原生 embedding 经完整 UND，但编码时不读取图像 KV；保留与 OBSERVED 相同的 shifted文字位置。编码结束后将完整视觉前缀与文本 KV按原生顺序组合。
-- OBSERVED：原生图像→文本 prefill，文本读取视觉前缀。这条上下文构造与原生编辑接口数值对齐。
-- STATIC 是显式读取干预，不能称为完全原生的联合上下文。
-- 两者的 token IDs、容量、位置、视觉前缀、重算噪声状态、t和GEN参数相同，仅 Memory writer 的图像读取不同。
+该路径验证“重复原生入口的 R1 writer 能否保留画风，同时通过 GEN 反馈产生后续编辑”。它不保证直接累积 R1 的 hidden 增量，也不保证反馈不会衰减。正式评测由用户启动。
 
-text-removed CFG只保留源图像VAE＋ViT；image-removed CFG独立prefill原始prompt，使用该分支自己的原生位置。不跨分支复制条件。
+## H200 执行
 
-## 首轮实验：40张图
+main 已合入重复R1 writer，默认小规模配置为 `configs/repeat_r1_pilot.json`。完整800题配置为 `configs/window_comparison.json`，同样使用 `full_depth_restart`。CUDA 继续调用原生 FlashAttention，不调用 Ascend SDPA。
 
-8个既有prompt、seed0，Base＋step9 STATIC／OBSERVED＋step19 STATIC／OBSERVED。每个非Base arm只更新一次。step9的t≈0.9302，step19的t≈0.8257。它们是两个分别生成完整图像的配对arm，不是在一张图上更新两次。
+```bash
+cd /private/yida_workspace/bagel-LatentCoT-main-repeat-r1-20261009
+export BACKEND=cuda
+export GPUS=0,1,2,3,4,5,6,7
+unset NPUS ASCEND_RT_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES COMPARISON_PROMPTS
+export OMP_NUM_THREADS=4
+export CONFIG="$PWD/configs/repeat_r1_pilot.json"
+export RUN=/private/yida_workspace/outputs/repeat_r1_h200_$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
+```
 
-只保留两项直接机制比较：同step OBSERVED对STATIC。仍报告各组对Base的结果，但不将其全部归因于Memory。不能凭变化或个例启动训练。
+使用分配给本任务的 GPU。全量Memory和GEN规则跨CUDA/NPU保持一致，不承诺两个后端逐位一致。正式评测由用户启动。
 
-## 问答与追踪
+## ModelArts 执行
 
-每个arm取原有vqa_list前三个问题，仅传问题，不传目标答案。没有生成完整反馈文本。短答预算16 tokens；达到上限记录 incomplete，不把它当已验证回答。
+SSH 为 modelarts-job。代码目录 `/root/bagel-LatentCoT-loop-layer-NPU`，分支 loop-layer-NPU。继承已有 Ascend SDPA、packed 变长 attention 和 BF16 适配，不承诺跨 CUDA/NPU 逐位一致。
 
-四种只读probe：
+正式评测由用户启动。下面选择重复R1路径，32题、9组、288张图，使用16个逻辑芯片。完整800题将 CONFIG 改为 configs/window_comparison.json。旧路径参照使用 configs/loop_layer_npu_legacy_pilot.json。
 
-1. native_vit_image：早期预测图的原生ViT-only理解上下文，校准观察能力。
-2. native_edit_visual：原生VAE＋ViT图像上下文，没有文本Memory。
-3. full_edit_context：视觉上下文＋Memory；答案可能直接来自图像，不足以证明Memory内容。
-4. memory_only_diagnostic：移除视觉KV，只保留各层文本Memory及原生shifted位置；上下文发生改变，明确标为非原生诊断。
+```bash
+cd /root/bagel-LatentCoT-loop-layer-NPU
+npu-smi info
+export BACKEND=npu
+export NPUS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export OMP_NUM_THREADS=4
+export CONFIG="$PWD/configs/loop_layer_npu_restart_pilot.json"
+unset COMPARISON_PROMPTS
+mkdir -p /root/outputs
+export RUN=/root/outputs/repeat_r1_$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
+```
 
-问题和生成的回答仅写入深拷贝。它们不进入GEN，不改变 canonical cache，不携带到下一采样步。标签待人工依据保存的早期预测图填写；不使用prompt目标或最终图像作当前观察标签。Memory初始化仍含prompt，因此存在间接复述风险。
-
-每次更新保存early_prediction.png、event.json及state.pt。state包括x_t、t、v0、v1、未裁剪x0_hat、全部28层文本Memory K/V。event记录token IDs、位置、长度、图像及state文件hash、x_t/t hash、CFG、velocity变化、四种probe原始回答、完整性及probe时间。续跑和报告会校验文件。静态／观察配对会检查相同step的更新前状态、预测图、文字布局及CFG。完整图像KV未保存，可从绑定模型及早期图像重建。
-
-原始latent和原生显示图有明确区别，人工问答只针对显示图；不能把高噪声预测图中的伪影当作可靠事实。
-
-## 正确性与准入
-
-CPU检查连续UND上下文与原生prefill一致、静态读取干预、容量／位置保持、probe不修改缓存、只在step9／19重算一次、x_t/t不变、失败后恢复原生方法。真实权重检查由用户启动，检查原生编辑上下文parity、缓存／权重不变、有限且可重复的velocity；不据此声称语义收益。
-
-数值检查→人工观察/probe校准→OBSERVED对STATIC的Repair／Damage和质量→判断是否有信息增量。若图像本身不可判读，记录unknown；若full-context能答而Memory-only不能答，先排查读取接口，不直接宣布Memory无信息。没有成功参照前不蒸馏，不训练。
-
-Looped-DiT借鉴仅为条件状态随深度连续传播、视觉信息参与条件更新。官方65a7705的DoubleStreamBlock拼接两路Q/K/V联合attention，并携带img、txt穿过body和各轮。本方案保持BAGEL原生的图像prefill→因果文本读取→GEN编辑顺序，不复现其对称joint attention、XSA、gate或GEN hidden跨body回送。
-
-## 源码与入口
-
-- BAGEL固定revision：056b5fd51a88c1eb4547318609e25d40080fcf87；来源hash见modeling/native_source.json。
-- bagel.py：prepare_prompts／forward_cache_update_text、forward_cache_update_vit、forward_cache_update_vae、generate_text、generate_image／_forward_flow。
-- 新核心：qwen_latent_cot/bagel/observation_memory.py。
-- 配置：configs/observation_comparison.json；数据：data/observation8.jsonl。
-- 入口仍只有scripts/compare_windows.py和compare_windows_8gpu.sh。默认配置已改为新方案。
-- 历史两个配置仍可显式指定，用于复现旧评测；不覆盖远端已完成的7200张结果或冻结源码快照。
+脚本绑定源码、权重、数据与配置；真实权重检查通过后生成、评分，再输出 comparison.html 和 quality_report。质量评分是 VLM 代理；GM 上升不能直接认定质量或净 Repair 改善。正式结果尚需本分支命令执行。

@@ -103,10 +103,12 @@ def test_call_and_sample_isolation_native_bypass_seed_cache_and_weights_immutabl
         assert all(torch.equal(model.language_model.state_dict()[name],w) for name,w in weights.items())
     finally:runtime.close()
 
-def test_real_weight_validator_orchestration_with_cpu_decoder():
+@pytest.mark.parametrize("memory_update",["legacy_layerwise","full_depth","full_depth_restart"])
+def test_real_weight_validator_orchestration_with_cpu_decoder(memory_update):
     from types import MethodType
     import importlib.util
     model,kwargs,runtime=setup();cache=kwargs['past_key_values'];seed=runtime.layerwise.seeds[cache]
+    runtime.config=replace(runtime.config,memory_update=memory_update)
     def flow(this,*,x_t,cfg_text_scale=1.,**unused):
         return runtime.decoder.forward_inference(**{**kwargs,'packed_query_sequence':x_t}).packed_query_sequence*cfg_text_scale
     model._forward_flow=MethodType(flow,model)
@@ -276,8 +278,8 @@ def test_full_und_observation_matches_native_prefill_and_static_read_control():
     assert all(torch.equal(context['past_key_values'].key_cache[i],k) and torch.equal(context['past_key_values'].value_cache[i],v) for i,(k,v) in before.items())
 
 
-@pytest.mark.parametrize('step_index',[9,19])
-def test_observation_recomputes_velocity_once_at_fixed_noise_time_and_restores_hook(tmp_path,step_index):
+@pytest.mark.parametrize('step_index,duration',[(9,1),(19,1),(9,5),(9,10),(9,20)])
+def test_observation_fixed_cache_window_at_current_noise_time_and_restores_hook(tmp_path,step_index,duration):
     from PIL import Image
     from qwen_latent_cot.bagel.observation_memory import ObservationMemoryGenerator,tensor_hash
     class Model(torch.nn.Module):
@@ -292,26 +294,70 @@ def test_observation_recomputes_velocity_once_at_fixed_noise_time_and_restores_h
             for i,t in enumerate(ts[:-1]):
                 v=self._forward_flow(x_t=x,timestep=torch.full((len(x),),t),past_key_values='native')
                 x=x-v*(ts[i]-ts[i+1])
+            self.final_latent=x;self.schedule=ts
             return [x]
     model=Model();original=model._forward_flow
     gen=ObservationMemoryGenerator.__new__(ObservationMemoryGenerator)
     gen.model=model;gen.device=torch.device('cpu');gen.runtime=None;gen.observation_step=step_index;gen.observe=True
+    gen.end_step=step_index+duration
     gen.questions=['How many objects?'];gen.probe_max_tokens=2;gen.trace_dir=tmp_path;gen.edit_sampling={'cfg_text_scale':3.,'cfg_img_scale':1.5,'cfg_interval':[.4,1.]}
+    writer_calls=[]
     def conditions(*args):
+        writer_calls.append(args)
         cache=NaiveCache(1);cache.key_cache[0]=torch.ones(3,1,2);cache.value_cache[0]=torch.ones(3,1,2)
         return {'past_key_values':'updated'},dict(past_key_values=cache),{},dict(visual_prefix_length=1)
     gen.engine=SimpleNamespace(prepare_conditions=conditions,probe=lambda *args:{'fake_probe':'never reaches GEN'})
     gen.prepare=lambda *args:({'packed_init_noises':torch.ones(2,3)},['common_noise'])
     gen.decode=lambda *args:Image.new('RGB',(512,512),'gray')
-    images,hashes=gen.generate(['prompt'],[(512,512)],[0])
-    assert len(model.calls)==50 and hashes==['common_noise'] and len(gen.events)==1
+    images,hashes=gen.generate(['prompt'],[(512,512)],[0],timestep_shift=3.)
+    assert len(model.calls)==49+duration and hashes==['common_noise'] and len(gen.events)==duration
+    assert len(writer_calls)==1 and [e['updates'] for e in gen.events]==[1]+[0]*(duration-1)
+    assert sum(bool(e['probes']) for e in gen.events)==1 and gen.events[-1]['held_memory_unchanged']
+    updated=[c for c in model.calls if c[2]=='updated']
+    assert len(updated)==duration
+    assert torch.equal(torch.tensor([float(c[1][0]) for c in updated]),model.schedule[step_index:gen.end_step])
+    expected=.8-.1*(model.schedule[step_index]-model.schedule[gen.end_step])
+    assert torch.allclose(model.final_latent,torch.full_like(model.final_latent,expected),atol=1e-6)
     a,b=model.calls[step_index:step_index+2]
     assert torch.equal(a[0],b[0]) and torch.equal(a[1],b[1])
     assert a[2]=='native' and b[2]=='updated'
     assert gen.events[0]['step_index']==step_index and gen.events[0]['updates']==1
     assert gen.events[0]['x_t_sha256']==tensor_hash(a[0])
     assert model._forward_flow==original and (tmp_path/'state.pt').exists()
+    from copy import deepcopy
+    from qwen_latent_cot.evaluation.io import validate_observation_record
+    record=dict(arm='test_observed',valid_file=True,observation_step=step_index,
+        conditioning_end_step=gen.end_step,observation_events=deepcopy(gen.events))
+    validate_observation_record(record)
+    missing=deepcopy(record);missing['observation_events'].pop()
+    with pytest.raises(ValueError,match='coverage'):validate_observation_record(missing)
+    mutable=deepcopy(record);mutable['observation_events'][-1]['held_memory_unchanged']=False
+    with pytest.raises(ValueError,match='immutability'):validate_observation_record(mutable)
+    if duration>1:
+        repeated=deepcopy(record);repeated['observation_events'][1]['updates']=1
+        with pytest.raises(ValueError,match='count'):validate_observation_record(repeated)
     # Failure must also restore the original denoiser method.
     gen.decode=lambda *args:(_ for _ in ()).throw(RuntimeError('diagnostic failure'))
     with pytest.raises(RuntimeError,match='diagnostic failure'):gen.generate(['prompt'],[(512,512)],[0])
     assert model._forward_flow==original
+
+
+def test_duration_arm_coverage_legacy_control_and_comparisons():
+    import json
+    from pathlib import Path
+    from qwen_latent_cot.evaluation.windows import validate_config,arm_configs,window_metadata,comparison_pairs,reference_arm
+    root=Path(__file__).resolve().parents[1]
+    c=validate_config(json.loads((root/'configs/observation_duration_comparison.json').read_text()),28)
+    arms=arm_configs(c);windows=window_metadata(c)
+    assert len(arms)==10 and c['expected_prompts']==32
+    old=arm_configs(json.loads((root/'configs/loop_layer_npu_legacy_pilot.json').read_text()))['EARLY_20_R2']
+    assert arms['LEGACY_EARLY_20_R2']==old
+    assert windows['LEGACY_EARLY_20_R2']['loop_step_indexes']==list(range(20))
+    for n in (1,5,10,20):
+        for kind in ('STATIC','OBSERVED'):
+            name=f'STEP_09_L{n:02d}_{kind}'
+            assert windows[name]['loop_step_indexes']==list(range(9,9+n))
+            assert windows[name]['memory_writer_calls']==1
+    assert windows['STEP_09_L20_OBSERVED']['covered_delta_t']>=windows['LEGACY_EARLY_20_R2']['covered_delta_t']
+    assert len(comparison_pairs(c))==11 and reference_arm(c)=='LEGACY_EARLY_20_R2'
+    assert all(a in arms and b in arms for a,b in comparison_pairs(c))

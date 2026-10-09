@@ -1,0 +1,25 @@
+{
+  "schema": 3,
+  "experiment": "observation_memory",
+  "comparison_axis": "fixed_observation_cache_duration",
+  "expected_num_hidden_layers": 28,
+  "layer_window": {"start_layer": 0, "end_layer": 28},
+  "observation_step": 9,
+  "conditioning_durations": [1, 5, 10, 20],
+  "updates_per_image": 1,
+  "legacy_early20_r2": true,
+  "sampling": {
+    "image_size": 512,
+    "num_timesteps": 50,
+    "timestep_shift": 3.0,
+    "cfg_text_scale": 4.0,
+    "cfg_renorm_type": "global"
+  },
+  "edit_sampling": {"cfg_text_scale": 3.0, "cfg_img_scale": 1.5, "cfg_interval": [0.4, 1.0]},
+  "seeds": [0],
+  "max_prompts": 32,
+  "expected_prompts": 32,
+  "benchmark": "data/prompts32.jsonl",
+  "probe_questions_per_image": 3,
+  "probe_max_tokens": 16
+}

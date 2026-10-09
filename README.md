@@ -1,10 +1,34 @@
-# BAGEL：原生观察驱动的 denoiser 内部 Memory
+# BAGEL：重复 R1 的连续 UND Memory loop
 
-当前默认方案是 **一次早期图像预测→完整原生 UND 更新→固定 x_t/t 重算 GEN**。没有完整文字反馈解码、adapter、gate、压缩或训练。正式质量效果尚未验证。
+main 当前测试路径为 `full_depth_restart`：每轮从原生第0层 hidden 出发，Memory 连续经过 UND 0–27 层。前一层输出进入下一层；末层 hidden 不回送首层。轮间信息通过 `M1 → GEN1 → GEN1 KV → writer2 → M2` 传递。GEN 每轮重算 `[0,8)`，最后执行一次 GEN suffix。0–7层保留更新后 hidden 的 KV 投影，8–27层保留原生 attention 输入 KV。
 
-22项CPU数值测试及CPU模拟流程检查已通过。真实权重检查由下方命令启动；CPU结果不证明语义收益或图像质量。
+保持原生 BAGEL 权重、MoT、全量 prompt、位置、特殊 token、CFG 和采样。不添加 adapter、gate、alpha、压缩或训练。该方案不使用 ViT，也不等价于原生图像理解。
 
-完整实现方案见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。这份文档对应当前代码；10月5日旧同层1/N方案不再代表实现。
+本地 CPU 数值测试40项通过；7项 NPU 测试因无设备跳过。新路径 R1 与原 full_depth 的 R1 数值一致。测试确认第二轮 UND 更新依赖 GEN1 KV；语义和画风改善尚待正式评测。
+
+方案见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。默认小规模配置 `configs/repeat_r1_pilot.json`：32题、seed0、Base＋Early10/Early20×R1/2/3/4，共288图。完整配置 `configs/window_comparison.json`：800题，共7200图。两者均使用 full_depth_restart。保留 full_depth 末层回送和 legacy_layerwise 独立层更新作为显式参照。
+
+## H200 用户运行
+
+正式评测由用户启动。下面目录为本次同步的 main 快照；GPUS 是该节点的本地卡号。
+
+```bash
+cd /private/yida_workspace/bagel-LatentCoT-main-repeat-r1-20261009
+export BACKEND=cuda
+export GPUS=0,1,2,3,4,5,6,7
+unset NPUS ASCEND_RT_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES COMPARISON_PROMPTS
+export OMP_NUM_THREADS=4
+export CONFIG="$PWD/configs/repeat_r1_pilot.json"
+export RUN=/private/yida_workspace/outputs/repeat_r1_h200_$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
+```
+
+脚本先执行真实权重数值检查，通过后生成、打分和导出 comparison.html。需要使用新输出目录。分页 HTML 依赖 gallery/，本地查看须下载整个结果目录。GPU 时间仅为工程记录。NPU 仍支持 BACKEND=npu 和 NPUS，执行说明见方案文档。
+
+## 原生图像观察路径（显式配置保留）
+
+原生观察路径使用 `configs/observation_comparison.json`，不由上述默认配置启动。其计算方式为一次早期图像预测→完整原生 UND 更新→固定 x_t/t 重算 GEN。没有完整文字反馈解码。
 
 首轮默认8题、seed0、5组，共40张图：Base，step9／step19分别各一个STATIC和OBSERVED。每张非Base图只更新一次。两个组保留相同视觉条件、文字token、位置、容量和GEN CFG，区别只在文本Memory编码时是否读取图像。
 
@@ -12,25 +36,6 @@
 
 每次更新保存早期预测图、x_t/t、前后velocity、全部文本Memory KV及四类短问答probe。问答通过缓存副本执行，仅供诊断，不回流到生成。问答正确性待人工标注；memory-only读取明确为非原生诊断。
 
-## 用户运行
-
-正式GPU检查、生成与评分由用户启动。脚本先绑定源码／权重／数据，再执行真实权重数值检查，通过后生成40张图、评分并导出HTML。默认配置为configs/observation_comparison.json。
-
-```bash
-cd /private/yida_workspace/bagel-LatentCoT-main-native-observation-20261009
-export GPUS=4,5,6,7
-export CONFIG="$PWD/configs/observation_comparison.json"
-unset COMPARISON_PROMPTS
-export RUN=/private/yida_workspace/outputs/und_native_observation_$(date +%Y%m%d_%H%M%S)
-set -o pipefail
-bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
-```
-
-结果在comparison.html、quality_report/和generation/worker_*/traces/；HTML内嵌早期图和probe。generation_seconds包含诊断，probe_seconds单独记录，不能作严格预算比较。
-
-支持原配置／源码／权重／分片数量不变时RESUME=1续跑。通用PROMPTS环境变量不会影响数据；自定义数据须显式设置COMPARISON_PROMPTS。
-
-## 历史路径与证据
+## 历史证据
 
 此前完整800题、seed0的7200张评测已完成。浅层独立UND循环在R1／R2有小幅正趋势，但净Repair区间跨零；R3／R4明确增加Damage。Early20 R4为412 Repair／1064 Damage。
-

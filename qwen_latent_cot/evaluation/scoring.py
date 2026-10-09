@@ -24,12 +24,15 @@ def normalize_atoms(atoms, expected):
 
 
 class LocalScorer:
-    def __init__(self, judge_path, official_source, device='cuda:0'):
+    def __init__(self, judge_path, official_source, device='auto'):
         import torch
+        from ..bagel.accelerator import set_device,device_info
         from transformers import AutoModelForImageTextToText, AutoProcessor
+        device=set_device(device)
         self.processor=AutoProcessor.from_pretrained(judge_path,local_files_only=True)
+        backend={'attn_implementation':'sdpa'} if device.type=='npu' else {}
         self.model=AutoModelForImageTextToText.from_pretrained(judge_path,local_files_only=True,
-            dtype=torch.bfloat16).to(device).eval()
+            dtype=torch.bfloat16,**backend).to(device).eval()
         source=Path(official_source)
         # Load the audited upstream functions without executing its top-level HF download.
         tree=ast.parse(source.read_text())
@@ -45,7 +48,7 @@ class LocalScorer:
             'official_source_sha256':sha256(source),'official_source':str(source.resolve()),
             'judge_model_sha256':{p.name:sha256(p) for p in weights},
             'judge_config_sha256':sha256(Path(judge_path)/'config.json'),
-            'judge_path':str(Path(judge_path).resolve()), 'device':device,
+            'judge_path':str(Path(judge_path).resolve()), 'device':str(device),'accelerator':device_info(device),
             'quality_prompt':QUALITY_PROMPT, 'quality_scale':'(integer_1_to_5 - 1)/4',
             'quality_is_proxy':True,'tiif':'local_deterministic_yes_no_variant',
             'boundary_tolerance':1e-6,'raw_atoms_preserved':True}

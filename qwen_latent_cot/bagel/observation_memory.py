@@ -12,6 +12,7 @@ import torch
 from .feedback import NativeFeedback
 from .inferencer import T2IGenerator, InvalidGeneratedImage, to_device
 from .modeling.bagel.qwen2_navit import NaiveCache
+from .accelerator import synchronize,seeded_context
 
 
 def tensor_hash(tensor):
@@ -41,7 +42,13 @@ def memory_context(context, prefix_length):
 
 class ObservationConditions(NativeFeedback):
     @torch.inference_mode()
-    def prepare_conditions(self,image,prompt,observe=True):
+    def prepare_conditions(self,image,prompt,observe=True,visual_seed=0):
+        with seeded_context(self.device,visual_seed):
+            flow,conditional,visual,meta=self._prepare_conditions(image,prompt,observe)
+        meta['visual_posterior_seed']=int(visual_seed)
+        return flow,conditional,visual,meta
+
+    def _prepare_conditions(self,image,prompt,observe):
         visual=self.image(image,self.context(),vae=True)
         prefix=visual['kv_lens'][0]
         conditional=deepcopy(visual)
@@ -108,11 +115,12 @@ class ObservationConditions(NativeFeedback):
 
 
 class ObservationMemoryGenerator(T2IGenerator):
-    def __init__(self,bundle,step,observe,trace_dir,questions=(),probe_max_tokens=16,edit_sampling=None):
+    def __init__(self,bundle,step,observe,trace_dir,questions=(),probe_max_tokens=16,edit_sampling=None,end_step=None):
         super().__init__(bundle)
         if hasattr(self.model.language_model.model,'_memory_loop_runtime'):
             raise ValueError('observation Memory requires an unwrapped native decoder')
         self.observation_step=step;self.observe=observe;self.trace_dir=trace_dir
+        self.end_step=step+1 if end_step is None else end_step
         self.questions=list(questions);self.probe_max_tokens=probe_max_tokens
         self.edit_sampling=edit_sampling or {'cfg_text_scale':3.,'cfg_img_scale':1.5,'cfg_interval':[.4,1.]}
         self.engine=ObservationConditions(bundle);self.events=[]
@@ -120,24 +128,37 @@ class ObservationMemoryGenerator(T2IGenerator):
     @torch.inference_mode()
     def generate(self,prompts,shapes,seeds,num_timesteps=50,**sampler):
         if len(prompts)!=1 or len(shapes)!=1 or len(seeds)!=1:raise ValueError('observation Memory runs one paired sample at a time')
-        if not 0<=self.observation_step<num_timesteps-1:raise ValueError('observation step outside native schedule')
+        end_step=getattr(self,'end_step',self.observation_step+1)
+        if not 0<=self.observation_step<end_step<=num_timesteps-1:raise ValueError('observation window outside native schedule')
         flow,hashes=self.prepare(prompts,shapes,seeds);self.events=[]
-        original=self.model._forward_flow;step=0
+        original=self.model._forward_flow;step=0;held=None;conditional=None;visual=None;meta=None
+        schedule=torch.linspace(1,0,num_timesteps,device=self.device)
+        shift=sampler.get('timestep_shift',1.)
+        schedule=shift*schedule/(1+(shift-1)*schedule)
+        def fingerprint():
+            prefix=meta['visual_prefix_length'];cache=conditional['past_key_values']
+            return {str(i):[tensor_hash(k[prefix:]),tensor_hash(cache.value_cache[i][prefix:])]
+                    for i,k in cache.key_cache.items()}
         def forward(this,**kwargs):
-            nonlocal step
+            nonlocal step,held,conditional,visual,meta
             current_step=step;step+=1
             native=original(**kwargs)
-            if current_step!=self.observation_step:return native
+            if not self.observation_step<=current_step<end_step:
+                if current_step==end_step:held=conditional=visual=meta=None
+                return native
             x=kwargs['x_t'];t=kwargs['timestep'];before=tensor_hash(x);time_before=tensor_hash(t)
-            estimate=x-t[:,None]*native
-            if not torch.isfinite(estimate).all():raise InvalidGeneratedImage('nonfinite early clean-image estimate')
-            preview=self.decode(estimate,shapes[0])
-            self.trace_dir.mkdir(parents=True,exist_ok=True)
-            preview_path=self.trace_dir/'early_prediction.png';preview.save(preview_path)
-            updated,conditional,visual,meta=self.engine.prepare_conditions(preview,prompts[0],self.observe)
-            if 'x_t' in updated or 'timestep' in updated or 'packed_init_noises' in updated:
-                raise ValueError('conditions may not replace the current noise/time')
-            args={**kwargs,**updated}
+            first=current_step==self.observation_step
+            if first:
+                estimate=x-t[:,None]*native
+                if not torch.isfinite(estimate).all():raise InvalidGeneratedImage('nonfinite early clean-image estimate')
+                preview=self.decode(estimate,shapes[0])
+                self.trace_dir.mkdir(parents=True,exist_ok=True)
+                preview_path=self.trace_dir/'early_prediction.png';preview.save(preview_path)
+                visual_seed=int(before[:16],16)%(2**63)
+                held,conditional,visual,meta=self.engine.prepare_conditions(preview,prompts[0],self.observe,visual_seed)
+                if 'x_t' in held or 'timestep' in held or 'packed_init_noises' in held:
+                    raise ValueError('conditions may not replace the current noise/time')
+            args={**kwargs,**held}
             interval=self.edit_sampling['cfg_interval'];tv=float(t[0])
             active=interval[0]<tv<=interval[1]
             args.update(cfg_text_scale=self.edit_sampling['cfg_text_scale'] if active else 1.,
@@ -145,25 +166,38 @@ class ObservationMemoryGenerator(T2IGenerator):
             corrected=original(**args)
             if not torch.isfinite(corrected).all():raise InvalidGeneratedImage('nonfinite conditioned velocity')
             if tensor_hash(x)!=before or tensor_hash(t)!=time_before:raise RuntimeError('feedback modified x_t or timestep')
-            prefix=meta['visual_prefix_length'];cache=conditional['past_key_values']
-            payload={'x_t':x.detach().cpu(),'timestep':t.detach().cpu(),'native_velocity':native.detach().cpu(),
-                'updated_velocity':corrected.detach().cpu(),'clean_image_estimate':estimate.detach().cpu(),
-                'memory_keys':{i:k[prefix:].detach().cpu() for i,k in cache.key_cache.items()},
-                'memory_values':{i:v[prefix:].detach().cpu() for i,v in cache.value_cache.items()}}
-            torch.save(payload,self.trace_dir/'state.pt')
-            begin=time.perf_counter()
-            probes=self.engine.probe(preview,conditional,visual,meta,self.questions,self.probe_max_tokens) if self.questions else {}
-            if self.device.type=='cuda':torch.cuda.synchronize()
-            probe_seconds=time.perf_counter()-begin if self.questions else 0.
+            probes={};probe_seconds=0.
+            if first:
+                prefix=meta['visual_prefix_length'];cache=conditional['past_key_values']
+                payload={'x_t':x.detach().cpu(),'timestep':t.detach().cpu(),'native_velocity':native.detach().cpu(),
+                    'updated_velocity':corrected.detach().cpu(),'clean_image_estimate':estimate.detach().cpu(),
+                    'memory_keys':{i:k[prefix:].detach().cpu() for i,k in cache.key_cache.items()},
+                    'memory_values':{i:v[prefix:].detach().cpu() for i,v in cache.value_cache.items()}}
+                torch.save(payload,self.trace_dir/'state.pt')
+                begin=time.perf_counter()
+                probes=self.engine.probe(preview,conditional,visual,meta,self.questions,self.probe_max_tokens) if self.questions else {}
+                synchronize(self.device)
+                probe_seconds=time.perf_counter()-begin if self.questions else 0.
+            delta=(corrected-native).float();dt=float(schedule[current_step]-schedule[current_step+1])
             event={'step_index':current_step,'timestep':tv,'x_t_sha256':before,'timestep_sha256':time_before,
-                'x_t_unchanged':True,'timestep_unchanged':True,'updates':1,'contexts':meta,'probes':probes,
+                'x_t_unchanged':True,'timestep_unchanged':True,'updates':int(first),'contexts':meta,'probes':probes,
                 'probe_seconds':probe_seconds,'velocity_max_abs_change':float((corrected-native).abs().max()),
+                'velocity_delta_rms':float(delta.square().mean().sqrt()),
+                'velocity_relative_delta':float(delta.norm()/native.float().norm().clamp_min(1e-12)),
+                'euler_dt':dt,'euler_delta_relative_xt':float(dt*delta.norm()/x.float().norm().clamp_min(1e-12)),
+                'observation_source_step':self.observation_step,'conditioning_end_step':end_step,
                 'prediction_scope':'early_model_estimate_not_final_image; image clipped only by native VAE display',
-                'source_preview':str(preview_path),'preview_sha256':hashlib.sha256(preview_path.read_bytes()).hexdigest(),
-                'saved_state':str(self.trace_dir/'state.pt'),'state_sha256':file_hash(self.trace_dir/'state.pt'),
                 'scope':'diagnostics_only; questions_never_enter_GEN',
                 'active_edit_cfg':{'text':args['cfg_text_scale'],'image':args['cfg_img_scale']},
-                'lifecycle':'one_selected_denoiser_call; cache_released_after_velocity_recompute'}
+                'lifecycle':'one_writer_then_fixed_cache_until_exclusive_end_step'}
+            if first:
+                event.update(source_preview=str(preview_path),preview_sha256=file_hash(preview_path),
+                    saved_state=str(self.trace_dir/'state.pt'),state_sha256=file_hash(self.trace_dir/'state.pt'),
+                    memory_fingerprint=fingerprint())
+            if current_step==end_step-1:
+                original_fingerprint=event['memory_fingerprint'] if first else self.events[0]['memory_fingerprint']
+                event['held_memory_unchanged']=fingerprint()==original_fingerprint
+                if not event['held_memory_unchanged']:raise RuntimeError('held Memory changed without a writer')
             self.events.append(event)
             return corrected
         self.model._forward_flow=MethodType(forward,self.model)
@@ -171,9 +205,11 @@ class ObservationMemoryGenerator(T2IGenerator):
             with self.autocast():
                 latents=self.model.generate_image(**flow,num_timesteps=num_timesteps,cfg_img_scale=1.,enable_taylorseer=False,**sampler)
                 images=[self.decode(latent,shape) for latent,shape in zip(latents,shapes)]
-            if step!=num_timesteps-1 or len(self.events)!=1:raise RuntimeError('expected exactly one feedback update in the native schedule')
+            if step!=num_timesteps-1 or len(self.events)!=end_step-self.observation_step or sum(e['updates'] for e in self.events)!=1:
+                raise RuntimeError('feedback coverage or writer count differs from configured window')
             return images,hashes
         except InvalidGeneratedImage as error:
             error.noise_hashes=hashes;raise
         finally:
+            held=conditional=visual=meta=None
             self.model._forward_flow=original
