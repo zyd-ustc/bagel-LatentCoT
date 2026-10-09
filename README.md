@@ -26,14 +26,11 @@ set -o pipefail
 bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
 ```
 
-请使用分配给本任务的卡，命令本身不代表当前卡空闲。仅保留上述两个比较脚本，不新增独立启动入口。结果在comparison.html、quality_report/和generation/worker_*/traces/；HTML内嵌早期图和probe。generation_seconds包含诊断，probe_seconds单独记录，不能作严格预算比较。
+结果在comparison.html、quality_report/和generation/worker_*/traces/；HTML内嵌早期图和probe。generation_seconds包含诊断，probe_seconds单独记录，不能作严格预算比较。
 
 支持原配置／源码／权重／分片数量不变时RESUME=1续跑。通用PROMPTS环境变量不会影响数据；自定义数据须显式设置COMPARISON_PROMPTS。
 
 ## 历史路径与证据
 
-此前完整800题、seed0的7200张评测已完成。浅层独立UND循环在R1／R2有小幅正趋势，但净Repair区间跨零；R3／R4明确增加Damage。Early20 R4为412 Repair／1064 Damage。历史结果不是新完整UND观察方案的验证。
+此前完整800题、seed0的7200张评测已完成。浅层独立UND循环在R1／R2有小幅正趋势，但净Repair区间跨零；R3／R4明确增加Damage。Early20 R4为412 Repair／1064 Damage。
 
-旧runner和两份旧配置保留用于复现与数值参照，须显式指定window_comparison.json或feedback_comparison.json。当前默认路径不调用它们。旧冻结远端目录与结果保持原样。
-
-本次修改前的完整tracked源码和Git bundle已备份到工作区older/before-native-observation-memory-20261009_151938/。
