@@ -2,7 +2,7 @@
 
 GEN computation and conditioning layout remain identical to the legacy path.
 Only body layers have current GEN KV. All UND layers read fixed native P and
-live self KV. Updated hidden is projected with the same-layer native weights.
+live self KV. Body KV uses updated hidden; suffix KV is the native block input.
 """
 import torch
 from .layerwise_memory import LayerKV,native_context
@@ -85,10 +85,16 @@ def run_und_state(loop,kwargs,runtime):
         for index in layers:
             before=pin_hidden(index,writer);old_kv=bank[index]
             additions=[gen_kv[index]] if index in gen_kv else []
-            writer,_=native_layer(index,before,seed.lengths,memory_rope,additions,'und')
+            suffix=index>=cfg.end_layer
+            writer,current=native_layer(index,before,seed.lengths,memory_rope,additions,'und',store=suffix)
             writer=pin_hidden(index,writer)
-            _,keys,values=project_und(decoder.layers[index],writer,memory_rope)
-            bank[index]=pin_kv(index,keys,values)
+            if suffix:
+                # Preserve legacy suffix: KV is written by native attention
+                # from the layer input, while its output continues the writer.
+                bank[index]=pin_kv(index,current.keys,current.values)
+            else:
+                _,keys,values=project_und(decoder.layers[index],writer,memory_rope)
+                bank[index]=pin_kv(index,keys,values)
             if runtime.kv_observer is not None:
                 runtime.kv_observer(event='writer_update',layer=index,phase='body',depth=cfg.extra_rounds,
                     from_round=round_index,to_round=round_index+1,current=bank[index],reference=old_kv,

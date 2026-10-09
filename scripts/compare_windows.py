@@ -62,7 +62,7 @@ def prepare_main():
     if config.get('memory_update')=='full_depth':
         plan['memory_topologies'].update(writer='continuous_all_layers_every_round',
             suffix='included_in_every_writer',recycle='last_UND_hidden_to_first_UND_layer',
-            gen_feedback_layers=config['layer_window'],kv_readout='same_layer_updated_hidden_projection')
+            gen_feedback_layers=config['layer_window'],kv_readout={'gen_body':'same_layer_updated_hidden_projection','gen_suffix':'native_attention_input_kv'})
     if config['experiment']=='feedback_pilot':
         plan['memory_topologies']={'mode':'native_full_interleaved_image_text_edit','implicit_loop':False,
             'capacity':'all_native_image_and_text_tokens','feedback':'full_text_reprefill_at_native_positions'}

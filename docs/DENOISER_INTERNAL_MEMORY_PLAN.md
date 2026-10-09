@@ -7,7 +7,7 @@
 - 每个活跃去噪步，单份H从原prompt的第0层输入hidden初始化。Memory容量、位置和特殊token固定规则不变，不跨去噪步保存。
 - 每轮writer从0到27层连续运行；第l层输出进入第l+1层，最后一层输出进入下一轮第0层。特殊token在各层恢复为该层原生prompt参考值。此次明确不处理深度错配。
 - 每层读取固定原prompt P_l和当前Memory self KV；0–7层另读取当前轮GEN_l KV。8–27层没有GEN KV，保持原GEN窗口及suffix计算量，不额外完成草稿或加入ViT。
-- 每层更新后的hidden用同一层原生UND norm/K/V/RoPE投影，生成供下一轮GEN读取的Memory KV。与旧body readout保持一致；不使用末层投影复制到所有层。
+- 0–7层更新后的hidden用同一层原生UND norm/K/V/RoPE投影，保持旧body readout。8–27层从原生attention自然保存block输入KV，恢复旧suffix读出。UND输出继续进入下一层并回送下一轮；不使用末层投影复制到所有层。
 - GEN每轮仍从同一个窗口入口重算0–7层：round0读取P，后续读取M并替换P。最后GEN只经过8–27层一次，读取最后一轮完整writer产生的对应层M。
 - R2为3次GEN body、2次完整28层UND writer。原prompt cache不可变，null-text CFG和非活跃时间步保持原生路径，每个去噪步仅推进一次sampler。
 - 保留BAGEL原生MoT、专家参数、归一化、投影、RoPE、全量prompt、BF16和原采样，不训练，不新增adapter、gate或alpha。完整UND遍历不是原生ViT图像理解等价路径。

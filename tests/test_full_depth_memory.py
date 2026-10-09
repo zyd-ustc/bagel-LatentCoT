@@ -43,7 +43,8 @@ def test_all_28_und_layers_are_connected_and_last_output_is_recycled(rounds):
         writes=[e for e in events if e['event']=='writer_update']
         assert len(writes)==rounds*28
         for e in writes:
-            _,k,v=project_und(decoder.layers[e['layer']],e['hidden_after'],rope)
+            state=e['hidden_after'] if e['layer']<8 else e['hidden_before']
+            _,k,v=project_und(decoder.layers[e['layer']],state,rope)
             assert torch.equal(k[content],e['current'].keys[content])
             assert torch.equal(v[content],e['current'].values[content])
         for e in (x for x in events if x['event']=='final_read'):
