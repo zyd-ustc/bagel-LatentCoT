@@ -28,23 +28,36 @@ def identity(row):
 
 def validate_observation_record(row):
     events=row['observation_events']
-    if row['arm']=='BASE':
+    if row['arm']=='BASE' or row.get('arm_type')=='legacy_memory_loop':
         if events:raise ValueError('Base has an observation update')
+        if row.get('arm_type')=='legacy_memory_loop' and (
+            row['arm']!='LEGACY_EARLY_20_R2' or row['loop_step_indexes']!=list(range(20))
+            or row['extra_rounds']!=2 or row['start_layer']!=0 or row['end_layer']!=8):
+            raise ValueError('legacy Early20 R2 control changed')
         return
     # A failed decode can stop before the selected step. Invalid arms remain in
     # quality/invalid-rate reporting, without inventing a successful update.
-    if row['valid_file'] and len(events)!=1:raise ValueError('expected one observation event')
-    for event in events:
-        if event['step_index']!=row['observation_step'] or event['updates']!=1:
+    start=row['observation_step'];end=row.get('conditioning_end_step',start+1)
+    if row['valid_file'] and [e['step_index'] for e in events]!=list(range(start,end)):
+        raise ValueError('observation conditioning coverage differs')
+    for index,event in enumerate(events):
+        if event['step_index']!=start+index or event['updates']!=int(index==0):
             raise ValueError('observation step/update count differs')
         if not event['x_t_unchanged'] or not event['timestep_unchanged']:
             raise ValueError('observation changed sampler state')
-        for path,digest in (('source_preview','preview_sha256'),('saved_state','state_sha256')):
-            if sha256(event[path])!=event[digest]:raise ValueError('observation artifact changed: '+path)
+        if index==0:
+            for path,digest in (('source_preview','preview_sha256'),('saved_state','state_sha256')):
+                if sha256(event[path])!=event[digest]:raise ValueError('observation artifact changed: '+path)
+        elif event['contexts']!=events[0]['contexts'] or event.get('probes'):
+            raise ValueError('held context changed or probe repeated')
+    if events and 'memory_fingerprint' in events[0] and row['valid_file'] and not events[-1].get('held_memory_unchanged'):
+        raise ValueError('held Memory immutability was not verified')
 
 
 def validate_observation_pair(row,other):
     if row['noise_sha256']!=other['noise_sha256']:raise ValueError('paired initial noise differs')
+    if row.get('conditioning_end_step')!=other.get('conditioning_end_step'):
+        raise ValueError('paired conditioning coverage differs')
     if not row['observation_events'] or not other['observation_events']:return
     a=row['observation_events'][0];b=other['observation_events'][0]
     for field in ('step_index','x_t_sha256','timestep_sha256','preview_sha256','active_edit_cfg'):
@@ -76,8 +89,18 @@ def load_manifests(paths):
             raise ValueError('image changed after generation')
     if provenance[0]['architecture']=='observation_memory':
         indexed={(r['arm'],*identity(r)):r for r in records}
+        anchors={}
         for row in records:
             validate_observation_record(row)
+            config=provenance[0]['arm_configs'][row['arm']]
+            if 'observation_step' in config:
+                if row['observation_step']!=config['observation_step'] or row.get('conditioning_end_step',row['observation_step']+1)!=config.get('conditioning_end_step',config['observation_step']+1):
+                    raise ValueError('recorded conditioning window differs from plan')
+                if provenance[0]['config'].get('conditioning_durations') and row['observation_events']:
+                    key=(*identity(row),row['observe_image']);event=row['observation_events'][0]
+                    signature={k:event[k] for k in ('x_t_sha256','timestep_sha256','preview_sha256','contexts','memory_fingerprint')}
+                    if key in anchors and signature!=anchors[key]:raise ValueError('duration arms did not start from the same fixed Memory')
+                    anchors[key]=signature
             if row['arm'].endswith('_OBSERVED'):
                 validate_observation_pair(row,indexed[(row['arm'].replace('_OBSERVED','_STATIC'),*identity(row))])
     return records, provenance[0]

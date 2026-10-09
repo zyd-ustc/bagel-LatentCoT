@@ -2,7 +2,9 @@
 
 **本页对应 NPU 分支。** 运行后端与检查状态见 [NPU_RUNTIME.md](docs/NPU_RUNTIME.md)。
 
-当前默认方案是 **一次早期图像预测→完整原生 UND 更新→固定 x_t/t 重算 GEN**。没有完整文字反馈解码、adapter、gate、压缩或训练。正式质量效果尚未验证。
+当前方案是 **一次早期图像预测→完整原生 UND 更新→使用固定缓存重算 GEN**。没有完整文字反馈解码、adapter、gate、压缩或训练。原始单步pilot已完成，尚未显示稳定语义收益。
+
+最新对比延长缓存作用时间：step9写入一次，分别持续1/5/10/20步，同时保留旧Early20 R2。32题、10组、320张图，16个NPU芯片命令见[OBSERVATION_DURATION_COMPARISON.md](docs/OBSERVATION_DURATION_COMPARISON.md)。配置为`configs/observation_duration_comparison.json`。33项CPU/NPU数值测试通过，新正式评测待用户执行。
 
 原main的22项CPU数值测试保留。NPU分支增加设备、attention和RNG隔离检查，真实权重数值检查与正式效果的状态分别记录在NPU_RUNTIME.md。
 
@@ -10,7 +12,7 @@
 
 首轮默认8题、seed0、5组，共40张图：Base，step9／step19分别各一个STATIC和OBSERVED。每张非Base图只更新一次。两个组保留相同视觉条件、文字token、位置、容量和GEN CFG，区别只在文本Memory编码时是否读取图像。
 
-文本Memory经过全部28层UND连续计算，KV从各层attention输入自然写入。最终GEN使用完整图像VAE＋ViT上下文和文本Memory；原生准备接口重建位置和CFG。重算沿用当前噪声和t，随后原始采样器只推进一次。缓存不跨步。
+文本Memory经过全部28层UND连续计算，KV从各层attention输入自然写入。GEN使用完整图像VAE＋ViT上下文和文本Memory；原生准备接口重建位置和CFG。每次重算沿用该步当前噪声和t，随后原始采样器只推进一次。原始pilot缓存只用一步；最新对比在配置窗口内跨步保持缓存。
 
 每次更新保存早期预测图、x_t/t、前后velocity、全部文本Memory KV及四类短问答probe。问答通过缓存副本执行，仅供诊断，不回流到生成。问答正确性待人工标注；memory-only读取明确为非原生诊断。
 

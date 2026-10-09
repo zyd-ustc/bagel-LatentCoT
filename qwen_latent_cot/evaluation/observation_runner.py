@@ -1,4 +1,4 @@
-"""Five paired arms: Base, static/observed native Memory at steps 9 and 19."""
+"""Paired observation arms and the unchanged legacy Early20 R2 control."""
 import json
 import time
 from pathlib import Path
@@ -6,6 +6,7 @@ import torch
 from .io import read_jsonl,sha256,validate_observation_record,validate_observation_pair
 from ..bagel.inferencer import T2IGenerator,InvalidGeneratedImage
 from ..bagel.observation_memory import ObservationMemoryGenerator
+from ..bagel.internal_loop import MODE,LoopConfig,InternalLoopRuntime
 from ..bagel.accelerator import synchronize,reset_peak_memory_stats,max_memory_allocated
 
 
@@ -24,15 +25,23 @@ def generate_observation(bundle,plan,args,completed,output,manifest):
             row=data[i];shape=(int(row.get('height',sampling['image_size'])),int(row.get('width',sampling['image_size'])))
             name=f'{i:05d}_s{seed}';trace=output/'traces'/arm/name
             questions=[q for q,_ in row['vqa_list'][:plan['config']['probe_questions_per_image']]]
-            generator=(T2IGenerator(bundle) if arm=='BASE' else ObservationMemoryGenerator(bundle,
-                setting['observation_step'],setting['observe_image'],trace,questions,
-                plan['config']['probe_max_tokens'],plan['config']['edit_sampling']))
+            legacy=setting['mode']==MODE;runtime=None
+            if legacy:
+                runtime=InternalLoopRuntime(bundle.model,LoopConfig(**setting))
+                generator=T2IGenerator(bundle,runtime)
+            else:
+                generator=(T2IGenerator(bundle) if arm=='BASE' else ObservationMemoryGenerator(bundle,
+                    setting['observation_step'],setting['observe_image'],trace,questions,
+                    plan['config']['probe_max_tokens'],plan['config']['edit_sampling'],
+                    end_step=setting.get('conditioning_end_step')))
             synchronize(device);reset_peak_memory_stats(device);begin=time.perf_counter()
             error=None
             try:
                 images,hashes=generator.generate([row['prompt']],[shape],[seed],num_timesteps=sampling['num_timesteps'],
                     timestep_shift=sampling['timestep_shift'],cfg_text_scale=sampling['cfg_text_scale'],cfg_renorm_type=sampling['cfg_renorm_type'])
             except InvalidGeneratedImage as exc:images=None;hashes=exc.noise_hashes;error=str(exc)
+            finally:
+                if runtime is not None:runtime.close()
             synchronize(device);elapsed=time.perf_counter()-begin
             path=output/arm/(name+'.png');path.parent.mkdir(exist_ok=True)
             if images is not None:images[0].save(path)
@@ -47,11 +56,23 @@ def generate_observation(bundle,plan,args,completed,output,manifest):
                 'peak_allocated_bytes':max_memory_allocated(device),'timing_scope':'engineering_with_preview_and_probes',
                 'probe_seconds':sum(e['probe_seconds'] for e in events),'observation_events':events,
                 'observation_step':setting.get('observation_step'),'observe_image':setting.get('observe_image'),
-                'extra_rounds':0 if arm=='BASE' else 1,'memory_capacity_policy':'full_original_prompt',
-                'memory_update_count':len(events),'memory_lifecycle':'one_selected_call_only',
-                'writer_depth':0 if arm=='BASE' else plan['native_depth'],'image_context_policy':'full_native_VAE_plus_ViT',
+                'extra_rounds':setting['extra_rounds'] if legacy else 0 if arm=='BASE' else 1,
+                'arm_type':'legacy_memory_loop' if legacy else 'base' if arm=='BASE' else 'observation_memory',
+                'memory_capacity_policy':'full_original_prompt',
+                'memory_update_count':40 if legacy else sum(e['updates'] for e in events),
+                'memory_lifecycle':'legacy_per_call_recurrence' if legacy else 'none' if arm=='BASE' else 'fixed_cache_until_exclusive_end_step',
+                'conditioning_end_step':setting.get('conditioning_end_step',setting.get('observation_step',-1)+1),
+                'conditioning_step_indexes':[e['step_index'] for e in events],
+                'writer_depth':0 if arm=='BASE' or legacy else plan['native_depth'],
+                'image_context_policy':'none' if arm=='BASE' or legacy else 'full_native_VAE_plus_ViT',
                 'probe_uses_actual_image_labels':False,'manual_probe_labels':'pending',
                 'observation_teacher_text_generated':False}
+            if legacy:
+                record.update(loop_step_indexes=plan['time_windows'][arm]['loop_step_indexes'],
+                    start_layer=setting['start_layer'],end_layer=setting['end_layer'],
+                    configured_loop_calls=plan['time_windows'][arm]['loop_calls'],
+                    writer_body_passes_per_active_call=2,gen_body_passes_per_active_call=3,
+                    writer_suffix_passes_per_active_call=1,native_prompt_lengths=list(generator.prompt_lengths))
             validate_observation_record(record)
             if arm.endswith('_OBSERVED'):
                 other=completed.get((arm.replace('_OBSERVED','_STATIC'),pid,seed))

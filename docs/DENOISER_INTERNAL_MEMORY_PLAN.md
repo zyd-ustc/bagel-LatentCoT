@@ -2,7 +2,9 @@
 
 NPU分支的运行适配与检查状态另见[NPU_RUNTIME.md](NPU_RUNTIME.md)。本分支还隔离条件编码的RNG，保留原生随机VAE后验，确保静态／观察配对使用相同视觉KV。
 
-日期：2026-10-09。NPU分支状态：29项CPU／NPU数值测试通过。CPU模拟流程通过分片生成／评分／HTML、续跑和配对／文件完整性检查。NPU真实权重的原生上下文／velocity parity检查通过；正式质量评测未执行。此文件描述当前实现，不沿用10月5日旧方案的同层1/N循环、压缩或训练安排。
+日期：2026-10-09。NPU分支状态：33项CPU／NPU数值测试通过。NPU真实权重的原生上下文／velocity parity检查通过；原始8 prompt单步评测已完成，尚未显示稳定的观察Memory语义增益。此文件不沿用10月5日旧方案的同层1/N循环、压缩或训练安排。
+
+NPU分支新增作用时长对比：一次原生观察写入，缓存持续使用1/5/10/20步，保留旧Early20 R2。详见[OBSERVATION_DURATION_COMPARISON.md](OBSERVATION_DURATION_COMPARISON.md)。下文单步生命周期描述对应原始`observation_comparison.json`；新配置使用窗口生命周期，正式结果待用户执行。
 
 目标是在固定 x_t/t 下，通过可检查的早期视觉证据更新条件，然后重算 GEN。先只更新一次，冻结 BAGEL 全部参数，不引入 adapter、gate、alpha、压缩或训练模块。
 

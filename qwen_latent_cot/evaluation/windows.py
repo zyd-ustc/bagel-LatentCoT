@@ -26,8 +26,12 @@ def validate_config(c,native_depth):
     elif c['experiment']=='feedback_pilot':
         if c['feedback_max_tokens']<1:raise ValueError('feedback token budget must be positive')
     elif c['experiment']=='observation_memory':
-        if c['observation_steps']!=[9,19] or c['updates_per_image']!=1:
-            raise ValueError('require exactly one update at step9 or step19 per arm')
+        if 'conditioning_durations' in c:
+            if c['observation_step']!=9 or c['conditioning_durations']!=[1,5,10,20] or c.get('legacy_early20_r2') is not True:
+                raise ValueError('require step9 fixed cache x 1/5/10/20 calls and legacy Early20 R2')
+        elif c['observation_steps']!=[9,19]:
+            raise ValueError('require step9/19 for the single-call comparison')
+        if c['updates_per_image']!=1:raise ValueError('require exactly one Memory writer per observed arm')
         if c['probe_questions_per_image']<1 or c['probe_max_tokens']<1:
             raise ValueError('observation diagnostics require positive probe budgets')
         if c['edit_sampling']!={'cfg_text_scale':3.,'cfg_img_scale':1.5,'cfg_interval':[.4,1.]}:
@@ -46,6 +50,15 @@ def arm_configs(c):
     if c['experiment']=='feedback_pilot':
         return dict(arms,GENERIC_EDIT=dict(base),FEEDBACK_EDIT=dict(base))
     if c['experiment']=='observation_memory':
+        if 'conditioning_durations' in c:
+            arms['LEGACY_EARLY_20_R2']=asdict(LoopConfig(mode=MODE,extra_rounds=2,start_layer=0,end_layer=8,
+                progress_start=0.,progress_end=19/48))
+            step=c['observation_step']
+            for duration in c['conditioning_durations']:
+                for name,observe in (('STATIC',False),('OBSERVED',True)):
+                    arms[f'STEP_{step:02d}_L{duration:02d}_{name}']=dict(base,observation_step=step,
+                        conditioning_end_step=step+duration,observe_image=observe)
+            return arms
         for step in c['observation_steps']:
             for name,observe in (('STATIC',False),('OBSERVED',True)):
                 arms[f'STEP_{step:02d}_{name}']=dict(base,observation_step=step,observe_image=observe)
@@ -63,11 +76,15 @@ def window_metadata(c):
         x=1-i/49
         return 3*x/(1+2*x)
     for arm,cfg in arm_configs(c).items():
-        if c['experiment']=='observation_memory':
-            steps=[cfg['observation_step']] if arm!='BASE' else []
+        observed=c['experiment']=='observation_memory' and 'observation_step' in cfg
+        if observed:
+            steps=list(range(cfg['observation_step'],cfg.get('conditioning_end_step',cfg['observation_step']+1)))
         else:steps=[i for i in range(49) if cfg['mode']!='BASE' and cfg['progress_start']<=i/48<=cfg['progress_end']]
         out[arm]={'step_start':min(steps) if steps else 0,'step_end':max(steps)+1 if steps else 0,
-            'loop_calls':len(steps),'loop_step_indexes':steps,'extra_rounds':(1 if steps else 0) if c['experiment']=='observation_memory' else cfg['extra_rounds'],
+            'loop_calls':len(steps),'loop_step_indexes':steps,'extra_rounds':1 if observed else cfg['extra_rounds'],
+            'memory_writer_calls':1 if observed else len(steps)*cfg['extra_rounds'],
+            'conditioning_kind':'fixed_observation_cache' if observed else 'legacy_local_loop' if steps else 'base',
+            'covered_delta_t':t(steps[0])-t(steps[-1]+1) if steps else 0.,
             't_first':t(steps[0]) if steps else None,'t_last':t(steps[-1]) if steps else None,
             't_after_window':t(steps[-1]+1) if steps else None}
     return out
@@ -75,11 +92,18 @@ def window_metadata(c):
 
 def comparison_pairs(c):
     if c['experiment']=='feedback_pilot':return [('FEEDBACK_EDIT','GENERIC_EDIT')]
-    if c['experiment']=='observation_memory':return [(f'STEP_{step:02d}_OBSERVED',f'STEP_{step:02d}_STATIC') for step in c['observation_steps']]
+    if c['experiment']=='observation_memory':
+        if 'conditioning_durations' in c:
+            prefix=f"STEP_{c['observation_step']:02d}_L"
+            pairs=[(f'{prefix}{n:02d}_OBSERVED',f'{prefix}{n:02d}_STATIC') for n in c['conditioning_durations']]
+            pairs += [(f'{prefix}{b:02d}_OBSERVED',f'{prefix}{a:02d}_OBSERVED')
+                      for a,b in zip(c['conditioning_durations'],c['conditioning_durations'][1:])]
+            return pairs+[(f'{prefix}{n:02d}_OBSERVED','LEGACY_EARLY_20_R2') for n in c['conditioning_durations']]
+        return [(f'STEP_{step:02d}_OBSERVED',f'STEP_{step:02d}_STATIC') for step in c['observation_steps']]
     pairs=[(f'EARLY_20_R{r}',f'EARLY_10_R{r}') for r in c['depths']]
     return pairs+[(f'{w["name"]}_R{r}',f'{w["name"]}_R{r-1}') for w in c['windows'] for r in c['depths'][1:]]
 
 
 def reference_arm(c):
-    if c['experiment']=='observation_memory':return 'STEP_09_STATIC'
+    if c['experiment']=='observation_memory':return 'LEGACY_EARLY_20_R2' if 'conditioning_durations' in c else 'STEP_09_STATIC'
     return 'GENERIC_EDIT' if c['experiment']=='feedback_pilot' else 'EARLY_10_R2'

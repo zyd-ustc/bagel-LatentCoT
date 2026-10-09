@@ -66,6 +66,10 @@ def prepare_main():
         plan['memory_topologies']={'mode':'native_early_image_full_UND_observation','capacity':'all_original_prompt_tokens',
             'visual_context':'full_native_VAE_plus_ViT','writer':'continuous_all_native_layers',
             'updates_per_arm':1,'lifecycle':'one_selected_denoiser_call','probe':'diagnostics_only'}
+        if 'conditioning_durations' in config:
+            plan['memory_topologies'].update(lifecycle='one_writer_then_fixed_cache_for_configured_window',
+                legacy_control='unchanged_Early20_R2_layers_0_8',
+                diagnostic_velocity='native_reference_at_each_current_arm_state; extra_compute')
     output=Path(a.plan)
     if output.exists():
         if read_plan(output)!=plan:raise ValueError('resume plan differs; preserve original config/source/model/benchmark')
@@ -268,6 +272,12 @@ def validate_main():
     if plan['config']['experiment']=='observation_memory':
         from qwen_latent_cot.bagel.observation_memory_checks import validate_observation
         results=validate_observation(bundle,plan['config'])
+        if plan['config'].get('legacy_early20_r2'):
+            legacy=plan['arm_configs']['LEGACY_EARLY_20_R2']
+            runtime=InternalLoopRuntime(bundle.model,LoopConfig(**legacy))
+            try:results['legacy_early20_r2']=validate(bundle,T2IGenerator(bundle,runtime),runtime,(2,))
+            finally:runtime.close()
+            results['passed']=results['passed'] and results['legacy_early20_r2']['passed']
         Path(a.output).write_text(json.dumps({'plan_sha256':sha256(a.plan),'accelerator':device_info(device),'checks':results},indent=2)+'\n')
         if not results['passed']:raise SystemExit(1)
         return
@@ -353,7 +363,7 @@ def write_summary(scored,run,output,resamples=10000):
         feedback=[r for r in scored if r['arm']=='FEEDBACK_EDIT']
         summary['feedback_format']={'valid':sum(r.get('feedback_format_valid') is True for r in feedback),'total':len(feedback),'visual_correctness':'not_verified_by_format_check'}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
-    lines=['# Frozen BAGEL: '+run['config']['experiment'],'','Quality is a VLM proxy; manual review is pending. Historical implicit arms use layers [0,8). Observation Memory uses full-depth UND prefill and native GEN; probes are diagnostic, not observed-image ground truth. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing does not establish budget compliance.','',
+    lines=['# Frozen BAGEL: '+run['config']['experiment'],'','Quality is a VLM proxy; manual review is pending. Historical implicit arms use layers [0,8). Observation Memory uses one full-depth UND prefill, then a fixed native visual/text cache for its configured window. Writer count and conditioning-call count are different. Probes are diagnostic, not observed-image ground truth. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing includes per-call native reference velocities and does not establish budget compliance.','',
         '|Arm|Semantic GM|Quality proxy|Invalid|Net Repair vs Base (95% CI)|Repair / Damage|',
         '|---|---:|---:|---:|---|---:|']
     for arm,s in summary['arms'].items():
@@ -363,13 +373,13 @@ def write_summary(scored,run,output,resamples=10000):
         for bucket,pair in stats['buckets'].items():
             lines.append(f"\n{arm} / {bucket}: {pair['paired_images']} images; Repair / Damage {pair['repair_count']} / {pair['damage_count']}.")
     if 'feedback_format' in summary:lines+=['',str(summary['feedback_format'])]
-    lines+=['','|Arm|Active steps [start,end)|Loop calls / 49|First / last active t|Median seconds|Peak GiB|',
-        '|---|---|---:|---|---:|---:|']
+    lines+=['','|Arm|Active steps [start,end)|Active calls / 49|Covered delta t|First / last active t|Median seconds|Peak GiB|',
+        '|---|---|---:|---:|---|---:|---:|']
     for arm,stats in summary['arms'].items():
         w=run['time_windows'][arm]
         bounds='none' if not w['loop_calls'] else f"[{w['step_start']},{w['step_end']})"
         ts='none' if not w['loop_calls'] else f"{w['t_first']:.4f} / {w['t_last']:.4f}"
-        lines.append(f"|{arm}|{bounds}|{w['loop_calls']} / 49|{ts}|{stats['latency_median_seconds']:.2f}|{stats['peak_allocated_bytes']/2**30:.2f}|")
+        lines.append(f"|{arm}|{bounds}|{w['loop_calls']} / 49|{w.get('covered_delta_t',0.):.4f}|{ts}|{stats['latency_median_seconds']:.2f}|{stats['peak_allocated_bytes']/2**30:.2f}|")
     for candidate,reference in comparison_pairs(run['config']):
         pair=summary['comparisons'][candidate+'_vs_'+reference]
         lines+=['',f"{candidate} vs {reference}: Repair / Damage {pair['repair_count']} / {pair['damage_count']}; "
@@ -418,7 +428,7 @@ def _export_page(root,output,selected=None):
     esc=lambda value:html.escape(str(value),quote=True)
     parts=['''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BAGEL · 配对图片</title><style>
     :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#141819;color:#ecf0ea;font:16px/1.5 system-ui,-apple-system,sans-serif}main{max-width:1720px;margin:auto;padding:28px 20px}h1{font-size:30px}h2{font-size:18px;font-weight:500}p,small,details{color:#b8c4bc}.meta{font:12px ui-monospace,monospace;overflow-wrap:anywhere}.grid{display:grid;gap:12px}.label{font:13px ui-monospace,monospace;color:#d4e6b4;padding:8px 0;overflow-wrap:anywhere}img{width:100%;height:auto;display:block;cursor:zoom-in}.pair{border-top:1px solid #435047;margin:30px 0;padding:14px 0}table{border-collapse:collapse;margin:20px 0;font-size:14px}th,td{padding:8px 14px;text-align:left;border-bottom:1px solid #435047}li{margin:8px 0}details{margin-top:12px}dialog{background:#141819;border:1px solid #687864;padding:10px;max-width:98vw;max-height:98vh}dialog img{width:auto;max-width:92vw;max-height:84vh;cursor:default}button{margin-bottom:8px}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}main{padding:20px 10px}}
-    </style><main><h1>BAGEL：配对对比实验</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。历史隐式loop使用[0,8)；新观察方案在一个指定步执行完整UND编码，再固定x_t/t重算GEN。问答probe仅作诊断，尚无人工观察标签。生成时间为工程日志。</p>''']
+    </style><main><h1>BAGEL：配对对比实验</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。旧loop使用[0,8)；新观察方案只写一次完整UND缓存，在配置的时间窗口内持续读取。问答probe仅作诊断，尚无人工观察标签。生成时间包含额外诊断计算。</p>''']
     parts.append(f'<p class="meta">RUN {esc(root.name)}<br>SOURCE {esc(summary["source_sha256"])}</p>')
     parts.append('<table><tr><th>Arm</th><th>Semantic GM</th><th>Quality proxy</th><th>Repair / Damage vs Base</th><th>Median seconds</th></tr>')
     for arm in arms:
@@ -434,7 +444,8 @@ def _export_page(root,output,selected=None):
             if any(row[k]!=base[k] for k in ('prompt','noise_sha256','height','width')):
                 raise ValueError('paired inputs differ')
             w=summary['time_windows'][arm]
-            label=arm if w['loop_calls']==0 else f"{arm} · step [{w['step_start']},{w['step_end']}) · R{w['extra_rounds']}"
+            suffix=(f"写1次 / 读{w['loop_calls']}步" if w.get('conditioning_kind')=='fixed_observation_cache' else f"R{w['extra_rounds']}")
+            label=arm if w['loop_calls']==0 else f"{arm} · step [{w['step_start']},{w['step_end']}) · {suffix}"
             parts.append(f'<div><div class="label">{esc(label)} · quality {row["quality_proxy"]:.2f}</div>')
             if row['valid_file']:
                 raw=Path(row['path']).read_bytes()
@@ -445,6 +456,7 @@ def _export_page(root,output,selected=None):
             if row.get('feedback_text'):
                 parts.append('<details><summary>BAGEL feedback</summary><pre style="white-space:pre-wrap">'+esc(row['feedback_text'])+'</pre></details>')
             for event in row.get('observation_events',[]):
+                if 'source_preview' not in event:continue
                 preview=Path(event['source_preview'])
                 if hashlib.sha256(preview.read_bytes()).hexdigest()!=event['preview_sha256']:raise ValueError('early preview changed')
                 image64=base64.b64encode(preview.read_bytes()).decode('ascii')
@@ -452,6 +464,11 @@ def _export_page(root,output,selected=None):
                     f'<p>step {event["step_index"]}, t={event["timestep"]:.4f}; 该图是早期预测，不是最终结果。</p>'+
                     f'<img loading="lazy" src="data:image/png;base64,{image64}" alt="early prediction" onclick="showImage(this)">'+
                     '<pre style="white-space:pre-wrap">'+esc(json.dumps(event['probes'],ensure_ascii=False,indent=2))+'</pre></details>')
+            if row.get('observation_events'):
+                trace=[{k:e[k] for k in ('step_index','timestep','updates','velocity_relative_delta','euler_dt','euler_delta_relative_xt','held_memory_unchanged') if k in e}
+                    for e in row['observation_events']]
+                parts.append('<details><summary>逐步速度偏移与缓存使用</summary><pre style="white-space:pre-wrap">'+
+                    esc(json.dumps(trace,ensure_ascii=False,indent=2))+'</pre></details>')
             if arm!='BASE':
                 changes=[];questions=row.get('semantic_questions') or []
                 for i,(a,b) in enumerate(zip(base['semantic_atoms'],row['semantic_atoms'])):
