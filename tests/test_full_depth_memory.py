@@ -33,7 +33,8 @@ def test_all_28_und_layers_are_connected_and_last_output_is_recycled(rounds):
             assert torch.equal(current[2][content],previous[3][content])
             assert torch.equal(current[2][seed.special_mask],seed.layer_hidden[current[0]][seed.special_mask])
         assert all(c[4]==[6,10] for c in und if c[0]<8)
-        assert all(c[4]==[4,6] for c in und if c[0]>=8)
+        assert all(c[4]==list(seed.lengths) for c in und if c[0]>=8)
+        # key_values_lens counts past KV; native attention adds live self KV.
         gen=[c for c in calls if c[1]=='gen']
         entry=[c[2] for c in gen if c[0]==0]
         assert len(entry)==rounds+1 and all(torch.equal(entry[0],x) for x in entry)

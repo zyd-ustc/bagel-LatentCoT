@@ -350,7 +350,7 @@ def test_duration_arm_coverage_legacy_control_and_comparisons():
     c=validate_config(json.loads((root/'configs/observation_duration_comparison.json').read_text()),28)
     arms=arm_configs(c);windows=window_metadata(c)
     assert len(arms)==10 and c['expected_prompts']==32
-    old=arm_configs(json.loads((root/'configs/window_comparison.json').read_text()))['EARLY_20_R2']
+    old=arm_configs(json.loads((root/'configs/loop_layer_npu_legacy_pilot.json').read_text()))['EARLY_20_R2']
     assert arms['LEGACY_EARLY_20_R2']==old
     assert windows['LEGACY_EARLY_20_R2']['loop_step_indexes']==list(range(20))
     for n in (1,5,10,20):
