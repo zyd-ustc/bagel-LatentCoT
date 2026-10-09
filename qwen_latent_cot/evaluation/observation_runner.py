@@ -6,12 +6,14 @@ import torch
 from .io import read_jsonl,sha256,validate_observation_record,validate_observation_pair
 from ..bagel.inferencer import T2IGenerator,InvalidGeneratedImage
 from ..bagel.observation_memory import ObservationMemoryGenerator
+from ..bagel.accelerator import synchronize,reset_peak_memory_stats,max_memory_allocated
 
 
 def generate_observation(bundle,plan,args,completed,output,manifest):
     if len(bundle.model.language_model.model.layers)!=plan['native_depth']:
         raise ValueError('loaded native decoder depth differs from plan')
     for record in completed.values():validate_observation_record(record)
+    device=next(bundle.model.parameters()).device
     data=read_jsonl(plan['benchmark'])[:len(plan['prompt_ids'])];sampling=plan['sampling']
     jobs=[(i,s) for i in range(len(data)) for s in plan['seeds']]
     for arm,setting in plan['arm_configs'].items():
@@ -25,13 +27,13 @@ def generate_observation(bundle,plan,args,completed,output,manifest):
             generator=(T2IGenerator(bundle) if arm=='BASE' else ObservationMemoryGenerator(bundle,
                 setting['observation_step'],setting['observe_image'],trace,questions,
                 plan['config']['probe_max_tokens'],plan['config']['edit_sampling']))
-            torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats();begin=time.perf_counter()
+            synchronize(device);reset_peak_memory_stats(device);begin=time.perf_counter()
             error=None
             try:
                 images,hashes=generator.generate([row['prompt']],[shape],[seed],num_timesteps=sampling['num_timesteps'],
                     timestep_shift=sampling['timestep_shift'],cfg_text_scale=sampling['cfg_text_scale'],cfg_renorm_type=sampling['cfg_renorm_type'])
             except InvalidGeneratedImage as exc:images=None;hashes=exc.noise_hashes;error=str(exc)
-            torch.cuda.synchronize();elapsed=time.perf_counter()-begin
+            synchronize(device);elapsed=time.perf_counter()-begin
             path=output/arm/(name+'.png');path.parent.mkdir(exist_ok=True)
             if images is not None:images[0].save(path)
             events=getattr(generator,'events',[])
@@ -42,7 +44,7 @@ def generate_observation(bundle,plan,args,completed,output,manifest):
             record={'arm':arm,'prompt_id':pid,'index':i,'prompt':row['prompt'],'seed':seed,'bucket':row.get('bucket','unclassified'),
                 'height':shape[0],'width':shape[1],'path':str(path),'image_sha256':sha256(path) if images is not None else None,
                 'noise_sha256':hashes[0],'valid_file':images is not None,'decode_error':error,'generation_seconds':elapsed,
-                'peak_allocated_bytes':torch.cuda.max_memory_allocated(),'timing_scope':'engineering_with_preview_and_probes',
+                'peak_allocated_bytes':max_memory_allocated(device),'timing_scope':'engineering_with_preview_and_probes',
                 'probe_seconds':sum(e['probe_seconds'] for e in events),'observation_events':events,
                 'observation_step':setting.get('observation_step'),'observe_image':setting.get('observe_image'),
                 'extra_rounds':0 if arm=='BASE' else 1,'memory_capacity_policy':'full_original_prompt',

@@ -3,6 +3,7 @@ import torch
 from PIL import Image
 from .observation_memory import ObservationConditions
 from .feedback import NativeFeedback
+from .accelerator import seeded_context
 
 
 def validate_observation(bundle,config):
@@ -12,7 +13,7 @@ def validate_observation(bundle,config):
     with torch.inference_mode(),engine.decoder.autocast():
         observed,context,visual,meta=engine.prepare_conditions(image,prompt,True)
         static,static_context,_,static_meta=engine.prepare_conditions(image,prompt,False)
-        reference,_,_=native.prepare_edit(image,prompt,123)
+        with seeded_context(engine.device,0):reference,_,_=native.prepare_edit(image,prompt,123)
         reference.pop('packed_init_noises')
         same=lambda a,b:all(torch.equal(a.key_cache[i],b.key_cache[i]) and torch.equal(a.value_cache[i],b.value_cache[i]) for i in a.key_cache)
         parity=same(context['past_key_values'],reference['past_key_values'])

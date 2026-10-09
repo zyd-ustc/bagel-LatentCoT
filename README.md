@@ -1,8 +1,10 @@
 # BAGEL：原生观察驱动的 denoiser 内部 Memory
 
+**本页对应 NPU 分支。** 运行后端与检查状态见 [NPU_RUNTIME.md](docs/NPU_RUNTIME.md)。
+
 当前默认方案是 **一次早期图像预测→完整原生 UND 更新→固定 x_t/t 重算 GEN**。没有完整文字反馈解码、adapter、gate、压缩或训练。正式质量效果尚未验证。
 
-22项CPU数值测试及CPU模拟流程检查已通过。真实权重检查由下方命令启动；CPU结果不证明语义收益或图像质量。
+原main的22项CPU数值测试保留。NPU分支增加设备、attention和RNG隔离检查，真实权重数值检查与正式效果的状态分别记录在NPU_RUNTIME.md。
 
 完整实现方案见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。这份文档对应当前代码；10月5日旧同层1/N方案不再代表实现。
 
@@ -14,19 +16,22 @@
 
 ## 用户运行
 
-正式GPU检查、生成与评分由用户启动。脚本先绑定源码／权重／数据，再执行真实权重数值检查，通过后生成40张图、评分并导出HTML。默认配置为configs/observation_comparison.json。
+正式生成与评分由用户启动。脚本先绑定源码／权重／数据，再执行真实权重数值检查，通过后生成40张图、评分并导出HTML。默认配置为configs/observation_comparison.json。
 
 ```bash
-cd /private/yida_workspace/bagel-LatentCoT-main-native-observation-20261009
-export GPUS=4,5,6,7
+cd /root/bagel-LatentCoT-NPU
+export BACKEND=npu
+export NPUS=0,2,4,6,8,10,12,14
+export OMP_NUM_THREADS=4
 export CONFIG="$PWD/configs/observation_comparison.json"
 unset COMPARISON_PROMPTS
-export RUN=/private/yida_workspace/outputs/und_native_observation_$(date +%Y%m%d_%H%M%S)
+mkdir -p /root/outputs
+export RUN=/root/outputs/und_native_observation_npu_$(date +%Y%m%d_%H%M%S)
 set -o pipefail
 bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
 ```
 
-请使用分配给本任务的卡，命令本身不代表当前卡空闲。仅保留上述两个比较脚本，不新增独立启动入口。结果在comparison.html、quality_report/和generation/worker_*/traces/；HTML内嵌早期图和probe。generation_seconds包含诊断，probe_seconds单独记录，不能作严格预算比较。
+在modelarts-job上执行。当前8张物理卡各有2个设备；上述命令每张卡选择一个Phy-ID。NPUS控制ASCEND_RT_VISIBLE_DEVICES，每个进程内部使用npu:0。运行前用npu-smi info确认分配和占用。仅保留上述两个比较脚本，不新增独立启动入口。结果在comparison.html、quality_report/和generation/worker_*/traces/；HTML内嵌早期图和probe。generation_seconds包含诊断，probe_seconds单独记录，不能作严格预算比较。
 
 支持原配置／源码／权重／分片数量不变时RESUME=1续跑。通用PROMPTS环境变量不会影响数据；自定义数据须显式设置COMPARISON_PROMPTS。
 

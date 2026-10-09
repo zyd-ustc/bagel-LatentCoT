@@ -94,7 +94,7 @@ def read_plan(path):
 def generate_main():
     p=argparse.ArgumentParser(description='Generate the configured paired comparison on a prompt shard')
     p.add_argument('--plan',required=True);p.add_argument('--output-dir',required=True)
-    p.add_argument('--device',default='cuda:0');p.add_argument('--shard-index',type=int,default=0)
+    p.add_argument('--device',default='auto');p.add_argument('--shard-index',type=int,default=0)
     p.add_argument('--num-shards',type=int,default=1)
     args=p.parse_args()
     import torch
@@ -103,7 +103,8 @@ def generate_main():
     from qwen_latent_cot.bagel.internal_loop import LoopConfig, InternalLoopRuntime
     plan=read_plan(args.plan)
     if not 0<=args.shard_index<args.num_shards:raise ValueError('invalid generation shard')
-    torch.cuda.set_device(torch.device(args.device))
+    from qwen_latent_cot.bagel.accelerator import set_device,device_info,synchronize,reset_peak_memory_stats,max_memory_allocated
+    device=set_device(args.device);args.device=str(device);backend=device_info(device)
     data=read_jsonl(plan['benchmark'])[:len(plan['prompt_ids'])];ids=plan['prompt_ids'];seeds=plan['seeds']
     sampling=plan['sampling']
     args.model_path=plan['model_path'];args.timestep_shift=sampling['timestep_shift']
@@ -111,7 +112,7 @@ def generate_main():
     args.cfg_text_scale=sampling['cfg_text_scale'];args.cfg_renorm_type=sampling['cfg_renorm_type']
     output=Path(args.output_dir).resolve();output.mkdir(parents=True,exist_ok=True)
     provenance=dict(plan,plan_sha256=sha256(args.plan),shard=[args.shard_index,args.num_shards],
-        gpu=torch.cuda.get_device_name(),precision='bfloat16',kernel='native_flash_attention',torch=torch.__version__,training=False)
+        gpu=backend['name'],accelerator=backend,precision='bfloat16',kernel=backend['attention_backend'],torch=torch.__version__,training=False)
     runfile=output/'run.json'
     if runfile.exists() and json.loads(runfile.read_text())!=provenance:
         raise ValueError('generation resume provenance differs')
@@ -144,7 +145,7 @@ def generate_main():
                 row=data[i]; shape=(int(row.get('height',args.image_size)),int(row.get('width',args.image_size)))
                 name=f'{i:05d}_s{seed}.png'; imagepath=output/arm/name; imagepath.parent.mkdir(exist_ok=True)
                 steps=args.num_timesteps
-                torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+                synchronize(device); reset_peak_memory_stats(device)
                 started=time.perf_counter()
                 invalid_error = None
                 try:
@@ -152,8 +153,8 @@ def generate_main():
                         timestep_shift=args.timestep_shift,cfg_text_scale=args.cfg_text_scale,cfg_renorm_type=args.cfg_renorm_type)
                 except InvalidGeneratedImage as error:
                     images = None; hashes = error.noise_hashes; invalid_error = str(error)
-                torch.cuda.synchronize(); elapsed=time.perf_counter()-started
-                peak=torch.cuda.max_memory_allocated()
+                synchronize(device); elapsed=time.perf_counter()-started
+                peak=max_memory_allocated(device)
                 if images is not None: images[0].save(imagepath)
                 record={'arm':arm,'prompt_id':ids[i],'index':i,'prompt':row['prompt'],'seed':seed,
                     'bucket':row.get('bucket','unclassified'),'height':shape[0],'width':shape[1],
@@ -255,24 +256,25 @@ def validate(bundle,generator,runtime,depths):
 def validate_main():
     p=argparse.ArgumentParser(description='Real-weight contracts and inactive-window native parity for five loop arms')
     p.add_argument('--plan',required=True);p.add_argument('--output',required=True)
-    p.add_argument('--device',default='cuda:0');a=p.parse_args()
+    p.add_argument('--device',default='auto');a=p.parse_args()
     import torch
     from qwen_latent_cot.bagel.backbone import load_native
     from qwen_latent_cot.bagel.internal_loop import LoopConfig,InternalLoopRuntime
     from qwen_latent_cot.bagel.inferencer import T2IGenerator
-    plan=read_plan(a.plan);torch.cuda.set_device(torch.device(a.device))
+    from qwen_latent_cot.bagel.accelerator import set_device,device_info
+    plan=read_plan(a.plan);device=set_device(a.device);a.device=str(device)
     bundle=load_native(plan['model_path'],a.device,plan['sampling']['timestep_shift'])
     results={}
     if plan['config']['experiment']=='observation_memory':
         from qwen_latent_cot.bagel.observation_memory_checks import validate_observation
         results=validate_observation(bundle,plan['config'])
-        Path(a.output).write_text(json.dumps({'plan_sha256':sha256(a.plan),'checks':results},indent=2)+'\n')
+        Path(a.output).write_text(json.dumps({'plan_sha256':sha256(a.plan),'accelerator':device_info(device),'checks':results},indent=2)+'\n')
         if not results['passed']:raise SystemExit(1)
         return
     if plan['config']['experiment']=='feedback_pilot':
         from qwen_latent_cot.bagel.feedback import validate_native_edit
         results['native_edit']=validate_native_edit(bundle,plan['config'])
-        Path(a.output).write_text(json.dumps({'plan_sha256':sha256(a.plan),'checks':results},indent=2)+'\n')
+        Path(a.output).write_text(json.dumps({'plan_sha256':sha256(a.plan),'accelerator':device_info(device),'checks':results},indent=2)+'\n')
         if not results['native_edit']['passed']:raise SystemExit(1)
         return
     for arm,config in plan['arm_configs'].items():
@@ -283,7 +285,7 @@ def validate_main():
             print(f"Numerical contracts {arm}: {results[arm]['passed']}",flush=True)
         finally:runtime.close()
     output=Path(a.output);output.parent.mkdir(parents=True,exist_ok=True)
-    output.write_text(json.dumps({'plan_sha256':sha256(a.plan),'windows':results},indent=2)+'\n')
+    output.write_text(json.dumps({'plan_sha256':sha256(a.plan),'accelerator':device_info(device),'windows':results},indent=2)+'\n')
     if not all(r['passed'] for r in results.values()):raise SystemExit(1)
 
 def score_main():
@@ -291,7 +293,7 @@ def score_main():
     p=argparse.ArgumentParser(description='Paired GenEval2/TIIF semantics, quality proxy, Repair/Damage and prompt-cluster CI')
     p.add_argument('--manifests',nargs='+',required=True);p.add_argument('--benchmark',required=True)
     p.add_argument('--judge-model',required=True);p.add_argument('--geneval2-source',required=True)
-    p.add_argument('--device',default='cuda:0');p.add_argument('--output-dir',required=True)
+    p.add_argument('--device',default='auto');p.add_argument('--output-dir',required=True)
     p.add_argument('--bootstrap-replicates',type=int,default=10000)
     p.add_argument('--num-shards',type=int,default=1);p.add_argument('--shard-index',type=int,default=0)
     args=p.parse_args()

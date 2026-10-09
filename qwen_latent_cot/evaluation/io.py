@@ -49,7 +49,7 @@ def validate_observation_pair(row,other):
     a=row['observation_events'][0];b=other['observation_events'][0]
     for field in ('step_index','x_t_sha256','timestep_sha256','preview_sha256','active_edit_cfg'):
         if a[field]!=b[field]:raise ValueError('static/observed pre-update conditions differ: '+field)
-    for field in ('text_ids','text_positions','memory_length','visual_prefix_length','conditional_lengths','conditional_rope','text_removed_lengths','image_removed_lengths'):
+    for field in ('text_ids','text_positions','memory_length','visual_prefix_length','conditional_lengths','conditional_rope','text_removed_lengths','image_removed_lengths','visual_posterior_seed'):
         if a['contexts'][field]!=b['contexts'][field]:raise ValueError('static/observed context contract differs: '+field)
 
 
@@ -63,7 +63,7 @@ def load_manifests(paths):
             if key in seen: raise ValueError('duplicate arm/prompt/seed record')
             seen.add(key); records.append(row)
     if not records: raise ValueError('empty manifests')
-    for key in ('schema', 'architecture', 'source_sha256', 'model_sha256', 'benchmark_sha256', 'sampling', 'loop', 'seeds', 'arms', 'prompt_ids', 'stage', 'diagnostics', 'memory_topologies', 'arm_configs', 'config', 'config_sha256', 'plan_sha256', 'native_depth', 'time_windows'):
+    for key in ('schema', 'architecture', 'source_sha256', 'model_sha256', 'benchmark_sha256', 'sampling', 'loop', 'seeds', 'arms', 'prompt_ids', 'stage', 'diagnostics', 'memory_topologies', 'arm_configs', 'config', 'config_sha256', 'plan_sha256', 'native_depth', 'time_windows', 'accelerator', 'precision', 'kernel', 'torch'):
         if any(run.get(key) != provenance[0].get(key) for run in provenance):
             raise ValueError(f'incompatible shard provenance: {key}')
     expected = {(p, s) for p in provenance[0]['prompt_ids'] for s in provenance[0]['seeds']}

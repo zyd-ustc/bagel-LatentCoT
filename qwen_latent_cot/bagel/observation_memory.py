@@ -12,6 +12,7 @@ import torch
 from .feedback import NativeFeedback
 from .inferencer import T2IGenerator, InvalidGeneratedImage, to_device
 from .modeling.bagel.qwen2_navit import NaiveCache
+from .accelerator import synchronize,seeded_context
 
 
 def tensor_hash(tensor):
@@ -41,7 +42,13 @@ def memory_context(context, prefix_length):
 
 class ObservationConditions(NativeFeedback):
     @torch.inference_mode()
-    def prepare_conditions(self,image,prompt,observe=True):
+    def prepare_conditions(self,image,prompt,observe=True,visual_seed=0):
+        with seeded_context(self.device,visual_seed):
+            flow,conditional,visual,meta=self._prepare_conditions(image,prompt,observe)
+        meta['visual_posterior_seed']=int(visual_seed)
+        return flow,conditional,visual,meta
+
+    def _prepare_conditions(self,image,prompt,observe):
         visual=self.image(image,self.context(),vae=True)
         prefix=visual['kv_lens'][0]
         conditional=deepcopy(visual)
@@ -134,7 +141,8 @@ class ObservationMemoryGenerator(T2IGenerator):
             preview=self.decode(estimate,shapes[0])
             self.trace_dir.mkdir(parents=True,exist_ok=True)
             preview_path=self.trace_dir/'early_prediction.png';preview.save(preview_path)
-            updated,conditional,visual,meta=self.engine.prepare_conditions(preview,prompts[0],self.observe)
+            visual_seed=int(before[:16],16)%(2**63)
+            updated,conditional,visual,meta=self.engine.prepare_conditions(preview,prompts[0],self.observe,visual_seed)
             if 'x_t' in updated or 'timestep' in updated or 'packed_init_noises' in updated:
                 raise ValueError('conditions may not replace the current noise/time')
             args={**kwargs,**updated}
@@ -153,7 +161,7 @@ class ObservationMemoryGenerator(T2IGenerator):
             torch.save(payload,self.trace_dir/'state.pt')
             begin=time.perf_counter()
             probes=self.engine.probe(preview,conditional,visual,meta,self.questions,self.probe_max_tokens) if self.questions else {}
-            if self.device.type=='cuda':torch.cuda.synchronize()
+            synchronize(self.device)
             probe_seconds=time.perf_counter()-begin if self.questions else 0.
             event={'step_index':current_step,'timestep':tv,'x_t_sha256':before,'timestep_sha256':time_before,
                 'x_t_unchanged':True,'timestep_unchanged':True,'updates':1,'contexts':meta,'probes':probes,

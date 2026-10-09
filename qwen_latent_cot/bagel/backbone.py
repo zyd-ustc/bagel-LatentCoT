@@ -7,6 +7,7 @@ from transformers import Qwen2Tokenizer
 from accelerate import init_empty_weights
 from .modeling.bagel import Bagel, BagelConfig, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel
 from .modeling.autoencoder import load_ae
+from .accelerator import set_device
 
 
 @dataclass
@@ -18,7 +19,8 @@ class NativeBundle:
     model_path: str
 
 
-def load_native(model_path, device='cuda:0', timestep_shift=3.0):
+def load_native(model_path, device='auto', timestep_shift=3.0):
+    device=set_device(device)
     path = Path(model_path)
     llm_cfg = Qwen2Config.from_json_file(path/'llm_config.json')
     llm_cfg.pad_token_id = getattr(llm_cfg, 'pad_token_id', None)
