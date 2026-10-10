@@ -59,6 +59,17 @@ def prepare_main():
             'suffix':'dynamic_final_writer_continuation', 'capacity':'full_prompt',
             'special_hidden_and_kv':'pinned_native', 'null_cfg':'native_bypass'},
         'loop':{'layer_window':config['layer_window'],'depth_and_time':'per_arm'}}
+    if config['experiment']=='joint_micro_loop':
+        plan['memory_topologies']={'mode':'same_layer_synchronous_GEN_UND',
+            'capacity':'full_prompt','initialization':'native_prompt_hidden_at_window_entrance',
+            'state_flow':'continuous_across_micro_steps_and_layers; local_to_denoiser_call',
+            'reads':'GEN:M+live_self; UND:P+old_GEN+live_self',
+            'kv_readout':'native_attention_layer_input_KV_for_both_branches',
+            'step_scale':'1/K on window layers; 1 on suffix layers',
+            'suffix':'one_synchronous_step_per_layer; both_states_continue',
+            'special_hidden_and_kv':'pinned_to_same_layer_native_prompt_reference',
+            'null_cfg':'native_bypass','K1_is_native_pipeline':False,
+            'legacy_control':'unchanged_legacy_layerwise_Early20_R2' if config.get('legacy_early20_r2') else None}
     if config.get('memory_update') in ('full_depth','full_depth_restart'):
         plan['memory_topologies'].update(writer='continuous_all_layers_every_round',
             suffix='included_in_every_writer',recycle=('native_prompt_entrance_each_round' if config['memory_update']=='full_depth_restart' else 'last_UND_hidden_to_first_UND_layer'),
@@ -109,7 +120,7 @@ def generate_main():
     import torch
     from qwen_latent_cot.bagel.backbone import load_native
     from qwen_latent_cot.bagel.inferencer import T2IGenerator, InvalidGeneratedImage
-    from qwen_latent_cot.bagel.internal_loop import LoopConfig, InternalLoopRuntime
+    from qwen_latent_cot.bagel.internal_loop import LoopConfig, InternalLoopRuntime, JOINT_MICRO
     plan=read_plan(args.plan)
     if not 0<=args.shard_index<args.num_shards:raise ValueError('invalid generation shard')
     from qwen_latent_cot.bagel.accelerator import set_device,device_info,synchronize,reset_peak_memory_stats,max_memory_allocated
@@ -185,6 +196,19 @@ def generate_main():
                     total_configured_gen_body_passes=(steps-1)+rounds*plan['time_windows'][arm]['loop_calls'],
                     start_layer=cfg.start_layer,end_layer=cfg.end_layer,
                     writer_suffix_layers=(plan['native_depth']-cfg.end_layer if mode!='BASE' else 0))
+                if mode==JOINT_MICRO:
+                    w=plan['time_windows'][arm]
+                    # Layer-local micro evaluations are not repeated body traversals.
+                    for key in ('writer_body_passes_per_active_call','writer_suffix_passes_per_active_call',
+                                'gen_body_passes_per_active_call','total_configured_gen_body_passes'):
+                        record.pop(key)
+                    record.update(memory_update='joint_micro',micro_steps=cfg.micro_steps,
+                        micro_step_scale=1/cfg.micro_steps,read_state='start_of_micro',
+                        body_pass_count_scope='layer_evaluations; no_body_restart',
+                        gen_layer_calls_per_active_call=w['gen_layer_calls_per_active_call'],
+                        und_layer_calls_per_active_call=w['und_layer_calls_per_active_call'],
+                        total_configured_gen_layer_calls=w['total_gen_layer_calls'],
+                        total_configured_und_layer_calls=w['total_und_layer_calls'])
                 with manifest.open('a') as f: f.write(json.dumps(record)+'\n'); f.flush()
                 print(f'{arm} prompt={ids[i]} seed={seed} {elapsed:.2f}s peak={peak/2**30:.2f}GiB',flush=True)
         finally: runtime.close()
@@ -269,7 +293,7 @@ def validate_main():
     p.add_argument('--device',default='auto');a=p.parse_args()
     import torch
     from qwen_latent_cot.bagel.backbone import load_native
-    from qwen_latent_cot.bagel.internal_loop import LoopConfig,InternalLoopRuntime
+    from qwen_latent_cot.bagel.internal_loop import LoopConfig,InternalLoopRuntime,JOINT_MICRO
     from qwen_latent_cot.bagel.inferencer import T2IGenerator
     from qwen_latent_cot.bagel.accelerator import set_device,device_info
     plan=read_plan(a.plan);device=set_device(a.device);a.device=str(device)
@@ -297,7 +321,11 @@ def validate_main():
         if arm=='BASE':continue
         runtime=InternalLoopRuntime(bundle.model,LoopConfig(**config))
         try:
-            results[arm]=validate(bundle,T2IGenerator(bundle,runtime),runtime,(config['extra_rounds'],))
+            if config['mode']==JOINT_MICRO:
+                from qwen_latent_cot.bagel.joint_micro_checks import validate_joint_micro
+                results[arm]=validate_joint_micro(bundle,T2IGenerator(bundle,runtime),runtime)
+            else:
+                results[arm]=validate(bundle,T2IGenerator(bundle,runtime),runtime,(config['extra_rounds'],))
             print(f"Numerical contracts {arm}: {results[arm]['passed']}",flush=True)
         finally:runtime.close()
     output=Path(a.output);output.parent.mkdir(parents=True,exist_ok=True)
@@ -369,7 +397,13 @@ def write_summary(scored,run,output,resamples=10000):
         feedback=[r for r in scored if r['arm']=='FEEDBACK_EDIT']
         summary['feedback_format']={'valid':sum(r.get('feedback_format_valid') is True for r in feedback),'total':len(feedback),'visual_correctness':'not_verified_by_format_check'}
     (output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
-    lines=['# Frozen BAGEL: '+run['config']['experiment'],'','Quality is a VLM proxy; manual review is pending. Historical implicit arms use layers [0,8). Observation Memory uses one full-depth UND prefill, then a fixed native visual/text cache for its configured window. Writer count and conditioning-call count are different. Probes are diagnostic, not observed-image ground truth. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing includes per-call native reference velocities and does not establish budget compliance.','',
+    description=('Joint micro: K is total evaluations per window layer, each residual scaled by 1/K. '
+        'Both branches read the start-of-micro states. Suffix layers use one joint step. '
+        'K1 is a coupled traversal, not the native Base pipeline. Native text-removed CFG bypasses the loop.'
+        if run['config']['experiment']=='joint_micro_loop' else
+        'Historical implicit arms use layers [0,8). Observation Memory writes one full-depth UND cache, '
+        'then reads it for the configured window. Probes are diagnostic, not image ground truth.')
+    lines=['# Frozen BAGEL: '+run['config']['experiment'],'',description+' Quality is a VLM proxy; manual review is pending. Confidence intervals are pointwise, without multiple-comparison correction. Engineering timing does not establish budget compliance.','',
         '|Arm|Semantic GM|Quality proxy|Invalid|Net Repair vs Base (95% CI)|Repair / Damage|',
         '|---|---:|---:|---:|---|---:|']
     for arm,s in summary['arms'].items():
@@ -434,7 +468,9 @@ def _export_page(root,output,selected=None):
     esc=lambda value:html.escape(str(value),quote=True)
     parts=['''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BAGEL · 配对图片</title><style>
     :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#141819;color:#ecf0ea;font:16px/1.5 system-ui,-apple-system,sans-serif}main{max-width:1720px;margin:auto;padding:28px 20px}h1{font-size:30px}h2{font-size:18px;font-weight:500}p,small,details{color:#b8c4bc}.meta{font:12px ui-monospace,monospace;overflow-wrap:anywhere}.grid{display:grid;gap:12px}.label{font:13px ui-monospace,monospace;color:#d4e6b4;padding:8px 0;overflow-wrap:anywhere}img{width:100%;height:auto;display:block;cursor:zoom-in}.pair{border-top:1px solid #435047;margin:30px 0;padding:14px 0}table{border-collapse:collapse;margin:20px 0;font-size:14px}th,td{padding:8px 14px;text-align:left;border-bottom:1px solid #435047}li{margin:8px 0}details{margin-top:12px}dialog{background:#141819;border:1px solid #687864;padding:10px;max-width:98vw;max-height:98vh}dialog img{width:auto;max-width:92vw;max-height:84vh;cursor:default}button{margin-bottom:8px}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}main{padding:20px 10px}}
-    </style><main><h1>BAGEL：配对对比实验</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。旧loop使用[0,8)；新观察方案只写一次完整UND缓存，在配置的时间窗口内持续读取。问答probe仅作诊断，尚无人工观察标签。生成时间包含额外诊断计算。</p>''']
+    </style><main><h1>BAGEL：配对对比实验</h1><p>同 prompt、同 noise seed。图片嵌入文件，可离线查看。点击图片查看原尺寸。评分是模型代理；Repair / Damage 未经人工确认。时间是工程记录。</p>''']
+    if summary['comparison']=='joint_micro_loop':
+        parts.append('<p>GEN／UND 在每层同步微循环。K 是窗口内每层总计算次数，残差步长 1/K；后续层执行一次并继续传递两份状态。K1 不是 Base。原始 prompt KV 固定；GEN 读取可变 Memory。LEGACY 是原有独立逐层 Memory 的 Early20 R2。</p>')
     parts.append(f'<p class="meta">RUN {esc(root.name)}<br>SOURCE {esc(summary["source_sha256"])}</p>')
     parts.append('<table><tr><th>Arm</th><th>Semantic GM</th><th>Quality proxy</th><th>Repair / Damage vs Base</th><th>Median seconds</th></tr>')
     for arm in arms:
@@ -450,7 +486,9 @@ def _export_page(root,output,selected=None):
             if any(row[k]!=base[k] for k in ('prompt','noise_sha256','height','width')):
                 raise ValueError('paired inputs differ')
             w=summary['time_windows'][arm]
-            suffix=(f"写1次 / 读{w['loop_calls']}步" if w.get('conditioning_kind')=='fixed_observation_cache' else f"R{w['extra_rounds']}")
+            suffix=(f"K{w['micro_steps']} · 步长 {w['step_scale']:g}" if w.get('conditioning_kind')=='joint_micro'
+                else f"写1次 / 读{w['loop_calls']}步" if w.get('conditioning_kind')=='fixed_observation_cache'
+                else f"R{w['extra_rounds']}")
             label=arm if w['loop_calls']==0 else f"{arm} · step [{w['step_start']},{w['step_end']}) · {suffix}"
             parts.append(f'<div><div class="label">{esc(label)} · quality {row["quality_proxy"]:.2f}</div>')
             if row['valid_file']:

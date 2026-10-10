@@ -1,8 +1,10 @@
 # 连续 UND Memory loop：main / loop-layer-NPU
 
+> 本文记录分支起点的旧拓扑。本分支 `loop-layer-joint-micro` 的当前实现见 [JOINT_MICRO_LOOP.md](JOINT_MICRO_LOOP.md)。新路径为每层同步 GEN／UND 微循环，不使用下述窗口重启或末层回送。
+
 ## 固定语义
 
-基于旧loop提交a87fa44实现连续完整UND更新。旧实现保留为数值参照，原完整回送评测配置memory_update=full_depth，核心实现full_depth_memory.py。
+基旧loop提交a87fa44实现连续完整UND更新。旧实现保留为数值参照，原完整回送评测配置memory_update=full_depth，核心实现full_depth_memory.py。
 
 - 每个活跃去噪步，单份H从原prompt的第0层输入hidden初始化。Memory容量、位置和特殊token固定规则不变，不跨去噪步保存。
 - 每轮writer从0到27层连续运行；第l层输出进入第l+1层，最后一层输出进入下一轮第0层。特殊token在各层恢复为该层原生prompt参考值。此次明确不处理深度错配。

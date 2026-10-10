@@ -1,6 +1,28 @@
-# BAGEL：重复 R1 的连续 UND Memory loop
+# BAGEL：每层同步 GEN／UND 微循环
 
-main 当前测试路径为 `full_depth_restart`：每轮从原生第0层 hidden 出发，Memory 连续经过 UND 0–27 层。前一层输出进入下一层；末层 hidden 不回送首层。轮间信息通过 `M1 → GEN1 → GEN1 KV → writer2 → M2` 传递。GEN 每轮重算 `[0,8)`，最后执行一次 GEN suffix。0–7层保留更新后 hidden 的 KV 投影，8–27层保留原生 attention 输入 KV。
+本分支 `loop-layer-joint-micro` 从 `loop-layer-NPU@42e7114` 创建。新路径在同一层维护 GEN／Memory 两份连续状态。每个微轮都读取轮初的原生 KV，分别运行 GEN／UND block，再以 `1/K` 更新两份状态并传给下一微轮／下一层。GEN 读取 Memory；UND 读取固定 prompt、轮初 GEN 和 live self KV。窗口后每层执行一次同步更新，最终只读出一次 velocity。
+
+新方案见 [JOINT_MICRO_LOOP.md](docs/JOINT_MICRO_LOOP.md)。没有 adapter、压缩或训练。K 是窗口内每层总计算次数；K1 已经包含 Memory 反馈，不等于 Base。语义编辑、Repair 和质量收益尚未验证。
+
+默认新实验 `configs/joint_micro_pilot.json`：32题、seed0、Base＋旧 Legacy Early20 R2＋Joint Early20 K1/K2/K4，共160图。仍使用 `[0,8)` 与原生 shifted sampling；正式评测由用户启动。
+
+```bash
+cd /root/bagel-LatentCoT-loop-layer-joint-micro-20261010
+export BACKEND=npu
+export NPUS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export CONFIG="$PWD/configs/joint_micro_pilot.json"
+export OMP_NUM_THREADS=4
+unset CUDA_VISIBLE_DEVICES ASCEND_RT_VISIBLE_DEVICES COMPARISON_PROMPTS
+export RUN=/root/outputs/joint_micro_$(date +%Y%m%d_%H%M%S)
+set -o pipefail
+bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
+```
+
+脚本先执行真实权重数值检查，再生成、打分并导出 `comparison.html`。也可使用 `BACKEND=cuda`／`GPUS` 在 H200 运行。旧实现和旧配置保留如下，不能用其 R 标签解释新路径的 K。
+
+## 起点实现与历史结果
+
+起点 main／loop-layer-NPU 的测试路径为 `full_depth_restart`：每轮从原生第0层 hidden 出发，Memory 连续经过 UND 0–27 层。前一层输出进入下一层；末层 hidden 不回送首层。轮间信息通过 `M1 → GEN1 → GEN1 KV → writer2 → M2` 传递。GEN 每轮重算 `[0,8)`，最后执行一次 GEN suffix。0–7层保留更新后 hidden 的 KV 投影，8–27层保留原生 attention 输入 KV。
 
 保持原生 BAGEL 权重、MoT、全量 prompt、位置、特殊 token、CFG 和采样。不添加 adapter、gate、alpha、压缩或训练。该方案不使用 ViT，也不等价于原生图像理解。
 

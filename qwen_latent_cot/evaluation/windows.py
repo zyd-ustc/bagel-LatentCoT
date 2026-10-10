@@ -2,7 +2,7 @@
 from dataclasses import asdict
 from pathlib import Path
 import json
-from qwen_latent_cot.bagel.internal_loop import LoopConfig, MODE
+from qwen_latent_cot.bagel.internal_loop import LoopConfig, MODE, JOINT_MICRO
 
 
 def load_comparison(path,native_depth):
@@ -13,12 +13,31 @@ def validate_config(c,native_depth):
     if c['schema']!=3 or native_depth!=c['expected_num_hidden_layers']:
         raise ValueError('incompatible comparison schema or native depth')
     expected_window={'start_layer':0,'end_layer':native_depth if c['experiment']=='observation_memory' else 8}
-    if c['layer_window']!=expected_window:
+    if c['experiment']=='joint_micro_loop':
+        start,end=c['layer_window']['start_layer'],c['layer_window']['end_layer']
+        if type(start) is not int or type(end) is not int or not 0<=start<end<=native_depth:
+            raise ValueError('joint micro window must be a nonempty native layer interval')
+    elif c['layer_window']!=expected_window:
         raise ValueError('layer window differs from selected experiment')
     s=c['sampling']
     if s['num_timesteps']!=50 or s['timestep_shift']!=3. or s['cfg_renorm_type']!='global':
         raise ValueError('comparison requires the bound 50-point shift3 native schedule')
-    if c['experiment']=='loop_grid':
+    if c['experiment']=='joint_micro_loop':
+        counts=c['micro_steps']
+        if (not counts or len(set(counts))!=len(counts)
+                or any(type(k) is not int or k<1 for k in counts) or counts!=sorted(counts)):
+            raise ValueError('require distinct, increasing positive integer micro_steps')
+        names=[]
+        for window in c['windows']:
+            a,b=window['step_start'],window['step_end']
+            if type(a) is not int or type(b) is not int or not 0<=a<b<=49:
+                raise ValueError('joint time windows must select native denoiser calls')
+            if not isinstance(window['name'],str) or not window['name'].replace('_','').isalnum():
+                raise ValueError('invalid joint window name')
+            names.append(window['name'])
+        if not names or len(set(names))!=len(names):raise ValueError('require unique joint time windows')
+        if type(c.get('legacy_early20_r2',False)) is not bool:raise ValueError('invalid legacy control flag')
+    elif c['experiment']=='loop_grid':
         if c['depths']!=[1,2,3,4] or c['windows']!=[
             {'name':'EARLY_10','step_start':0,'step_end':10},
             {'name':'EARLY_20','step_start':0,'step_end':20}]:
@@ -47,6 +66,16 @@ def validate_config(c,native_depth):
 def arm_configs(c):
     base=asdict(LoopConfig(mode='BASE',extra_rounds=0,**c['layer_window']))
     arms={'BASE':base}
+    if c['experiment']=='joint_micro_loop':
+        if c.get('legacy_early20_r2'):
+            arms['LEGACY_EARLY_20_R2']=asdict(LoopConfig(mode=MODE,extra_rounds=2,
+                start_layer=0,end_layer=8,progress_end=19/48))
+        for window in c['windows']:
+            for steps in c['micro_steps']:
+                arms[f"JOINT_{window['name']}_K{steps}"]=asdict(LoopConfig(mode=JOINT_MICRO,
+                    extra_rounds=0,micro_steps=steps,**c['layer_window'],
+                    progress_start=window['step_start']/48,progress_end=(window['step_end']-1)/48))
+        return arms
     if c['experiment']=='feedback_pilot':
         return dict(arms,GENERIC_EDIT=dict(base),FEEDBACK_EDIT=dict(base))
     if c['experiment']=='observation_memory':
@@ -88,10 +117,28 @@ def window_metadata(c):
             'covered_delta_t':t(steps[0])-t(steps[-1]+1) if steps else 0.,
             't_first':t(steps[0]) if steps else None,'t_last':t(steps[-1]) if steps else None,
             't_after_window':t(steps[-1]+1) if steps else None}
+        if cfg['mode']==JOINT_MICRO:
+            width=cfg['end_layer']-cfg['start_layer'];suffix=c['expected_num_hidden_layers']-cfg['end_layer']
+            body=width*cfg['micro_steps'];gen_calls=cfg['start_layer']+body+suffix
+            und_calls=body+suffix
+            out[arm].update(micro_steps=cfg['micro_steps'],step_scale=1/cfg['micro_steps'],
+                conditioning_kind='joint_micro',memory_writer_calls=len(steps),
+                memory_writer_count_unit='one_connected_traversal_with_micro_steps_per_active_call',
+                gen_layer_calls_per_active_call=gen_calls,und_layer_calls_per_active_call=und_calls,
+                total_gen_layer_calls=(49-len(steps))*c['expected_num_hidden_layers']+len(steps)*gen_calls,
+                total_und_layer_calls=len(steps)*und_calls)
     return out
 
 
 def comparison_pairs(c):
+    if c['experiment']=='joint_micro_loop':
+        pairs=[]
+        for window in c['windows']:
+            prefix=f"JOINT_{window['name']}_K"
+            pairs += [(prefix+str(b),prefix+str(a)) for a,b in zip(c['micro_steps'],c['micro_steps'][1:])]
+            if c.get('legacy_early20_r2'):
+                pairs += [(prefix+str(k),'LEGACY_EARLY_20_R2') for k in c['micro_steps']]
+        return pairs
     if c['experiment']=='feedback_pilot':return [('FEEDBACK_EDIT','GENERIC_EDIT')]
     if c['experiment']=='observation_memory':
         if 'conditioning_durations' in c:
@@ -106,5 +153,8 @@ def comparison_pairs(c):
 
 
 def reference_arm(c):
+    if c['experiment']=='joint_micro_loop':
+        return ('LEGACY_EARLY_20_R2' if c.get('legacy_early20_r2')
+                else f"JOINT_{c['windows'][0]['name']}_K{c['micro_steps'][0]}")
     if c['experiment']=='observation_memory':return 'LEGACY_EARLY_20_R2' if 'conditioning_durations' in c else 'STEP_09_STATIC'
     return 'GENERIC_EDIT' if c['experiment']=='feedback_pilot' else 'EARLY_10_R2'

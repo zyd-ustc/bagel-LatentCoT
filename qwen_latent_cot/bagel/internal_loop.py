@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from types import MethodType
 
 MODE = 'LAYERWISE_UND_STATE_REPLACE'
-MODES = ('BASE', MODE)
+JOINT_MICRO = 'LAYERWISE_JOINT_MICRO'
+MODES = ('BASE', MODE, JOINT_MICRO)
 
 
 @dataclass(frozen=True)
@@ -13,12 +14,19 @@ class LoopConfig:
     start_layer: int = 0
     end_layer: int = 8
     memory_update: str = "legacy_layerwise"
+    micro_steps: int = 1
     progress_start: float = 0.0
     progress_end: float = 1.0
 
     def __post_init__(self):
-        if self.mode not in MODES or self.extra_rounds < 0:
-            raise ValueError('only Base and persistent UND Memory loop are supported')
+        if self.mode not in MODES or type(self.extra_rounds) is not int or self.extra_rounds < 0:
+            raise ValueError('invalid inference loop mode or extra_rounds')
+        if type(self.micro_steps) is not int or self.micro_steps < 1:
+            raise ValueError('micro_steps must be a positive integer')
+        if self.mode == JOINT_MICRO and self.extra_rounds != 0:
+            raise ValueError('joint micro loops use micro_steps (total K), not extra_rounds')
+        if self.mode != JOINT_MICRO and self.micro_steps != 1:
+            raise ValueError('micro_steps only applies to LAYERWISE_JOINT_MICRO')
         if self.memory_update not in ('legacy_layerwise','full_depth','full_depth_restart'):
             raise ValueError('unknown Memory update topology')
         if not 0 <= self.start_layer < self.end_layer:
@@ -44,6 +52,7 @@ class InternalLoopRuntime:
         self.step_index = 0
         self.kv_observer = kv_observer
         self.increment_observer = None  # Read-only, opt-in diagnostics.
+        self.joint_observer = None  # Same-layer, synchronous micro-state snapshots.
         self.diagnostics_enabled = diagnostics
         self.diagnostics = []
         from .layerwise_memory import LayerwiseMemoryLoop
@@ -55,7 +64,8 @@ class InternalLoopRuntime:
         self.decoder.forward_inference = MethodType(wrapped, self.decoder)
 
     def begin_prefill(self, cache, token_ids, lengths, special_ids):
-        if self.config.mode == MODE and self.config.extra_rounds > 0:
+        if (self.config.mode == JOINT_MICRO
+                or self.config.mode == MODE and self.config.extra_rounds > 0):
             self.layerwise.begin_prefill(cache, token_ids, lengths, special_ids, self.config)
 
     def end_prefill(self):
@@ -68,13 +78,16 @@ class InternalLoopRuntime:
         if kwargs.get('mode', 'und') == 'und' and self.layerwise.prefill is not None:
             return self.layerwise.capture_prefill(self.original, kwargs, self.config)
         cfg = self.config
-        active = (kwargs.get('mode', 'und') == 'gen' and cfg.mode == MODE
-                  and cfg.extra_rounds > 0
+        active = (kwargs.get('mode', 'und') == 'gen'
+                  and (cfg.mode == JOINT_MICRO or cfg.mode == MODE and cfg.extra_rounds > 0)
                   and cfg.progress_start <= self.progress <= cfg.progress_end)
         if not active:
             return self.original(**kwargs)
         if kwargs.get('update_past_key_values', True) or kwargs.get('is_causal', True):
             raise ValueError('GEN loop requires immutable prompt KV and noncausal attention')
+        if cfg.mode == JOINT_MICRO:
+            from .joint_micro import run_joint_micro
+            return run_joint_micro(self.layerwise, kwargs, self)
         return self.layerwise.run(kwargs, self)
 
     def close(self):

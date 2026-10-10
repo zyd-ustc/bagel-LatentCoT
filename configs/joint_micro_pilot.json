@@ -1,0 +1,20 @@
+{
+  "schema": 3,
+  "experiment": "joint_micro_loop",
+  "expected_num_hidden_layers": 28,
+  "layer_window": {"start_layer": 0, "end_layer": 8},
+  "windows": [{"name": "EARLY_20", "step_start": 0, "step_end": 20}],
+  "micro_steps": [1, 2, 4],
+  "legacy_early20_r2": true,
+  "sampling": {
+    "image_size": 512,
+    "num_timesteps": 50,
+    "timestep_shift": 3.0,
+    "cfg_text_scale": 4.0,
+    "cfg_renorm_type": "global"
+  },
+  "seeds": [0],
+  "max_prompts": 32,
+  "expected_prompts": 32,
+  "benchmark": "data/prompts32.jsonl"
+}

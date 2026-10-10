@@ -32,7 +32,7 @@ SCORER_PYTHON=${SCORER_PYTHON:-$default_scorer_python}
 MODEL_PATH=${MODEL_PATH:-$default_model}
 # Do not inherit generic PROMPTS from an unrelated experiment.
 PROMPTS=${COMPARISON_PROMPTS:-}
-CONFIG=${CONFIG:-$ROOT/configs/repeat_r1_pilot.json}
+CONFIG=${CONFIG:-$ROOT/configs/joint_micro_pilot.json}
 JUDGE=${JUDGE_MODEL:-$default_judge}
 OFFICIAL=${GENEVAL2_SOURCE:-$default_official}
 GPUS=${NPUS:-${GPUS:-0,1,2,3,4,5,6,7}}
