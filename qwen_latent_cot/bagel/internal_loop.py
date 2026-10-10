@@ -43,6 +43,7 @@ class InternalLoopRuntime:
         self.progress = 0.0
         self.step_index = 0
         self.kv_observer = kv_observer
+        self.increment_observer = None  # Read-only, opt-in diagnostics.
         self.diagnostics_enabled = diagnostics
         self.diagnostics = []
         from .layerwise_memory import LayerwiseMemoryLoop

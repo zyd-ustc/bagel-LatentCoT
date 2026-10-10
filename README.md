@@ -39,3 +39,7 @@ bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
 ## 历史证据
 
 此前完整800题、seed0的7200张评测已完成。浅层独立UND循环在R1／R2有小幅正趋势，但净Repair区间跨零；R3／R4明确增加Damage。Early20 R4为412 Repair／1064 Damage。
+
+## Memory 增量定位
+
+NPU诊断使用 `scripts/diagnose_increments_npu.sh` 和 `configs/increment_diagnostics.json`。默认32条真实Early20 R4轨迹，在step0/4/9/19固定x_t/t比较R0–4，记录GEN/Memory逐层变化及条件/CFG velocity。原生采样每步仍只推进一次。执行命令与字段说明见 [INCREMENT_DIAGNOSTICS.md](docs/INCREMENT_DIAGNOSTICS.md)。

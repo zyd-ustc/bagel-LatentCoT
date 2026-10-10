@@ -42,6 +42,7 @@ def run_und_state(loop,kwargs,runtime):
     writer=seed.layer_hidden[cfg.start_layer].clone()
     bank=dict(native)
     restart=cfg.memory_update=='full_depth_restart'
+    observer=runtime.increment_observer
 
     def pin_hidden(index,state):
         return torch.where(seed.special_mask[:,None],seed.layer_hidden[index],state)
@@ -72,10 +73,16 @@ def run_und_state(loop,kwargs,runtime):
         for index in range(cfg.start_layer,cfg.end_layer):
             replacing=round_index>0
             if replacing and round_index==cfg.extra_rounds:observe_read(index,'body')
+            before_gen=hidden
             hidden,current=native_layer(index,hidden,gen_lengths,gen_rope,
-                [bank[index]] if replacing else [],'gen',store=round_index<cfg.extra_rounds,
+                [bank[index]] if replacing else [],'gen',store=round_index<cfg.extra_rounds or observer is not None,
                 include_prompt=not replacing)
             if current is not None:gen_kv[index]=current
+            if observer is not None:
+                observer(event='gen_layer',layer=index,phase='body',round=round_index,
+                    input_hidden=before_gen,output_hidden=hidden,input_kv=current,read_kv=bank[index],
+                    image_indexes=kwargs['packed_vae_token_indexes'],text_indexes=kwargs['packed_text_indexes'],
+                special_mask=seed.special_mask)
             if runtime.diagnostics_enabled:
                 runtime.diagnostics.append(dict(phase='gen',layer=index,round=round_index,
                     gen_reads_memory=replacing,memory_slots_per_sample=list(seed.lengths),
@@ -91,7 +98,7 @@ def run_und_state(loop,kwargs,runtime):
             before=pin_hidden(index,writer);old_kv=bank[index]
             additions=[gen_kv[index]] if index in gen_kv else []
             suffix=index>=cfg.end_layer
-            writer,current=native_layer(index,before,seed.lengths,memory_rope,additions,'und',store=suffix)
+            writer,current=native_layer(index,before,seed.lengths,memory_rope,additions,'und',store=suffix or observer is not None)
             writer=pin_hidden(index,writer)
             if suffix:
                 # Preserve legacy suffix: KV is written by native attention
@@ -100,6 +107,10 @@ def run_und_state(loop,kwargs,runtime):
             else:
                 _,keys,values=project_und(decoder.layers[index],writer,memory_rope)
                 bank[index]=pin_kv(index,keys,values)
+            if observer is not None:
+                observer(event='memory_layer',layer=index,phase='body' if not suffix else 'suffix',round=round_index+1,
+                    input_hidden=before,output_hidden=writer,input_kv=current,read_kv=bank[index],
+                    reference_kv=old_kv,special_mask=seed.special_mask,gen_feedback=index in gen_kv)
             if runtime.kv_observer is not None:
                 runtime.kv_observer(event='writer_update',layer=index,phase='body',depth=cfg.extra_rounds,
                     from_round=round_index,to_round=round_index+1,current=bank[index],reference=old_kv,
@@ -113,7 +124,14 @@ def run_und_state(loop,kwargs,runtime):
                         **memory_slot_stats(b)))
     for index in range(cfg.end_layer,len(decoder.layers)):
         observe_read(index,'suffix')
-        hidden,_=native_layer(index,hidden,gen_lengths,gen_rope,[bank[index]],'gen',include_prompt=False)
+        before_gen=hidden
+        hidden,current=native_layer(index,hidden,gen_lengths,gen_rope,[bank[index]],'gen',
+            store=observer is not None,include_prompt=False)
+        if observer is not None:
+            observer(event='gen_layer',layer=index,phase='suffix',round=cfg.extra_rounds,
+                input_hidden=before_gen,output_hidden=hidden,input_kv=current,read_kv=bank[index],
+                image_indexes=kwargs['packed_vae_token_indexes'],text_indexes=kwargs['packed_text_indexes'],
+                special_mask=seed.special_mask)
     normalized=torch.zeros_like(hidden)
     text,image=kwargs['packed_text_indexes'],kwargs['packed_vae_token_indexes']
     normalized[text]=decoder.norm(hidden[text]);normalized[image]=decoder.norm_moe_gen(hidden[image])

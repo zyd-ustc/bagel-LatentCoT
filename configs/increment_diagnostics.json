@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "max_prompts": 32,
+  "seeds": [0],
+  "steps": [0, 4, 9, 19],
+  "max_rounds": 4,
+  "trajectory": "Early20_R4",
+  "memory_update": "full_depth_restart",
+  "save_previews": true,
+  "tensor_layers": []
+}
