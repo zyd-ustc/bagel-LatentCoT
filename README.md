@@ -1,7 +1,9 @@
 # BAGEL：冻结模型的独立 Memory 拓扑诊断
 
-本页对应 `loop-layer` 分支。实现基点为 `loop-layer-NPU@42e71148826011b74473a170c4ab62072d6c70ab`。
-本分支只保留新诊断路径。历史循环、prompt 替换、观察反馈、旧测试及旧启动脚本均已移除。
+`main` 为主分支；`loop-layer-NPU` 共享同一实现，仅采用 NPU 优先的自动设备选择。实现基点为 `loop-layer-NPU@42e71148826011b74473a170c4ab62072d6c70ab`。
+`main` 的 `auto` 优先 CUDA，其次 NPU；`loop-layer-NPU` 的 `auto` 优先 NPU，其次 CUDA。两者均保留 NPU 的 attention、BF16 和 RNG 适配，显式设备请求不会被替换。
+
+当前实现只保留新诊断路径。历史循环、prompt 替换、观察反馈、旧测试及旧启动脚本均已移除。
 
 依据：[诊断协议](docs/memory_topology_diagnostic_protocol_20261011.md)。代码映射、数据格式和验证边界见[实现说明](docs/MEMORY_TOPOLOGY_IMPLEMENTATION.md)。
 
