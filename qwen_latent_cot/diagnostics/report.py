@@ -59,6 +59,8 @@ def summarize(runs, output):
             entry = dict(topology=topology, stage=stage, arm=arm, t=t, label_type=label, source=source, init=init,
                          nll=sum(r['nll'] for r in rows)/len(rows), fact_accuracy=cluster_interval(rows, 'fact_accuracy'),
                          unknown_assertion_rate=cluster_interval(rows, 'unknown_assertion_rate'))
+            entry['equivalent_to'] = 'Source-swap' if arm == 'Memory-swap' else None
+            entry['independent_evidence'] = arm != 'Memory-swap'
             entry['by_category'] = {}
             for category in ('object', 'attribute', 'count', 'relation'):
                 category_rows = []
@@ -76,6 +78,7 @@ def summarize(runs, output):
             cfg_norm_ratio=sum(r['cfg']['norm_ratio'] for r in rows)/len(rows),
             repeat_cfg_error=max(r['repeat_error']['cfg']['normalized_difference'] for r in rows),
             layout_native_shift_parity=max(r['layout_native_shift_parity']['cfg']['normalized_difference'] for r in rows),
+            fixed_bank_content=rows[0].get('fixed_bank_content', 'legacy_definition_review_manifest'),
             semantics='pending independent factual review'))
     for key, rows in final_groups.items():
         raw['final_image'].append(dict(topology=key[0], arm=key[1], reference=key[2], t=key[3],
@@ -89,7 +92,9 @@ def summarize(runs, output):
         if isinstance(value, float): return f'{value:.4f}'
         return str(value).replace('|', '/')
     lines = ['# Memory 拓扑诊断报告', '', '事实分数使用预先固定的短语规则；数值变化不代表语义有效或画质改善。',
-             '区间按场景族聚类重采样；t=1单独列出。未完成盲评的最终图像结果保留为空。', '']
+             '区间按场景族聚类重采样；t=1单独列出。未完成盲评的最终图像结果保留为空。',
+             'Source-swap 与 Memory-swap 在确定性 writer 中等价，属于同一份证据。Source-off 与 Memory-masked 回答不同的干预问题。',
+             '修正后的 G-fixed 使用可见的全零 K/V；G-neutral 使用中性文本 seed 的 K/V，含固定文本内容。旧版 G-fixed 含中性文本，不可直接比较。', '']
     tables = [('文本桥', 'text_bridge', ['topology','stage','arm','init','nll','fact_accuracy']),
               ('视觉 Caption', 'visual_caption', ['topology','arm','t','label_type','source','nll','fact_accuracy','unknown_assertion_rate']),
               ('GEN 局部敏感性', 'gen_local', ['topology','arm','t','source','conditional_difference','cfg_difference','cfg_norm_ratio','repeat_cfg_error']),

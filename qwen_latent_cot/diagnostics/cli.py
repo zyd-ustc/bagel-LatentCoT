@@ -64,7 +64,7 @@ def main():
     runtime.native_files = run_manifest['model_files']
     try:
         if args.command in ('train', 'gen'):
-            if c0.get('model_files') != run_manifest['model_files'] or c0.get('instruction') != config['caption_instruction']:
+            if c0.get('model_files') != run_manifest['model_files'] or c0.get('instruction') != config['c0_instruction'] or c0.get('instruction_token_ids') != runtime.c0_instruction_ids:
                 raise ValueError('C0 calibration does not match native model/tokenizer or decode instruction')
         if args.command == 'caption' and args.checkpoint:
             load_checkpoint(args.checkpoint, runtime)  # Explicit init controls are allowed.
@@ -83,7 +83,7 @@ def main():
                 evaluate(runtime, selected, 'C0' if args.command == 'calibrate' else args.stage, output)
                 if args.command == 'calibrate':
                     write_json(output/'calibration.json', dict(passed=False, model_files=run_manifest['model_files'],
-                        config_hash=run_manifest['config_hash'], instruction=runtime.config['caption_instruction'],
+                        config_hash=run_manifest['config_hash'], instruction=runtime.config['c0_instruction'], instruction_token_ids=runtime.c0_instruction_ids,
                         status='inspect captions.jsonl free text against references, then record passed=true with reviewer'))
             else:
                 from .gen import diagnose_gen

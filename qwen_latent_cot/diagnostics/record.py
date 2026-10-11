@@ -109,8 +109,9 @@ def load_checkpoint(path, runtime, expected_stage=None):
     if (saved['topology'], saved['slots'], saved['rank'], saved['depth'], saved['seed_ids']) != (
         runtime.writer.topology, runtime.writer.slots, runtime.writer.rank, len(runtime.decoder.layers), runtime.seed_ids):
         raise ValueError('checkpoint topology/capacity/depth/initialization mismatch')
-    for key in ('writer_position_start', 'caption_instruction', 'neutral_prompt', 'resolution'):
-        if saved['config'][key] != runtime.config[key]:
+    for key in ('writer_position_start', 'caption_instruction', 'neutral_prompt', 'resolution',
+                'adapter_type', 'posterior_seed_policy', 'posterior_seed', 'training_state_sampling', 'fact_scoring'):
+        if saved['config'].get(key) != runtime.config[key]:
             raise ValueError('checkpoint interface configuration mismatch: '+key)
     if expected_stage and saved['stage'] != expected_stage:
         raise ValueError('checkpoint has incorrect training stage')

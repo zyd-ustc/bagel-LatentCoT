@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bagel-latent-cot"
-version = "0.6.0"
+version = "0.6.1"
 description = "Frozen BAGEL independent L/C Memory topology diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"

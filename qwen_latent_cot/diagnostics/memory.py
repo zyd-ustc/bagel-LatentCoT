@@ -154,7 +154,7 @@ class LowRankResidual(nn.Module):
         nn.init.zeros_(self.up.weight)
 
     def forward(self, hidden):
-        return self.up(F.gelu(self.down(hidden.to(self.down.weight.dtype)))).to(hidden.dtype)
+        return self.up(self.down(hidden.to(self.down.weight.dtype))).to(hidden.dtype)
 
 
 class MemoryWriter(nn.Module):
@@ -220,7 +220,7 @@ def neutral_seeds(decoder, token_ids, samples=1):
 
 
 def consume_bank(decoder, bank, starts):
-    """Apply consumer RoPE ONCE to unrotated Memory keys."""
+    """Apply consumer RoPE ONCE; preserve K/V gradients through the frozen decoder."""
     if len(starts) != len(bank.layers[0].lengths):
         raise ValueError('consumer positions must match samples')
     positions = torch.cat([torch.arange(s, s+bank.slots, device=bank.layers[0].keys.device) for s in starts])
