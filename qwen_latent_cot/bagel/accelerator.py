@@ -11,12 +11,12 @@ import torch
 def resolve_device(spec='auto'):
     text=str(spec)
     if text=='auto':
-        if torch.cuda.is_available():text='cuda:0'
-        else:
-            try:importlib.import_module('torch_npu')
-            except ModuleNotFoundError as error:
-                if error.name!='torch_npu':raise
-            text='npu:0' if hasattr(torch,'npu') and torch.npu.is_available() else 'cpu'
+        try:importlib.import_module('torch_npu')
+        except ModuleNotFoundError as error:
+            if error.name!='torch_npu':raise
+        if hasattr(torch,'npu') and torch.npu.is_available():text='npu:0'
+        elif torch.cuda.is_available():text='cuda:0'
+        else:text='cpu'
     if text.startswith('npu'):
         importlib.import_module('torch_npu')
     device=torch.device(text)
