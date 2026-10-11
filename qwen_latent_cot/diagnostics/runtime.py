@@ -5,13 +5,20 @@ import torch
 from PIL import Image
 from .memory import MemoryWriter, neutral_seeds, consume_bank
 from .native import text_source, device_inputs, empty_cache, capture_gen, gen_memory_call
-from .data import controlled_noise, tensor_hash
+from .data import controlled_noise, tensor_hash, file_hash
+from .schedule import native_suffix
 from ..bagel.accelerator import seeded_context, synchronize
 from .numerics import autocast_for
 
 
 class DiagnosticRuntime:
     def __init__(self, bundle, config, topology):
+        for key, expected in dict(adapter_type='linear_low_rank_v1',
+                                  training_state_sampling='independent_uniform_v1',
+                                  posterior_seed_policy='image_content_hash_v1',
+                                  fact_scoring='locked_literal_assertion_v2').items():
+            if config.get(key) != expected:
+                raise ValueError('unsupported diagnostic policy: '+key)
         self.bundle, self.config = bundle, config
         self.model = bundle.model
         self.decoder = self.model.language_model.model
@@ -30,9 +37,20 @@ class DiagnosticRuntime:
         self.writer = MemoryWriter(self.decoder, topology, config['slots'], config['rank'])
         with autocast_for(self.device):
             self.seeds = neutral_seeds(self.decoder, torch.tensor(ids, device=self.device))
-        self.instruction_ids = [bundle.token_ids['bos_token_id']] + bundle.tokenizer.encode(
-            config['caption_instruction'], add_special_tokens=False)
+        self.instruction_ids = self.prompt_ids(config['caption_instruction'])
+        self.c0_instruction_ids = self.prompt_ids(config['c0_instruction'])
         self._neutral_context = None
+
+    def prompt_ids(self, instruction):
+        # Use exactly the native tokenizer call and BOS/EOS wrapper.
+        inputs, _, _ = self.model.prepare_prompts([0], [0], [instruction],
+                                                  self.bundle.tokenizer, self.bundle.token_ids)
+        return inputs['packed_text_ids'].tolist()
+
+    def image_posterior_seed(self, path):
+        import hashlib
+        digest = hashlib.sha256(f"{self.config['posterior_seed']}:{file_hash(path)}".encode()).digest()
+        return int.from_bytes(digest[:8], 'big') % (2**63-1)
 
     def answer_ids(self, caption):
         return self.bundle.tokenizer.encode(caption, add_special_tokens=False) + [self.bundle.token_ids['eos_token_id']]
@@ -86,19 +104,23 @@ class DiagnosticRuntime:
                 raise ValueError('trajectory state must record source and unchanged prompt')
             if abs(float(saved['t'])-t) > 1e-7 or saved.get('noise_seed') != noise_seed:
                 raise ValueError('requested t/seed differs from trajectory metadata')
+            if (saved.get('sampler_steps'), saved.get('timestep_shift')) != (self.config['sampler_steps'], self.config['timestep_shift']):
+                raise ValueError('trajectory native sampler grid differs from runtime configuration')
             x = saved['x_t'].to(self.device)
-            source = 'trajectory'; step = saved['step_index']
+            source = 'trajectory'; step = saved['step_index']; posterior_seed = None
             prompt = row['prompt']
         else:
             if row['label_type'] != 'clean' or not row.get('image'):
                 raise ValueError('controlled visual states require verified clean image labels')
-            x0 = self.encode_image(row['image'], self.config['posterior_seed'])
+            posterior_seed = self.image_posterior_seed(row['image'])
+            x0 = self.encode_image(row['image'], posterior_seed)
             x = controlled_noise(x0, t, noise_seed)
             source = 'controlled'; step = None
             prompt = self.config['neutral_prompt']
         flow, lengths, positions = self.flow_inputs(prompt)
         metadata = dict(state_source=source, t=t, step_index=step, noise_seed=noise_seed,
-                        posterior_seed=self.config['posterior_seed'], x_t_hash=tensor_hash(x),
+                        posterior_seed=posterior_seed, posterior_seed_base=self.config['posterior_seed'],
+                        posterior_seed_policy=self.config['posterior_seed_policy'], x_t_hash=tensor_hash(x),
                         prompt=prompt, label_type=row['label_type'])
         return x, flow, lengths, positions, metadata
 
@@ -163,7 +185,10 @@ class DiagnosticRuntime:
     @torch.no_grad()
     def continue_once(self, x, t, final_velocity, flow, remaining_times):
         """Inject only the selected node; subsequent calls are native."""
-        times = [t] + list(remaining_times)
+        expected = native_suffix(self.config, t)
+        if len(expected) != len(remaining_times) or any(abs(a-b) > 1e-7 for a, b in zip(expected, remaining_times)):
+            raise ValueError('continuation must use the complete native sampler suffix')
+        times = [t] + expected
         if times[-1] != 0 or any(a <= b for a, b in zip(times, times[1:])):
             raise ValueError('continuation requires actual decreasing native times ending at zero')
         state = x.clone()

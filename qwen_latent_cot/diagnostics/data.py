@@ -85,7 +85,7 @@ def score_facts(text, facts):
     Dataset aliases encode accepted assertions; alternatives encode false ones.
     Negated clauses are not credited. Keep free captions for human audit.
     """
-    clauses = re.split(r'[.!?;]', text.lower())
+    clauses = re.split(r'[.!?;,]|\b(?:but|however|whereas)\b', text.lower())
     def contains(phrase):
         pattern = r'(?<!\w)' + re.escape(phrase.lower()) + r'(?!\w)'
         return any(re.search(pattern, clause) and not re.search(r'\b(no|not|without|unknown|unclear)\b', clause)
@@ -102,7 +102,7 @@ def score_facts(text, facts):
     unknown = [f for f in items if f['unknown']]
     return dict(fact_accuracy=sum(f['correct'] for f in known)/len(known) if known else None,
                 unknown_assertion_rate=sum(f['asserted'] for f in unknown)/len(unknown) if unknown else None,
-                facts=items, scoring='locked_literal_assertion_v1')
+                facts=items, scoring='locked_literal_assertion_v2')
 
 
 def cluster_interval(rows, key, seed=0, repeats=1000):

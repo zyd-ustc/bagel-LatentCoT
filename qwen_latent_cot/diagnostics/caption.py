@@ -10,12 +10,13 @@ from .numerics import autocast_for
 from ..bagel.accelerator import synchronize, reset_peak_memory_stats, max_memory_allocated
 
 
-def caption_result(runtime, row, prefix, start):
+def caption_result(runtime, row, prefix, start, stage):
+    instruction_ids = runtime.c0_instruction_ids if stage == 'C0' else runtime.instruction_ids
     synchronize(runtime.device)
     start_time = time.perf_counter()
     with autocast_for(runtime.device):
-        loss, _ = teacher_forcing(runtime.bundle, runtime.instruction_ids, runtime.answer_ids(row['caption']), prefix, start)
-        text, ids = free_caption(runtime.bundle, runtime.instruction_ids, prefix, start,
+        loss, _ = teacher_forcing(runtime.bundle, instruction_ids, runtime.answer_ids(row['caption']), prefix, start)
+        text, ids = free_caption(runtime.bundle, instruction_ids, prefix, start,
                                  runtime.config['max_caption_tokens'])
     if not torch.isfinite(loss):
         raise FloatingPointError('non-finite caption NLL')
@@ -75,13 +76,17 @@ def evaluate(runtime, rows, stage, output, controls=True):
                         writer_times['Source-swap'] = runtime.last_writer_seconds
                         writer_times['Memory-swap'] = 0.
                         arms['Source-swap'] = (runtime.caption_prefix(other_bank), bank.slots)
-                        arms['Memory-swap'] = (runtime.caption_prefix(other_bank), bank.slots)
+                        arms['Memory-swap'] = arms['Source-swap']
                         if t == 1 and meta['state_source'] == 'controlled':
                             if meta['x_t_hash'] != other_meta['x_t_hash']:
                                 raise RuntimeError('pure noise depends on clean image; stop')
                     if t == 1:
                         arms['Pure-noise'] = arms['Correct']
+            decoded = {}
             for arm, (prefix, start) in arms.items():
+                evidence_arm = 'Source-swap' if arm == 'Memory-swap' else arm
+                if evidence_arm not in decoded:
+                    decoded[evidence_arm] = caption_result(runtime, row, prefix, start, stage)
                 item = dict(sample_id=row['sample_id'], scene_id=row['scene_id'], family_id=row.get('family_id') or row.get('pair_id') or row['scene_id'],
                             pair_id=row.get('pair_id'), split=row['split'], stage=stage, arm=arm,
                             topology=runtime.writer.topology, swap_id=row.get('swap_id') if 'swap' in arm else None,
@@ -90,7 +95,10 @@ def evaluate(runtime, rows, stage, output, controls=True):
                             caption_query_start=start, memory_masked=arm=='Memory-masked',
                             source_expert='GEN_native' if stage=='C2' else 'UND_native_text_oracle', **meta,
                             writer_seconds=writer_times.get(arm, 0.),
-                            **caption_result(runtime, row, prefix, start))
+                            instruction_token_ids=runtime.c0_instruction_ids if stage == 'C0' else runtime.instruction_ids,
+                            intervention_evidence_group='donor_bank_swap' if 'swap' in arm else arm,
+                            equivalent_to='Source-swap' if arm == 'Memory-swap' else None,
+                            **decoded[evidence_arm])
                 if 'swap' in arm and other is not None:
                     item['donor_fact_accuracy'] = score_facts(item['text'], other['facts'])['fact_accuracy']
                     shared = [f for f in row['facts'] if f in other['facts']]
@@ -100,14 +108,7 @@ def evaluate(runtime, rows, stage, output, controls=True):
             synchronize(runtime.device)
             append_json(output/'timing.jsonl', dict(sample_id=row['sample_id'], t=t, noise_seed=seed,
                         seconds=time.perf_counter()-start_time, peak_memory_bytes=max_memory_allocated(runtime.device)))
-    # Pure-noise controls compare EXACT free outputs across different x0 labels.
-    noise = {}
-    for row in result:
-        if row.get('t') == 1 and row['arm'] == 'Correct' and row['state_source'] == 'controlled':
-            key = (row['noise_seed'], row['x_t_hash'])
-            previous = noise.setdefault(key, row['generated_ids'])
-            if previous != row['generated_ids']:
-                raise RuntimeError('pure-noise output differs across x0 labels; stop')
+    check_pure_noise(result)
     grouped = {}
     for row in result:
         key = (row['arm'], row.get('t'), row['label_type'], row['state_source'])
@@ -120,6 +121,18 @@ def evaluate(runtime, rows, stage, output, controls=True):
                             unknown_assertion_rate=cluster_interval(items, 'unknown_assertion_rate'), samples=len(items)))
     write_json(output/'caption_summary.json', summary)
     return result
+
+
+def check_pure_noise(rows):
+    noise = {}
+    for row in rows:
+        if row.get('t') == 1 and row['arm'] == 'Correct' and row['state_source'] == 'controlled':
+            # Fixed resolution/dtype/prompt are enforced by this runtime. Group by seed,
+            # never by the hash whose equality this audit is supposed to establish.
+            current = (row['x_t_hash'], row['generated_ids'])
+            previous = noise.setdefault(row['noise_seed'], current)
+            if previous != current:
+                raise RuntimeError('pure-noise state or output differs across x0 labels; stop')
 
 
 def train(runtime, rows, stage, output, parent=None, scratch=False):
@@ -140,20 +153,22 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
     guard = FrozenGuard(runtime.model, runtime.bundle.vae)
     optimizer = torch.optim.AdamW(runtime.writer.parameters(), lr=cfg['learning_rate'], weight_decay=cfg['weight_decay'])
     rng = random.Random(cfg['seed']); order = list(range(len(pool))); rng.shuffle(order); cursor = 0
-    times = list(cfg['train_t']); rng.shuffle(times); noise_index = 0
+    time_rng = random.Random(cfg['seed']+1); noise_rng = random.Random(cfg['seed']+2)
+    noise_index = 0
     reset_peak_memory_stats(runtime.device)
     save_checkpoint(output/'init.pt', runtime, 0, stage+'-init', parent)
     best = (-float('inf'), -float('inf'))
     start_time = time.perf_counter()
     for step in range(1, cfg['steps']+1):
         optimizer.zero_grad(set_to_none=True)
-        losses = []
+        losses = []; sampled_states = []; gradient_audit = None
         for micro in range(cfg['effective_batch']):
             if cursor == len(order):
                 rng.shuffle(order); cursor = 0
             row = pool[order[cursor]]; cursor += 1
-            t = times[noise_index % len(times)] if stage == 'C2' else None
-            seed = cfg['noise_seeds'][noise_index % len(cfg['noise_seeds'])]; noise_index += 1
+            t = time_rng.choice(cfg['train_t']) if stage == 'C2' else None
+            seed = noise_rng.randrange(2**63-1); noise_index += 1
+            sampled_states.append(dict(sample_id=row['sample_id'], t=t, noise_seed=seed))
             source, _ = prepare_source(runtime, row, stage, t, seed)
             with autocast_for(runtime.device):
                 bank = runtime.memory(source)
@@ -161,6 +176,13 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
                                           runtime.caption_prefix(bank), bank.slots)
             if not torch.isfinite(loss):
                 raise FloatingPointError('non-finite training NLL')
+            if step == 1 and micro == 0:
+                tensors = [value for kv in bank.layers for value in (kv.keys, kv.values)]
+                grads = torch.autograd.grad(loss, tensors, retain_graph=True)
+                if any(not torch.isfinite(g).all() or not g.abs().max() > 0 for g in grads):
+                    raise RuntimeError('caption gradient must reach both K and V at every Memory layer')
+                gradient_audit = [dict(layer=i, k_max=float(grads[2*i].abs().max()),
+                                       v_max=float(grads[2*i+1].abs().max())) for i in range(len(bank.layers))]
             (loss/cfg['effective_batch']).backward(); losses.append(float(loss.detach()))
             if step == 1 and micro == 0:
                 gradients = {n: p.grad for n, p in runtime.writer.named_parameters()}
@@ -172,7 +194,7 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
         norm = torch.nn.utils.clip_grad_norm_(runtime.writer.parameters(), cfg['gradient_clip'], error_if_nonfinite=True)
         optimizer.step(); guard.check()
         synchronize(runtime.device)
-        append_json(output/'train.jsonl', dict(step=step, nll=sum(losses)/len(losses), gradient_norm=float(norm),
+        append_json(output/'train.jsonl', dict(step=step, sampled_states=sampled_states, memory_gradient_audit=gradient_audit, nll=sum(losses)/len(losses), gradient_norm=float(norm),
                     elapsed_seconds=time.perf_counter()-start_time, peak_memory_bytes=max_memory_allocated(runtime.device)))
         if step % cfg['eval_every'] == 0 or step == cfg['steps']:
             validation_path = output/f'validation_{step:06d}'; validation_path.mkdir()
@@ -188,7 +210,7 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
                 write_json(output/'selection.json', dict(step=step, rule=cfg['selection'], fact_accuracy=score[0], nll=-score[1]))
             save_checkpoint(output/'last.pt', runtime, step, stage, parent)
             torch.save(dict(optimizer=optimizer.state_dict(), step=step, rng=rng.getstate(), order=order,
-                            cursor=cursor, noise_index=noise_index), output/'optimizer.pt')
+                            cursor=cursor, noise_index=noise_index, time_rng=time_rng.getstate(), noise_rng=noise_rng.getstate()), output/'optimizer.pt')
     guard.check()
     write_json(output/'training_summary.json', dict(stage=stage, scratch=scratch, parent=parent,
                 steps=cfg['steps'], best_validation_fact_accuracy=best[0], frozen_guard='passed',

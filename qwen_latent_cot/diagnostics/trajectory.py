@@ -1,6 +1,7 @@
 """Capture actual native sampler nodes; observation labels remain unverified."""
 import torch
 from .data import controlled_noise, tensor_hash
+from .schedule import native_times, nearest_node
 from .record import append_json, write_json, FrozenGuard
 
 
@@ -8,10 +9,9 @@ from .record import append_json, write_json, FrozenGuard
 def collect(runtime, rows, output):
     guard = FrozenGuard(runtime.model, runtime.bundle.vae)
     cfg = runtime.config
-    times = torch.linspace(1, 0, cfg['sampler_steps'])
-    times = cfg['timestep_shift']*times/(1+(cfg['timestep_shift']-1)*times)
+    times = native_times(cfg)
     requested = [t for t in cfg['eval_t'] if t < 1]
-    selected = {int((times[:-1]-t).abs().argmin()) for t in requested}
+    selected = {nearest_node(cfg, t)[0] for t in requested}
     records = []
     for row in rows:
         for seed in cfg['noise_seeds']:

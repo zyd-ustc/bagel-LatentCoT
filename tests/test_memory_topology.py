@@ -258,10 +258,23 @@ def test_train_transfer_caption_and_gen_pipeline(runtime, tmp_path):
     gen = tmp_path/'gen'; gen.mkdir()
     diagnose_gen(runtime, rows[2:], gen, str(c1/'best.pt'), str(c2/'best.pt'), continuation=True)
     records = [json.loads(line) for line in (gen/'gen.jsonl').read_text().splitlines()]
-    assert {'G-base', 'G-layout', 'G-fixed', 'G-text', 'G-TL', 'G-VL', 'G-swap-TL', 'G-swap-VL'} == {r['arm'] for r in records}
+    assert {'G-base', 'G-layout', 'G-fixed', 'G-neutral', 'G-text', 'G-TL', 'G-VL', 'G-swap-TL', 'G-swap-VL'} == {r['arm'] for r in records}
     assert (gen/'blind_annotations.csv').exists()
     assert all(r['prompt'] == 'an object' and r['writer_prompt'] == 'An image.' for r in records)
     assert all(r['frozen_guard'] == 'passed' for r in records)
+    from qwen_latent_cot.diagnostics.schedule import native_suffix, nearest_node
+    actual = nearest_node(runtime.config, .5)[1]
+    assert all(r['requested_t'] == .5 and r['t'] == actual for r in records)
+    assert all(r['continuation_times'] == [actual]+native_suffix(runtime.config, actual) for r in records)
+    expected = runtime.state(rows[2], actual, 0)[0]
+    stored = torch.load(gen/'test_a_000.pt', weights_only=True)
+    torch.testing.assert_close(stored['x_t'], expected, rtol=0, atol=0)
+    swap_rows = [r for r in evaluated if 'swap' in r['arm']]
+    assert all(r['intervention_evidence_group'] == 'donor_bank_swap' for r in swap_rows)
+    assert all(r['equivalent_to'] == 'Source-swap' for r in swap_rows if r['arm'] == 'Memory-swap')
+    train_records = [json.loads(line) for line in (c2/'train.jsonl').read_text().splitlines()]
+    assert all(g['k_max'] > 0 and g['v_max'] > 0 for g in train_records[0]['memory_gradient_audit'])
+    assert train_records[0]['sampled_states'][0]['t'] in runtime.config['train_t']
 
 
 def test_checkpoint_rejects_native_provenance_change(runtime, tmp_path):
@@ -342,3 +355,165 @@ def test_cli_c0_manifest_serializes_native_vae_config(runtime, tmp_path, monkeyp
     assert record['status'].startswith('executed')
     assert not json.loads((output/'calibration.json').read_text())['passed']
     assert not any('build/' in name for name in record['source_hashes'])
+
+@pytest.mark.parametrize('path', ['keys', 'values'])
+@pytest.mark.parametrize('topology', ['L', 'C'])
+def test_caption_gradient_reaches_each_memory_path(lm, topology, path):
+    from qwen_latent_cot.diagnostics.memory import MemoryBank
+    writer, seeds, source, positions = setup_writer(lm, topology)
+    original = writer(seeds, source, positions)
+    for kv in original.layers:
+        getattr(kv, path).retain_grad()
+    bank = MemoryBank(tuple(KV(kv.layer,
+        kv.keys if path == 'keys' else kv.keys.detach(),
+        kv.values if path == 'values' else kv.values.detach(), kv.lengths, False)
+        for kv in original.layers), topology, 16)
+    loss, _ = teacher_forcing(SimpleNamespace(model=SimpleNamespace(language_model=lm)),
+                             [1, 2, 3], [7, 8, 9], consume_bank(lm.model, bank, [0]), 16)
+    loss.backward()
+    assert all(getattr(kv, path).grad is not None and getattr(kv, path).grad.abs().max() > 0
+               for kv in original.layers)
+    assert all(a.up.weight.grad is not None and a.up.weight.grad.abs().max() > 0 for a in writer.adapters)
+
+
+def test_chain_gradient_crosses_frozen_und_blocks(lm):
+    from qwen_latent_cot.diagnostics.memory import MemoryBank
+    writer, seeds, source, positions = setup_writer(lm, 'C')
+    # Only the last layer bank is connected: earlier adapters need downstream UND input gradients.
+    bank = writer(seeds, source, positions)
+    isolated = MemoryBank(tuple(KV(kv.layer, kv.keys if i == 2 else kv.keys.detach(),
+        kv.values if i == 2 else kv.values.detach(), kv.lengths, False)
+        for i, kv in enumerate(bank.layers)), 'C', 16)
+    loss, _ = teacher_forcing(SimpleNamespace(model=SimpleNamespace(language_model=lm)),
+                             [1, 2, 3], [7, 8, 9], consume_bank(lm.model, isolated, [0]), 16)
+    loss.backward()
+    assert writer.adapters[0].up.weight.grad.abs().max() > 0
+    assert all(p.grad is None and not p.requires_grad for p in lm.parameters())
+
+
+def test_literal_negation_is_local_to_assertion():
+    facts = [dict(category='attribute', aliases=['red'], alternatives=['blue'])]
+    for text in ('a red cube, not blue', 'a red cube but not blue', 'not blue, a red cube'):
+        assert score_facts(text, facts)['fact_accuracy'] == 1
+    for text in ('no red cube', 'not a red cube', 'a red and blue cube', 'unknown red cube'):
+        assert score_facts(text, facts)['fact_accuracy'] == 0
+
+
+def test_c0_uses_own_repeat_instruction(runtime):
+    inputs, _, _ = runtime.model.prepare_prompts([0], [0], [runtime.config['c0_instruction']],
+        runtime.bundle.tokenizer, runtime.bundle.token_ids)
+    expected = inputs['packed_text_ids'].tolist()
+    assert runtime.c0_instruction_ids == expected
+    assert runtime.config['c0_instruction'] != runtime.config['caption_instruction']
+
+
+def test_low_rank_residual_is_linear(lm):
+    from qwen_latent_cot.diagnostics.memory import LowRankResidual
+    adapter = LowRankResidual(32, 4)
+    with torch.no_grad(): adapter.up.weight.normal_()
+    x = torch.randn(16, 32)
+    torch.testing.assert_close(adapter(2*x), 2*adapter(x))
+
+
+def test_continuation_rejects_partial_first_step(runtime):
+    x = torch.ones(4, 8)
+    with pytest.raises(ValueError, match='native'):
+        runtime.continue_once(x, .05, x, {}, [0.])
+
+
+def test_pure_noise_audit_compares_hashes_without_swap():
+    from qwen_latent_cot.diagnostics.caption import check_pure_noise
+    rows = [dict(t=1, arm='Correct', state_source='controlled', noise_seed=0,
+                 x_t_hash=h, generated_ids=[1]) for h in ('a', 'b')]
+    with pytest.raises(RuntimeError, match='pure.noise'):
+        check_pure_noise(rows)
+
+
+def test_real_qwen2_tokenizer_matches_native_prompt_wrapper(runtime, tmp_path):
+    from transformers import Qwen2Tokenizer
+    from transformers.models.qwen2.tokenization_qwen2 import bytes_to_unicode
+    vocab = {char: index for index, char in enumerate(bytes_to_unicode().values())}
+    vocab.update({'<|endoftext|>': 256, '<|im_start|>': 257, '<|im_end|>': 258})
+    vocab_path = tmp_path/'vocab.json'; vocab_path.write_text(json.dumps(vocab))
+    merges_path = tmp_path/'merges.txt'; merges_path.write_text('#version: 0.2\n')
+    tokenizer = Qwen2Tokenizer(vocab_file=str(vocab_path), merges_file=str(merges_path))
+    runtime.bundle.tokenizer = tokenizer
+    runtime.bundle.token_ids.update(bos_token_id=257, eos_token_id=258)
+    for instruction in (runtime.config['c0_instruction'], runtime.config['caption_instruction'], '复述红色方块。'):
+        actual = runtime.prompt_ids(instruction)
+        prepared, _, _ = runtime.model.prepare_prompts([0], [0], [instruction], tokenizer, runtime.bundle.token_ids)
+        assert actual == prepared['packed_text_ids'].tolist()
+        assert actual == [257]+tokenizer.encode(instruction, add_special_tokens=False)+[258]
+    assert runtime.prompt_ids(runtime.config['c0_instruction']) != runtime.prompt_ids(runtime.config['caption_instruction'])
+    assert runtime.answer_ids('a red cube') == tokenizer.encode('a red cube', add_special_tokens=False)+[258]
+
+
+def test_c0_both_decode_paths_receive_repeat_instruction(runtime, monkeypatch):
+    import qwen_latent_cot.diagnostics.caption as caption
+    calls = []
+    runtime.c0_instruction_ids = [1, 11, 12, 2]
+    runtime.instruction_ids = [1, 20, 21, 2]
+    def loss(bundle, instruction, answer, prefix, start):
+        calls.append(instruction); return torch.tensor(1.), None
+    def free(bundle, instruction, prefix, start, max_tokens):
+        calls.append(instruction); return 'a red cube', [11]
+    monkeypatch.setattr(caption, 'teacher_forcing', loss)
+    monkeypatch.setattr(caption, 'free_caption', free)
+    caption.caption_result(runtime, dict(caption='a red cube', facts=[]), None, 0, 'C0')
+    assert calls == [runtime.c0_instruction_ids]*2
+
+
+def test_controlled_continuation_uses_complete_native_steps(runtime, monkeypatch):
+    from qwen_latent_cot.diagnostics.schedule import native_times, native_suffix, nearest_node
+    runtime.config.update(sampler_steps=50, timestep_shift=3)
+    times = native_times(runtime.config)
+    for requested in (.05, .25, .5, .75, .9):
+        index, actual = nearest_node(runtime.config, requested)
+        seen = []
+        def velocity(x, t, flow):
+            seen.append(t); return x, torch.ones_like(x)
+        monkeypatch.setattr(runtime, 'velocity', velocity)
+        result = runtime.continue_once(torch.ones(4, 8), actual, torch.ones(4, 8), {}, native_suffix(runtime.config, actual))
+        assert seen == times[index+1:-1]
+        torch.testing.assert_close(result, torch.full_like(result, 1-actual))
+        assert native_suffix(runtime.config, actual)[0] == times[index+1]
+        with pytest.raises(ValueError, match='native'):
+            runtime.continue_once(torch.ones(4, 8), actual, torch.ones(4, 8), {}, native_suffix(runtime.config, actual)[:-1])
+
+
+def test_image_posterior_seeds_depend_on_content_and_preserve_rng(runtime, tmp_path):
+    from PIL import Image
+    a = tmp_path/'a.png'; b = tmp_path/'b.png'; same = tmp_path/'same.png'
+    Image.new('RGB', (32, 32), color='red').save(a)
+    Image.new('RGB', (32, 32), color='blue').save(b)
+    same.write_bytes(a.read_bytes())
+    before = torch.random.get_rng_state().clone()
+    assert runtime.image_posterior_seed(a) == runtime.image_posterior_seed(same)
+    assert runtime.image_posterior_seed(a) != runtime.image_posterior_seed(b)
+    runtime.encode_image(a, runtime.image_posterior_seed(a))
+    torch.testing.assert_close(before, torch.random.get_rng_state(), rtol=0, atol=0)
+
+
+def test_checkpoint_rejects_pre_correction_contract(runtime, tmp_path):
+    from qwen_latent_cot.diagnostics.record import save_checkpoint, load_checkpoint
+    path = tmp_path/'old.pt'; save_checkpoint(path, runtime, 1, 'C1')
+    old = torch.load(path, weights_only=True)
+    del old['config']['adapter_type']; torch.save(old, path)
+    with pytest.raises(ValueError, match='adapter_type'):
+        load_checkpoint(path, runtime)
+
+
+def test_pure_noise_audit_rejects_output_mismatch_at_same_hash():
+    from qwen_latent_cot.diagnostics.caption import check_pure_noise
+    rows = [dict(t=1, arm='Correct', state_source='controlled', noise_seed=0,
+                 x_t_hash='same', generated_ids=[token]) for token in (1, 2)]
+    with pytest.raises(RuntimeError, match='pure.noise'):
+        check_pure_noise(rows)
+
+
+def test_trajectory_rejects_different_native_schedule(runtime, tmp_path):
+    path = tmp_path/'state.pt'
+    torch.save(dict(state_source='trajectory', prompt='an object', t=.5, noise_seed=0,
+                    sampler_steps=50, timestep_shift=3, x_t=torch.ones(4,8), step_index=1), path)
+    with pytest.raises(ValueError, match='sampler grid'):
+        runtime.state(dict(state=str(path), prompt='an object', label_type='observed'), .5, 0)
