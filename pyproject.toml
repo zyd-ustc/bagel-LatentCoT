@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bagel-latent-cot"
-version = "0.5.0"
-description = "Frozen BAGEL with native early-image observation and full-depth UND Memory"
+version = "0.6.0"
+description = "Frozen BAGEL independent L/C Memory topology diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,6 +20,9 @@ dependencies = [
   "numpy>=1.26.0",
   "scipy>=1.10.0",
 ]
+
+[project.scripts]
+memory-topology = "qwen_latent_cot.diagnostics.cli:main"
 
 [project.optional-dependencies]
 dev = [

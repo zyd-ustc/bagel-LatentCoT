@@ -16,3 +16,10 @@ k64_gallery/
 *.pth
 *.bin
 .env
+
+# Independent Memory diagnostic artifacts
+outputs/
+build/
+dist/
+*.egg-info/
+.pytest_cache/

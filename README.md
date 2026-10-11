@@ -1,45 +1,94 @@
-# BAGEL：重复 R1 的连续 UND Memory loop
+# BAGEL：冻结模型的独立 Memory 拓扑诊断
 
-main 当前测试路径为 `full_depth_restart`：每轮从原生第0层 hidden 出发，Memory 连续经过 UND 0–27 层。前一层输出进入下一层；末层 hidden 不回送首层。轮间信息通过 `M1 → GEN1 → GEN1 KV → writer2 → M2` 传递。GEN 每轮重算 `[0,8)`，最后执行一次 GEN suffix。0–7层保留更新后 hidden 的 KV 投影，8–27层保留原生 attention 输入 KV。
+本页对应 `loop-layer` 分支。实现基点为 `loop-layer-NPU@42e71148826011b74473a170c4ab62072d6c70ab`。
+本分支只保留新诊断路径。历史循环、prompt 替换、观察反馈、旧测试及旧启动脚本均已移除。
 
-保持原生 BAGEL 权重、MoT、全量 prompt、位置、特殊 token、CFG 和采样。不添加 adapter、gate、alpha、压缩或训练。该方案不使用 ViT，也不等价于原生图像理解。
+依据：[诊断协议](docs/memory_topology_diagnostic_protocol_20261011.md)。代码映射、数据格式和验证边界见[实现说明](docs/MEMORY_TOPOLOGY_IMPLEMENTATION.md)。
 
-本地 CPU 数值测试40项通过；7项 NPU 测试因无设备跳过。新路径 R1 与原 full_depth 的 R1 数值一致。测试确认第二轮 UND 更新依赖 GEN1 KV；语义和画风改善尚待正式评测。
+- L 每层从自己的固定中性种子开始。C 将更新后的 hidden 传给下一层。
+- 两组各层执行一次完整冻结 UND block 和一个低秩残差。两组均使用更新后的 hidden 做同层读出。
+- 固定 16 槽位、512 分辨率、全部模型层。仅 Caption 阶段训练新增残差；原 BAGEL、VAE 和 GEN 始终冻结。
+- Caption decoder 只读 Memory、固定指令和已生成答案前缀。GEN 保留原 prompt，仅在选定 denoiser 调用读取一次 Memory。
+- `Memory-masked` / `G-layout` 屏蔽 attention 中的对应位置。Memory K 保存为未旋转形式，消费时只应用一次 RoPE。
 
-方案见 [DENOISER_INTERNAL_MEMORY_PLAN.md](docs/DENOISER_INTERNAL_MEMORY_PLAN.md)。默认小规模配置 `configs/repeat_r1_pilot.json`：32题、seed0、Base＋Early10/Early20×R1/2/3/4，共288图。完整配置 `configs/window_comparison.json`：800题，共7200图。两者均使用 full_depth_restart。保留 full_depth 末层回送和 legacy_layerwise 独立层更新作为显式参照。
+本地检查使用随机初始化的小型原生 BAGEL 层和测试用 VAE/tokenizer。未运行真实 BAGEL 权重、NPU/GPU 训练或质量评测。
 
-## H200 用户运行
+## 安装与工程检查
 
-正式评测由用户启动。下面目录为本次同步的 main 快照；GPUS 是该节点的本地卡号。
+在本仓库根目录执行。先安装目标设备的 PyTorch；Ascend 还需要与环境匹配的 `torch_npu`，CUDA 原生路径需要 `flash-attn`。
 
 ```bash
-cd /private/yida_workspace/bagel-LatentCoT-main-repeat-r1-20261009
-export BACKEND=cuda
-export GPUS=0,1,2,3,4,5,6,7
-unset NPUS ASCEND_RT_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES COMPARISON_PROMPTS
-export OMP_NUM_THREADS=4
-export CONFIG="$PWD/configs/repeat_r1_pilot.json"
-export RUN=/private/yida_workspace/outputs/repeat_r1_h200_$(date +%Y%m%d_%H%M%S)
-set -o pipefail
-bash scripts/compare_windows_8gpu.sh "$RUN" 2>&1 | tee "${RUN}.log"
+python -m pip install -e '.[dev]'
+python -m pytest -q
+memory-topology --help
 ```
 
-脚本先执行真实权重数值检查，通过后生成、打分和导出 comparison.html。需要使用新输出目录。分页 HTML 依赖 gallery/，本地查看须下载整个结果目录。GPU 时间仅为工程记录。NPU 仍支持 BACKEND=npu 和 NPUS，执行说明见方案文档。
+唯一启动入口为 `memory-topology`。等价入口是 `python -m qwen_latent_cot.diagnostics.cli`；`scripts/memory_topology.py` 只是同一入口的薄封装。
 
-## 原生图像观察路径（显式配置保留）
+## 按协议运行
 
-原生观察路径使用 `configs/observation_comparison.json`，不由上述默认配置启动。其计算方式为一次早期图像预测→完整原生 UND 更新→固定 x_t/t 重算 GEN。没有完整文字反馈解码。
+先准备核验数据。`DATA` 指向同一份包含 train/val/test 的 JSONL，按原图/场景族固定 split，包含反事实配对。
+下面的模型、数据和输出路径需要换成目标主机的实际路径。所有运行使用同一配置；缩减预算时，L/C 必须一起缩减。
 
-首轮默认8题、seed0、5组，共40张图：Base，step9／step19分别各一个STATIC和OBSERVED。每张非Base图只更新一次。两个组保留相同视觉条件、文字token、位置、容量和GEN CFG，区别只在文本Memory编码时是否读取图像。
+```bash
+export MODEL=/path/to/BAGEL
+export DATA=/path/to/verified_memory_dataset.jsonl
+export OUT=/path/to/memory_topology_outputs
+export DEVICE=npu:0
 
-文本Memory经过全部28层UND连续计算，KV从各层attention输入自然写入。最终GEN使用完整图像VAE＋ViT上下文和文本Memory；原生准备接口重建位置和CFG。重算沿用当前噪声和t，随后原始采样器只推进一次。缓存不跨步。
+# 1. 在验证集校准原生文本 oracle 的自由解码。
+memory-topology calibrate --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+  --split val --output "$OUT/c0"
+```
 
-每次更新保存早期预测图、x_t/t、前后velocity、全部文本Memory KV及四类短问答probe。问答通过缓存副本执行，仅供诊断，不回流到生成。问答正确性待人工标注；memory-only读取明确为非原生诊断。
+检查 `c0/captions.jsonl` 的自由文本与参考 caption。确认解码协议可用后，在 `c0/calibration.json` 记录 `passed: true` 和核验者。代码校验同一模型、tokenizer、VAE及解码指令，不通过时禁止训练和 GEN 结果解释。
 
-## 历史证据
+```bash
+# 2. 相同预算训练 C1-L/C；输出 init.pt、best.pt、last.pt。
+for TOPOLOGY in L C; do
+  memory-topology train --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+    --stage C1 --topology "$TOPOLOGY" --c0-pass "$OUT/c0/calibration.json" \
+    --output "$OUT/c1_$TOPOLOGY"
+done
 
-此前完整800题、seed0的7200张评测已完成。浅层独立UND循环在R1／R2有小幅正趋势，但净Repair区间跨零；R3／R4明确增加Damage。Early20 R4为412 Repair／1064 Damage。
+# 3. 各自从 C1 的共同验证规则所选 checkpoint 迁移至 C2。
+for TOPOLOGY in L C; do
+  memory-topology train --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+    --stage C2 --topology "$TOPOLOGY" --checkpoint "$OUT/c1_$TOPOLOGY/best.pt" \
+    --c0-pass "$OUT/c0/calibration.json" --output "$OUT/c2_$TOPOLOGY"
+done
 
-## Memory 增量定位
+# 4. 测试集 Caption 对照；分别评估 init、best、last。
+for TOPOLOGY in L C; do
+  memory-topology caption --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+    --stage C1 --topology "$TOPOLOGY" --checkpoint "$OUT/c1_$TOPOLOGY/init.pt" \
+    --output "$OUT/c1_init_test_$TOPOLOGY"
+  memory-topology caption --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+    --stage C1 --topology "$TOPOLOGY" --checkpoint "$OUT/c1_$TOPOLOGY/best.pt" \
+    --output "$OUT/c1_test_$TOPOLOGY"
+  memory-topology caption --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+    --stage C2 --topology "$TOPOLOGY" --checkpoint "$OUT/c2_$TOPOLOGY/best.pt" \
+    --output "$OUT/c2_test_$TOPOLOGY"
+done
 
-NPU诊断使用 `scripts/diagnose_increments_npu.sh` 和 `configs/increment_diagnostics.json`。默认32条真实Early20 R4轨迹，在step0/4/9/19固定x_t/t比较R0–4，记录GEN/Memory逐层变化及条件/CFG velocity。原生采样每步仍只推进一次。执行命令与字段说明见 [INCREMENT_DIAGNOSTICS.md](docs/INCREMENT_DIAGNOSTICS.md)。
+# 5. GEN 局部阶梯。原 prompt 保留，CFG 分支保持原生。
+for TOPOLOGY in L C; do
+  memory-topology gen --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+    --topology "$TOPOLOGY" --text-checkpoint "$OUT/c1_$TOPOLOGY/best.pt" \
+    --visual-checkpoint "$OUT/c2_$TOPOLOGY/best.pt" \
+    --c0-pass "$OUT/c0/calibration.json" --output "$OUT/gen_$TOPOLOGY"
+done
+
+# 6. 合并相同模型、数据、源码和配置的结果，生成四张表。
+memory-topology report --runs "$OUT/c1_test_L" "$OUT/c1_test_C" \
+  "$OUT/c2_test_L" "$OUT/c2_test_C" "$OUT/gen_L" "$OUT/gen_C" \
+  --output "$OUT/report"
+```
+
+C2-scratch 使用 `train --stage C2 --scratch`，省略 `--checkpoint`，两组预算保持一致。`last.pt` 使用相同 Caption 命令单独评估。
+
+`trajectory` 命令从原生 prompt/seed 运行采样，保存真实 `x_t/t/step` 和条件速度预测图；候选观察标签默认 `verified: false`。人工核验 caption/facts/unknown 后，才能作为观察数据进入诊断。
+
+GEN 局部结果通过语义检查后，使用新输出目录加 `--continue-sampling` 做后续采样。每个 arm 只在选定节点读取一次 Memory，随后恢复原生。先按协议固定小规模数据及节点，避免默认展开所有 t×arm。匿名图像与 `blind_annotations.csv` 用于分别核验事实和画质；`blind_key.json` 不交给盲评者。
+
+默认配置为 [memory_topology.json](configs/memory_topology.json)。训练上限是每组 5,000 optimizer steps、有效 batch 32，微批为 1；每 250 步验证。当前不实现分布式训练或断点恢复。输出目录必须为空，失败和已完成运行不会被覆盖。

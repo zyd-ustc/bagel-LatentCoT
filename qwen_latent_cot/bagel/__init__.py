@@ -1,1 +1,1 @@
-"""Frozen BAGEL with persistent UND state and full dynamic prompt-KV replacement."""
+"""Frozen native BAGEL runtime for independent Memory diagnostics."""

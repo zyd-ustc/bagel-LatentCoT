@@ -1,4 +1,5 @@
 """CUDA FlashAttention; Ascend SDPA from the old port; float32 CPU oracle."""
+from contextlib import nullcontext
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
@@ -40,7 +41,8 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
             # FlashAttention aligns causal masks to the bottom right for KV caches.
             nq, nk = qi.shape[2], ki.shape[2]
             mask = torch.arange(nk,device=q.device)[None, :] <= torch.arange(nq,device=q.device)[:, None] + nk-nq
-        out = scaled_dot_product_attention(qi, ki, vi, attn_mask=mask,dropout_p=0.,is_causal=False,
-            scale=kwargs.get('softmax_scale'))
+        with torch.autocast('cpu', enabled=False) if q.device.type=='cpu' else nullcontext():
+            out = scaled_dot_product_attention(qi, ki, vi, attn_mask=mask,dropout_p=0.,is_causal=False,
+                scale=kwargs.get('softmax_scale'))
         outputs.append(out[0].transpose(0, 1).to(q.dtype))
     return torch.cat(outputs) if outputs else q.new_empty(q.shape)

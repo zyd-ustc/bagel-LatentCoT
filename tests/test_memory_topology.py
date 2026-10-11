@@ -1,0 +1,344 @@
+"""New protocol tests using real tiny native MoT layers, never historical loops."""
+from types import SimpleNamespace
+import json
+import pytest
+import torch
+from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import Qwen2Config, Qwen2ForCausalLM, NaiveCache
+from qwen_latent_cot.diagnostics.memory import (
+    KV, MemoryWriter, neutral_seeds, rope_for, rotate, project, consume_bank, packed_attention, und_block)
+from qwen_latent_cot.diagnostics.native import teacher_forcing, gen_memory_call, capture_gen
+from qwen_latent_cot.diagnostics.data import controlled_noise, score_facts, load_dataset, velocity_stats
+from qwen_latent_cot.diagnostics.record import FrozenGuard
+
+
+@pytest.fixture
+def lm():
+    torch.manual_seed(7)
+    cfg = Qwen2Config(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=3,
+                     num_attention_heads=4, num_key_value_heads=2, layer_module='Qwen2MoTDecoderLayer')
+    return Qwen2ForCausalLM(cfg).to(torch.bfloat16).eval().requires_grad_(False)
+
+
+def native_call(lm, h, positions, lengths, cache, prefix_lengths, mode='und', update=False):
+    query = []; past = []; offset = 0
+    for n, p in zip(lengths, prefix_lengths):
+        past.extend(range(offset, offset+p)); query.extend(range(offset+p, offset+p+n)); offset += p+n
+    kwargs = dict(packed_query_sequence=h, query_lens=torch.tensor(lengths, dtype=torch.int32),
+                  packed_query_position_ids=positions, packed_query_indexes=torch.tensor(query),
+                  past_key_values=cache, key_values_lens=torch.tensor(prefix_lengths, dtype=torch.int32),
+                  packed_key_value_indexes=torch.tensor(past, dtype=torch.long), update_past_key_values=update,
+                  is_causal=mode == 'und', mode=mode)
+    if mode == 'gen':
+        kwargs.update(packed_text_indexes=torch.tensor([0, len(h)-1]),
+                      packed_vae_token_indexes=torch.arange(1, len(h)-1))
+    return lm.forward_inference(**kwargs)
+
+
+def source_for(lm, samples=1):
+    hidden = lm.model.embed_tokens(torch.arange(4, 9).repeat(samples))
+    cache = NaiveCache(3)
+    native_call(lm, hidden, torch.arange(5).repeat(samples), (5,)*samples, cache, (0,)*samples, update=True)
+    return tuple(KV(i, cache.key_cache[i], cache.value_cache[i], (5,)*samples) for i in range(3)), cache
+
+
+def setup_writer(lm, topology='L', samples=1):
+    source, _ = source_for(lm, samples)
+    seeds = neutral_seeds(lm.model, torch.arange(16), samples)
+    writer = MemoryWriter(lm.model, topology, rank=4)
+    return writer, seeds, source, torch.arange(20, 36).repeat(samples)
+
+
+def test_neutral_seed_prefill_matches_native_inputs(lm):
+    ids = torch.arange(16)
+    seeds = neutral_seeds(lm.model, ids)
+    captured = []; handles = []
+    for layer in lm.model.layers:
+        handles.append(layer.register_forward_pre_hook(lambda m, args, kw: captured.append(kw['packed_query_sequence'].clone()), with_kwargs=True))
+    native_call(lm, lm.model.embed_tokens(ids), torch.arange(16), (16,), NaiveCache(3), (0,), update=True)
+    for handle in handles: handle.remove()
+    for ours, native in zip(seeds, captured): torch.testing.assert_close(ours, native, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('topology', ['L', 'C'])
+def test_full_bank_post_block_readout_and_gradient(lm, topology):
+    writer, seeds, source, positions = setup_writer(lm, topology)
+    guard = FrozenGuard(lm)
+    bank = writer(seeds, source, positions)
+    assert len(bank.layers) == 3 and all(not kv.rotated for kv in bank.layers)
+    for kv in bank.layers: assert kv.keys.shape == (16, 2, 8)
+    bundle = SimpleNamespace(model=SimpleNamespace(language_model=lm))
+    loss, logits = teacher_forcing(bundle, [1, 2, 3], [7, 8, 9], consume_bank(lm.model, bank, [0]), 16)
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in writer.parameters())
+    assert all(adapter.up.weight.grad.abs().max() > 0 for adapter in writer.adapters)
+    before = {n: p.clone() for n, p in lm.named_parameters()}
+    torch.optim.AdamW(writer.parameters(), lr=.01).step()
+    guard.check()
+    for n, p in lm.named_parameters(): torch.testing.assert_close(p, before[n], rtol=0, atol=0)
+
+
+def test_topology_changes_only_hidden_propagation(lm):
+    l, seeds, source, positions = setup_writer(lm, 'L')
+    c = MemoryWriter(lm.model, 'C', rank=4); c.load_state_dict(l.state_dict())
+    lb, cb = l(seeds, source, positions), c(seeds, source, positions)
+    torch.testing.assert_close(lb.layers[0].keys, cb.layers[0].keys, rtol=0, atol=0)
+    assert not torch.equal(lb.layers[1].keys, cb.layers[1].keys)
+    # Alter layer zero adapter only. L layer one cannot change; C must change.
+    with torch.no_grad(): l.adapters[0].up.weight.fill_(.1); c.adapters[0].up.weight.fill_(.1)
+    ll, cc = l(seeds, source, positions), c(seeds, source, positions)
+    torch.testing.assert_close(lb.layers[1].keys, ll.layers[1].keys, rtol=0, atol=0)
+    assert not torch.equal(cb.layers[1].keys, cc.layers[1].keys)
+    assert sum(p.numel() for p in l.parameters()) == sum(p.numel() for p in c.parameters())
+
+
+def test_rope_once_and_same_layer_guard(lm):
+    writer, seeds, source, positions = setup_writer(lm)
+    bank = writer(seeds, source, positions)
+    consumed = consume_bank(lm.model, bank, [42])
+    original = bank.layers[0].keys.clone()
+    rope = rope_for(lm.model, original, torch.arange(42, 58))
+    torch.testing.assert_close(consumed[0].keys, rotate(original, rope), rtol=0, atol=0)
+    torch.testing.assert_close(bank.layers[0].keys, original, rtol=0, atol=0)
+    bad = list(source); bad[1] = source[0]
+    with pytest.raises(ValueError): writer(seeds, bad, positions)
+
+
+def test_packed_sample_isolation_and_whole_bank_swap(lm):
+    writer, seeds, source, positions = setup_writer(lm, samples=2)
+    bank = writer(seeds, source, positions)
+    changed = tuple(KV(i, torch.cat((s.keys[:5], s.keys[5:]+10)), s.values, s.lengths) for i, s in enumerate(source))
+    other = writer(seeds, changed, positions)
+    for a, b in zip(bank.layers, other.layers):
+        torch.testing.assert_close(a.keys[:16], b.keys[:16], rtol=0, atol=0)
+    swapped = bank.swap([1, 0])
+    for a, b in zip(bank.layers, swapped.layers):
+        torch.testing.assert_close(b.keys[:16], a.keys[16:], rtol=0, atol=0)
+
+
+def test_mask_excludes_keys_instead_of_zeroing_values():
+    q = torch.tensor([[[1.]]]); k = torch.tensor([[[1.]], [[100.]]]); v = torch.tensor([[[7.]], [[0.]]])
+    masked = packed_attention(q, k, v, (1,), (2,), visible=torch.tensor([True, False]))
+    zero_value = packed_attention(q, k, v, (1,), (2,))
+    assert masked.item() == 7 and zero_value.item() < .01
+
+
+def test_caption_is_causal_and_targets_are_shifted(lm):
+    writer, seeds, source, positions = setup_writer(lm)
+    bank = writer(seeds, source, positions)
+    bundle = SimpleNamespace(model=SimpleNamespace(language_model=lm))
+    prefix = consume_bank(lm.model, bank, [0])
+    loss, logits = teacher_forcing(bundle, [1, 2, 3], [7, 8, 9], prefix, 16)
+    changed_loss, changed = teacher_forcing(bundle, [1, 2, 3], [7, 8, 10], prefix, 16)
+    torch.testing.assert_close(logits, changed, rtol=0, atol=0)  # final target never fed as input
+    assert loss != changed_loss
+    _, changed_prefix = teacher_forcing(bundle, [1, 2, 3], [7, 11, 9], prefix, 16)
+    torch.testing.assert_close(logits[:2], changed_prefix[:2], rtol=0, atol=0)
+
+
+def test_source_off_ignores_image(lm):
+    writer, seeds, source, positions = setup_writer(lm)
+    changed = tuple(KV(s.layer, s.keys*100, s.values+100, s.lengths) for s in source)
+    a, b = writer(seeds, source, positions, True), writer(seeds, changed, positions, True)
+    for x, y in zip(a.layers, b.layers): torch.testing.assert_close(x.keys, y.keys, rtol=0, atol=0)
+
+
+def test_native_gen_capture_matches_native_cache(lm):
+    _, cache = source_for(lm)
+    h = lm.model.embed_tokens(torch.arange(6))
+    with capture_gen(lm.model, cache) as captured:
+        native_call(lm, h, torch.full((6,), 5), (6,), cache, (5,), 'gen', update=True)
+    for i, kv in captured.items():
+        torch.testing.assert_close(kv.keys, cache.key_cache[i][5:], rtol=0, atol=0)
+        torch.testing.assert_close(kv.values, cache.value_cache[i][5:], rtol=0, atol=0)
+
+
+def test_gen_layout_matches_native_shift_and_restores(lm):
+    _, cache = source_for(lm)
+    writer, seeds, source, positions = setup_writer(lm)
+    fixed = writer.fixed_bank(seeds)
+    h = lm.model.embed_tokens(torch.arange(6))
+    snapshot = [cache.key_cache[i].clone() for i in range(3)]
+    original = lm.model.forward_inference
+    expected = native_call(lm, h, torch.full((6,), 21), (6,), cache, (5,), 'gen').packed_query_sequence
+    with gen_memory_call(lm.model, cache, fixed, (5,), [5], masked=True):
+        actual = native_call(lm, h, torch.full((6,), 5), (6,), cache, (5,), 'gen').packed_query_sequence
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert lm.model.forward_inference == original
+    for i in range(3): torch.testing.assert_close(cache.key_cache[i], snapshot[i], rtol=0, atol=0)
+    with pytest.raises(RuntimeError):
+        with gen_memory_call(lm.model, cache, fixed, (5,), [5]):
+            native_call(lm, h, torch.full((6,), 5), (6,), cache, (5,), 'gen')
+            native_call(lm, h, torch.full((6,), 5), (6,), cache, (5,), 'gen')
+    assert lm.model.forward_inference == original
+
+
+def test_pure_noise_independent_of_x0_and_rng():
+    state = torch.random.get_rng_state().clone()
+    a = controlled_noise(torch.zeros(8, 4), 1., 12)
+    b = controlled_noise(torch.full((8, 4), float('nan')), 1., 12)
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    torch.testing.assert_close(torch.random.get_rng_state(), state, rtol=0, atol=0)
+
+
+def test_freeze_guard_rejects_updates(lm):
+    guard = FrozenGuard(lm)
+    with torch.no_grad(): lm.lm_head.weight.add_(1)
+    with pytest.raises(RuntimeError): guard.check()
+
+
+def test_scene_split_and_swap_contract(tmp_path):
+    rows = [dict(sample_id=str(i), scene_id='shared', split=split, caption='a red cube', label_type='clean',
+                 verified=True, facts=[]) for i, split in enumerate(['train', 'test'])]
+    path = tmp_path/'data.jsonl'; path.write_text('\n'.join(json.dumps(row) for row in rows))
+    with pytest.raises(ValueError, match='family'): load_dataset(path)
+
+
+def test_fact_rules_keep_unknown_and_negation_separate():
+    facts = [dict(category='attribute', aliases=['red'], alternatives=['blue']),
+             dict(category='count', aliases=['two'], alternatives=['three'], unknown=True)]
+    assert score_facts('A red cube.', facts)['fact_accuracy'] == 1
+    assert score_facts('No red cube.', facts)['fact_accuracy'] == 0
+    assert score_facts('Two red cubes.', facts)['unknown_assertion_rate'] == 1
+
+
+def test_velocity_metrics_reject_nan():
+    with pytest.raises(FloatingPointError): velocity_stats(torch.tensor([float('nan')]), torch.ones(1))
+
+@pytest.fixture
+def runtime(lm, tmp_path):
+    from qwen_latent_cot.bagel.modeling.bagel.bagel import Bagel, BagelConfig
+    from qwen_latent_cot.diagnostics.runtime import DiagnosticRuntime
+    class Tokenizer:
+        all_special_ids = [1, 2, 3]
+        def encode(self, text, add_special_tokens=True):
+            return list(range(4, 24)) if len(text) > 30 else [4, 5, 6, 7]
+        def decode(self, ids, skip_special_tokens=True):
+            return 'token' if ids else ''
+    class VAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.dummy = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+        def encode(self, pixels):
+            return torch.nn.functional.avg_pool2d(pixels[:, :2], 8)
+        def decode(self, latent):
+            return torch.nn.functional.interpolate(torch.cat((latent, latent[:, :1]), 1), scale_factor=8)
+    model = Bagel(lm, None, BagelConfig(visual_und=False, llm_config=lm.config,
+                  vae_config=SimpleNamespace(downsample=8, z_channels=2), max_latent_size=4)).to(torch.bfloat16).eval()
+    torch.nn.init.normal_(model.llm2vae.weight, std=.01)
+    cfg = json.loads(__import__('pathlib').Path('configs/memory_topology.json').read_text())
+    cfg.update(resolution=32, steps=1, effective_batch=1, eval_every=1, max_caption_tokens=2,
+               eval_t=[.5, 1.], noise_seeds=[0], sampler_steps=4)
+    bundle = SimpleNamespace(model=model, vae=VAE(), tokenizer=Tokenizer(), token_ids={
+        'bos_token_id':1, 'eos_token_id':2, 'start_of_image':1, 'end_of_image':3}, model_path=str(tmp_path))
+    runtime = DiagnosticRuntime(bundle, cfg, 'L'); runtime.native_files = {'fake': 'engineering-only'}
+    return runtime
+
+
+def test_train_transfer_caption_and_gen_pipeline(runtime, tmp_path):
+    from pathlib import Path
+    from PIL import Image
+    from qwen_latent_cot.diagnostics.caption import train, evaluate
+    from qwen_latent_cot.diagnostics.gen import diagnose_gen
+    from qwen_latent_cot.diagnostics.record import load_checkpoint
+    image = tmp_path/'image.png'; Image.new('RGB', (32, 32), color='red').save(image)
+    def row(name, split, swap=None):
+        return dict(sample_id=name, scene_id=name, split=split, caption='a token', label_type='clean',
+                    verified=True, prompt='an object', image=str(image), swap_id=swap,
+                    facts=[dict(category='object', aliases=['token'], alternatives=['missing'])])
+    rows = [row('train', 'train'), row('val', 'val'), row('test_a', 'test', 'test_b'), row('test_b', 'test', 'test_a')]
+    c1 = tmp_path/'c1'; c1.mkdir()
+    train(runtime, rows, 'C1', c1)
+    assert (c1/'best.pt').exists() and (c1/'last.pt').exists()
+    c2 = tmp_path/'c2'; c2.mkdir()
+    train(runtime, rows, 'C2', c2, str(c1/'best.pt'))
+    assert (c2/'best.pt').exists()
+    cap = tmp_path/'caption'; cap.mkdir()
+    evaluated = evaluate(runtime, rows[2:], 'C2', cap)
+    assert {'Correct', 'Source-off', 'Source-swap', 'Memory-swap', 'Memory-masked', 'Pure-noise'} <= {r['arm'] for r in evaluated}
+    runtime.config['eval_t'] = [.5]
+    gen = tmp_path/'gen'; gen.mkdir()
+    diagnose_gen(runtime, rows[2:], gen, str(c1/'best.pt'), str(c2/'best.pt'), continuation=True)
+    records = [json.loads(line) for line in (gen/'gen.jsonl').read_text().splitlines()]
+    assert {'G-base', 'G-layout', 'G-fixed', 'G-text', 'G-TL', 'G-VL', 'G-swap-TL', 'G-swap-VL'} == {r['arm'] for r in records}
+    assert (gen/'blind_annotations.csv').exists()
+    assert all(r['prompt'] == 'an object' and r['writer_prompt'] == 'An image.' for r in records)
+    assert all(r['frozen_guard'] == 'passed' for r in records)
+
+
+def test_checkpoint_rejects_native_provenance_change(runtime, tmp_path):
+    from qwen_latent_cot.diagnostics.record import save_checkpoint, load_checkpoint
+    path = tmp_path/'checkpoint.pt'; save_checkpoint(path, runtime, 1, 'C1')
+    runtime.native_files = {'different': 'checkpoint'}
+    with pytest.raises(ValueError, match='provenance'): load_checkpoint(path, runtime)
+
+
+def test_trajectory_records_actual_native_times(runtime, tmp_path):
+    from qwen_latent_cot.diagnostics.trajectory import collect
+    folder = tmp_path/'trajectory'; folder.mkdir()
+    collect(runtime, [dict(sample_id='sample', scene_id='scene', split='test', prompt='an object')], folder)
+    rows = [json.loads(line) for line in (folder/'observation_candidates.jsonl').read_text().splitlines()]
+    assert rows and all(not r['verified'] and r['label_type'] == 'observed' for r in rows)
+    for row in rows:
+        state = torch.load(folder/row['state'], weights_only=True)
+        assert state['t'] == row['actual_t'] and state['state_source'] == 'trajectory'
+
+
+def test_report_keeps_four_tables_and_does_not_invent_blind_labels(tmp_path):
+    from qwen_latent_cot.diagnostics.report import summarize
+    from qwen_latent_cot.diagnostics.record import write_json
+    run = tmp_path/'run'; run.mkdir()
+    write_json(run/'manifest.json', dict(model_files={}, dataset_hash='fixed', depth=3, slots=16,
+                                        config={}, source_hashes={}, topology='L'))
+    item = dict(topology='L', stage='C1', arm='Correct', label_type='clean', state_source='text_oracle',
+                initialization_only=False, nll=2., fact_accuracy=1., scene_id='one', facts=[])
+    (run/'captions.jsonl').write_text(json.dumps(item)+'\n')
+    output = tmp_path/'report'; summarize([str(run)], output)
+    tables = json.loads((output/'tables.json').read_text())
+    assert set(tables) == {'text_bridge', 'visual_caption', 'gen_local', 'final_image'}
+    assert tables['final_image'] == [] and tables['text_bridge'][0]['fact_accuracy']['mean'] == 1.
+
+
+def test_report_rejects_incomparable_models(tmp_path):
+    from qwen_latent_cot.diagnostics.report import summarize
+    from qwen_latent_cot.diagnostics.record import write_json
+    runs = []
+    for index in range(2):
+        run = tmp_path/str(index); run.mkdir(); runs.append(str(run))
+        write_json(run/'manifest.json', dict(model_files={'weights':str(index)}, dataset_hash='fixed', depth=3,
+                                            slots=16, config={}, source_hashes={}, topology='L'))
+    with pytest.raises(ValueError, match='different'): summarize(runs, tmp_path/'output')
+
+
+def test_original_image_cannot_cross_split_under_different_ids(tmp_path):
+    path = tmp_path/'image.bin'; path.write_bytes(b'same original image')
+    rows = [dict(sample_id=str(i), scene_id=str(i), split=split, caption='x', verified=True,
+                 label_type='clean', image='image.bin', facts=[]) for i, split in enumerate(['train', 'test'])]
+    dataset = tmp_path/'data.jsonl'; dataset.write_text('\n'.join(json.dumps(r) for r in rows))
+    with pytest.raises(ValueError, match='original image'): load_dataset(dataset)
+
+
+def test_cli_c0_manifest_serializes_native_vae_config(runtime, tmp_path, monkeypatch):
+    import sys
+    from qwen_latent_cot.diagnostics.cli import main
+    import qwen_latent_cot.bagel.backbone as backbone
+    from qwen_latent_cot.bagel.modeling.autoencoder import AutoEncoderParams
+    # Use the ACTUAL native VAE config dataclass, which transformers leaves nested.
+    runtime.model.config.vae_config = AutoEncoderParams(256, 3, 8, 128, 3, [1,2,4,4], 2, 16, .3611, .1159)
+    native_dir = tmp_path/'native'; native_dir.mkdir()
+    (native_dir/'llm_config.json').write_text('{}')
+    runtime.bundle.model_path = str(native_dir)
+    config = dict(runtime.config, resolution=512)
+    config_path = tmp_path/'config.json'; config_path.write_text(json.dumps(config))
+    dataset = tmp_path/'dataset.jsonl'
+    dataset.write_text(json.dumps(dict(sample_id='calibrate', scene_id='scene', split='val',
+                       caption='a token', label_type='clean', verified=True,
+                       facts=[dict(category='object', aliases=['token'], alternatives=['absent'])]))+'\n')
+    monkeypatch.setattr(backbone, 'load_native', lambda *args: runtime.bundle)
+    output = tmp_path/'calibration'
+    monkeypatch.setattr(sys, 'argv', ['memory-topology', 'calibrate', '--model', str(native_dir),
+                        '--data', str(dataset), '--config', str(config_path), '--split', 'val', '--output', str(output)])
+    main()
+    record = json.loads((output/'manifest.json').read_text())
+    assert record['native_config']['vae_config']['scale_factor'] == .3611
+    assert record['status'].startswith('executed')
+    assert not json.loads((output/'calibration.json').read_text())['passed']
+    assert not any('build/' in name for name in record['source_hashes'])
