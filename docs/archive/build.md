@@ -22,4 +22,4 @@ SHA256：`1bd28f5a55d9af16c4b8e6d56d0a5124c131d8d01d3264fefcb62e0456260cbc`。
 
 未执行真实BAGEL权重、目标NPU/CUDA全模型检查、正式训练或人工质量评测。本记录支持工程代码构建状态，不支持caption接地、GEN语义消费或画质改善结论。
 
-[返回实验记录](../experiments.md#10-工程验证记录) · [返回 README](../../README.md)
+[返回实验记录](../experiments.md) · [返回 README](../../README.md)

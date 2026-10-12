@@ -43,4 +43,4 @@ t≈0.05 的最近原生节点仍只剩一个完整区间。这是该原生网�
 
 分支同步后的核对结果另存外层 artifacts/memory_topology_review_20261011/branch_sync.json。用户原有未提交删除与图示资产不包含在本次提交中。
 
-[返回实验记录](../experiments.md#10-工程验证记录) · [返回 README](../../README.md)
+[返回实验记录](../experiments.md) · [返回 README](../../README.md)
