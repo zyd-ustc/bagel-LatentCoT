@@ -8,7 +8,7 @@ shift 2
 [[ ! -e "$RUN" ]] || { echo 'Use a fresh output directory' >&2; exit 1; }
 PYTHON=${MODEL_PYTHON:-/root/venvs/bagel-NPU/bin/python}
 MODEL=${MODEL_PATH:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}
-DATA=${VISUAL_DATA:-/data/zyd_workspace/bagel-LatentCoT/datasets/visual_memory640.jsonl}
+DATA=${VISUAL_DATA:-/data/zyd_workspace/bagel-LatentCoT/datasets/visual_memory_full.jsonl}
 TEXT_DATA=${TEXT_DATA:-/data/zyd_workspace/bagel-LatentCoT/datasets/c1_response_text2192.jsonl}
 TEACHER=${TEXT_TEACHER:-/root/outputs/c1_response_expand_20261012_141729/best.pt}
 C0=${C0_PASS:-/root/outputs/c0_text16_20261012_111241/calibration.json}

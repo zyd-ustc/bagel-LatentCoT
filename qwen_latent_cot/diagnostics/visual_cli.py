@@ -12,6 +12,29 @@ from .record import manifest, write_json, append_json
 from .visual_record import initialize_student, load_visual_checkpoint
 
 
+def load_input_rows(args, cfg):
+    """Validate image contents once on rank 0, then share normalized rows."""
+    result = [None]
+    if parallel.rank() == 0:
+        try:
+            rows = load_dataset(args.data, visual=True,
+                                allow_unreviewed_proxy=cfg.get('allow_unreviewed_proxy', False))
+            if any(not re.fullmatch(r'[A-Za-z0-9_-]+', row['sample_id']) for row in rows):
+                raise ValueError('sample_id must be a safe filename identifier')
+            text_rows = load_dataset(args.text_data) if args.text_data else []
+            result[0] = dict(rows=rows, text_rows=text_rows, error=None)
+        except Exception as error:
+            if parallel.world_size() == 1:
+                raise
+            result[0] = dict(error=f'{type(error).__name__}: {error}')
+    if parallel.world_size() > 1:
+        import torch.distributed as dist
+        dist.broadcast_object_list(result, src=0)
+    if result[0]['error']:
+        raise ValueError('rank 0 dataset validation failed: ' + result[0]['error'])
+    return result[0]['rows'], result[0]['text_rows']
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['check', 'train', 'eval', 'sample', 'label-states'])
@@ -30,6 +53,7 @@ def main(argv=None):
     parser.add_argument('--c0-pass')
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='val')
     parser.add_argument('--steps', type=int, help='override budget, e.g. 20 for resource check')
+    parser.add_argument('--validation-max-families', type=int, help='fixed validation family budget; 0 uses all')
     parser.add_argument('--skip-validation', action='store_true', help='resource checks only; no selected best checkpoint')
     parser.add_argument('--eval-t', nargs='+', type=float)
     parser.add_argument('--noise-seeds', nargs='+', type=int)
@@ -41,13 +65,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
     cfg = json.loads(Path(args.config).read_text())
     if args.steps is not None: cfg['steps'] = args.steps
+    if args.validation_max_families is not None:
+        if args.validation_max_families < 0:
+            parser.error('--validation-max-families must be nonnegative')
+        cfg['validation_max_families'] = args.validation_max_families
     if args.eval_t is not None: cfg['eval_t'] = args.eval_t
     if args.noise_seeds is not None: cfg['noise_seeds'] = args.noise_seeds
     stage = args.stage or cfg['stage']
-    rows = load_dataset(args.data, visual=True, allow_unreviewed_proxy=cfg.get('allow_unreviewed_proxy', False))
-    if any(not re.fullmatch(r'[A-Za-z0-9_-]+', row['sample_id']) for row in rows):
-        raise ValueError('sample_id must be a safe filename identifier')
-    text_rows = load_dataset(args.text_data) if args.text_data else []
+    if args.command == 'check' and args.distributed:
+        parser.error('E0 runs on one NPU before formal 16-NPU training')
+    if not args.distributed and int(os.environ.get('WORLD_SIZE', '1')) > 1:
+        parser.error('torchrun requires --distributed')
+    if args.distributed:
+        args.device = str(parallel.initialize(args.device))
+    rows, text_rows = load_input_rows(args, cfg)
     if args.command == 'train':
         if int(cfg['effective_batch']*cfg['replay_fraction']) and not text_rows:
             parser.error('25% global replay requires --text-data with existing train/val captions')
@@ -55,12 +86,6 @@ def main(argv=None):
             parser.error('joint/loop training must start from a selected visual parent')
     if args.command in ('eval', 'sample') and not args.checkpoint:
         parser.error('evaluation requires --checkpoint')
-    if args.command == 'check' and args.distributed:
-        parser.error('E0 runs on one NPU before formal 16-NPU training')
-    if not args.distributed and int(os.environ.get('WORLD_SIZE', '1')) > 1:
-        parser.error('torchrun requires --distributed')
-    if args.distributed:
-        args.device = str(parallel.initialize(args.device))
     output = Path(args.output).resolve()
     if parallel.rank() == 0:
         if output.exists() and any(output.iterdir()):

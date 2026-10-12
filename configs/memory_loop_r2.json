@@ -36,6 +36,7 @@
   "weight_decay": 0.0,
   "gradient_clip": 1.0,
   "eval_every": 100,
+  "validation_max_families": 64,
   "max_caption_tokens": 48,
   "cfg_text_scale": 4.0,
   "cfg_renorm_min": 0.0,

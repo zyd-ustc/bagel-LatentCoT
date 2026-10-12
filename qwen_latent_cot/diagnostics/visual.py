@@ -129,6 +129,13 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
     validate_config(runtime, stage)
     pool = [row for row in rows if row['split'] == 'train']
     val = [row for row in rows if row['split'] == 'val']
+    validation_limit = cfg.get('validation_max_families', 0)
+    if validation_limit:
+        import hashlib
+        families = sorted({row['family_id'] for row in val}, key=lambda family:
+                          hashlib.sha256(f"{cfg['seed']}:{family}".encode()).hexdigest())
+        selected_families = set(families[:validation_limit])
+        val = [row for row in val if row['family_id'] in selected_families]
     replay = [row for row in text_rows if row['split'] == 'train']
     replay_val = [row for row in text_rows if row['split'] == 'val']
     batch = cfg['effective_batch']; world = parallel.world_size(); worker = parallel.rank()
@@ -153,6 +160,11 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
     teacher_guard = FrozenGuard(student.text_teacher)
     reset_peak_memory_stats(runtime.device); start = time.perf_counter()
     if worker == 0:
+        write_json(output/'validation_selection.json', dict(
+                   maximum_families=validation_limit, seed=cfg['seed'],
+                   policy='stable SHA256 order by seed/family; source val split only',
+                   family_ids=sorted({row['family_id'] for row in val}),
+                   sample_ids=[row['sample_id'] for row in val]))
         save_visual_checkpoint(output/'init.pt', student, start_step, stage, parent)
         write_json(output/'freeze_gradient_audit.json', dict(status='started',
                    model_files=runtime.native_files, guard='native/teacher tensor identity and version',

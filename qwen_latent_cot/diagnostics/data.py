@@ -108,6 +108,8 @@ def load_dataset(path, *, visual=False, allow_unreviewed_proxy=False):
             if path not in image_hashes:
                 image_hashes[path] = file_hash(path)
             digest = image_hashes[path]
+            if visual and row.get('image_sha256') and row['image_sha256'] != digest:
+                raise ValueError('paired image content differs from locked image_sha256')
             if image_splits.setdefault(digest, row['split']) != row['split']:
                 raise ValueError('same original image content leaks across splits')
         if row.get('state') and row['label_type'] != 'observed':

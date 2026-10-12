@@ -87,6 +87,8 @@ def load_visual_checkpoint(path, student, *, optimizer=None, resume=False, expec
                 raise ValueError('exact resume configuration differs: '+key)
         if saved.get('data_hashes') != getattr(runtime, 'data_hashes', None):
             raise ValueError('resume visual/text dataset hashes changed')
+        if saved['config'].get('validation_max_families', 0) != runtime.config.get('validation_max_families', 0):
+            raise ValueError('exact resume validation family budget changed')
         optimizer.load_state_dict(saved['optimizer'])
         rng = saved['rng']; random.setstate(rng['python']); torch.set_rng_state(rng['torch'].cpu())
         n = rng['numpy']; np.random.set_state((n['kind'], np.array(n['keys'], dtype=np.uint32),

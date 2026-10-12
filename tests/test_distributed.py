@@ -104,10 +104,29 @@ def visual_training_worker(rank, port, root):
         rows=[]
         for split in ('train','val'):
             for index,color in enumerate(('red','blue')):
-                path=workspace/f'{split}_{index}.png';Image.new('RGB',(32,32),color).save(path)
+                path=workspace/f'{split}_{index}.png'
+                image=Image.new('RGB',(32,32),color)
+                if split=='val':image.putpixel((0,0),(1,2,3))
+                image.save(path)
                 rows.append(visual_label(dict(sample_id=f'{split}_{index}',scene_id=f'{split}_{index}',
                     split=split,caption='a token',facts=[],verified=True,image=str(path))))
         text_rows=[dict(row) for row in rows]
+        from types import SimpleNamespace
+        from qwen_latent_cot.diagnostics.visual_cli import load_input_rows
+        manifest = Path(root)/'paired.jsonl'
+        if rank == 0:
+            manifest.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+        parallel.barrier()
+        # A non-root worker must receive rows, never open its nonexistent input.
+        source = manifest if rank == 0 else Path(root)/'not_on_worker_1.jsonl'
+        rows, text_rows = load_input_rows(SimpleNamespace(data=source, text_data=source), cfg)
+        assert len(rows) == len(text_rows) == 4
+        try:
+            load_input_rows(SimpleNamespace(data=Path(root)/'missing.jsonl', text_data=None), cfg)
+        except ValueError as error:
+            assert 'rank 0 dataset validation failed' in str(error)
+        else:
+            raise AssertionError('all workers must receive the root validation failure')
         student=VisualStudent(runtime);student.text_teacher_hash='test'
         output=Path(root)/'training'
         if rank==0:output.mkdir()
