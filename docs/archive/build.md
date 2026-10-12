@@ -1,4 +1,6 @@
-# 代码构建验证记录
+# 首次构建
+
+状态：历史工程记录。记录日期：2026-10-11。
 
 日期：2026-10-11（Asia/Shanghai）。分支：`loop-layer`。实现基点：`42e71148826011b74473a170c4ab62072d6c70ab`。
 
@@ -19,3 +21,5 @@ SHA256：`1bd28f5a55d9af16c4b8e6d56d0a5124c131d8d01d3264fefcb62e0456260cbc`。
 测试使用真实小型原生Qwen2MoT/BAGEL模块，覆盖L/C传播、native prefill种子和GEN KV等价、post-block读出、梯度与冻结、样本隔离、完整bank交换、因果移位、真mask、单次RoPE、pure-noise/RNG独立性、checkpoint模型来源、split泄漏、C1→C2→GEN、轨迹、报告及C0入口的原生VAE配置dataclass序列化。完整流程中的tokenizer和VAE是测试替身。
 
 未执行真实BAGEL权重、目标NPU/CUDA全模型检查、正式训练或人工质量评测。本记录支持工程代码构建状态，不支持caption接地、GEN语义消费或画质改善结论。
+
+[返回验证记录](../validation.md) · [返回 README](../../README.md)
