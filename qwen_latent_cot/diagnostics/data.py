@@ -21,15 +21,64 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def load_dataset(path):
+LABEL_KINDS = ('target_clean', 'observation_proxy', 'target_observation_gap')
+
+
+def visual_label(row):
+    """Normalize new labels without upgrading unreviewed proxies to confirmations."""
+    kind = row.get('label_kind', 'target_clean')
+    if kind not in LABEL_KINDS:
+        raise ValueError('unknown visual label_kind')
+    row = dict(row, label_kind=kind)
+    row.setdefault('family_id', row.get('scene_id', row.get('image_id')))
+    row.setdefault('scene_id', row.get('family_id'))
+    row.setdefault('image_id', row.get('scene_id'))
+    row.setdefault('prompt', 'An image.')
+    row.setdefault('label_type', 'observed' if row.get('state') else 'clean')
+    if kind == 'target_clean':
+        row.setdefault('target_caption', row.get('caption'))
+        row.setdefault('target_facts', row.get('facts', []))
+        row['caption'], row['facts'] = row['target_caption'], row['target_facts']
+        row['confirmed_label'] = row.get('verified') is True
+    else:
+        required = ('t', 'noise_seed', 'round', 'observation_caption', 'observation_facts',
+                    'observation_method', 'review_status', 'observation_state_hash')
+        if any(key not in row for key in required):
+            raise ValueError('observation labels require actual state, method and review metadata')
+        if not 0 <= row['t'] <= 1 or not isinstance(row['noise_seed'], int) or row['round'] != 0:
+            raise ValueError('first visual label interface requires S0 labels with actual t/seed')
+        if not re.fullmatch('[0-9a-f]{64}', row['observation_state_hash']):
+            raise ValueError('observation_state_hash must be SHA256 of labelled x_t')
+        if not row.get('observation_image_hash') and not row.get('state'):
+            raise ValueError('observation proxy requires source image hash')
+        if row.get('state') and not row.get('trajectory_checkpoint_hash'):
+            raise ValueError('trajectory label must identify generating checkpoint')
+        row['confirmed_label'] = row.get('verified') is True and row['review_status'] == 'approved'
+        if kind == 'target_observation_gap':
+            if not row.get('target_caption') or not row.get('gap_caption') or 'gap_facts' not in row:
+                raise ValueError('gap label requires explicit reviewed gap and target references')
+            row['caption'], row['facts'] = row['gap_caption'], row['gap_facts']
+        else:
+            row['caption'], row['facts'] = row['observation_caption'], row['observation_facts']
+        row.setdefault('uncertain_facts', [])
+        row['facts'] = row['facts'] + [dict(f, unknown=True) for f in row['uncertain_facts']]
+    if not isinstance(row.get('caption'), str) or not row['caption'].strip() or not row.get('family_id'):
+        raise ValueError('visual labels require nonempty caption and family_id')
+    return row
+
+
+def load_dataset(path, *, visual=False, allow_unreviewed_proxy=False):
     root = Path(path).resolve().parent
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+    if visual:
+        rows = [visual_label(row) for row in rows]
     ids = {}; families = {}; pairs = {}; image_splits = {}; image_hashes = {}
     for row in rows:
         required = ('sample_id', 'scene_id', 'split', 'caption', 'label_type', 'verified', 'facts')
         if any(key not in row for key in required) or row['split'] not in ('train', 'val', 'test'):
             raise ValueError('dataset requires IDs, frozen split, caption, labels, verification and facts')
-        if row['sample_id'] in ids or row['label_type'] not in ('clean', 'observed') or row['verified'] is not True:
+        proxy_allowed = visual and allow_unreviewed_proxy and row['label_kind'] == 'observation_proxy'
+        if row['sample_id'] in ids or row['label_type'] not in ('clean', 'observed') or (row['verified'] is not True and not proxy_allowed):
             raise ValueError('duplicate sample or unverified/unknown label type')
         ids[row['sample_id']] = row
         family = row.get('family_id', row['scene_id'])

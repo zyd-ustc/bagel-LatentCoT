@@ -125,6 +125,43 @@ class DiagnosticRuntime:
         return x, flow, lengths, positions, metadata
 
     @torch.no_grad()
+    def training_state(self, row, t, noise_seed):
+        """Keep sampled epsilon/x0; trajectory states deliberately have no flow target."""
+        from .flow_training import TrainingState
+        if row.get('state'):
+            x, flow, lengths, positions, meta = self.state(row, t, noise_seed)
+            x0 = epsilon = None
+            saved = torch.load(row['state'], map_location='cpu', weights_only=True)
+            if saved.get('checkpoint_hash') != row.get('trajectory_checkpoint_hash'):
+                raise ValueError('trajectory checkpoint provenance differs from label')
+        else:
+            posterior_seed = self.image_posterior_seed(row['image'])
+            x0 = self.encode_image(row['image'], posterior_seed)
+            generator = torch.Generator(device='cpu').manual_seed(noise_seed)
+            epsilon = torch.randn(x0.shape, generator=generator, dtype=torch.float32).to(x0.device, x0.dtype)
+            x = epsilon if t == 1 else (1-t)*x0+t*epsilon
+            if self.config.get('source_prompt_policy', 'neutral') == 'neutral':
+                prompt = self.config['neutral_prompt']
+            elif self.config.get('source_prompt_policy') == 'deployment' and self.config.get('allow_target_prompt'):
+                prompt = row['prompt']
+            else:
+                raise ValueError('deployment/target prompt requires explicit allow_target_prompt')
+            flow, lengths, positions = self.flow_inputs(prompt)
+            meta = dict(state_source='controlled_paired', t=t, noise_seed=noise_seed,
+                        posterior_seed=posterior_seed, posterior_seed_policy=self.config['posterior_seed_policy'],
+                        x_t_hash=tensor_hash(x), image_hash=file_hash(row['image']), prompt=prompt)
+        if row.get('label_kind') in ('observation_proxy', 'target_observation_gap'):
+            if abs(float(row['t'])-t) > 1e-7 or row['noise_seed'] != noise_seed:
+                raise ValueError('observation label must match actual state t/noise seed')
+            if row['observation_state_hash'] != tensor_hash(x):
+                raise ValueError('observation label belongs to a different x_t')
+            if row.get('observation_image_hash') and meta.get('image_hash') != row['observation_image_hash']:
+                raise ValueError('observation image provenance differs')
+        meta.update(label_kind=row.get('label_kind', 'target_clean'), round=0,
+                    confirmed_label=row.get('confirmed_label', row.get('verified', False)))
+        return TrainingState(x, x0, epsilon, float(t), flow, lengths, positions, meta)
+
+    @torch.no_grad()
     def velocity(self, x, t, flow):
         timestep = torch.full((len(x),), t, device=self.device)
         # Save the conditional prediction BEFORE native CFG/renormalization.
