@@ -59,7 +59,6 @@ def diagnose_gen(runtime, rows, output, text_checkpoint, visual_checkpoint, cont
             flow, lengths, positions = runtime.flow_inputs(row['prompt'])
             if metadata['state_source'] == 'trajectory':
                 flow = state_flow
-            source = runtime.visual_source(x, t, state_flow)
             native = runtime.velocity(x, t, flow)
             repeat = runtime.velocity(x, t, flow)
             layout = runtime.gen_arm(x, t, flow, fixed, lengths, positions, masked=True)
@@ -85,6 +84,7 @@ def diagnose_gen(runtime, rows, output, text_checkpoint, visual_checkpoint, cont
                 arms['G-swap-T'+runtime.writer.topology] = runtime.gen_arm(x, t, flow, swap_text, lengths, positions)
                 banks['text_swap'] = swap_text
             if visual_checkpoint:
+                source = runtime.visual_source(x, t, state_flow)
                 load_checkpoint(visual_checkpoint, runtime, 'C2')
                 visual_bank = runtime.memory(source)
                 banks['visual'] = visual_bank

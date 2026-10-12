@@ -94,7 +94,7 @@ Caption decoder只能读取Memory、固定指令和答案前缀。教师强制�
 
 首轮actual `t=0.5`，noise seeds为0/1。8个场景对×2seed形成16个并行任务；每卡处理完整一对、共32个样本状态。配对成员保留在同一worker，以满足swap来源读取。每个样本的各arm共享同一x_t/t/p；同图跨t的noise规则仍按第2节执行。
 
-执行现有7组：G-base、G-layout、G-fixed、G-neutral、G-text、G-TC、G-swap-TC。不提供visual checkpoint，不跑G-VC，不续采样，不展开噪声网格。固定/布局项用于解释原有读出，不另扩展消融。当前GEN命令是单进程，需补16卡按场景对/seed分片与汇总的启动层；训练的 `--distributed`不能用于GEN。
+执行现有7组：G-base、G-layout、G-fixed、G-neutral、G-text、G-TC、G-swap-TC。不提供visual checkpoint，不跑G-VC，不续采样，不展开噪声网格。固定/布局项用于解释原有读出，不另扩展消融。原生GEN命令是单进程；`scripts/gen_npu.py`已提供16卡按场景对/seed分片与汇总。训练的 `--distributed`不能用于GEN。
 
 记录conditional与CFG后velocity、预测图 `decode(x_t-t*v)` 的目标/错配颜色、对象和承载面、伪影及耗时。输出变化与方向相似均不能单独证明有用；G-text的原生文本布局不同，不能将端到端velocity差直接当作设计中的共享query响应蒸馏loss。
 

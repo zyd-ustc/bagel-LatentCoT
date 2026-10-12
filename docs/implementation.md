@@ -1,6 +1,6 @@
 # 实现
 
-状态：NPU分支C1联合训练已运行；GEN分片启动层与蒸馏待扩展。更新：2026-10-12。
+状态：C1已运行；16卡GEN分片/汇总已实现；蒸馏待扩展。更新：2026-10-12。
 
 [返回 README](../README.md)
 
@@ -13,13 +13,14 @@
 |[caption.py](../qwen_latent_cot/diagnostics/caption.py)|C0复述校准；C1文本压缩与C2视觉迁移，均为caption CE|
 |[runtime.py](../qwen_latent_cot/diagnostics/runtime.py)|VAE编码、状态构造、CFG速度、图像与原生网格续采样|
 |[gen.py](../qwen_latent_cot/diagnostics/gen.py)|base/layout/fixed/neutral/text/文本Memory/视觉Memory/swap阶梯|
+|[gen_parallel.py](../qwen_latent_cot/diagnostics/gen_parallel.py)|8对×2seed的16卡分片、核对与局部预测图汇总|
 |[trajectory.py](../qwen_latent_cot/diagnostics/trajectory.py)|原生轨迹及待核验观察标签|
 |[data.py](../qwen_latent_cot/diagnostics/data.py)|split、反事实、噪声、字面事实分与聚类区间|
 |[record.py](../qwen_latent_cot/diagnostics/record.py)|manifest、checkpoint来源与冻结检查|
 |[report.py](../qwen_latent_cot/diagnostics/report.py)|四张结果表与盲评汇总|
 |[cli.py](../qwen_latent_cot/diagnostics/cli.py)|唯一执行入口、配置与C0门槛|
 
-当前保留C checkpoint做文本GEN读取；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；目前没有GEN多卡分片/汇总启动器，`--distributed`仅用于训练。下一步所需数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
+当前保留C checkpoint做文本GEN读取；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；16卡GEN启动器为 `scripts/gen_npu.py`；每卡接收完整场景对和一个seed。`--distributed`仅用于训练。文本GEN未提供视觉checkpoint时不捕获未使用的视觉KV。下一步所需数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
 
 当前没有hidden/KV对齐、教师logit KL、语义读出或GEN响应蒸馏。C1的caption KV是writer输入来源；不等于以其hidden作为蒸馏目标。后续扩展按[设计](design.md)新增teacher响应与损失，保留现有CE基线。
 
