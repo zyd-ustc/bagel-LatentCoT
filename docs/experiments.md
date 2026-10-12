@@ -6,6 +6,8 @@
 
 ## 1. 固定比较条件
 
+Ascend默认16卡并行，使用 `loop-layer-NPU`。评测按样本分片；训练按独立组安排，联合训练需另实现梯度同步。C0首跑为16条短文本，每卡一条；启动命令见[运行](run.md)。
+
 L/C共同使用16槽位、全部UND层、512分辨率、相同新增参数量、来源、读出位置和预算。每层一次writer，Memory不跨去噪步，GEN只在一个节点读取一次。原BAGEL与原prompt保持冻结/保留。
 
 记录模型/源码/tokenizer/VAE/config hash，设备、dtype、attention后端与随机流。按原图/场景族固定train/val/test；同图的噪声、caption改写与反事实变体不得跨split。

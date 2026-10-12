@@ -6,6 +6,8 @@
 
 本页命令不包含拟议的响应蒸馏或语义读出损失。目标主机的真实权重实验由用户执行。数据格式见[实现](implementation.md)，实验顺序见[实验](experiments.md)。
 
+Ascend 实验默认使用 `loop-layer-NPU` 分支和16卡并行。评测按样本分片；独立实验按组分配。当前训练入口没有分布式梯度同步，不能用16个独立训练进程冒充一个联合训练。
+
 ## 1. 安装与检查
 
 在本仓库根目录执行。先安装目标设备的 PyTorch；Ascend 还需要与环境匹配的 `torch_npu`，CUDA 原生路径需要 `flash-attn`。
@@ -19,6 +21,26 @@ memory-topology --help
 唯一启动入口为 `memory-topology`。等价入口是 `python -m qwen_latent_cot.diagnostics.cli`；`scripts/memory_topology.py` 只是同一入口的薄封装。
 
 ## 2. 原生文本校准
+
+### modelarts-job：16条文本、16卡
+
+在同步后的 `/root/bagel-LatentCoT-loop-layer-NPU` 执行：
+
+```bash
+cd /root/bagel-LatentCoT-loop-layer-NPU
+OUT=/root/outputs/c0_text16_$(date +%Y%m%d_%H%M%S)
+/root/venvs/bagel-NPU/bin/python scripts/c0_npu.py \
+  --model /data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT \
+  --output "$OUT"
+```
+
+启动器让物理逻辑设备0–15各处理一条caption，进程内部均用 `npu:0`。它保留原生C0入口与默认配置，汇总16条结果，不自动判定通过。每卡加载一份冻结BAGEL。
+
+输入为 [c0_text16.jsonl](../data/c0_text16.jsonl)。这些人工编写文本只用于复述校准；`verified`指文本事实核对，不代表核验了图像。不能用它们作C2视觉标签。
+
+查看 `$OUT/captions.jsonl` 的 `caption/text`，以及 `$OUT/summary.json`。逐卡日志和manifest在 `$OUT/workers/`。核验全部16条后，在汇总的 `$OUT/calibration.json` 记录 `passed: true` 与 `reviewer`，后续使用这个路径。
+
+### 通用入口
 
 先准备核验数据。`DATA` 指向同一份包含 train/val/test 的 JSONL，按原图/场景族固定 split，包含反事实配对。
 下面的模型、数据和输出路径需要换成目标主机的实际路径。所有运行使用同一配置；缩减预算时，L/C 必须一起缩减。
