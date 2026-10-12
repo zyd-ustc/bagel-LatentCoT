@@ -41,13 +41,18 @@ def broadcast_parameters(module):
 
 
 @torch.no_grad()
-def sum_gradients(module):
+def sum_gradients(module, *, allow_unused=False):
     """Losses are divided by GLOBAL batch before backward; sum, do not average."""
-    if world_size() == 1:
-        return
-    parameters = list(module.parameters())
+    parameters = [p for p in module.parameters() if p.requires_grad]
+    if allow_unused:
+        # A rank may contain text-only replay with a disabled visual branch.
+        for parameter in parameters:
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
     if any(parameter.grad is None for parameter in parameters):
         raise RuntimeError('every writer parameter must receive a gradient')
+    if world_size() == 1:
+        return
     flattened = torch.cat([parameter.grad.reshape(-1) for parameter in parameters])
     dist.all_reduce(flattened, op=dist.ReduceOp.SUM)
     offset = 0

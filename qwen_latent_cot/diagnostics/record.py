@@ -57,7 +57,7 @@ def git_context(root):
         source_origin='repository_with_source_hashes')
 
 
-def manifest(runtime, args, data_path):
+def manifest(runtime, args, data_path, *, rows=None):
     bundle = runtime.bundle
     root = Path(__file__).resolve().parents[2]
     native_root = Path(bundle.model_path)
@@ -65,7 +65,7 @@ def manifest(runtime, args, data_path):
                     (p.suffix in ('.json', '.safetensors') or p.name.startswith(('tokenizer', 'vocab', 'merges')))]
     result = dict(protocol=runtime.config['protocol'], config=runtime.config,
                   config_hash=file_hash(args.config), dataset_hash=file_hash(data_path),
-                  data_asset_hashes={str(p): file_hash(p) for p in sorted({r[k] for r in load_dataset(data_path) for k in ('image', 'state') if r.get(k)})},
+                  data_asset_hashes={str(p): file_hash(p) for p in sorted({r[k] for r in (load_dataset(data_path) if rows is None else rows) for k in ('image', 'state') if r.get(k)})},
                   timestamp_utc=datetime.now(timezone.utc).isoformat(), host=platform.node(), command=sys.argv,
                   model_path=str(native_root.resolve()), dataset_path=str(Path(data_path).resolve()),
                   config_path=str(Path(args.config).resolve()),
