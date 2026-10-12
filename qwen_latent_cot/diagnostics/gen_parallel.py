@@ -65,7 +65,7 @@ def prepare(data, config, output, model, checkpoint, c0):
             if len(selected) != 1:
                 raise ValueError('each row must assert exactly one target color: red or blue')
             asserted = set(re.findall(r'\b(?:red|blue)\b', row['caption'].lower()))
-            if asserted != selected:
+            if not selected <= asserted or (pairing == "controlled_color_pair" and asserted != selected):
                 raise ValueError('caption and target color fact disagree')
             colors.extend(selected)
         if set(colors) != {'red', 'blue'}:
