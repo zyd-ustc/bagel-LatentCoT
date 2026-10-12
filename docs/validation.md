@@ -91,3 +91,21 @@ C1未见测试集与自然caption泛化、C2视觉迁移、GEN对Memory内容的
 本轮为异场景配对的定性Memory实验，不是同场景仅颜色变化的控制实验。GEN画质与Memory语义效果待人工审查。
 
 启动器现在将清单的配对类型写入plan与summary，区分控制颜色对与异场景错配。针对分片和汇总的2项已有测试通过（0.83秒，`/tmp/bagel-loop-check-venv`）；系统Python缺少PyTorch动态库，未用于本轮检查。
+
+## 9. 16图GEN定性首跑
+
+2026-10-12，`modelarts-job:/root/outputs/gen_sample16_C_20261012`完成16卡并行、16张源图、2个noise seed、t=0.5、7组条件，共224张局部预测图。代码版本 `72f2031`；C checkpoint沿用第4节，BAGEL冻结检查通过。未续采样，未运行视觉Memory或C2。
+
+|组别|相对G-layout的条件速度差异均值|相对G-layout的CFG速度差异均值|
+|---|---:|---:|
+|G-base|0.01933|0.07735|
+|G-layout|0|0|
+|G-fixed|0.00563|0.02251|
+|G-neutral|0.01607|0.06413|
+|G-text|0.02502|0.09965|
+|G-TC|0.01357|0.05424|
+|G-swap-TC|0.01355|0.05416|
+
+数值为归一化向量差异，不是图像质量分。参考是G-layout；G-base与其差异包含位置布局影响。G-TC与G-swap-TC的平均幅度接近，不能据此判断内容是否被消费。重复原生CFG误差为0；语义与伪影尚待人工审查。
+
+`review/index.html`汇总32页对照图，每页为原图加7组条件；同一源图按seed分开。`local_blind/`保留224张匿名预测图及独立映射。人工优先比较G-text、G-TC、G-swap-TC，并检查G-base与G-layout的布局影响。所有图为x0_hat，不是最终生成结果；异场景swap不构成颜色独立控制证据。
