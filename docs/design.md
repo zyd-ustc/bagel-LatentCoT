@@ -56,7 +56,7 @@ Caption先经冻结BAGEL原生文本prefill，得到逐层来源KV。连续Memor
 
 $$
 L_{\mathrm{cap}}=-\frac1N\sum_{j=1}^{N}
-\log P_{\mathrm{UND}}(y_j\mid M,I,y_{<j}).
+\log P_{\mathrm{UND}}(y_j\mid M,I,y_{\lt j}).
 $$
 
 `M`是Memory，`I`是固定指令，`y_j`是目标caption的第j个token。Memory槽位与caption token无需一一对应。当前实现使用caption token监督，没有hidden逐token匹配或教师logit KL损失。
@@ -70,8 +70,8 @@ $$
 教师与学生共用同一query和共同KV，条件进入同一softmax：
 
 $$
-O_l^T=\operatorname{Attn}(Q_l,B_l\cup T_l),\qquad
-O_l^S=\operatorname{Attn}(Q_l,B_l\cup M_l).
+O_l^T=\mathrm{Attn}(Q_l,B_l\cup T_l),\qquad
+O_l^S=\mathrm{Attn}(Q_l,B_l\cup M_l).
 $$
 
 输出长度由query数决定，不取决于caption或Memory长度。教师响应停止梯度，学生响应保留到Memory K/V及新增残差的梯度。
@@ -79,9 +79,9 @@ $$
 读出使用第0/13/27层的attention逐head输出，位于GEN输出投影之前；每层选64个图像query。三层等权的归一化均方误差为：
 
 $$
-L_{\mathrm{read}}=\frac13\sum_{l\in\{0,13,27\}}
-\frac{\operatorname{mean}((O_l^S-\operatorname{sg}(O_l^T))^2)}
-{\max(\operatorname{mean}((O_l^T)^2),10^{-8})}.
+L_{\mathrm{read}}=\frac13\sum_{l\in\lbrace 0,13,27\rbrace}
+\frac{\mathrm{mean}((O_l^S-\mathrm{sg}(O_l^T))^2)}
+{\max(\mathrm{mean}((O_l^T)^2),10^{-8})}.
 $$
 
 `sg`表示停止梯度。实际训练损失为：
