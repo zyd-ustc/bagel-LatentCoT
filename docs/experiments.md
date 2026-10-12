@@ -173,4 +173,29 @@ Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256
 
 首次检查在屏蔽布局处失败：0.4%元素超过容差，最大差0.0625。保留16位置平移，并让屏蔽臂直接使用原生attention；可见Memory的GEN attention使用原生无mask SDPA，旧UND路径保留。修复后平移对照误差为0。第二次检查在恢复初值时复制冻结writer，触发参数版本检查；改为仅恢复被测试更新的视觉模块后，完整E0通过。两个失败输出保留，未记为训练结果。
 
-通过输出：`/root/outputs/visual_loop_e0_pass_20261012/e0.json`。本地CPU测试使用真实小型MoT层及两进程梯度同步，66项通过。正式16卡视觉训练、独立图像标签评测和完整采样质量评测尚未执行；512/64/64视觉清单尚未准备，现有自然文本prompt没有升级为配对图像标签。
+通过输出：`/root/outputs/visual_loop_e0_pass_20261012/e0.json`。本地CPU测试使用真实小型MoT层及两进程梯度同步，66项通过。当次E0时，正式16卡视觉训练、独立图像标签评测和完整采样质量评测尚未执行；512/64/64视觉清单尚未准备，现有自然文本prompt没有升级为配对图像标签。
+
+## 11. 全量视觉配对清单
+
+2026-10-12，modelarts-job，用户改为使用全量配对数据，以训练步数控制预算。`scripts/prepare_visual_data.py`读取CoRT一致性数据的三个原始split，只取标注为匹配的终态图像及其目标文本，生成 `/data/zyd_workspace/bagel-LatentCoT/datasets/visual_memory_full.jsonl`。
+
+|项目|数量|
+|---|---:|
+|来源记录|36,624|
+|训练|29,300|
+|验证|3,662|
+|测试|3,646|
+|入选合计|36,608|
+|排除此前GEN审查图|16，均来自原test split|
+|重复图片、缺失图片及不可读图片|0|
+|caption不超过48 tokens|29,861|
+|caption为49–128 tokens|5,801|
+|caption超过128 tokens|946|
+
+保留完整caption与原始split，没有重新划分或截断文本。数据集SHA256为 `157089d0d0ed157b9fdd179985f54d5b8ce4fa0440980eee36bd97601f4c33ee`；来源清单哈希及构建统计保存在同目录 `visual_memory_full.summary.json`。
+
+远端使用训练数据读取器完成全量校验：36,608条、36,608个独立family，schema、图片存在性、锁定图片哈希、family及图片内容跨split隔离均通过。输出为同目录 `visual_memory_full.validation.json`。
+
+匹配依据是数据集的终态一致性标注，不是新增人工caption审查。记录 `human_reviewed=false` 及来源范围；没有生成事实标签，`target_facts=[]`，事实准确率不可用。学生GEN prompt固定为 `An image.`，答案caption只用于监督。观察代理标签尚未构建。
+
+训练入口默认使用全量train池，16卡、global batch16、25%文本回放，通过 `--steps`控制更新次数。训练期间的val固定选择最多64个场景，独立评测保留完整val/test。输入校验改为rank 0执行一次后分发，避免16个进程重复读取全部图片。相关18项本地测试通过；尚未启动视觉训练。
