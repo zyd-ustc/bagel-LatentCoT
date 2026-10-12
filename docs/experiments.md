@@ -1,102 +1,181 @@
-# 实验
+# 实验记录
 
-状态：CE诊断已实现；蒸馏消融待实现。更新：2026-10-11。
+更新：2026-10-12。本页仅记录已执行的实验、日志指标与用户人工审查反馈。
 
-[返回 README](../README.md)
+[返回README](../README.md) · [设计](design.md)
 
-## 1. 固定比较条件
+## 1. Training-free探索
 
-L/C共同使用16槽位、全部UND层、512分辨率、相同新增参数量、来源、读出位置和预算。每层一次writer，Memory不跨去噪步，GEN只在一个节点读取一次。原BAGEL与原prompt保持冻结/保留。
+以下为用户在对话中报告的实验。未提供固定运行目录、样本数或量化指标。
 
-记录模型/源码/tokenizer/VAE/config hash，设备、dtype、attention后端与随机流。按原图/场景族固定train/val/test；同图的噪声、caption改写与反事实变体不得跨split。
-
-工程检查先用16样本。拟议数据预算：约2,000训练图、256验证图、256测试图，测试至少64对单属性反事实场景。规模是诊断起点，不代表训练充分。缩减时L/C同步缩减。
-
-## 2. 状态与标签
-
-|来源|构造|用途|
-|---|---|---|
-|受控加噪|`x_t=(1-t)x0+tε`，同图/seed各t复用ε|训练与噪声曲线|
-|原生轨迹|保存原生采样的actual t/step/x_t|部署分布验证|
-|文本oracle|caption原生prefill|文本压缩与消费接口校准|
-
-测试t为`{0.05,0.25,0.50,0.75,0.90,1.00}`；训练只用前五桶，直接使用actual t，不二次sigmoid/shift。t=1为纯噪声负对照，不纳入语义恢复平均。
-
-`y_clean`描述干净图像；`y_obs`描述`decode(x_t-t*v_base)`中人工确认的可见事实，允许unknown。两者分表，不将目标正确率当观察准确率。轨迹自动caption必须核验后使用。
-
-固定中性prompt用于主视觉写入任务；原生完整prompt用于额外轨迹任务。即使decoder看不到prompt，GEN仍可能携带其内容，因此必须做相同prompt、不同图像/seed的反事实检查。
-
-## 3. Caption与蒸馏阶段
-
-1. **C0**：原生caption上下文能自由复述；用正确补充文本验证GEN探针协议，不预设文字一定改善图像。
-2. **C1**：文本KV压缩为Memory；分别训练L/C。
-3. **C2**：从各自C1迁移到GEN KV输入；caption只用于teacher/损失。保留同预算scratch组检查桥梁作用。
-4. **消费验证**：冻结全部新增参数，执行第5节读取阶梯。
-
-当前CE预算为每组5,000 optimizer steps、有效batch32、每250步验证；其余参数由[配置](../configs/memory_topology.json)绑定。蒸馏沿用共同预算，另记录query数、采样层和训练成本。checkpoint仅按验证集共同规则选取；待实现蒸馏需预先固定选择规则，不能沿用规则名却暗改含义。
-
-拟议最小消融（L/C各跑）：
-
-|组|损失|回答的问题|
-|---|---|---|
-|CE-only|当前caption交叉熵|现有基线|
-|Read-only|GEN响应蒸馏|生成消费约束是否有效|
-|Read+Sem|响应蒸馏＋UND语义读出|是否保留细粒度语义|
-|Read+Sem+CE|再加caption交叉熵|可解码性辅助是否有用；后续项|
-
-对齐方式与位置契约见[设计](design.md)。不增加额外可训练GEN reader来解释这一轮结果。
-
-## 4. 信息路径对照
-
-|对照|改变|判断|
-|---|---|---|
-|Correct|正确来源/Memory|主结果|
-|Source-off|writer不读来源|是否依赖视觉/文本来源|
-|Source-swap|同t/p换反事实来源|写入是否随事实改变|
-|Memory-swap|decoder/GEN读另一图的完整bank|消费是否依赖内容|
-|Memory-masked|彻底排除Memory softmax项|语言/原条件基线|
-|Pure-noise|t=1，同ε跨不同x0|输入和自由输出必须相同；检查泄漏|
-
-单样本确定性writer下，Source-swap与Memory-swap等价，不能算两份独立证据。交换保留槽位数、位置与全部层级，记录donor ID。
-
-Caption decoder只能读取Memory、固定指令和答案前缀。教师强制需要因果移位；自由解码与反事实事实分是必需检查。对齐loss下降不能代替这些证据。
-
-## 5. GEN读取阶梯
-
-|组|条件|作用|
-|---|---|---|
-|G-base|原prompt，原生布局|原生基线|
-|G-layout|保留新增位置，彻底mask Memory|位置/布局控制|
-|G-fixed|全零但可见的KV槽位|softmax可见槽位控制|
-|G-neutral|固定中性文本seed KV|固定内容/分布控制|
-|G-text|原prompt后原生追加caption|显式文本oracle|
-|G-TL/TC|C1文本压缩Memory|压缩到GEN接口|
-|G-VL/VC|C2视觉Memory|完整学生路径|
-|G-swap|替换成反事实Memory|内容因果影响|
-
-所有Memory组容量/位置一致。G-text文本长度可能不同，只作功能参照。零V仍改变softmax分母；G-layout才是真mask。当前直接拼接KV会改变GEN位置，G-layout不保证等于G-base。
-
-先固定同一`x_t,t,p`比较conditional与CFG后velocity，再做后续采样。记录重复原生调用误差，比较响应范数/方向、预测图与对应事实；attention权重大或输出变化不能证明有用。
-
-两类任务分开报告：欠指定prompt＋caption补充，用于校准语义接口；完整prompt的原生轨迹观察，用于检查实际部署。当前事实不一定是修复指令，Memory被读取也可能强化错误。
-
-继续采样仅首节点注入，然后恢复原生条件。取最近原生时间节点并按actual t重建受控状态；保存requested t/actual t/全部后续节点。初步8场景检查，通过后扩到64场景、2seed、约0.9/0.5/0.25三个节点。受控图继续采样称状态条件补全，不能称纯噪声文生图提升。
-
-## 6. 报告与继续条件
-
-主表：文本桥；视觉caption按t；GEN响应与反事实；最终事实与画质。按场景族聚类计算区间，同图t/seed不当独立样本。t=1与clean/observed分表。
-
-保留自由文本、对象/属性/计数/关系分项、unknown错误断言率、donor/未修改事实、conditional/CFG变化、盲评胜平负、耗时与显存。响应蒸馏额外报告未见query/噪声/改写的误差与梯度。
-
-|结果|下一步|
+|实验|用户报告的结果|
 |---|---|
-|C0失败|修复原生解码/探针协议|
-|文本桥失败|检查压缩、读出、位置、容量、梯度|
-|文本Memory有效，视觉Memory无效|检查GEN→Memory与噪声适配|
-|Caption可读，GEN仅无语义扰动|消费接口仍不成立|
-|正确/错配/fixed效果相同|不能归因Memory内容|
-|语义随Memory改变但画质退化|接口可读，保真不足；不增加循环|
-|语义改善且质量稳定|只支持已测任务/t/单步范围|
-|L/C差异区间重叠|证据不足，按成本选择后续对象|
+|loop-layer推理模式比较|legacy_layerwise的training-free效果最好|
+|将Memory作为独立latent序列|生成侧对Memory内容不敏感；随后使用prompt hidden初始化Memory|
+|每层独立更新与一份Memory经过连续UND层|人工审查图像结果差异不大|
+|joint-micro残差更新|R1之后的图像全部退化为噪点|
 
-参数变化、串样、答案泄漏、重复RoPE、t=1关联不可见x0时先修复实现。出现大面积噪点停止扩大该组。数值容差按目标设备重复误差设定；质量非劣门槛在盲评前确定。
+## 2. C0原生文本校准
+
+2026-10-12，modelarts-job，NPU分支提交 `152e13a`。16条人工编写caption，16卡各处理一条，任务为原生caption上下文的自由复述。没有压缩Memory或低秩残差训练。
+
+|指标|结果|
+|---|---:|
+|完成样本|16/16|
+|平均教师强制NLL|0.271115|
+|严格文本匹配|7/16|
+|预设字面事实分|15条为1，c0_08为0|
+|含加载与汇总的端到端耗时|54.0313秒|
+
+人工审查：主要对象、颜色、数量与关系保留。c0_08的“single orange”与“one orange”等价，但字面词表未计入；c0_15出现额外尺寸、材质和光照描述。C0经人工确认放行；严格复述存在改写与扩写。
+
+输出：`/root/outputs/c0_text16_20261012_111241`。
+
+## 3. C1 Caption训练
+
+2026-10-12，modelarts-job，提交 `c3eff5a`。每层独立更新（L）与连续更新（C）各完成100步，均使用16卡HCCL、全局batch16、BF16；BAGEL冻结检查通过。文本划分为64 train / 8 val / 8 test，测试集未执行。
+
+|指标|L历史参照|C连续更新|
+|---|---:|---:|
+|第1步训练NLL|2.958457|2.976080|
+|第100步训练NLL|0.430248|0.000001472|
+|best步数|50|100|
+|best验证NLL|1.336711|0.458495|
+|best验证字面事实分|16.67%|45.83%|
+|第100步验证颜色正确|4/8，均输出红色|8/8|
+|第100步完整文本匹配|0/8|0/8|
+|rank0框架分配峰值|28.312 GiB|28.415 GiB|
+|训练日志计时|41.542秒|51.208秒|
+
+计时包含中途验证，不含模型加载与最后一次验证。C的自由输出仍有对象和承载面替换，8条中7条把desk替换为table；bicycle→bike未被字面评分计为正确。后续实验使用C的step 100 best。
+
+输出：`/root/outputs/c1_pilot_20261012_113553`。C checkpoint为 `C/best.pt`，SHA256 `d12b40adbf3f7aced96e51afef117fa8efda9ef42037f3e1b6147cac159a1ac2`。
+
+## 4. 源图筛选与GEN对照定义
+
+2026-10-12，从 `qwen_latent_cot_v3_adapted_20260816/manifests/cort36k_test.jsonl`流式采样16张终态图像，red/blue各8张，采样seed为20261012。只读取入选原图。Codex目视核对对象与目标颜色，写入简短caption；来源prompt另存，没有直接作为图像真值。
+
+清单 `memory_gen_sample16.jsonl`采用8个异场景swap对，配对标记为 `unrelated_scene_mismatch`，共同prompt为 `An image.`。所有同图/seed/时间的条件共享同一状态。
+
+|组|实际条件|
+|---|---|
+|G-base|原prompt与原生位置布局|
+|G-layout|预留Memory位置，彻底屏蔽新增KV|
+|G-fixed|全零且可见的Memory KV|
+|G-neutral|固定中性文本种子的KV|
+|G-text|原prompt后原生追加caption|
+|G-TC|caption经C writer压缩得到的16槽Memory|
+|G-swap-TC|读取配对另一张图caption的C Memory|
+
+图像状态使用 `x_t=(1-t)x0+tε`，评测图为 `decode(x_t-t*v)` 的局部x0_hat。下列GEN实验均运行7组条件，保留原生无文本CFG分支，没有续采样或视觉Memory。
+
+源图输出：`/root/outputs/source_sample16_20261012_121337`。所有数据清单位于 `/data/zyd_workspace/bagel-LatentCoT/datasets`。
+
+## 5. 蒸馏前GEN评测
+
+### 16图、t=0.5
+
+2026-10-12，提交 `72f2031`。使用C1-C step 100，16卡，16图×2个noise seed（0/1）×7组，共32状态、224张局部预测图；冻结检查通过。
+
+|组|相对G-layout条件速度差异|相对G-layout的CFG速度差异|
+|---|---:|---:|
+|G-base|0.01933|0.07735|
+|G-layout|0|0|
+|G-fixed|0.00563|0.02251|
+|G-neutral|0.01607|0.06413|
+|G-text|0.02502|0.09965|
+|G-TC|0.01357|0.05424|
+|G-swap-TC|0.01355|0.05416|
+
+以上为归一化向量差异。重复原生CFG误差为0。像素绝对差均值（0–255）：G-TC与G-swap-TC为0.539，G-text与G-base为1.864。用户人工审查：“图片看起来完全一样”。
+
+输出：`/root/outputs/gen_sample16_C_20261012`。
+
+### 原4图、t=0.7/0.8/0.9
+
+2026-10-12，提交 `a69976f`。保留sample_pair_01/04的4张图，C1-C step 100，noise seeds 0/1/2/3，16卡按2对×4seed×2组t分片。共48状态、336张局部预测图；冻结检查通过。
+
+|actual t|G-text vs G-base像素差|G-TC vs G-swap-TC像素差|G-TC vs G-neutral像素差|
+|---|---:|---:|---:|
+|0.7|4.4156|0.6599|1.8853|
+|0.8|7.8226|0.8632|2.6719|
+|0.9|21.8758|1.9538|4.8701|
+
+各项为该t下16状态的平均像素绝对差（0–255）。用户人工审查：只有G-text有明显变化，其余对照组几乎完全相同。
+
+输出：`/root/outputs/gen_recheck_C_t789_20261012`；数据清单为 `memory_gen_recheck4.jsonl`。
+
+## 6. GEN响应蒸馏100步
+
+2026-10-12，modelarts-job，提交 `788de2e`。从C1-C step 100初始化，16卡HCCL、global batch16、lr=1e-5、100步、每50步验证。损失为response＋0.1×caption NLL；原生BAGEL冻结检查通过。
+
+文本沿用64 train / 8 val / 8 test。Query图为原16图中的12 train / 4 val；各rank缓存一张训练图在t=0.7/0.8/0.9的3份探针。16卡中的4张训练图重复分配，但noise seed不同。验证query使用独立seed。
+
+响应读出固定0/13/27层，每层64个query，预留64个条件位置，共同prompt/self KV进入同一softmax。
+
+|响应训练步数|验证response|验证Caption NLL|验证字面事实分|选择损失|
+|---|---:|---:|---:|---:|
+|0|0.044724|0.458495|45.83%|0.090574|
+|50|0.033690|0.395288|58.33%|0.073219|
+|100|0.020588|0.752646|66.67%|0.095852|
+
+best按验证response＋0.1 NLL选中step 50；用户指定step 100 last用于GEN审查。
+
+输出：`/root/outputs/c1_response_20261012_134848`。Step 100 last SHA256：`725ab4a4cc33a3fa68cfaa1283905948dd0d885a397c4ceeb724009045e2c2ce`。
+
+## 7. 响应100步的GEN对照
+
+2026-10-12，使用响应step 100 last，复用原4图、noise seeds 0/1/2/3、t=0.7/0.8/0.9，16卡，共48状态、336张局部预测图。
+
+用户人工审查：G-TC在一些样例上与base、swap等其他对照组明显拉开差距。未提供逐图评分。
+
+输出：`/root/outputs/gen_response100_t789_20261012`。
+
+## 8. 扩展响应训练1000步
+
+2026-10-12，modelarts-job，训练提交 `1f2b614`。从响应step 100 last加载writer，重新创建AdamW，新增1000步，累计响应1100步。16卡HCCL、global batch16、lr=1e-5、每250步验证；损失与读出设置沿用首跑，冻结检查通过。
+
+|数据|训练|验证|测试|
+|---|---:|---:|---:|
+|原模板文本|64|8|8|
+|新增自然描述|2048|32|32|
+|合计文本|2112|40|40|
+|GEN query图|128|原4图|未另设|
+
+自然描述取自cort36k各split的短生成prompt，最多40 tokenizer tokens，只用于文本oracle，没有作为图像caption标签。其source ID与入选训练query图分离。每卡8张训练图×3个t，共384份训练探针。测试文本未参与训练或checkpoint选择。
+
+|本轮步数|累计响应步数|验证response|验证Caption NLL|模板字面事实分|
+|---|---:|---:|---:|---:|
+|0|100|0.032839|4.789251|66.67%|
+|250|350|0.024535|0.482668|100%|
+|500|600|0.021407|0.279060|100%|
+|750|850|0.019490|0.221803|100%|
+|1000|1100|0.018171|0.163620|100%|
+
+验证均值覆盖40条文本；字面事实分只覆盖8条有预设词表的模板，自然描述没有该评分。末步模板response/NLL为0.013619/0.000258，自然描述为0.019309/0.204460。选择损失0.034533，best选中本轮step 1000。
+
+输出：`/root/outputs/c1_response_expand_20261012_141729`。训练日志区分本轮step与 `response_cumulative_steps`；原C1的100步Caption训练不计入响应步数。
+
+## 9. 累计1100步的GEN对照
+
+2026-10-12，modelarts-job。使用扩展训练step 1000 best，累计响应1100步。原4图，actual t=0.9，noise seeds 0–7，16卡，共32状态、224张局部x0_hat；冻结检查通过，没有续采样。
+
+Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256 `255aa6d7c5ffed326a554891e2189dbbd2bdc309fe05c6433b10258a095e3f56`。
+
+**用户人工审查结论：G-TC与G-text性能效果基本持平。** 本记录对应所测局部预测图，没有逐图量化评分或最终采样画质统计。
+
+输出：`/root/outputs/gen_response1100_t09_20261012_143335`。
+
+## 10. 工程验证记录
+
+|已执行检查|实际记录|
+|---|---|
+|首次构建|23项小模型测试、wheel构建及安装后CLI检查通过|
+|实现修正|40项小模型测试；梯度故障注入、原生时间网格与wheel源码一致性检查通过|
+|联合训练入口|41项本地测试；双进程CPU与16卡HCCL通信/梯度归约检查通过|
+|GEN启动与数据分片|43项本地测试；完整swap对、16卡分片及结果汇总检查通过|
+|响应蒸馏实现|47项本地测试；共享softmax、教师停止梯度、Memory梯度和冻结参数检查通过|
+|真实BAGEL单卡响应检查|捕获GEN query、响应反传及一次AdamW更新通过，原生参数保持冻结|
+|扩展训练入口|49项小模型测试；128图按每卡8图分配、无事实词表的自然文本汇总及语法检查通过|
+
+真实单卡响应检查记录为 `/tmp/response_npu_smoke.log`与 `/tmp/response_npu_smoke.json`。历史构建与修正记录见[首次构建](archive/build.md)和[审查修正](archive/review.md)。工程测试中的完整VAE/tokenizer流程使用替身；真实BAGEL运行单独记录于前述实验。
