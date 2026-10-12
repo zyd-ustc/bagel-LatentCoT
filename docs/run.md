@@ -88,7 +88,7 @@ export C0_PASS=/root/outputs/c0_text16_20261012_111241/calibration.json
 
 C为step 100，SHA256与选择原因见[验证](validation.md#4-c1结果与拓扑选择)。checkpoint保持不变，不覆盖原输出，不按GEN结果重选。
 
-下一步先准备[GEN颜色校准](experiments.md#当前首跑c的颜色消费)的16张核验图像与8个场景对。每个worker的数据必须包含一对及双方 `swap_id`，图像路径使用绝对路径或按分片文件位置正确解析。与其对应的worker配置保留默认接口参数和 `train_t`，仅将 `eval_t`设为 `[0.5,1.0]`、`noise_seeds`设为该worker的 `[0]`或 `[1]`；GEN入口跳过t=1，不额外采样。按 `pair_id × seed`分配16个worker，输出目录分别独立，汇总时按原场景对聚合。
+以下为已完成GEN首跑的复现说明；当前下一步是实现C的GEN响应蒸馏，人工审查结论见[验证](validation.md#人工审查与后续选择)。复现原颜色控制方案时，需准备[GEN颜色校准](experiments.md#当前首跑c的颜色消费)所述的16张核验图像与8个场景对；实际首跑使用下述异场景定性清单。每个worker的数据必须包含一对及双方 `swap_id`，图像路径使用绝对路径或按分片文件位置正确解析。与其对应的worker配置保留默认接口参数和 `train_t`，仅将 `eval_t`设为 `[0.5,1.0]`、`noise_seeds`设为该worker的 `[0]`或 `[1]`；GEN入口跳过t=1，不额外采样。按 `pair_id × seed`分配16个worker，输出目录分别独立，汇总时按原场景对聚合。
 
 16卡总启动器已实现。数据根目录固定为 `/data/zyd_workspace/bagel-LatentCoT/datasets`，默认清单为该目录下 `memory_gen_color16.jsonl`，可用 `--data`覆盖。检查到的现有CoRT/结构化编辑清单不满足颜色配对格式：含编辑目标、未核验标记或旧图像路径。不得自动将target prompt当成图像真值；默认颜色清单尚不存在。本轮改用16张已有图像的定性采样清单 `memory_gen_sample16.jsonl`，启动时用 `--data`指定。
 
@@ -120,7 +120,7 @@ tail -f "$OUT.log"
 
 ### 后续C2（尚未启动）
 
-只有文本Memory在GEN颜色任务中产生合理语义作用、预测图未出现明显损伤后，才准备独立图像-caption训练/验证数据。C2沿用C拓扑，以 `$C1_C`初始化，caption仅用于监督。使用16卡联合训练，暂不恢复L或scratch组；GEN首轮校准数据不混入C2训练后再当独立测试。响应蒸馏若先成为下一步，需要实现损失入口后另给启动命令。
+只有文本Memory在GEN颜色任务中产生合理语义作用、预测图未出现明显损伤后，才准备独立图像-caption训练/验证数据。C2沿用C拓扑，以 `$C1_C`初始化，caption仅用于监督。使用16卡联合训练，暂不恢复L或scratch组；GEN首轮校准数据不混入C2训练后再当独立测试。人工审查后已选择先做GEN响应蒸馏；损失入口尚未实现，没有可用启动命令。C2继续暂缓。
 
 ## 4. 轨迹与后续采样
 

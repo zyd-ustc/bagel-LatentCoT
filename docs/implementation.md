@@ -20,7 +20,7 @@
 |[report.py](../qwen_latent_cot/diagnostics/report.py)|四张结果表与盲评汇总|
 |[cli.py](../qwen_latent_cot/diagnostics/cli.py)|唯一执行入口、配置与C0门槛|
 
-当前保留C checkpoint做文本GEN读取；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；16卡GEN启动器为 `scripts/gen_npu.py`；每卡接收完整场景对和一个seed。`--distributed`仅用于训练。文本GEN未提供视觉checkpoint时不捕获未使用的视觉KV。下一步所需数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
+当前保留C checkpoint；文本GEN读取与高噪声复查已完成，人工审查仅G-text有明显变化，其余组几乎相同。下一步优先实现GEN响应蒸馏，暂不进入C2；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；16卡GEN启动器为 `scripts/gen_npu.py`；每卡接收完整场景对和一个seed。`--distributed`仅用于训练。文本GEN未提供视觉checkpoint时不捕获未使用的视觉KV。GEN复现的数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
 
 当前没有hidden/KV对齐、教师logit KL、语义读出或GEN响应蒸馏。C1的caption KV是writer输入来源；不等于以其hidden作为蒸馏目标。后续扩展按[设计](design.md)新增teacher响应与损失，保留现有CE基线。
 
