@@ -153,6 +153,8 @@ def join_prefix(source, keys, values, lengths):
 
 
 def und_block(layer, hidden, rope, lengths, source=None, *, causal=False, query_adapter=None):
+    counter = getattr(layer, '_diagnostic_cost_counter', None)
+    if counter is not None: counter.counts[2] += 1
     a = layer.self_attn
     q, k, v = project(a, layer.input_layernorm(hidden), query_adapter=query_adapter)
     q, k = rotate(q, rope), rotate(k, rope)

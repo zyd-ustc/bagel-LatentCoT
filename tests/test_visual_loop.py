@@ -212,3 +212,18 @@ def test_layer_and_final_norm_hooks_are_read_only(visual_runtime):
     assert set(tensors) == {0,1,2,'final_head'}
     assert set(tensors[0]) == {'hidden_before_norm','hidden_after_norm','attention_output'}
     assert not tensors['final_head']['normalized_hidden'].requires_grad
+
+
+def test_E0_restores_only_the_tested_visual_parameters(visual_runtime, tmp_path):
+    from qwen_latent_cot.diagnostics.flow_checks import check
+    runtime, row = visual_runtime; student = VisualStudent(runtime)
+    guard = FrozenGuard(student.writer, student.text_teacher)
+    original = {name:p.clone() for name,p in student.visual.named_parameters()}
+    out = tmp_path/'e0';out.mkdir()
+    result = check(student, [row, dict(row,sample_id='b')], out)
+    assert result['status'] == 'E0_passed'
+    assert result['native_parameters_hash_before'] == result['native_parameters_hash_after']
+    guard.check()
+    for name,p in student.visual.named_parameters():
+        torch.testing.assert_close(p, original[name], rtol=0, atol=0)
+        assert p.grad is None

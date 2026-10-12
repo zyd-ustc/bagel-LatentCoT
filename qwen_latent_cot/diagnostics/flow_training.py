@@ -82,3 +82,25 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
 
 def flow_mse(output, state):
     return (output.velocity.float()-state.flow_target()).square().mean()
+
+
+class ExecutionCounter:
+    """Count actual decoder/layer entries, including checkpoint recomputation."""
+    def __init__(self, runtime):
+        self.counts = [0, 0, 0]  # GEN entries, GEN layer entries, UND layer entries
+        self.handles = []
+        self.layers = runtime.decoder.layers
+        def decoder_hook(module, args, kwargs):
+            if kwargs.get('mode') == 'gen': self.counts[0] += 1
+        def layer_hook(module, args, kwargs):
+            self.counts[1 if kwargs.get('mode') == 'gen' else 2] += 1
+        self.handles.append(runtime.decoder.register_forward_pre_hook(decoder_hook, with_kwargs=True))
+        for layer in self.layers:
+            if hasattr(layer, '_diagnostic_cost_counter'):
+                raise RuntimeError('cost counter already attached')
+            object.__setattr__(layer, '_diagnostic_cost_counter', self)
+            self.handles.append(layer.register_forward_pre_hook(layer_hook, with_kwargs=True))
+
+    def close(self):
+        for handle in self.handles: handle.remove()
+        for layer in self.layers: object.__delattr__(layer, '_diagnostic_cost_counter')

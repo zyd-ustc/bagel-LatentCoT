@@ -121,7 +121,7 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
     from .record import FrozenGuard, append_json, write_json
     from .visual_record import save_visual_checkpoint, load_visual_checkpoint
     from .visual_objectives import semantic_loss, state_probe, bank_response, generation_caption, text_keep
-    from .flow_training import conditional_gen, flow_mse
+    from .flow_training import conditional_gen, flow_mse, ExecutionCounter
     from .loop_training import memory_loop
     from .visual_evaluation import evaluate, evaluate_text_keep, refresh_trajectories
     from ..bagel.accelerator import synchronize, reset_peak_memory_stats, max_memory_allocated
@@ -160,9 +160,10 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
                    teacher_hash=student.text_teacher_hash, writer_trainable=cfg['train_writer'],
                    text_replay_provides_gradient=cfg['train_writer'], cross_round_gradients=cfg['cross_round_gradients']))
     parallel.barrier()
+    counter = ExecutionCounter(runtime)
     for step in range(start_step+1, cfg['steps']+1):
         student.train(); optimizer.zero_grad(set_to_none=True)
-        sums = [0.]*12; samples = []
+        sums = [0.]*15; samples = []
         # Spread replay ranks across steps; each rank advances the same RNG/order.
         replay_indexes = {(step+i) % batch for i in range(replay_count)}
         for micro in range(batch):
@@ -174,6 +175,7 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
             text_row = replay[rng.randrange(len(replay))] if replay else None
             if micro % world != worker:
                 continue
+            before_cost = list(counter.counts)
             state = runtime.training_state(row, t, seed)
             is_replay = micro in replay_indexes
             components = {name: torch.zeros((), device=runtime.device) for name in ('sem', 'read', 'gen', 'keep')}
@@ -185,7 +187,7 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
                 label_kind = 'text_replay'; rounds = 0
             else:
                 rounds = 2 if stage == 'C3-loop' else 1
-                if stage == 'C2-observe':
+                if stage == 'C2-observe' or (stage == 'C2-joint' and not cfg['loss_weights']['gen']):
                     with torch.no_grad(): source = conditional_gen(runtime, state).source
                     banks = [student.write(source, t)]; exits = []; gen_calls += 1
                 else:
@@ -206,6 +208,16 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
             loss = sum(cfg['loss_weights'][name]*value for name, value in components.items())
             if not torch.isfinite(loss):
                 raise FloatingPointError('non-finite visual objective')
+            objective_gradients = {}
+            if step in cfg.get('objective_gradient_audit_steps', [1]):
+                for name, value in components.items():
+                    if value.requires_grad and cfg['loss_weights'][name]:
+                        gradients = torch.autograd.grad(value, trainable, retain_graph=True, allow_unused=True)
+                        if any(g is not None and not torch.isfinite(g).all() for g in gradients):
+                            raise FloatingPointError('non-finite objective gradient: '+name)
+                        objective_gradients[name] = float(sum(g.float().square().sum() for g in gradients if g is not None).sqrt())
+                    else:
+                        objective_gradients[name] = None
             if loss.requires_grad:
                 (loss/batch).backward()
             elif not is_replay:
@@ -213,13 +225,17 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
             for index, name in enumerate(('sem', 'read', 'gen', 'keep')):
                 sums[2*index] += float(components[name].detach())
                 sums[2*index+1] += int((name == 'keep') == is_replay)
+            cost = [a-b for a,b in zip(counter.counts, before_cost)]
+            for j,value in enumerate(cost): sums[12+j] += value
             sums[8] += float(loss.detach()); sums[9] += 1; sums[10] += gen_calls; sums[11] += int(not is_replay)*rounds
             samples.append(dict(sample_id=(text_row if is_replay else row)['sample_id'],
                                 state_sample_id=row['sample_id'], global_micro=micro, rank=worker,
                                 t=t, noise_seed=seed, label_kind=label_kind, rounds=rounds,
                                 gen_conditional_calls=gen_calls, state=state.metadata,
                                 read_metrics=read_metrics, keep_metrics=keep_metrics,
-                                full_GEN_input_gradient=stage != 'C2-observe' and not is_replay))
+                                actual_execution_entries=dict(gen=cost[0], gen_layers=cost[1], und_layers=cost[2]),
+                                objective_unweighted_gradient_norms=objective_gradients,
+                                full_GEN_input_gradient=bool(cfg['loss_weights']['gen']) and not is_replay))
         missing = [name for name, p in student.named_parameters() if p.requires_grad and p.grad is None]
         if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in trainable):
             raise FloatingPointError('non-finite trainable-module gradient')
@@ -239,7 +255,9 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
                 for i, name in enumerate(('sem', 'read', 'gen', 'keep'))},
                 gradient_norm=float(norm), group_gradient_norms=group_norms,
                 rank0_unused_parameter_names=missing, world_size=world, global_effective_batch=batch,
-                gen_conditional_calls=int(totals[10]), full_gen_layer_calls=int(totals[10])*len(runtime.decoder.layers),
+                gen_conditional_calls=int(totals[10]), actual_gen_entries_including_recomputation=int(totals[12]),
+                full_gen_layer_calls=int(totals[13]), und_layer_calls=int(totals[14]),
+                cost_basis='actual layer entries incl checkpoint/audit recomputation; not FLOPs',
                 visual_writer_layer_calls=int(totals[11])*len(runtime.decoder.layers),
                 elapsed_seconds=time.perf_counter()-start, resources=resources,
                 sampled_states=global_samples, frozen_guard='passed'))
@@ -266,6 +284,7 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
                            guard='native/teacher tensor identity and inplace version; native gradients absent',
                            group_gradient_norms=group_norms, text_replay_provides_gradient=cfg['train_writer']))
             parallel.barrier()
+    counter.close()
     if worker == 0:
         write_json(output/'training_summary.json', dict(stage=stage, completed_steps=cfg['steps'],
                    resumed_from_step=start_step, best_validation_nll=best, skip_validation=skip_validation,

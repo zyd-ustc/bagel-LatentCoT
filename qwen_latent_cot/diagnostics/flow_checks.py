@@ -30,7 +30,7 @@ def check(student, rows, output):
     print('E0: hashing frozen native parameters...', flush=True)
     before = parameter_hash(runtime.model, runtime.bundle.vae)
     reset_peak_memory_stats(runtime.device); records = []
-    originals = {name: value.detach().clone() for name, value in student.state_dict().items()}
+    originals = {name: value.detach().clone() for name, value in student.visual.state_dict().items()}
     import time
     synchronize(runtime.device); start = time.perf_counter()
     for index, t in enumerate((.25, .75, .9)):
@@ -98,7 +98,9 @@ def check(student, rows, output):
     print('E0: rechecking frozen parameter hashes...', flush=True)
     after = parameter_hash(runtime.model, runtime.bundle.vae)
     if before != after: raise RuntimeError('native model parameter SHA256 changed')
-    student.load_state_dict(originals, strict=True); guard.check(); synchronize(runtime.device)
+    student.visual.load_state_dict(originals, strict=True)
+    student.visual.zero_grad(set_to_none=True)
+    guard.check(); synchronize(runtime.device)
     result = dict(status='E0_passed', native_parameters_hash_before=before, native_parameters_hash_after=after,
                   contracts=records, gradients=gradients, cache_unchanged=True,
                   same_state_R2=True, fixed_M1_equals_R1=True, diagnostic_flag_output_unchanged=True,
