@@ -51,6 +51,11 @@ def observe_layers(runtime, cache):
             pre, post = attention_hook(index)
             handles.append(layer.self_attn.register_forward_pre_hook(pre, with_kwargs=True))
             handles.append(layer.self_attn.register_forward_hook(post, with_kwargs=True))
+        def head_hook(module, args, result):
+            if 'final_head' not in tensors:
+                tensors['final_head'] = dict(normalized_hidden=args[0].detach().float().cpu(),
+                                             velocity_head_output=result.detach().float().cpu())
+        handles.append(runtime.model.llm2vae.register_forward_hook(head_hook))
         yield tensors
     finally:
         for handle in handles: handle.remove()
@@ -124,15 +129,15 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                     read_loss, read_metrics = bank_response(runtime, bank, response_teacher, probe)
                     item['read_response'] = dict(loss=float(read_loss), layers=read_metrics)
                 if layer_diagnostics:
-                    with observe_layers(runtime, state.flow['past_key_values']) as observed:
-                        repeated = conditional_gen(runtime, state, bank, capture=False, masked=arm=='G-layout')
-                    # R0 and raw target-text use another layout; their native tensors are already
-                    # represented by base/oracle velocity and are not relabelled as Memory calls.
-                    if arm not in ('R0', 'Target-text-oracle'):
-                        torch.testing.assert_close(prediction.velocity, repeated.velocity,
-                                                   rtol=cfg.get('numeric_rtol', .02), atol=cfg.get('numeric_atol', .002))
-                        name = f'layers_{row["sample_id"]}_t{t}_s{seed}_{arm}.pt'
-                        torch.save(observed, output/name); item['layer_tensors'] = name
+                    inspected_state = oracle_state if arm == 'Target-text-oracle' else state
+                    inspected_bank = None if arm in ('R0', 'Target-text-oracle') else bank
+                    with observe_layers(runtime, inspected_state.flow['past_key_values']) as observed:
+                        repeated = conditional_gen(runtime, inspected_state, inspected_bank,
+                                                   capture=False, masked=arm=='G-layout')
+                    torch.testing.assert_close(prediction.velocity, repeated.velocity,
+                                               rtol=cfg.get('numeric_rtol', .02), atol=cfg.get('numeric_atol', .002))
+                    name = f'layers_{row["sample_id"]}_t{t}_s{seed}_{arm}.pt'
+                    torch.save(observed, output/name); item['layer_tensors'] = name
                 if save_images:
                     if arm == 'R0':
                         conditional, cfg_velocity = runtime.velocity(state.x_t, t, state.flow)

@@ -159,6 +159,12 @@ def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_pos
                 return original(**kwargs)
             if kwargs.get('update_past_key_values', True):
                 raise ValueError('GEN Memory consumption cannot persist its KV')
+            if masked:
+                # All Memory keys are excluded. Preserve the 16-position shift
+                # in decoder_call, but use the exact native unmasked kernel on
+                # prompt/self keys. An extra all-true mask selects a different
+                # Ascend SDPA reduction and can accumulate BF16 drift.
+                return original(**kwargs)
             h = kwargs['packed_query_sequence']
             ti, ii = kwargs['packed_text_indexes'], kwargs['packed_vae_token_indexes']
             q, k, v = project(self, h, 'gen', ti, ii)
@@ -180,7 +186,7 @@ def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_pos
                     mask[len(prompt_k):len(prompt_k)+bank.slots] = False
                 visible.append(mask); klens.append(len(mask))
             result = packed_attention(q, torch.cat(all_k), torch.cat(all_v), qlens, klens,
-                                      visible=torch.cat(visible)).reshape(len(h), -1)
+                                      native_unmasked=True).reshape(len(h), -1)
             out = torch.zeros_like(h)
             out[ti] = self.o_proj(result[ti]); out[ii] = self.o_proj_moe_gen(result[ii])
             return out, conditional_cache

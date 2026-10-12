@@ -106,7 +106,8 @@ def project(attention, normalized, mode='und', text_indexes=None, image_indexes=
     return q, k, v
 
 
-def packed_attention(q, k, v, query_lengths, key_lengths, *, causal=False, visible=None):
+def packed_attention(q, k, v, query_lengths, key_lengths, *, causal=False, visible=None,
+                     native_unmasked=False):
     """Differentiable SDPA with bottom-right causal masks and strict isolation.
 
     visible is a packed key mask. False keys never enter the softmax.
@@ -125,7 +126,9 @@ def packed_attention(q, k, v, query_lengths, key_lengths, *, causal=False, visib
         vi = v[ko:ko+nk].transpose(0, 1)[None]
         groups = qi.shape[1] // ki.shape[1]
         ki = ki.repeat_interleave(groups, 1); vi = vi.repeat_interleave(groups, 1)
-        mask = torch.ones(nq, nk, dtype=torch.bool, device=q.device)
+        if native_unmasked and (causal or visible is not None):
+            raise ValueError('native unmasked path cannot receive an explicit mask')
+        mask = None if native_unmasked else torch.ones(nq, nk, dtype=torch.bool, device=q.device)
         if causal:
             mask &= torch.arange(nk, device=q.device)[None] <= torch.arange(nq, device=q.device)[:, None] + nk-nq
         if visible is not None:

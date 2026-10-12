@@ -198,3 +198,17 @@ def test_complete_sampling_updates_once_and_resets_seed(visual_runtime):
     assert len(records) == runtime.config['sampler_steps']-1
     assert all(r['sampler_updates'] == 1 for r in records)
     assert sum(r['gen_calls_including_cfg'] for r in records) > sum(r['gen_calls_including_cfg'] for r in other)
+
+
+def test_layer_and_final_norm_hooks_are_read_only(visual_runtime):
+    from qwen_latent_cot.diagnostics.visual_evaluation import observe_layers
+    runtime, row = visual_runtime
+    state = runtime.training_state(row, .75, 4)
+    with torch.no_grad():
+        expected = conditional_gen(runtime, state, capture=False)
+        with observe_layers(runtime, state.flow['past_key_values']) as tensors:
+            actual = conditional_gen(runtime, state, capture=False)
+    torch.testing.assert_close(actual.velocity, expected.velocity, rtol=0, atol=0)
+    assert set(tensors) == {0,1,2,'final_head'}
+    assert set(tensors[0]) == {'hidden_before_norm','hidden_after_norm','attention_output'}
+    assert not tensors['final_head']['normalized_hidden'].requires_grad
