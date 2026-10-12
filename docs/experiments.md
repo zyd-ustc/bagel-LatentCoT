@@ -151,3 +151,26 @@ best按验证response＋0.1 NLL选中step 50；用户指定step 100 last用于GE
 Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256 `255aa6d7c5ffed326a554891e2189dbbd2bdc309fe05c6433b10258a095e3f56`。
 
 **人工审查结论：G-TC与G-text性能效果基本持平。** 本记录对应所测局部预测图，没有逐图量化评分或最终采样画质统计。
+
+## 10. 视觉闭环实现与Ascend E0
+
+2026-10-12，modelarts-job，NPU分支提交 `92a17f5`。实现C2-observe、C2-joint及C3-loop，默认冻结BAGEL/DiT/VAE和原文本writer；新增感知t的低秩UND query残差。正式训练入口默认16卡，E0按方案使用单NPU。
+
+初始化及独立教师沿用第9节1100步best；远端SHA256已核对。E0复用 `memory_gen_recheck4.jsonl` 中 `sharegpt4o_1117`、`sharegpt4o_42006` 两图，检查t=0.25/0.75/0.9的三个固定状态；完整R2反向使用首图、t=0.75、noise seed43。
+
+|检查|实测结果|
+|---|---|
+|无Memory可微conditional与原生conditional|三个t最大绝对差均为0|
+|屏蔽Memory与原生平移16位置参照|三个t最大绝对差均为0|
+|零视觉模块与C1直接GEN读取、关闭视觉模块与文本writer|逐项一致|
+|完整R2速度损失到视觉模块|28层输出投影首步梯度有限且非零；第二步输入投影也非零|
+|同一状态R2、固定M1重复调用、诊断开关|合同通过；prompt cache未变化|
+|BAGEL与VAE参数哈希|前后均为 `c50b0a68abad7914aa9fbe5a4fff450e2bb4453c54651f6b09b7039f0f06d1f2`|
+|峰值NPU内存|38,551,704,576 bytes，约35.9 GiB|
+|检查计时|28.83秒；模型加载、manifest及首次参数哈希在计时外|
+
+两个工程更新的flow MSE为0.237012和0.236920；测试结束恢复视觉模块初值，没有保存为训练模型。容差记录在 `e0.json`：rtol=0.02，atol按BF16精度、原生重复误差及速度RMS计算；原生重复误差均为0。
+
+首次检查在屏蔽布局处失败：0.4%元素超过容差，最大差0.0625。保留16位置平移，并让屏蔽臂直接使用原生attention；可见Memory的GEN attention使用原生无mask SDPA，旧UND路径保留。修复后平移对照误差为0。第二次检查在恢复初值时复制冻结writer，触发参数版本检查；改为仅恢复被测试更新的视觉模块后，完整E0通过。两个失败输出保留，未记为训练结果。
+
+通过输出：`/root/outputs/visual_loop_e0_pass_20261012/e0.json`。本地CPU测试使用真实小型MoT层及两进程梯度同步，66项通过。正式16卡视觉训练、独立图像标签评测和完整采样质量评测尚未执行；512/64/64视觉清单尚未准备，现有自然文本prompt没有升级为配对图像标签。
