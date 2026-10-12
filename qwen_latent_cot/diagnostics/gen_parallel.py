@@ -1,4 +1,4 @@
-"""Sixteen independent NPU workers for eight complete color pairs and two seeds."""
+"""Sixteen independent NPU workers for eight swap pairs and two seeds."""
 import argparse
 import csv
 import hashlib
@@ -42,6 +42,10 @@ def prepare(data, config, output, model, checkpoint, c0):
     if len(rows) != 16 or any(row['split'] != 'test' or row['label_type'] != 'clean'
                               or not row.get('image') or row.get('state') for row in rows):
         raise ValueError('GEN color pilot requires exactly 16 verified clean test images, not trajectory states')
+    pairing_modes = {row.get('pairing', 'controlled_color_pair') for row in rows}
+    if len(pairing_modes) != 1 or not pairing_modes <= {'controlled_color_pair', 'unrelated_scene_mismatch'}:
+        raise ValueError('dataset must declare one supported pairing mode')
+    pairing = next(iter(pairing_modes))
     groups = {}
     for row in rows:
         if not re.fullmatch(r'[A-Za-z0-9_-]+', row['sample_id']):
@@ -95,7 +99,7 @@ def prepare(data, config, output, model, checkpoint, c0):
     plan = dict(data=str(data), dataset_hash=digest(data), common_config=common,
                 model=str(Path(model).resolve()), checkpoint=str(Path(checkpoint).resolve()),
                 checkpoint_hash=checkpoint_hash, c0=str(Path(c0).resolve()), tasks=tasks,
-                samples=16, states=32, expected_records=224, topology='C', continuation=False)
+                samples=16, states=32, expected_records=224, topology='C', continuation=False, pairing=pairing)
     write_json(output/'plan.json', plan)
     return plan
 
@@ -161,7 +165,7 @@ def aggregate(output, plan):
         writer.writerow(['blind_file', 'observed_color', 'unchanged_facts', 'quality', 'artifacts', 'notes'])
         writer.writerows([[row['blind_file'], '', '', '', '', ''] for row in mapping])
     write_json(output/'summary.json', dict(samples=16, scene_pairs=8, states=32, records=len(records),
-               topology='C', checkpoint_hash=plan['checkpoint_hash'], numeric_by_arm=numeric,
+               topology='C', pairing=plan['pairing'], checkpoint_hash=plan['checkpoint_hash'], numeric_by_arm=numeric,
                frozen_guard='passed', continuation=False, image_kind='x0_hat',
                semantics='pending factual review; numeric sensitivity is not semantic success',
                worker_manifests=manifests))

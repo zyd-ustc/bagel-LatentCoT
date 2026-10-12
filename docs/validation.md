@@ -83,3 +83,11 @@ C1未见测试集与自然caption泛化、C2视觉迁移、GEN对Memory内容的
 2026-10-12，43项本地测试通过（5.06秒）。新增检查覆盖完整swap对分片、相对图像路径转绝对路径、16个任务的224条结果汇总、缺失arm拒绝汇总，以及局部预测图使用独立审查文件，不混入最终采样统计。未运行真实GEN任务。
 
 数据根目录为 `/data/zyd_workspace/bagel-LatentCoT/datasets`。已查看CoRT验证清单、结构化test候选和适配manifest的示例：存在多轮编辑目标、`verified: false`和旧绝对路径；这些示例不能直接作为核验颜色对。默认 `memory_gen_color16.jsonl`尚未准备。数据转换与图像语义核验未完成，不将缺失标签归因于模型表现。
+
+## 8. 16张源图筛选
+
+2026-10-12，源图与缩略总览位于 `modelarts-job:/root/outputs/source_sample16_20261012_121337`。清单保存原始文件路径、来源行和prompt。Codex目视核对总览，为16张图分别写简短caption，仅核验可见对象与目标颜色；未核验原prompt的全部细节。
+
+本轮为异场景配对的定性Memory实验，不是同场景仅颜色变化的控制实验。GEN画质与Memory语义效果待人工审查。
+
+启动器现在将清单的配对类型写入plan与summary，区分控制颜色对与异场景错配。针对分片和汇总的2项已有测试通过（0.83秒，`/tmp/bagel-loop-check-venv`）；系统Python缺少PyTorch动态库，未用于本轮检查。

@@ -16,7 +16,7 @@
 |工程验证|历史40项小模型测试通过；新增联合训练检查见验证文档|
 |真实 BAGEL C0|16卡完成16条；文本语义读取可用，严格匹配7/16，存在扩写|
 |真实 BAGEL C1|L/C各100步已完成；保留C，验证字面事实分45.8%，颜色8/8；完整语义仍有错误|
-|当前下一步|固定C checkpoint做GEN颜色读取；C2与生成质量尚未评测|
+|当前下一步|已筛选16张源图；固定C checkpoint做GEN定性读取，待人工审查|
 
 ## 快速开始
 
@@ -29,7 +29,7 @@ memory-topology --help
 
 当前保留C，L暂停；选择依据与checkpoint见[验证](docs/validation.md#4-c1结果与拓扑选择)，下一步见[实验](docs/experiments.md#当前首跑c的颜色消费)。首次复现从[原生文本校准](docs/run.md#2-原生文本校准)开始。完整命令、核验数据格式和结果解读见下表。
 
-Ascend 实验使用 `loop-layer-NPU`，默认16卡并行。C0按样本分片；GEN按场景对×seed分片，启动器已实现，颜色配对清单待准备；C1/C2通过 `torchrun --distributed` 同步新增writer梯度，原BAGEL冻结。
+Ascend 实验使用 `loop-layer-NPU`，默认16卡并行。C0按样本分片；GEN按场景对×seed分片，启动器已实现，本轮使用16张异场景图像的定性清单；C1/C2通过 `torchrun --distributed` 同步新增writer梯度，原BAGEL冻结。
 
 ## 文档
 
