@@ -9,8 +9,10 @@ from .loop_training import memory_loop
 from .visual_objectives import semantic_result, state_probe, text_keep, bank_response, generation_caption
 from .record import FrozenGuard, append_json, write_json
 from .data import tensor_hash, velocity_stats, cluster_interval, file_hash
-from .schedule import native_times
+from .schedule import native_times, nearest_node
 from .native import gen_memory_call
+from .memory import MemoryBank, KV
+from .gen import supplemental_flow
 
 
 def states_for(row, config):
@@ -68,14 +70,22 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
     guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher)
     by_id = {r['sample_id']: r for r in (donor_rows if donor_rows is not None else rows)}; records = []; blind = []
     output.mkdir(parents=True, exist_ok=True)
-    fixed_source = None
+    fixed_source = None; fixed_metadata = None
     for row in rows:
         for t, seed in states_for(row, cfg):
+            requested_t = t
+            if continue_sampling and row['label_kind'] == 'target_clean' and not row.get('state'):
+                t = nearest_node(cfg, requested_t)[1]
             state = runtime.training_state(row, t, seed)
             base = conditional_gen(runtime, state)
-            if fixed_source is None: fixed_source = base.source
+            if fixed_source is None:
+                fixed_source = base.source; fixed_metadata = dict(state.metadata, sample_id=row['sample_id'])
             loop = memory_loop(student, state, rounds, diagnostics=True)
             arms = {'R1': (loop.banks[0], loop.exits[0])}
+            provenance = {'R1': dict(state.metadata, source_round=0),
+                          'R2-new': dict(state.metadata, source_round=1),
+                          'R2-old': dict(state.metadata, source_round=0),
+                          'R2-fixed': dict(state.metadata, source_round=0, reused_M1=True)}
             if rounds == 2:
                 arms['R2-new'] = (loop.banks[-1], loop.exits[-1])
                 if controls:
@@ -90,15 +100,28 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                 off = student.write(base.source, t, source_off=True)
                 fixed = student.write(fixed_source, t)
                 neutral = student.writer.fixed_bank(runtime.seeds)
+                zero = MemoryBank(tuple(KV(kv.layer, torch.zeros_like(kv.keys), torch.zeros_like(kv.values),
+                                           kv.lengths, False) for kv in neutral.layers), 'fixed', neutral.slots)
+                provenance.update({'C1-direct-GEN': dict(state.metadata, source_round=0, visual_adapter=False),
+                                   'Source-off': dict(source='ignored', t=t),
+                                   'Fixed-source': fixed_metadata,
+                                   'G-fixed': dict(source='zero_KV'),
+                                   'G-neutral': dict(source='neutral_seed'),
+                                   'G-layout': dict(source='masked'),
+                                   'R0': dict(source='no_Memory'),
+                                   'Target-C1-oracle': dict(source='target_caption_C1', oracle=True),
+                                   'Target-text-oracle': dict(source='target_caption_native_prefill', oracle=True)})
                 for name, bank, masked in [('C1-direct-GEN', direct, False), ('Source-off', off, False),
-                                           ('Fixed-source', fixed, False), ('G-fixed', neutral, False),
+                                           ('Fixed-source', fixed, False), ('G-fixed', zero, False), ('G-neutral', neutral, False),
                                            ('G-layout', neutral, True)]:
                     arms[name] = (bank, conditional_gen(runtime, state, bank, masked=masked, capture=False))
                 arms['R0'] = (neutral, base)
                 if row.get('target_caption'):
                     teacher = student.teacher_bank(row['target_caption'])
                     arms['Target-C1-oracle'] = (teacher, conditional_gen(runtime, state, teacher, capture=False))
-                    oracle_flow, lens, pos = runtime.flow_inputs(state.metadata['prompt']+'\n'+row['target_caption'])
+                    oracle_flow = supplemental_flow(runtime, state.flow, state.lengths, state.positions, row['target_caption'])
+                    lens = tuple(oracle_flow['key_values_lens'].tolist())
+                    pos = [int(oracle_flow['packed_position_ids'][0])]
                     oracle_state = replace(state, flow=oracle_flow, lengths=lens, positions=pos)
                     arms['Target-text-oracle'] = (teacher, conditional_gen(runtime, oracle_state, capture=False))
                 if donor:
@@ -106,20 +129,23 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                     if (donor_state.metadata['prompt'], donor_state.t) != (state.metadata['prompt'], state.t):
                         raise ValueError('swap must preserve actual prompt and t')
                     donor_loop = memory_loop(student, donor_state, 1, diagnostics=True)
+                    provenance['Source-swap'] = dict(donor_state.metadata, sample_id=donor['sample_id'], source_round=0)
+                    provenance['R2-swap'] = dict(donor_state.metadata, sample_id=donor['sample_id'], source_round=1)
                     bank = donor_loop.banks[0]
                     arms['Source-swap'] = (bank, conditional_gen(runtime, state, bank, capture=False))
                     if rounds == 2:
                         swapped = memory_loop(student, state, 2, feedback='swap',
-                                              donor_source=donor_loop.exits[0].source, diagnostics=True)
+                                              donor_source=donor_loop.exits[0].source, diagnostics=True,
+                                              donor_metadata=donor_state.metadata)
                         arms['R2-swap'] = (swapped.banks[-1], swapped.exits[-1])
             teacher_caption = generation_caption(row, cfg)
             probe = state_probe(runtime, state) if teacher_caption else None
             response_teacher = student.teacher_bank(teacher_caption) if teacher_caption else None
             for arm, (bank, prediction) in arms.items():
                 item = dict(sample_id=row['sample_id'], scene_id=row['scene_id'], family_id=row['family_id'],
-                            split=row['split'], arm=arm, t=t, noise_seed=seed, round=prediction.round,
+                            split=row['split'], arm=arm, t=t, requested_t=requested_t, noise_seed=seed, round=prediction.round,
                             label_kind=row['label_kind'], confirmed_label=row['confirmed_label'],
-                            state=state.metadata, caption=semantic_result(runtime, row, bank),
+                            state=state.metadata, source_provenance=provenance.get(arm), caption=semantic_result(runtime, row, bank),
                             conditional_flow_mse=float(flow_mse(prediction, state)) if state.x0 is not None else None,
                             diagnostics=state_diagnostics(bank, loop.banks[0], prediction, base),
                             caption_probe='UND reads associated Memory bank; not a GEN image caption',
@@ -284,13 +310,22 @@ def collect_label_states(runtime, rows, output):
         for t, seed in states_for(row, runtime.config):
             state = runtime.training_state(row, t, seed)
             name = f'{row["sample_id"]}_t{t}_s{seed}'
-            runtime.image(state.x_t).save(output/(name+'.png'))
+            method = runtime.config.get('observation_proxy_method', 'conditional_x0_hat')
+            if method == 'conditional_x0_hat':
+                velocity = conditional_gen(runtime, state, capture=False).velocity
+                preview = state.x_t-state.t*velocity
+            elif method == 'decode_noisy_latent':
+                preview = state.x_t
+            else:
+                raise ValueError('unknown observation proxy method')
+            runtime.image(preview).save(output/(name+'.png'))
             torch.save(dict(x_t=state.x_t.cpu(), t=t, noise_seed=seed,
                             metadata=state.metadata), output/(name+'.pt'))
             append_json(output/'observation_candidates.jsonl', dict(row,
                         sample_id=name.replace('.', '_'), label_kind='observation_proxy',
                         t=t, noise_seed=seed, round=0, verified=False, review_status='pending',
-                        observation_method='unlabelled_decoded_noisy_state',
+                        observation_method=method+'_v1',
+                        observation_preview_hash=file_hash(output/(name+'.png')),
                         observation_caption='', observation_facts=[], uncertain_facts=[],
                         observation_image_hash=state.metadata.get('image_hash'),
                         observation_state_hash=state.metadata['x_t_hash'],

@@ -17,7 +17,7 @@ def main():
         from .visual_cli import main as visual_main
         return visual_main([routes[sys.argv[1]], *sys.argv[2:]])
     parser = argparse.ArgumentParser(description='Frozen BAGEL independent Memory protocol (2026-10-11)')
-    parser.add_argument('command', choices=['calibrate', 'train', 'caption', 'gen', 'trajectory', 'report', 'distill'])
+    parser.add_argument('command', choices=['calibrate', 'train', 'caption', 'gen', 'trajectory', 'report', 'distill', *routes])
     parser.add_argument('--model')
     parser.add_argument('--query-data', help='independent verified train/val images for shared GEN queries')
     parser.add_argument('--data')

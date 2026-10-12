@@ -40,7 +40,8 @@ def bank_response(runtime, bank, teacher_bank, probe):
     teacher = consume_bank(runtime.decoder, teacher_bank, probe['prompt_positions'])
     condition = {index: (teacher[index].keys, teacher[index].values)
                  for index in runtime.config['response_layers']}
-    return response_loss(runtime, bank, condition, probe)
+    return response_loss(runtime, bank, condition, probe,
+                         filter_weak_teacher=runtime.config.get('response_filter_weak_teacher', True))
 
 
 def generation_caption(row, config):

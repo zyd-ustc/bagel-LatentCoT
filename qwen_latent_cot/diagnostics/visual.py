@@ -266,18 +266,37 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
         if step % cfg['eval_every'] == 0 or step == cfg['steps']:
             parallel.barrier()
             schedule = dict(rng=rng.getstate(), order=order, cursor=cursor)
-            if worker == 0:
-                if not skip_validation:
-                    directory = output/f'validation_{step:06d}'; directory.mkdir()
-                    records = evaluate(student, val, directory, rounds=2 if stage == 'C3-loop' else 1, controls=False)
-                    primary = [r for r in records if r['arm'] == 'R1' and r['t'] != 1]
-                    score = sum(r['caption']['nll'] for r in primary)/len(primary)
+            if not skip_validation:
+                directory = output/f'validation_{step:06d}'
+                local_directory = directory/f'rank_{worker:02d}'
+                local_directory.mkdir(parents=True, exist_ok=True)
+                families = sorted({row['family_id'] for row in val})
+                assigned = set(families[worker::world])
+                local_val = [row for row in val if row['family_id'] in assigned]
+                records = evaluate(student, local_val, local_directory,
+                                   rounds=2 if stage == 'C3-loop' else 1, controls=False)
+                primary = [row for row in records if row['arm'] == 'R1' and row['t'] != 1]
+                nll_sum, count = parallel.sum_statistics([sum(row['caption']['nll'] for row in primary), len(primary)], runtime.device)
+                if count == 0: raise ValueError('validation requires non-pure-noise states')
+                score = nll_sum/count
+                brief = parallel.gather_samples([dict(sample_id=row['sample_id'], family_id=row['family_id'],
+                          scene_id=row['scene_id'], arm=row['arm'], t=row['t'], noise_seed=row['noise_seed'],
+                          label_kind=row['label_kind'], confirmed_label=row['confirmed_label'],
+                          nll=row['caption']['nll'], fact_accuracy=row['caption']['fact_accuracy'],
+                          unknown_assertion_rate=row['caption']['unknown_assertion_rate'], rank=worker)
+                          for row in records])
+                if replay_val:
+                    evaluate_text_keep(student, replay_val[worker::world], val, local_directory)
+                parallel.barrier()
+                if worker == 0:
+                    write_json(directory/'metrics_index.json', brief)
+                    write_json(directory/'selection.json', dict(selection_nll=score, states=int(count),
+                               scope='R1 semantic validation excludes t1; no acceptance inference'))
                     if best is None or score < best:
                         best = score
                         save_visual_checkpoint(output/'best.pt', student, step, stage, parent, optimizer, schedule, best)
-                    if replay_val:
-                        evaluate_text_keep(student, replay_val, val, directory)
                     refresh_trajectories(student, pool, directory, step)
+            if worker == 0:
                 save_visual_checkpoint(output/'last.pt', student, step, stage, parent, optimizer, schedule, best)
                 write_json(output/'freeze_gradient_audit.json', dict(status='passed', step=step,
                            model_files=runtime.native_files, text_teacher_hash=student.text_teacher_hash,

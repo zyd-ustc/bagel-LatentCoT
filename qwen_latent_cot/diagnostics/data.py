@@ -74,6 +74,8 @@ def load_dataset(path, *, visual=False, allow_unreviewed_proxy=False):
         rows = [visual_label(row) for row in rows]
     ids = {}; families = {}; pairs = {}; image_splits = {}; image_hashes = {}
     for row in rows:
+        if visual and not (row.get('image') or row.get('state')):
+            raise ValueError('visual data requires a paired image or provenance-locked trajectory state')
         required = ('sample_id', 'scene_id', 'split', 'caption', 'label_type', 'verified', 'facts')
         if any(key not in row for key in required) or row['split'] not in ('train', 'val', 'test'):
             raise ValueError('dataset requires IDs, frozen split, caption, labels, verification and facts')
@@ -94,11 +96,13 @@ def load_dataset(path, *, visual=False, allow_unreviewed_proxy=False):
                 or not isinstance(fact.get('alternatives', []), list)
                 or not all(isinstance(a, str) and a.strip() for a in fact.get('alternatives', []))):
                 raise ValueError('facts require predetermined aliases and alternative assertions')
-        for key in ('image', 'state'):
+        for key in ('image', 'state', 'observation_preview') if visual else ('image', 'state'):
             if row.get(key):
                 row[key] = str((root / row[key]).resolve())
                 if not Path(row[key]).is_file():
                     raise ValueError(f'missing dataset {key}: {row[key]}')
+        if visual and row.get('observation_preview_hash') and row.get('observation_preview') and file_hash(row['observation_preview']) != row['observation_preview_hash']:
+            raise ValueError('observation preview hash differs from reviewed image')
         if row.get('image'):
             path = row['image']
             if path not in image_hashes:

@@ -227,3 +227,37 @@ def test_E0_restores_only_the_tested_visual_parameters(visual_runtime, tmp_path)
     for name,p in student.visual.named_parameters():
         torch.testing.assert_close(p, original[name], rtol=0, atol=0)
         assert p.grad is None
+
+
+def test_weak_teacher_response_is_reported_and_filtered(visual_runtime):
+    from qwen_latent_cot.diagnostics.visual_objectives import state_probe, bank_response
+    runtime, row = visual_runtime; student = VisualStudent(runtime)
+    runtime.config['response_filter_weak_teacher'] = True
+    runtime.config['response_condition_energy_min'] = 1e10  # lock out both layers
+    state = runtime.training_state(row, .9, 4)
+    with torch.no_grad(): source = conditional_gen(runtime, state).source
+    bank = student.write(source, .9); teacher = student.teacher_bank(row['target_caption'])
+    loss, metrics = bank_response(runtime, bank, teacher, state_probe(runtime,state))
+    assert float(loss) == 0 and all(r['weak_teacher_filtered'] for r in metrics)
+    assert all('condition_energy' in r for r in metrics)
+
+
+def test_R2_controls_keep_original_prompt_and_use_actual_sampler_nodes(visual_runtime, tmp_path):
+    from qwen_latent_cot.diagnostics.visual_evaluation import evaluate
+    runtime, row = visual_runtime;student = VisualStudent(runtime)
+    runtime.config['eval_t']=[.75];runtime.config['noise_seeds']=[0]
+    other_image=tmp_path/'blue.png';Image.new('RGB',(32,32),'blue').save(other_image)
+    a=dict(row,split='test',swap_id='b')
+    b=dict(row,sample_id='b',scene_id='b',family_id='b',split='test',image=str(other_image),swap_id='a')
+    cache,lens,positions=runtime.prompt_context(runtime.config['neutral_prompt'])
+    reference=[cache.key_cache[i].clone() for i in range(3)]
+    out=tmp_path/'controls';out.mkdir()
+    records=evaluate(student,[a,b],out,rounds=2,save_images=True,continue_sampling=True,layer_diagnostics=True)
+    arms={r['arm'] for r in records}
+    assert {'R0','R1','R2-new','R2-old','R2-fixed','R2-swap','Source-swap',
+            'Target-text-oracle','Target-C1-oracle','G-fixed','G-neutral','G-layout'} <= arms
+    assert all(r['requested_t']==.75 and r['t']!=.75 for r in records)
+    assert all(r['image_policy']=='single_native_node_injection_then_native_suffix' for r in records)
+    assert all((out/r['layer_tensors']).exists() for r in records)
+    for i,k in enumerate(reference):torch.testing.assert_close(k,cache.key_cache[i],rtol=0,atol=0)
+    assert (out/'blind_mapping.json').exists()

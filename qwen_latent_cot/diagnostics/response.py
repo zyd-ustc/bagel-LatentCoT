@@ -97,7 +97,7 @@ def normalized_response_loss(student, teacher, floor=1e-8):
     return (student.float()-teacher).square().mean()/teacher.square().mean().clamp_min(floor)
 
 
-def response_loss(runtime, bank, teacher, probe):
+def response_loss(runtime, bank, teacher, probe, *, filter_weak_teacher=False):
     memory = consume_bank(runtime.decoder, bank, probe['prompt_positions'])
     losses = []; metrics = []
     for index in runtime.config['response_layers']:
@@ -110,6 +110,12 @@ def response_loss(runtime, bank, teacher, probe):
         mk, mv = memory[index].keys.to(q.dtype), memory[index].values.to(v.dtype)
         student = attention_response(q, k, v, mk, mv)
         loss = normalized_response_loss(student, target, runtime.config['response_energy_floor'])
+        teacher_energy = target.float().square().mean()
+        condition_energy = (target-baseline).float().square().mean()
+        weak = filter_weak_teacher and (float(teacher_energy) < runtime.config['response_energy_floor']
+                    or float(condition_energy) < runtime.config.get('response_condition_energy_min', 0.))
+        if weak:
+            loss = loss * 0.
         losses.append(loss)
         with torch.no_grad():
             delta_t = (target-baseline).float(); delta_s = (student-baseline).float()
@@ -119,6 +125,9 @@ def response_loss(runtime, bank, teacher, probe):
                                 teacher_condition_delta_norm=float(delta_t.norm()),
                                 student_condition_delta_norm=float(delta_s.norm()),
                                 condition_delta_cosine=float(torch.nn.functional.cosine_similarity(delta_s.flatten(), delta_t.flatten(), dim=0))))
+            if filter_weak_teacher:
+                metrics[-1].update(teacher_energy=float(teacher_energy), condition_energy=float(condition_energy),
+                                   weak_teacher_filtered=bool(weak))
     return torch.stack(losses).mean(), metrics
 
 

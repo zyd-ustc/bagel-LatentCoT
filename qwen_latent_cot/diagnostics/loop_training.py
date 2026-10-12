@@ -13,10 +13,13 @@ class LoopOutput:
 
 
 def memory_loop(student, state, rounds=1, *, feedback='new', donor_source=None,
-                diagnostics=False, checkpoint_activations=False):
+                diagnostics=False, checkpoint_activations=False, donor_metadata=None):
     if rounds not in (1, 2) or feedback not in ('new', 'old', 'fixed', 'swap'):
         raise ValueError('first loop interface supports R1/R2 and new/old/fixed/swap')
     runtime = student.runtime
+    if feedback == 'swap':
+        if not donor_metadata or (donor_metadata.get('prompt'), donor_metadata.get('t')) != (state.metadata['prompt'], state.t):
+            raise ValueError('swap feedback requires verified same-prompt/t donor metadata')
     cross_round = runtime.config.get('cross_round_gradients', False)
     with torch.no_grad():
         baseline = conditional_gen(runtime, state, round_index=0)

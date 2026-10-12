@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import torch
@@ -44,6 +45,8 @@ def main(argv=None):
     if args.noise_seeds is not None: cfg['noise_seeds'] = args.noise_seeds
     stage = args.stage or cfg['stage']
     rows = load_dataset(args.data, visual=True, allow_unreviewed_proxy=cfg.get('allow_unreviewed_proxy', False))
+    if any(not re.fullmatch(r'[A-Za-z0-9_-]+', row['sample_id']) for row in rows):
+        raise ValueError('sample_id must be a safe filename identifier')
     text_rows = load_dataset(args.text_data) if args.text_data else []
     if args.command == 'train':
         if int(cfg['effective_batch']*cfg['replay_fraction']) and not text_rows:

@@ -10,7 +10,8 @@ INTERFACE = ('visual_architecture', 'visual_rank', 'label_interface_version', 'l
              'visual_source_policy', 'source_prompt_policy', 'allow_target_prompt',
              'response_position_reserve', 'response_teacher',
              'observation_response_teacher',
-             'response_layers', 'response_query_count', 'response_energy_floor')
+             'response_layers', 'response_query_count', 'response_energy_floor',
+             'response_filter_weak_teacher', 'response_condition_energy_min')
 STAGES = ('C2-observe', 'C2-joint', 'C3-loop')
 
 
@@ -70,6 +71,10 @@ def load_visual_checkpoint(path, student, *, optimizer=None, resume=False, expec
             raise ValueError('visual interface mismatch: '+key)
     if saved.get('text_teacher_hash') != student.text_teacher_hash:
         raise ValueError('independent text teacher provenance changed')
+    teacher = student.text_teacher.state_dict()
+    if set(saved['text_teacher']) != set(teacher) or any(
+            not torch.equal(saved['text_teacher'][name], value) for name,value in teacher.items()):
+        raise ValueError('saved teacher tensors differ from the locked independent text teacher')
     student.visual.load_state_dict(saved['visual'], strict=True)
     student.text_teacher.load_state_dict(saved['text_teacher'], strict=True)
     student.text_teacher.eval().requires_grad_(False)

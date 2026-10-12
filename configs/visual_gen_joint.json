@@ -85,5 +85,10 @@
   },
   "text_teacher_sha256": "255aa6d7c5ffed326a554891e2189dbbd2bdc309fe05c6433b10258a095e3f56",
   "numeric_rtol": 0.02,
-  "numeric_atol": 0.002
+  "numeric_atol": 0.002,
+  "response_filter_weak_teacher": true,
+  "response_condition_energy_min": 1e-10,
+  "objective_gradient_audit_steps": [
+    1
+  ]
 }

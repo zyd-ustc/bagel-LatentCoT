@@ -1,5 +1,6 @@
 """Native text/source capture and temporary, single-call GEN consumption."""
 from contextlib import contextmanager
+from dataclasses import replace
 from types import MethodType
 import torch
 from .memory import KV, consume_bank, project, rotate, rope_for, packed_attention, und_block
@@ -26,7 +27,10 @@ def text_source(bundle, texts):
     inputs, lengths, positions = model.prepare_prompts([0]*len(texts), [0]*len(texts), texts,
                                                        bundle.tokenizer, bundle.token_ids)
     cache = model.forward_cache_update_text(empty_cache(decoder), **device_inputs(inputs, device))
-    return cache_kv(cache, lengths), inputs, positions
+    source_positions = tuple(inputs['packed_text_position_ids'].tolist())
+    source = tuple(replace(kv, positions=source_positions, token_roles=('text',)*len(kv.keys))
+                   for kv in cache_kv(cache, lengths))
+    return source, inputs, positions
 
 
 @contextmanager
@@ -65,7 +69,7 @@ def capture_gen(decoder, conditional_cache, *, t=None, round_index=0,
             if detach:
                 keys, values = keys.detach(), values.detach()
             captured[index] = KV(index, keys, values, lengths, True, 'visual', t,
-                                 round_index, tuple(roles), pos, 'mixed_und_gen')
+                                 round_index, tuple(roles), pos, 'gen' if source_policy == 'image_only' else 'mixed_und_gen')
         return hook
     try:
         for i, layer in enumerate(decoder.layers):
