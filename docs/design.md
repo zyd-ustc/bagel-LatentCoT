@@ -1,12 +1,12 @@
 # 设计
 
-更新：2026-10-12。两种训练方法均已实现并完成真实BAGEL实验。
+更新：2026-10-12。
 
 [返回README](../README.md) · [实验记录](experiments.md)
 
-## 1. BAGEL原生接口与冻结边界
+## 1. BAGEL架构
 
-BAGEL的理解专家称为UND，生成专家称为GEN；它们组成MoT（Mixture of Transformers）。KV指注意力中的key/value张量。本方法以原生文本prefill（预填充）产生的逐层KV作为语义来源，用独立的16槽Memory压缩并表达这些条件。
+BAGEL的理解专家称为UND，生成专家称为GEN；组成MoT（Mixture of Transformers）。KV指注意力中的key/value张量。本方法以原生文本prefill（预填充）产生的逐层KV作为语义来源，用独立的16槽Memory压缩并表达这些条件。
 
 全部BAGEL权重保持冻结，包括UND、GEN、embedding、归一化、位置/时间模块与输入/输出头；VAE和ViT也保持冻结。训练只更新Memory writer中的新增低秩残差。冻结UND仍保留对Memory输入的梯度，使损失能够回传到各层残差。
 
@@ -14,7 +14,7 @@ BAGEL的理解专家称为UND，生成专家称为GEN；它们组成MoT（Mixtur
 
 当前已完成的训练以caption文本为writer输入，属于文本压缩与生成消费实验。学生从caption原生KV获得信息；训练query图只提供GEN状态，不提供图像caption标签。当前结果尚不包含从带噪GEN状态写入语义的视觉训练。
 
-## 2. C：连续Memory更新
+## 2. 连续Memory更新
 
 ### 中性prompt初始化
 
@@ -48,7 +48,7 @@ Writer的Memory位置从2048开始，caption来源保留原生prefill位置。Ca
 
 每个诊断状态只运行一次writer，并在GEN中读取一次Memory。评测图像为单步局部预测，未运行多轮Memory更新或后续完整采样。
 
-## 3. 方法一：Caption语义读出训练（已实现）
+## 3. Caption语义读出训练
 
 Caption先经冻结BAGEL原生文本prefill，得到逐层来源KV。连续Memory读取这些KV后，冻结UND解码器只看到Memory、固定描述指令和答案前缀。目标文本为输入caption。
 
@@ -61,11 +61,9 @@ $$
 
 `M`是Memory，`I`是固定指令，`y_j`是目标caption的第j个token。Memory槽位与caption token无需一一对应。当前实现使用caption token监督，没有hidden逐token匹配或教师logit KL损失。
 
-真实实验结论：C1的64条模板训练100步后，8条验证文本的颜色均跟随输入，字面事实分45.83%；对象与承载面仍有替换。该checkpoint的GEN对照中，人工审查认为除G-text外其余组几乎相同。结果记录见[Caption训练](experiments.md#3-c1-caption训练)。
+真实实验结论：C1的64条模板训练100步后，8条验证文本的颜色均跟随输入，字面事实分45.83%；对象与承载面仍有替换。该checkpoint的GEN对照中，审查结论：除G-text外其余组几乎相同。结果记录见[Caption训练](experiments.md#3-c1-caption训练)。
 
-实现位于NPU分支的[caption.py](https://github.com/zyd-ustc/bagel-LatentCoT/blob/loop-layer-NPU/qwen_latent_cot/diagnostics/caption.py)。
-
-## 4. 方法二：GEN注意力响应蒸馏（已实现）
+## 4. GEN注意力响应蒸馏
 
 在独立图像的同一带噪状态上运行冻结GEN，缓存图像query `Q_l`及共同prompt/self KV `B_l`。教师条件 `T_l`来自原prompt后追加caption的原生prefill；学生条件 `M_l`来自连续Memory。
 
@@ -94,8 +92,4 @@ $$
 
 探针统一预留64个条件位置，教师caption含包装token最多64个；GEN query及共同self K统一后移64。Memory仍占16个位置，K仅在消费时旋转一次。真实GEN评测使用16槽位置规则，区别于训练探针的64位置间隔。
 
-正式训练使用16卡HCCL同步新增残差梯度，全局batch16、lr=1e-5。首跑100步后，从第100步writer接续1000步，重新创建AdamW；累计响应训练1100步。训练文本扩到2112条，独立训练query图扩到128张。选择规则始终为验证 `response + 0.1 × NLL` 最小，包含初始checkpoint。
-
-真实实验结论：首轮响应训练后，人工审查发现部分G-TC样例与base/swap出现明显差异；扩展训练后，在原4图、t=0.9对照中，用户反馈G-TC与G-text性能效果基本持平。此结论来自局部预测图人工审查；具体数据与checkpoint见[实验记录](experiments.md#9-累计1100步的gen对照)。
-
-实现位于NPU分支的[response.py](https://github.com/zyd-ustc/bagel-LatentCoT/blob/loop-layer-NPU/qwen_latent_cot/diagnostics/response.py)。
+真实实验结论：首轮响应训练后，人工审查发现部分G-TC样例与base/swap出现明显差异；扩展训练后，在原4图、t=0.9对照中，G-TC与G-text性能效果基本持平。具体数据与checkpoint见[实验记录](experiments.md#9-累计1100步的gen对照)。

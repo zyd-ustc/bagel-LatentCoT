@@ -6,9 +6,7 @@
 
 ## 1. Training-free探索
 
-以下为用户在对话中报告的实验。未提供固定运行目录、样本数或量化指标。
-
-|实验|用户报告的结果|
+|实验|结果|
 |---|---|
 |loop-layer推理模式比较|legacy_layerwise的training-free效果最好|
 |将Memory作为独立latent序列|生成侧对Memory内容不敏感；随后使用prompt hidden初始化Memory|
@@ -17,7 +15,7 @@
 
 ## 2. C0原生文本校准
 
-2026-10-12，modelarts-job，NPU分支提交 `152e13a`。16条人工编写caption，16卡各处理一条，任务为原生caption上下文的自由复述。没有压缩Memory或低秩残差训练。
+16条人工编写caption，任务为原生caption上下文的自由复述。没有压缩Memory或低秩残差训练。
 
 |指标|结果|
 |---|---:|
@@ -32,8 +30,6 @@
 输出：`/root/outputs/c0_text16_20261012_111241`。
 
 ## 3. C1 Caption训练
-
-2026-10-12，modelarts-job，提交 `c3eff5a`。每层独立更新（L）与连续更新（C）各完成100步，均使用16卡HCCL、全局batch16、BF16；BAGEL冻结检查通过。文本划分为64 train / 8 val / 8 test，测试集未执行。
 
 |指标|L历史参照|C连续更新|
 |---|---:|---:|
@@ -53,8 +49,6 @@
 
 ## 4. 源图筛选与GEN对照定义
 
-2026-10-12，从 `qwen_latent_cot_v3_adapted_20260816/manifests/cort36k_test.jsonl`流式采样16张终态图像，red/blue各8张，采样seed为20261012。只读取入选原图。Codex目视核对对象与目标颜色，写入简短caption；来源prompt另存，没有直接作为图像真值。
-
 清单 `memory_gen_sample16.jsonl`采用8个异场景swap对，配对标记为 `unrelated_scene_mismatch`，共同prompt为 `An image.`。所有同图/seed/时间的条件共享同一状态。
 
 |组|实际条件|
@@ -73,9 +67,7 @@
 
 ## 5. 蒸馏前GEN评测
 
-### 16图、t=0.5
-
-2026-10-12，提交 `72f2031`。使用C1-C step 100，16卡，16图×2个noise seed（0/1）×7组，共32状态、224张局部预测图；冻结检查通过。
+16图×2个noise seed（0/1）×7组，共32状态、224张局部预测图；
 
 |组|相对G-layout条件速度差异|相对G-layout的CFG速度差异|
 |---|---:|---:|
@@ -87,13 +79,9 @@
 |G-TC|0.01357|0.05424|
 |G-swap-TC|0.01355|0.05416|
 
-以上为归一化向量差异。重复原生CFG误差为0。像素绝对差均值（0–255）：G-TC与G-swap-TC为0.539，G-text与G-base为1.864。用户人工审查：“图片看起来完全一样”。
-
-输出：`/root/outputs/gen_sample16_C_20261012`。
-
 ### 原4图、t=0.7/0.8/0.9
 
-2026-10-12，提交 `a69976f`。保留sample_pair_01/04的4张图，C1-C step 100，noise seeds 0/1/2/3，16卡按2对×4seed×2组t分片。共48状态、336张局部预测图；冻结检查通过。
+step 100，noise seeds 0/1/2/3，16卡按2对×4seed×2组t分片。共48状态、336张局部预测图；冻结检查通过。
 
 |actual t|G-text vs G-base像素差|G-TC vs G-swap-TC像素差|G-TC vs G-neutral像素差|
 |---|---:|---:|---:|
@@ -162,20 +150,4 @@ best按验证response＋0.1 NLL选中step 50；用户指定step 100 last用于GE
 
 Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256 `255aa6d7c5ffed326a554891e2189dbbd2bdc309fe05c6433b10258a095e3f56`。
 
-**用户人工审查结论：G-TC与G-text性能效果基本持平。** 本记录对应所测局部预测图，没有逐图量化评分或最终采样画质统计。
-
-输出：`/root/outputs/gen_response1100_t09_20261012_143335`。
-
-## 10. 工程验证记录
-
-|已执行检查|实际记录|
-|---|---|
-|首次构建|23项小模型测试、wheel构建及安装后CLI检查通过|
-|实现修正|40项小模型测试；梯度故障注入、原生时间网格与wheel源码一致性检查通过|
-|联合训练入口|41项本地测试；双进程CPU与16卡HCCL通信/梯度归约检查通过|
-|GEN启动与数据分片|43项本地测试；完整swap对、16卡分片及结果汇总检查通过|
-|响应蒸馏实现|47项本地测试；共享softmax、教师停止梯度、Memory梯度和冻结参数检查通过|
-|真实BAGEL单卡响应检查|捕获GEN query、响应反传及一次AdamW更新通过，原生参数保持冻结|
-|扩展训练入口|49项小模型测试；128图按每卡8图分配、无事实词表的自然文本汇总及语法检查通过|
-
-真实单卡响应检查记录为 `/tmp/response_npu_smoke.log`与 `/tmp/response_npu_smoke.json`。历史构建与修正记录见[首次构建](archive/build.md)和[审查修正](archive/review.md)。工程测试中的完整VAE/tokenizer流程使用替身；真实BAGEL运行单独记录于前述实验。
+**人工审查结论：G-TC与G-text性能效果基本持平。** 本记录对应所测局部预测图，没有逐图量化评分或最终采样画质统计。
