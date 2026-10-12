@@ -30,12 +30,15 @@ def text_source(bundle, texts):
 
 
 @contextmanager
-def capture_gen(decoder, conditional_cache):
+def capture_gen(decoder, conditional_cache, *, t=None, round_index=0,
+                positions=None, detach=True, source_policy='full_query'):
     """Observe native normalized GEN input KV without mutating its layout.
 
     Capture only the conditional branch. GEN image queries retain native GEN
     expert parameters, K norm and positions. No prompt KV enters the source.
     """
+    if source_policy not in ('full_query', 'image_only'):
+        raise ValueError('unknown GEN source policy')
     captured = {}; handles = []
     def observer(index):
         def hook(attention, args, kwargs):
@@ -45,7 +48,24 @@ def capture_gen(decoder, conditional_cache):
                                       kwargs['packed_text_indexes'], kwargs['packed_vae_token_indexes'])
             keys = rotate(keys, kwargs['packed_query_position_embeddings']).to(torch.bfloat16)
             lengths = tuple(int(n) for n in kwargs['query_lens'].tolist())
-            captured[index] = KV(index, keys.detach().clone(), values.detach().clone(), lengths)
+            roles = ['boundary'] * len(keys)
+            for token in kwargs['packed_vae_token_indexes'].tolist():
+                roles[token] = 'image'
+            pos = tuple(int(p) for p in positions.tolist()) if positions is not None else ()
+            if source_policy == 'image_only':
+                selected = kwargs['packed_vae_token_indexes']
+                offsets = [0]
+                for length in lengths:
+                    offsets.append(offsets[-1]+length)
+                lengths = tuple(sum(a <= i < b for i in selected.tolist())
+                                for a, b in zip(offsets, offsets[1:]))
+                keys, values = keys[selected], values[selected]
+                roles = ['image'] * len(keys)
+                pos = tuple(pos[i] for i in selected.tolist()) if pos else ()
+            if detach:
+                keys, values = keys.detach(), values.detach()
+            captured[index] = KV(index, keys, values, lengths, True, 'visual', t,
+                                 round_index, tuple(roles), pos, 'mixed_und_gen')
         return hook
     try:
         for i, layer in enumerate(decoder.layers):

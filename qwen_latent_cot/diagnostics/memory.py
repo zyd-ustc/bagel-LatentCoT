@@ -1,5 +1,5 @@
 """Independent frozen-UND Memory. Keys in MemoryBank are ALWAYS unrotated."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import nullcontext
 import torch
 from torch import nn
@@ -13,12 +13,25 @@ class KV:
     values: torch.Tensor
     lengths: tuple[int, ...]
     rotated: bool = True
+    source_kind: str = 'text'
+    t: float | None = None
+    round: int = 0
+    token_roles: tuple[str, ...] = ()
+    positions: tuple[int, ...] = ()
+    expert: str = 'und'
 
     def __post_init__(self):
         if self.keys.shape != self.values.shape or self.keys.ndim != 3:
             raise ValueError('KV must have matching [tokens, heads, head_dim] shapes')
         if any(n < 0 for n in self.lengths) or sum(self.lengths) != len(self.keys):
             raise ValueError('KV lengths do not cover packed samples')
+        if self.token_roles and len(self.token_roles) != len(self.keys):
+            raise ValueError('token roles do not cover source')
+        if self.positions and len(self.positions) != len(self.keys):
+            raise ValueError('positions do not cover source')
+
+    def detached(self):
+        return replace(self, keys=self.keys.detach(), values=self.values.detach())
 
 
 @dataclass(frozen=True)
@@ -63,10 +76,14 @@ def rotate(states, rope):
     return (states * cos[:, None] + rotated * sin[:, None]).to(states.dtype)
 
 
-def project(attention, normalized, mode='und', text_indexes=None, image_indexes=None):
+def project(attention, normalized, mode='und', text_indexes=None, image_indexes=None,
+            query_adapter=None):
     """Native expert-specific Q/K/V and Q/K norms, before RoPE."""
     if mode == 'und':
-        q = attention.q_norm(attention.q_proj(normalized).view(-1, attention.num_heads, attention.head_dim))
+        raw_q = attention.q_proj(normalized)
+        if query_adapter is not None:
+            raw_q = raw_q + query_adapter(normalized).to(raw_q.dtype)
+        q = attention.q_norm(raw_q.view(-1, attention.num_heads, attention.head_dim))
         k = attention.k_norm(attention.k_proj(normalized).view(-1, attention.num_key_value_heads, attention.head_dim))
         v = attention.v_proj(normalized).view_as(k)
     elif mode == 'gen':
@@ -132,9 +149,9 @@ def join_prefix(source, keys, values, lengths):
     return torch.cat(merged_k), torch.cat(merged_v), tuple(a+b for a, b in zip(source.lengths, lengths))
 
 
-def und_block(layer, hidden, rope, lengths, source=None, *, causal=False):
+def und_block(layer, hidden, rope, lengths, source=None, *, causal=False, query_adapter=None):
     a = layer.self_attn
-    q, k, v = project(a, layer.input_layernorm(hidden))
+    q, k, v = project(a, layer.input_layernorm(hidden), query_adapter=query_adapter)
     q, k = rotate(q, rope), rotate(k, rope)
     klens = lengths
     if source is not None:
@@ -170,7 +187,8 @@ class MemoryWriter(nn.Module):
         self.adapters = nn.ModuleList([LowRankResidual(width, rank) for _ in decoder.layers])
         self.to(device=decoder.embed_tokens.weight.device)
 
-    def forward(self, seeds, source, positions, source_off=False):
+    def forward(self, seeds, source, positions, source_off=False, *, source_kind='text',
+                t=None, visual_adapter=None, detach_source=True):
         count = len(self.decoder.layers)
         if len(seeds) != count or len(source) != count:
             raise ValueError('seeds and source must cover ALL decoder layers')
@@ -187,8 +205,16 @@ class MemoryWriter(nn.Module):
             if h.shape != seeds[0].shape or len(h) != sum(slot_lengths):
                 raise ValueError('invalid neutral seed shape')
             rope = rope_for(self.decoder, h, positions)
-            detached = KV(index, source[index].keys.detach(), source[index].values.detach(), lengths)
-            u = und_block(layer, h, rope, slot_lengths, None if source_off else detached)
+            origin = source[index].detached() if detach_source else source[index]
+            if origin.positions and set(origin.positions).intersection(positions.tolist()):
+                raise ValueError('GEN source positions overlap writer slots')
+            query_adapter = None
+            if visual_adapter is not None and source_kind == 'visual':
+                if t is None or not 0 <= float(t) <= 1:
+                    raise ValueError('visual writing requires actual t in [0, 1]')
+                query_adapter = lambda normalized, i=index: visual_adapter(i, normalized, t)
+            u = und_block(layer, h, rope, slot_lengths, None if source_off else origin,
+                          query_adapter=query_adapter)
             hidden = u + adapter(u)
             _, k, v = project(layer.self_attn, layer.input_layernorm(hidden))
             bank.append(KV(index, k, v, slot_lengths, False))
