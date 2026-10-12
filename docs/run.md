@@ -164,3 +164,29 @@ tail -f "$OUT.log"
 先加载模型、缓存每卡3份query并做step 0验证，然后开始100步联合训练；日志每10步显示response loss与caption NLL。rank0记录 `train.jsonl/selection.json/training_summary.json`、`init.pt/best.pt/last.pt`和step 0/50/100验证。验证目录保存自由caption与逐层响应指标，所有query缓存及来源保留。此入口不支持断点恢复。
 
 `best.pt`允许保留step 0；训练loss或探针loss下降不代表生成改善。完成后用新checkpoint作为 `--text-checkpoint`重跑真实GEN读取，暂不运行C2或续采样。
+
+### 第100步响应checkpoint的真实GEN对照与本地审查
+
+用户指定使用 `/root/outputs/c1_response_20261012_134848/last.pt`（step 100），不是选择规则选出的step 50 best。在modelarts-job运行以下命令，保持原4图、noise seeds 0/1/2/3与actual t=0.7/0.8/0.9，16卡并行，共48状态、336张预测图：
+
+```bash
+cd /root/bagel-LatentCoT-loop-layer-NPU
+OUT=/root/outputs/gen_response100_t789_20261012
+nohup bash scripts/gen_response_review_npu.sh "$OUT" > "$OUT.log" 2>&1 < /dev/null &
+echo "$OUT"
+tail -f "$OUT.log"
+```
+
+输出目录必须全新。完成后自动生成 `review/index.html`和 `review.tar.gz`，与 `/root/outputs/gen_recheck_C_t789_20261012`的蒸馏前结果逐t并排；检查原图状态哈希、prompt与caption一致。`GEN_CHECKPOINT/GEN_DATA/GEN_BASELINE/MODEL_PYTHON`可覆盖默认路径。所有图仍为局部x0_hat，未续采样。
+
+日志出现 `Review archive:`后，在本地Mac运行：
+
+```bash
+LOCAL=/Users/zyd/Documents/LCoT-codex/artifacts/gen_response100_t789
+mkdir -p "$LOCAL"
+scp modelarts-job:/root/outputs/gen_response100_t789_20261012/review.tar.gz "$LOCAL/"
+tar -xzf "$LOCAL/review.tar.gz" -C "$LOCAL"
+open "$LOCAL/review/index.html"
+```
+
+仅下载审查图与结果，不下载模型、原图库或大tensor缓存。若修改远端OUT，本地scp路径同步修改。

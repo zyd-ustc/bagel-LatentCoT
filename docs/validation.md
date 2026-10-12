@@ -139,3 +139,9 @@ C1未见测试集与自然caption泛化、C2视觉迁移、最终画质尚未验
 `modelarts-job`真实BAGEL单卡NPU检查通过：固定C step 100，原生GEN在t=0.9捕获共享query，原生caption构造教师响应，响应损失反传到0/13/27层Memory K/V及全部28层残差，并完成一次AdamW更新；冻结检查通过。记录为 `/tmp/response_npu_smoke.log`和 `/tmp/response_npu_smoke.json`。该检查未运行16卡响应训练，不证明生成质量。
 
 数据已准备在指定datasets根目录：`c1_text80.jsonl`保留64/8/8文本划分；`memory_response_queries16.jsonl`为12张训练query图与4张验证query图，验证保留原高噪声复查的4张图。正式100步训练尚未启动，命令见[运行](run.md#c的gen响应蒸馏16卡联合训练)。
+
+## 12. 响应蒸馏100步结果与后续checkpoint
+
+`modelarts-job:/root/outputs/c1_response_20261012_134848`完成100步、16卡HCCL、global batch 16；源码 `788de2e`，BAGEL冻结检查通过。初始/50/100步验证response loss分别为0.044724/0.033690/0.020588，caption NLL为0.458495/0.395288/0.752646，字面事实分45.8%/58.3%/66.7%。按response＋0.1 NLL最小选step 50 best，保留原选择记录。
+
+用户指定下一轮真实GEN对照使用step 100 `last.pt`，SHA256 `725ab4a4cc33a3fa68cfaa1283905948dd0d885a397c4ceeb724009045e2c2ce`。该选择用于检查响应蒸馏较充分的候选，不改写best或宣称生成质量已改善。复用原4图/t/seed，结果尚待运行与人工审查，命令见[运行](run.md#第100步响应checkpoint的真实gen对照与本地审查)。
