@@ -190,3 +190,22 @@ open "$LOCAL/review/index.html"
 ```
 
 仅下载审查图与结果，不下载模型、原图库或大tensor缓存。若修改远端OUT，本地scp路径同步修改。
+
+### 响应蒸馏扩展训练：16卡
+
+在modelarts-job的NPU仓库运行。使用现有数据目录，从response100 last加载writer；额外1000步、每250步验证。重新创建优化器，不是完整优化器断点恢复。
+
+```bash
+cd /root/bagel-LatentCoT-loop-layer-NPU
+/root/venvs/bagel-NPU/bin/python scripts/prepare_response_expansion.py
+OUT=/root/outputs/c1_response_expand_$(date +%Y%m%d_%H%M%S)
+nohup bash scripts/c1_response_expand_npu.sh "$OUT" > "$OUT.log" 2>&1 < /dev/null &
+echo "$OUT"
+tail -f "$OUT.log"
+```
+
+准备脚本固定生成 `c1_response_text2192.jsonl`（2112 train / 40 val / 40 test）及 `memory_response_queries132.jsonl`（128 train / 原4 val）。已有相同清单可复用。自然描述最多40 tokenizer tokens，仅验证文本oracle来源，不声称对应图像的caption真实。
+
+配置为 [c1_response_expand.json](../configs/c1_response_expand.json)。每卡8图×3个t，先缓存探针、执行step 0验证，再联合训练。`train.jsonl`区分本轮step与 `response_cumulative_steps`，结束累计响应1100步。`best.pt`仍按混合验证response＋0.1 NLL选择；`last.pt`保留最后一步。自然描述和原模板分组报告，字面事实分只统计模板。
+
+完成后用新 `best.pt/last.pt`重跑原4图真实GEN；保持既有图、t、seed与对照，不扩大采样任务。训练启动器的路径覆盖变量与首跑相同。

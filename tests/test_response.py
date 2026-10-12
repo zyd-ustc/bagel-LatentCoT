@@ -67,3 +67,29 @@ def test_capture_and_response_loss_train_all_C_adapters_without_changing_BAGEL(l
     assert all(adapter.down.weight.grad.abs().max()>0 for adapter in writer.adapters)
     for name,p in lm.named_parameters():torch.testing.assert_close(p,original[name],rtol=0,atol=0)
     assert len(metrics)==2
+
+
+def test_expanded_query_pools_use_all_128_images_once():
+    from qwen_latent_cot.diagnostics.response import training_images
+    rows = list(range(128))
+    assigned = [training_images(rows, rank, 16, 8) for rank in range(16)]
+    assert all(len(pool) == 8 for pool in assigned)
+    assert sorted(item for pool in assigned for item in pool) == rows
+    assert training_images(list(range(12)), 15, 16) == [3]
+
+
+def test_natural_caption_validation_keeps_missing_fact_scores(monkeypatch, tmp_path):
+    from qwen_latent_cot.diagnostics import response
+    runtime = SimpleNamespace(writer=SimpleNamespace(eval=lambda: None), text=lambda text: (text,),
+        memory=lambda text: SimpleNamespace(slots=16), caption_prefix=lambda bank: None,
+        config={'response_caption_weight': .1})
+    monkeypatch.setattr(response, 'teacher_condition', lambda runtime, text: (None, []))
+    monkeypatch.setattr(response, 'caption_result', lambda runtime, row, *args:
+                        dict(nll=2., fact_accuracy=.5 if row['facts'] else None))
+    monkeypatch.setattr(response, 'response_loss', lambda *args: (torch.tensor(.2), []))
+    rows = [dict(sample_id='old', caption='old', facts=[{}]),
+            dict(sample_id='new', caption='new', facts=[], dataset_group='natural_text')]
+    result = response.validate(runtime, rows, [[dict(sample_id='q', t=.8, noise_seed=1)]], tmp_path)
+    assert result['literal_fact_accuracy'] == .5
+    assert result['literal_fact_scored_samples'] == 1
+    assert result['groups']['natural_text']['samples'] == 1

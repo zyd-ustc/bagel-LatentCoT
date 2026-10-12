@@ -20,7 +20,7 @@
 |[report.py](../qwen_latent_cot/diagnostics/report.py)|四张结果表与盲评汇总|
 |[cli.py](../qwen_latent_cot/diagnostics/cli.py)|唯一执行入口、配置与C0门槛|
 
-当前保留C checkpoint；文本GEN读取与高噪声复查已完成，人工审查仅G-text有明显变化，其余组几乎相同。GEN响应蒸馏入口已实现，正式训练待运行，暂不进入C2；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；16卡GEN启动器为 `scripts/gen_npu.py`；每卡接收完整场景对和一个seed。`--distributed`仅用于训练。文本GEN未提供视觉checkpoint时不捕获未使用的视觉KV。GEN复现的数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
+当前保留C checkpoint；蒸馏前的文本GEN读取与高噪声复查已完成，人工审查仅G-text有明显变化，其余组几乎相同。GEN响应蒸馏100步已完成，部分样例G-TC与对照出现差异；扩展训练入口已补，暂不进入C2；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；16卡GEN启动器为 `scripts/gen_npu.py`；每卡接收完整场景对和一个seed。`--distributed`仅用于训练。文本GEN未提供视觉checkpoint时不捕获未使用的视觉KV。GEN复现的数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
 
 当前已实现共享GEN query响应蒸馏；没有hidden/KV逐token对齐、教师logit KL或语义读出蒸馏。C1的caption KV是writer输入来源；不等于以其hidden作为蒸馏目标。`response.py`实现冻结query捕获、共同softmax响应损失及联合训练；`distill --distributed`为入口，保留现有CE基线。
 
@@ -78,3 +78,13 @@ Source-swap与Memory-swap在单样本确定性writer下共用donor解码，记�
 历史实现保留在older分支；清理清单见[归档](archive/cleanup.json)。实际验证与修正记录见[验证](validation.md)。
 
 响应训练checkpoint的stage为 `C1-read`，仅保存新增残差参数，可由现有caption/GEN入口读取。探针保存在 `query_rank_*.pt/query_validation.pt`，构造方式与图像哈希在 `probe_manifest.json`，训练及验证分别记录响应loss、caption NLL、逐层响应幅度/方向和自由caption。该入口不支持断点恢复。
+
+### 响应蒸馏接续与数据扩展
+
+`distill`接受C1或C1-read parent，仅加载writer权重，重新创建AdamW。checkpoint及训练日志记录 `response_cumulative_steps`；本轮step表示新增步数，parent hash保留来源链。原始C1 CE步数不计入累计响应步数。
+
+`response_images_per_rank=8`使128张训练query图按rank交错分配，每卡缓存24个探针。原配置未设置此字段时保留单图pilot行为。查询池和caption池独立抽样，BAGEL/DiT/VAE继续冻结。
+
+`prepare_response_expansion.py`以固定seed流式抽取文本及图像路径，仅对抽中的图像读取内容哈希。保留原80条模板；自然文本无人工事实词表，`fact_accuracy=null`，验证按dataset_group分别报告response/NLL。总事实分仅统计有词表的模板样本，记录评分样本数，避免自然文本被误计为失败或成功。
+
+`c1_response_expand_npu.sh`绑定扩展清单、1000步配置及response100 last，复用16卡HCCL入口。数据清单存储在指定datasets目录，不向代码仓库复制图像。

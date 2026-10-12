@@ -137,6 +137,15 @@ def validate_config(runtime):
         raise ValueError('invalid response loss coefficients')
 
 
+def training_images(rows, worker, world, count=None):
+    """Assign equal, disjoint image pools; preserve the original one-image pilot."""
+    if count is None:
+        return [rows[worker % len(rows)]]
+    if not isinstance(count, int) or count <= 0 or len(rows) < world*count:
+        raise ValueError('response_images_per_rank requires enough distinct training images')
+    return rows[worker:world*count:world]
+
+
 @torch.no_grad()
 def validate(runtime, rows, probes, output):
     runtime.writer.eval()
@@ -154,13 +163,23 @@ def validate(runtime, rows, probes, output):
             append_json(output/'responses.jsonl', dict(sample_id=row['sample_id'], query_sample_id=probe['sample_id'],
                         t=probe['t'], noise_seed=probe['noise_seed'], response_loss=float(loss), layers=metrics,
                         teacher_token_ids=ids))
-        item = dict(sample_id=row['sample_id'], response_loss=sum(errors)/len(errors), **caption)
+        item = dict(sample_id=row['sample_id'], dataset_group=row.get('dataset_group', 'legacy_template'),
+                    response_loss=sum(errors)/len(errors), **caption)
         append_json(output/'captions.jsonl', item); records.append(item)
     summary = dict(response_loss=sum(r['response_loss'] for r in records)/len(records),
                    nll=sum(r['nll'] for r in records)/len(records),
-                   literal_fact_accuracy=sum(r['fact_accuracy'] for r in records)/len(records),
+                   literal_fact_accuracy=None,
                    samples=len(records), quality_status='shared-query probe only; true GEN quality unverified')
     summary['selection_loss'] = summary['response_loss']+runtime.config['response_caption_weight']*summary['nll']
+    scored = [r['fact_accuracy'] for r in records if r['fact_accuracy'] is not None]
+    summary['literal_fact_accuracy'] = sum(scored)/len(scored) if scored else None
+    summary['literal_fact_scored_samples'] = len(scored)
+    summary['groups'] = {}
+    for group in sorted({r['dataset_group'] for r in records}):
+        items = [r for r in records if r['dataset_group'] == group]
+        summary['groups'][group] = dict(samples=len(items),
+            response_loss=sum(r['response_loss'] for r in items)/len(items),
+            nll=sum(r['nll'] for r in items)/len(items))
     write_json(output/'summary.json', summary)
     return summary
 
@@ -171,7 +190,9 @@ def train(runtime, rows, query_rows, output, parent):
     cfg = runtime.config; validate_config(runtime)
     if not parent:
         raise ValueError('response training requires the retained C1 checkpoint')
-    load_checkpoint(parent, runtime, 'C1')
+    saved = load_checkpoint(parent, runtime, ('C1', 'C1-read'))
+    parent_steps = saved.get('response_cumulative_steps', saved['step'] if saved['stage'] == 'C1-read' else 0)
+    runtime.response_cumulative_steps = parent_steps
     pool = [r for r in rows if r['split'] == 'train' and r['label_type'] == 'clean']
     val = [r for r in rows if r['split'] == 'val' and r['label_type'] == 'clean']
     query_train = [r for r in query_rows if r['split'] == 'train']
@@ -185,12 +206,15 @@ def train(runtime, rows, query_rows, output, parent):
     guard = FrozenGuard(runtime.model, runtime.bundle.vae)
     if worker == 0:
         print('Preparing frozen GEN query probes on all ranks...', flush=True)
-    query_row = query_train[worker % len(query_train)]
-    probes = [make_probe(runtime, query_row, t, cfg['seed']+1000+worker) for t in cfg['response_t']]
+    images = training_images(query_train, worker, world, cfg.get('response_images_per_rank'))
+    probes = []; query_meta = []
+    for index, query_row in enumerate(images):
+        seed = cfg['seed']+1000+worker+world*index
+        probes.extend(make_probe(runtime, query_row, t, seed) for t in cfg['response_t'])
+        query_meta.append(dict(rank=worker, image=query_row['image'], image_hash=file_hash(query_row['image']),
+                               sample_id=query_row['sample_id'], noise_seed=seed, t=cfg['response_t']))
     torch.save(probes, output/f'query_rank_{worker:02d}.pt')
-    query_meta = dict(rank=worker, image=query_row['image'], image_hash=file_hash(query_row['image']),
-                      sample_id=query_row['sample_id'], noise_seed=cfg['seed']+1000+worker, t=cfg['response_t'])
-    metadata = parallel.gather_samples([query_meta])
+    metadata = parallel.gather_samples(query_meta)
     val_probes = []
     if worker == 0:
         print('Preparing held-out query probes and initial validation...', flush=True)
@@ -254,10 +278,12 @@ def train(runtime, rows, query_rows, output, parent):
         parallel.sum_gradients(runtime.writer)
         norm = torch.nn.utils.clip_grad_norm_(runtime.writer.parameters(), cfg['gradient_clip'], error_if_nonfinite=True)
         optimizer.step(); guard.check(); synchronize(runtime.device)
+        runtime.response_cumulative_steps = parent_steps+step
         totals = parallel.sum_statistics(sums, runtime.device)
         global_samples = sorted(parallel.gather_samples(samples), key=lambda r: r['global_micro'])
         if worker == 0:
-            append_json(output/'train.jsonl', dict(step=step, loss=totals[0]/totals[3], response_loss=totals[1]/totals[3],
+            append_json(output/'train.jsonl', dict(step=step, response_cumulative_steps=parent_steps+step,
+                        loss=totals[0]/totals[3], response_loss=totals[1]/totals[3],
                         caption_nll=totals[2]/totals[3], gradient_norm=float(norm), memory_gradient_audit=audit,
                         world_size=world, global_effective_batch=cfg['effective_batch'], sampled_states=global_samples,
                         elapsed_seconds=time.perf_counter()-start, rank0_peak_memory_bytes=max_memory_allocated(runtime.device)))
@@ -277,6 +303,10 @@ def train(runtime, rows, query_rows, output, parent):
     guard.check()
     if worker == 0:
         write_json(output/'training_summary.json', dict(stage='C1-read', steps=cfg['steps'], world_size=world,
+                   parent_response_steps=parent_steps, response_cumulative_steps=parent_steps+cfg['steps'],
+                   optimizer_policy='fresh_AdamW_with_parent_adapter_weights',
+                   train_caption_samples=len(pool), validation_caption_samples=len(val),
+                   training_query_images=len(metadata), images_per_rank=len(images), probes_per_rank=len(probes),
                    global_effective_batch=cfg['effective_batch'], parent=parent, parent_hash=file_hash(parent),
                    best_validation_selection_loss=best, frozen_guard='passed', caption_weight=cfg['response_caption_weight'],
                    query_policy='rank_local_fixed_training_queries; held_out_validation_images_and_noise',

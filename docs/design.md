@@ -134,7 +134,7 @@ $$
 
 已有人工观察：独立Memory在training-free时作用较弱；L/C差异不大；joint-micro多轮出现噪点。原始输出未在本轮复核，不写成原因已确定或质量已验证的结论。
 
-完整实验与继续条件见[实验](experiments.md)。当前代码只实现CE路径，映射与限制见[实现](implementation.md)。
+完整实验与继续条件见[实验](experiments.md)。当前代码实现CE与共享query响应蒸馏，映射与限制见[实现](implementation.md)。
 
 ### 响应蒸馏首版实现
 
@@ -143,3 +143,9 @@ $$
 读出固定为第0/13/27层的attention逐head输出、每层64个图像query；共同prompt/self KV全部保留在同一softmax。基线query及self K的位置统一后移64，教师在原prompt后原生追加caption（含包装token最多64个），Memory占原prompt后16个位置。教师与学生共用Q/B/位置；导出Memory K仅在消费时旋转一次。该64位置间隔是局部探针布局，真实GEN仍沿用16槽消费，不能把探针loss当作端到端等价。
 
 损失为三层等权归一化响应MSE＋0.1×caption CE。0.1是首跑配置，不是验证过的最佳系数；本轮为read+CE，没有实现语义logit蒸馏。global batch 16，100步，lr=1e-5，每50步验证；按验证response＋0.1×NLL最小选择，并包含step 0，避免强行选退化checkpoint。caption自由输出和事实分另记，选中checkpoint不等于语义成功。
+
+### 响应蒸馏扩展的边界
+
+响应step 100在部分样例出现可辨GEN内容差异，支持继续训练C writer。扩展同时增加自然文本语义覆盖和独立GEN query状态覆盖，保持冻结原生模型、同层UND K/V读出、独立16槽Memory及既有GEN消费接口。新增1000步从当前writer接续，不改动DiT参数或引入GEN hidden的新写入接口。
+
+短生成prompt在本阶段是文本oracle，不是已核验图像caption。文本输入和教师条件来自同一描述，训练query图与描述独立。这仍训练“如何表达文本条件”，不解决“从带噪GEN状态获取正确语义”。C2继续留待后续。

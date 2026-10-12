@@ -144,4 +144,12 @@ C1未见测试集与自然caption泛化、C2视觉迁移、最终画质尚未验
 
 `modelarts-job:/root/outputs/c1_response_20261012_134848`完成100步、16卡HCCL、global batch 16；源码 `788de2e`，BAGEL冻结检查通过。初始/50/100步验证response loss分别为0.044724/0.033690/0.020588，caption NLL为0.458495/0.395288/0.752646，字面事实分45.8%/58.3%/66.7%。按response＋0.1 NLL最小选step 50 best，保留原选择记录。
 
-用户指定下一轮真实GEN对照使用step 100 `last.pt`，SHA256 `725ab4a4cc33a3fa68cfaa1283905948dd0d885a397c4ceeb724009045e2c2ce`。该选择用于检查响应蒸馏较充分的候选，不改写best或宣称生成质量已改善。复用原4图/t/seed，结果尚待运行与人工审查，命令见[运行](run.md#第100步响应checkpoint的真实gen对照与本地审查)。
+用户指定下一轮真实GEN对照使用step 100 `last.pt`，SHA256 `725ab4a4cc33a3fa68cfaa1283905948dd0d885a397c4ceeb724009045e2c2ce`。该选择用于检查响应蒸馏较充分的候选，不改写best或宣称生成质量已改善。复用原4图/t/seed的运行与人工审查已完成，结果见第13节；命令见[运行](run.md#第100步响应checkpoint的真实gen对照与本地审查)。
+
+## 13. response100 GEN人工审查与扩展决定
+
+`modelarts-job:/root/outputs/gen_response100_t789_20261012`已完成原4图、actual t=0.7/0.8/0.9、noise seeds 0/1/2/3的16卡对照：48状态、336张局部预测图。使用response100 last，SHA256 `725ab4a4cc33a3fa68cfaa1283905948dd0d885a397c4ceeb724009045e2c2ce`。
+
+2026-10-12用户人工审查：G-TC在一些样例与base、swap等对照明显不同。这是范围有限的积极信号；尚无逐图语义方向评分、成功率或最终采样画质结论，也不推翻蒸馏前对照的阴性结果。
+
+决定：保留C，从response100 last加载writer，新增1000步并扩大文本/query数据；所有原生参数继续冻结，暂不进入C2。扩展预算与数据来源见[实验](experiments.md#响应蒸馏扩展训练)。扩展训练结果尚未产生。

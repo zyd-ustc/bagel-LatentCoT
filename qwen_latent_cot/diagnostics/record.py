@@ -99,7 +99,9 @@ def save_checkpoint(path, runtime, step, stage, parent=None):
     torch.save(dict(adapters=runtime.writer.state_dict(), topology=runtime.writer.topology,
                     slots=runtime.writer.slots, rank=runtime.writer.rank, depth=len(runtime.decoder.layers),
                     seed_ids=runtime.seed_ids, config=runtime.config, step=step, stage=stage, parent=parent,
-                    native_files=runtime.native_files, parent_hash=file_hash(parent) if parent else None), path)
+                    native_files=runtime.native_files,
+                    response_cumulative_steps=getattr(runtime, 'response_cumulative_steps', 0),
+                    parent_hash=file_hash(parent) if parent else None), path)
 
 
 def load_checkpoint(path, runtime, expected_stage=None):
