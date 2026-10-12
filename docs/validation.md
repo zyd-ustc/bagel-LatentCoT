@@ -131,3 +131,11 @@ C1未见测试集与自然caption泛化、C2视觉迁移、最终画质尚未验
 结论：原生caption条件显示可辨作用；当前C1-C Memory未显示超出布局、固定或中性槽位的可辨作用，正确与错配Memory也无明显区别。现有证据不支持GEN有效使用学生Memory的内容。此结论不否定C1中UND可读出的部分caption信息，也不证明Memory完全不含语义；G-text的明显变化尚不等于语义正确或最终画质提升。
 
 后续：保留C step 100与全部结果，优先实现冻结GEN的响应蒸馏，使新增writer学习原生caption的GEN响应。BAGEL/DiT保持冻结，暂不进入C2、不增加同模板CE步数、不扩大局部噪声网格或续采样。蒸馏尚未实现或运行；具体损失按[设计](design.md#4-路线二冻结-gen-的注意力响应蒸馏优先)制定。
+
+## 11. GEN响应蒸馏实现检查
+
+2026-10-12，首版实现提交 `bdcf0b0`。本地47项测试通过（4.47秒）：新增检查覆盖共同KV/条件KV同一softmax、不同条件长度、教师停止梯度、原生GEN query捕获，以及仅响应损失对Memory K/V和全部C残差的梯度；优化后BAGEL参数保持不变。已有双进程全局batch梯度SUM检查继续通过。
+
+`modelarts-job`真实BAGEL单卡NPU检查通过：固定C step 100，原生GEN在t=0.9捕获共享query，原生caption构造教师响应，响应损失反传到0/13/27层Memory K/V及全部28层残差，并完成一次AdamW更新；冻结检查通过。记录为 `/tmp/response_npu_smoke.log`和 `/tmp/response_npu_smoke.json`。该检查未运行16卡响应训练，不证明生成质量。
+
+数据已准备在指定datasets根目录：`c1_text80.jsonl`保留64/8/8文本划分；`memory_response_queries16.jsonl`为12张训练query图与4张验证query图，验证保留原高噪声复查的4张图。正式100步训练尚未启动，命令见[运行](run.md#c的gen响应蒸馏16卡联合训练)。
