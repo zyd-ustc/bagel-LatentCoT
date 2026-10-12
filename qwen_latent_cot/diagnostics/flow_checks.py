@@ -24,13 +24,17 @@ def check(student, rows, output):
     """Engineering-only updates of adapters; never saves them as a trained model."""
     runtime = student.runtime
     if len(rows) < 2: raise ValueError('E0 requires at least two distinct fixed image states')
-    guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher)
+    if any(p.requires_grad for p in student.writer.parameters()):
+        raise ValueError('E0 first checks require the original text writer frozen')
+    guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher, student.writer)
+    print('E0: hashing frozen native parameters...', flush=True)
     before = parameter_hash(runtime.model, runtime.bundle.vae)
     reset_peak_memory_stats(runtime.device); records = []
     originals = {name: value.detach().clone() for name, value in student.state_dict().items()}
     import time
     synchronize(runtime.device); start = time.perf_counter()
     for index, t in enumerate((.25, .75, .9)):
+        print(f'E0: native/zero/layout contracts t={t}', flush=True)
         state = runtime.training_state(rows[index % len(rows)], t, index)
         with torch.no_grad():
             a = runtime.velocity(state.x_t, t, state.flow)[0]
@@ -67,6 +71,7 @@ def check(student, rows, output):
     optimizer = torch.optim.AdamW(student.visual.parameters(), lr=1e-4)
     gradients = []
     for step in range(2):
+        print(f'E0: complete R2 GEN backward step={step+1}', flush=True)
         optimizer.zero_grad(set_to_none=True)
         loop = memory_loop(student, state, 2, checkpoint_activations=runtime.config.get('activation_checkpointing', True))
         loss = torch.stack([flow_mse(exit, state) for exit in loop.exits]).mean()
@@ -90,6 +95,7 @@ def check(student, rows, output):
     for index, (k, v) in enumerate(cache_before):
         torch.testing.assert_close(k, cache.key_cache[index], rtol=0, atol=0)
         torch.testing.assert_close(v, cache.value_cache[index], rtol=0, atol=0)
+    print('E0: rechecking frozen parameter hashes...', flush=True)
     after = parameter_hash(runtime.model, runtime.bundle.vae)
     if before != after: raise RuntimeError('native model parameter SHA256 changed')
     student.load_state_dict(originals, strict=True); guard.check(); synchronize(runtime.device)

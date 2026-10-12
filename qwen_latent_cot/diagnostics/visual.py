@@ -148,7 +148,8 @@ def train(student, rows, text_rows, stage, output, parent, *, resume=None, skip_
             raise ValueError('resume dataset sampling pool changed')
         start_step, best = saved['step'], saved['best']
     parallel.broadcast_parameters(student)
-    guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher)
+    guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher,
+                        *([student.writer] if not cfg['train_writer'] else []))
     teacher_guard = FrozenGuard(student.text_teacher)
     reset_peak_memory_stats(runtime.device); start = time.perf_counter()
     if worker == 0:

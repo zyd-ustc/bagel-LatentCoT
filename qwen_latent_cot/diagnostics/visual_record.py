@@ -42,7 +42,7 @@ def save_visual_checkpoint(path, student, step, stage, parent, optimizer=None, s
                           position=numpy_state[2], has_gauss=numpy_state[3], cached_gauss=numpy_state[4]))
     accelerator = getattr(torch, runtime.device.type, None)
     if runtime.device.type != 'cpu':
-        rng['accelerator'] = accelerator.get_rng_state_all()
+        rng['accelerator_selected'] = accelerator.get_rng_state(runtime.device)
     saved = dict(format_version=FORMAT_VERSION, adapters=student.writer.state_dict(),
                  visual=student.visual.state_dict(), text_teacher=student.text_teacher.state_dict(),
                  text_teacher_hash=student.text_teacher_hash, stage=stage, step=step,
@@ -52,6 +52,8 @@ def save_visual_checkpoint(path, student, step, stage, parent, optimizer=None, s
                  parent_hash=file_hash(parent) if parent else None,
                  trainable_parameter_names=[name for name, p in student.named_parameters() if p.requires_grad],
                  frozen_parameter_names=[name for name, _ in runtime.model.named_parameters()],
+                 vae_frozen_parameter_names=[name for name, _ in runtime.bundle.vae.named_parameters()],
+                 frozen_student_parameter_names=[name for name,p in student.named_parameters() if not p.requires_grad],
                  data_hashes=getattr(runtime, 'data_hashes', None),
                  optimizer=optimizer.state_dict() if optimizer is not None else None,
                  schedule=schedule, best=best, rng=rng)
@@ -84,6 +86,6 @@ def load_visual_checkpoint(path, student, *, optimizer=None, resume=False, expec
         rng = saved['rng']; random.setstate(rng['python']); torch.set_rng_state(rng['torch'].cpu())
         n = rng['numpy']; np.random.set_state((n['kind'], np.array(n['keys'], dtype=np.uint32),
                                               n['position'], n['has_gauss'], n['cached_gauss']))
-        if 'accelerator' in rng:
-            getattr(torch, runtime.device.type).set_rng_state_all([value.cpu() for value in rng['accelerator']])
+        if 'accelerator_selected' in rng:
+            getattr(torch, runtime.device.type).set_rng_state(rng['accelerator_selected'].cpu(), runtime.device)
     return saved
