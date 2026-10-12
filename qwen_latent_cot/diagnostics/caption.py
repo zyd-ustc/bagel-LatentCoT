@@ -6,6 +6,7 @@ from .memory import consume_bank
 from .native import teacher_forcing, free_caption
 from .data import score_facts, cluster_interval
 from .record import append_json, write_json, save_checkpoint, load_checkpoint, FrozenGuard
+from . import distributed as parallel
 from .numerics import autocast_for
 from ..bagel.accelerator import synchronize, reset_peak_memory_stats, max_memory_allocated
 
@@ -137,6 +138,9 @@ def check_pure_noise(rows):
 
 def train(runtime, rows, stage, output, parent=None, scratch=False):
     cfg = runtime.config
+    world, worker = parallel.world_size(), parallel.rank()
+    if cfg['effective_batch'] % world:
+        raise ValueError('global effective_batch must be divisible by world size')
     if stage == 'C2':
         if parent:
             load_checkpoint(parent, runtime, 'C1')
@@ -150,13 +154,16 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
         raise ValueError('training requires verified train/val pools and validation facts')
     if stage == 'C2' and any(r.get('state') for r in pool+val):
         raise ValueError('main C2 train/validation uses controlled clean states only')
+    parallel.broadcast_parameters(runtime.writer)
     guard = FrozenGuard(runtime.model, runtime.bundle.vae)
     optimizer = torch.optim.AdamW(runtime.writer.parameters(), lr=cfg['learning_rate'], weight_decay=cfg['weight_decay'])
     rng = random.Random(cfg['seed']); order = list(range(len(pool))); rng.shuffle(order); cursor = 0
     time_rng = random.Random(cfg['seed']+1); noise_rng = random.Random(cfg['seed']+2)
     noise_index = 0
     reset_peak_memory_stats(runtime.device)
-    save_checkpoint(output/'init.pt', runtime, 0, stage+'-init', parent)
+    if worker == 0:
+        save_checkpoint(output/'init.pt', runtime, 0, stage+'-init', parent)
+    parallel.barrier()
     best = (-float('inf'), -float('inf'))
     start_time = time.perf_counter()
     for step in range(1, cfg['steps']+1):
@@ -168,7 +175,10 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
             row = pool[order[cursor]]; cursor += 1
             t = time_rng.choice(cfg['train_t']) if stage == 'C2' else None
             seed = noise_rng.randrange(2**63-1); noise_index += 1
-            sampled_states.append(dict(sample_id=row['sample_id'], t=t, noise_seed=seed))
+            # Every rank advances the same global schedule, but executes its own slice.
+            if micro % world != worker:
+                continue
+            sampled_states.append(dict(sample_id=row['sample_id'], t=t, noise_seed=seed, rank=worker, global_micro=micro))
             source, _ = prepare_source(runtime, row, stage, t, seed)
             with autocast_for(runtime.device):
                 bank = runtime.memory(source)
@@ -191,27 +201,38 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
                 if not any(g.abs().max() > 0 for n, g in gradients.items() if '.up.' in n):
                     raise RuntimeError('caption gradients do not reach Memory adapters')
                 guard.check()
+        parallel.sum_gradients(runtime.writer)
         norm = torch.nn.utils.clip_grad_norm_(runtime.writer.parameters(), cfg['gradient_clip'], error_if_nonfinite=True)
         optimizer.step(); guard.check()
         synchronize(runtime.device)
-        append_json(output/'train.jsonl', dict(step=step, sampled_states=sampled_states, memory_gradient_audit=gradient_audit, nll=sum(losses)/len(losses), gradient_norm=float(norm),
-                    elapsed_seconds=time.perf_counter()-start_time, peak_memory_bytes=max_memory_allocated(runtime.device)))
+        loss_sum, sample_count = parallel.sum_statistics([sum(losses), len(losses)], runtime.device)
+        sampled_states = sorted(parallel.gather_samples(sampled_states), key=lambda item: item['global_micro'])
+        if worker == 0:
+            append_json(output/'train.jsonl', dict(step=step, sampled_states=sampled_states, memory_gradient_audit=gradient_audit,
+                        world_size=world, global_effective_batch=cfg['effective_batch'], nll=loss_sum/sample_count,
+                        gradient_norm=float(norm), elapsed_seconds=time.perf_counter()-start_time,
+                        rank0_peak_memory_bytes=max_memory_allocated(runtime.device)))
         if step % cfg['eval_every'] == 0 or step == cfg['steps']:
-            validation_path = output/f'validation_{step:06d}'; validation_path.mkdir()
-            scored = evaluate(runtime, val, stage, validation_path, controls=False)
-            primary = [r for r in scored if r['arm'] == 'Correct' and r.get('t') != 1]
-            accuracy = cluster_interval(primary, 'fact_accuracy')
-            if accuracy is None:
-                raise ValueError('validation has no known facts for checkpoint selection')
-            # Same rule/budget for L/C. Literal facts and NLL are saved separately.
-            score = (accuracy['mean'], -sum(r['nll'] for r in primary)/len(primary))
-            if score > best:
-                best = score; save_checkpoint(output/'best.pt', runtime, step, stage, parent)
-                write_json(output/'selection.json', dict(step=step, rule=cfg['selection'], fact_accuracy=score[0], nll=-score[1]))
-            save_checkpoint(output/'last.pt', runtime, step, stage, parent)
-            torch.save(dict(optimizer=optimizer.state_dict(), step=step, rng=rng.getstate(), order=order,
-                            cursor=cursor, noise_index=noise_index, time_rng=time_rng.getstate(), noise_rng=noise_rng.getstate()), output/'optimizer.pt')
+            parallel.barrier()
+            if worker == 0:
+                validation_path = output/f'validation_{step:06d}'; validation_path.mkdir()
+                scored = evaluate(runtime, val, stage, validation_path, controls=False)
+                primary = [r for r in scored if r['arm'] == 'Correct' and r.get('t') != 1]
+                accuracy = cluster_interval(primary, 'fact_accuracy')
+                if accuracy is None:
+                    raise ValueError('validation has no known facts for checkpoint selection')
+                # Same rule/budget for L/C. Literal facts and NLL are saved separately.
+                score = (accuracy['mean'], -sum(r['nll'] for r in primary)/len(primary))
+                if score > best:
+                    best = score; save_checkpoint(output/'best.pt', runtime, step, stage, parent)
+                    write_json(output/'selection.json', dict(step=step, rule=cfg['selection'], fact_accuracy=score[0], nll=-score[1]))
+                save_checkpoint(output/'last.pt', runtime, step, stage, parent)
+                torch.save(dict(optimizer=optimizer.state_dict(), step=step, rng=rng.getstate(), order=order,
+                                cursor=cursor, noise_index=noise_index, time_rng=time_rng.getstate(), noise_rng=noise_rng.getstate()), output/'optimizer.pt')
+            parallel.barrier()
     guard.check()
-    write_json(output/'training_summary.json', dict(stage=stage, scratch=scratch, parent=parent,
-                steps=cfg['steps'], best_validation_fact_accuracy=best[0], frozen_guard='passed',
-                quality_status='not established by NLL or engineering checks'))
+    if worker == 0:
+        write_json(output/'training_summary.json', dict(stage=stage, scratch=scratch, parent=parent,
+                    world_size=world, global_effective_batch=cfg['effective_batch'],
+                    steps=cfg['steps'], best_validation_fact_accuracy=best[0], frozen_guard='passed',
+                    quality_status='not established by NLL or engineering checks'))

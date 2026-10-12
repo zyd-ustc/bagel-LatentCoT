@@ -1,12 +1,12 @@
 # 运行
 
-状态：适用于当前CE实现。更新：2026-10-11。
+状态：适用于当前CE实现。更新：2026-10-12。
 
 [返回 README](../README.md)
 
 本页命令不包含拟议的响应蒸馏或语义读出损失。目标主机的真实权重实验由用户执行。数据格式见[实现](implementation.md)，实验顺序见[实验](experiments.md)。
 
-Ascend 实验默认使用 `loop-layer-NPU` 分支和16卡并行。评测按样本分片；独立实验按组分配。当前训练入口没有分布式梯度同步，不能用16个独立训练进程冒充一个联合训练。
+Ascend 实验默认使用 `loop-layer-NPU` 分支和16卡并行。评测按样本分片；训练用 `torchrun --distributed` 同步writer梯度。`effective_batch`是全局batch，须被卡数整除；每卡微批1。
 
 ## 1. 安装与检查
 
@@ -60,17 +60,39 @@ memory-topology calibrate --model "$MODEL" --data "$DATA" --device "$DEVICE" \
 
 ## 3. 训练与评测
 
+### modelarts-job：C1首跑
+
+C0已按[验证记录](validation.md)人工放行，范围仅为原生文本语义读取。首跑使用 [c1_pilot.json](../configs/c1_pilot.json) 与 [c1_text80.jsonl](../data/c1_text80.jsonl)：64/8/8条文本、100步、全局batch16、每50步验证。L/C依次各用16卡联合训练，只更新writer；每组处理1,600条训练样本。模板文本不代表图像核验数据。
+
+```bash
+cd /root/bagel-LatentCoT-loop-layer-NPU
+OUT=/root/outputs/c1_pilot_$(date +%Y%m%d_%H%M%S)
+nohup bash scripts/c1_npu.sh "$OUT" > "$OUT.log" 2>&1 < /dev/null &
+echo "$OUT"
+tail -f "$OUT.log"
+```
+
+默认C0路径为 `/root/outputs/c0_text16_20261012_111241/calibration.json`；可用环境变量 `C0_PASS`覆盖。`MODEL_PATH`、`DIAGNOSTIC_DATA`、`DIAGNOSTIC_CONFIG`、`MODEL_PYTHON`同样可覆盖。C0的16条数据全属val，不能直接作为C1训练集。
+
+结果分别位于 `$OUT/L`、`$OUT/C`。`train.jsonl`记录全局NLL、16卡全局样本和同步后梯度范数；验证与checkpoint仅由rank0写入。检查自由输出与错配事实，再决定是否扩展训练。此入口没有断点恢复。
+
+### 通用入口
+
 ```bash
 # 2. 相同预算训练 C1-L/C；输出 init.pt、best.pt、last.pt。
 for TOPOLOGY in L C; do
-  memory-topology train --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+  python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=16 \
+    -m qwen_latent_cot.diagnostics.cli train --distributed \
+    --model "$MODEL" --data "$DATA" --device "$DEVICE" \
     --stage C1 --topology "$TOPOLOGY" --c0-pass "$OUT/c0/calibration.json" \
     --output "$OUT/c1_$TOPOLOGY"
 done
 
 # 3. 各自从 C1 的共同验证规则所选 checkpoint 迁移至 C2。
 for TOPOLOGY in L C; do
-  memory-topology train --model "$MODEL" --data "$DATA" --device "$DEVICE" \
+  python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=16 \
+    -m qwen_latent_cot.diagnostics.cli train --distributed \
+    --model "$MODEL" --data "$DATA" --device "$DEVICE" \
     --stage C2 --topology "$TOPOLOGY" --checkpoint "$OUT/c1_$TOPOLOGY/best.pt" \
     --c0-pass "$OUT/c0/calibration.json" --output "$OUT/c2_$TOPOLOGY"
 done
@@ -110,4 +132,4 @@ C2-scratch 使用 `train --stage C2 --scratch`，省略 `--checkpoint`，两组�
 
 GEN 局部结果通过语义检查后，使用新输出目录加 `--continue-sampling` 做后续采样。每个 arm 只在选定节点读取一次 Memory，随后恢复原生。先按协议固定小规模数据及节点，避免默认展开所有 t×arm。匿名图像与 `blind_annotations.csv` 用于分别核验事实和画质；`blind_key.json` 不交给盲评者。
 
-默认配置为 [memory_topology.json](../configs/memory_topology.json)。训练上限是每组 5,000 optimizer steps、有效 batch 32，微批为 1；每 250 步验证。当前不实现分布式训练或断点恢复。输出目录必须为空，失败和已完成运行不会被覆盖。
+默认配置为 [memory_topology.json](../configs/memory_topology.json)。训练上限是每组 5,000 optimizer steps、有效 batch 32，微批为 1；每 250 步验证。支持writer数据并行训练；尚不支持断点恢复。输出目录必须为空，失败和已完成运行不会被覆盖。

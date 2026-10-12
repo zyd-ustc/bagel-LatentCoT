@@ -2,6 +2,7 @@
 import argparse
 import json
 import re
+import os
 from pathlib import Path
 import torch
 from .data import load_dataset
@@ -26,7 +27,12 @@ def main():
     parser.add_argument('--scratch', action='store_true')
     parser.add_argument('--continue-sampling', action='store_true')
     parser.add_argument('--c0-pass', help='calibration.json with manually verified C0 freedom-to-decode pass')
+    parser.add_argument('--distributed', action='store_true', help='synchronize writer gradients across torchrun workers; effective_batch is global')
     args = parser.parse_args()
+    if args.distributed and args.command != 'train':
+        parser.error('--distributed is supported only for train')
+    if not args.distributed and int(os.environ.get('WORLD_SIZE', '1')) > 1:
+        parser.error('torchrun training requires --distributed')
     if args.command == 'report':
         if not args.runs:
             parser.error('report requires --runs')
@@ -51,16 +57,31 @@ def main():
         c0 = json.loads(Path(args.c0_pass).read_text())
         if c0.get('passed') is not True:
             raise ValueError('C0 decoding has not passed; repair protocol before training/GEN interpretation')
+    from . import distributed as parallel
+    if args.distributed:
+        args.device = str(parallel.initialize(args.device))
+        if config['effective_batch'] % parallel.world_size():
+            raise ValueError('global effective_batch must be divisible by WORLD_SIZE')
     output = Path(args.output).resolve()
-    if output.exists() and any(output.iterdir()):
+    if parallel.rank() == 0 and output.exists() and any(output.iterdir()):
         raise ValueError('output must be empty; never mix runs or overwrite old records')
-    output.mkdir(parents=True, exist_ok=True)
+    if parallel.rank() == 0:
+        output.mkdir(parents=True, exist_ok=True)
+    parallel.barrier()
     torch.manual_seed(config['seed'])
     from ..bagel.backbone import load_native
     from .runtime import DiagnosticRuntime
     runtime = DiagnosticRuntime(load_native(args.model, args.device, config['timestep_shift']), config, args.topology)
-    run_manifest = manifest(runtime, args, args.data)
-    write_json(output/'manifest.json', run_manifest)
+    run_manifest = manifest(runtime, args, args.data) if parallel.rank() == 0 else None
+    if parallel.world_size() > 1:
+        import torch.distributed as dist
+        shared = [run_manifest]
+        dist.broadcast_object_list(shared, src=0)
+        run_manifest = shared[0]
+    run_manifest['distributed'] = dict(world_size=parallel.world_size(), global_effective_batch=config['effective_batch'],
+                                       gradient_reduction='SUM_after_global_batch_loss_scaling', backend=dist.get_backend() if args.distributed else None)
+    if parallel.rank() == 0:
+        write_json(output/'manifest.json', run_manifest)
     runtime.native_files = run_manifest['model_files']
     try:
         if args.command in ('train', 'gen'):
@@ -94,7 +115,10 @@ def main():
         run_manifest['failure'] = dict(type=type(error).__name__, message=str(error))
         raise
     finally:
-        write_json(output/'manifest.json', run_manifest)
+        if parallel.rank() == 0:
+            write_json(output/'manifest.json', run_manifest)
+        if args.distributed:
+            dist.destroy_process_group()
 
 
 if __name__ == '__main__':

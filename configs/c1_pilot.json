@@ -1,0 +1,49 @@
+{
+  "protocol": "memory_topology_diagnostic_protocol_20261011",
+  "slots": 16,
+  "rank": 32,
+  "resolution": 512,
+  "neutral_text": "The scene is available for a general description with neutral content and no specific objects attributes counts or spatial relations mentioned here.",
+  "neutral_prompt": "An image.",
+  "caption_instruction": "Describe the image briefly. State objects, colors, counts, and spatial relations. If the evidence is unclear, say unknown.\n",
+  "writer_position_start": 2048,
+  "seed": 0,
+  "posterior_seed": 17,
+  "noise_seeds": [
+    0,
+    1
+  ],
+  "eval_t": [
+    0.05,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    1.0
+  ],
+  "train_t": [
+    0.05,
+    0.25,
+    0.5,
+    0.75,
+    0.9
+  ],
+  "steps": 100,
+  "effective_batch": 16,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.0,
+  "gradient_clip": 1.0,
+  "eval_every": 50,
+  "max_caption_tokens": 48,
+  "cfg_text_scale": 4.0,
+  "cfg_renorm_min": 0.0,
+  "cfg_renorm_type": "global",
+  "sampler_steps": 50,
+  "timestep_shift": 3.0,
+  "selection": "validation_literal_fact_accuracy_then_nll",
+  "c0_instruction": "Repeat the preceding caption exactly. Do not describe a new image or add information.\n",
+  "adapter_type": "linear_low_rank_v1",
+  "training_state_sampling": "independent_uniform_v1",
+  "posterior_seed_policy": "image_content_hash_v1",
+  "fact_scoring": "locked_literal_assertion_v2"
+}

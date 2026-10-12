@@ -1,6 +1,6 @@
 # 实现
 
-状态：main 已实现CE诊断；蒸馏接口待扩展。更新：2026-10-11。
+状态：main 已实现CE诊断；蒸馏接口待扩展。更新：2026-10-12。
 
 [返回 README](../README.md)
 
@@ -29,7 +29,8 @@
 - Writer位置从2048起；来源重叠时报错。Caption Memory位置从0起，指令/答案从16起。
 - GEN Memory接原prompt之后，query平移16；G-layout同样平移但mask新增KV。
 - 原模型与VAE全部冻结，writer只注册新增残差。冻结UND保留输入梯度；首批检查每层Memory K/V与新增模块梯度。
-- 微批1、梯度累积实现有效batch32；无分布式或resume入口。TaylorSeer禁用。
+- 微批1；`--distributed`通过HCCL同步writer梯度。全局batch均分各卡，loss除以全局batch后按SUM归约，再裁剪与更新；BAGEL不参与梯度通信。TaylorSeer禁用，无resume入口。
+- 所有rank推进同一全局样本/t/noise随机流，各自执行按rank分配的微批；仅rank0做验证、记录模型hash和保存checkpoint，其他rank等待。每个拓扑独立联合训练，不混合L/C梯度。
 - 可微诊断attention为显式mask的PyTorch SDPA；CUDA原生参照为FlashAttention，NPU沿用既有SDPA。目标后端数值容差未验证。
 - 图像固定RGB bicubic resize到512；原生VAE scale/shift/patchify与posterior采样保留。posterior seed由内容hash派生，并与扩散、t、样本顺序随机流分开。
 
