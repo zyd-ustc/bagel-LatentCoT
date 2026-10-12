@@ -52,3 +52,30 @@ def test_joint_optimizer_matches_global_batch():
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
     mp.spawn(worker, args=(port,), nprocs=2, join=True)
+
+
+def visual_worker(rank, port):
+    os.environ.update(WORLD_SIZE='2', RANK=str(rank), LOCAL_RANK=str(rank),
+                      MASTER_ADDR='127.0.0.1', MASTER_PORT=str(port))
+    parallel.initialize('cpu')
+    try:
+        module = torch.nn.ModuleDict({'visual':torch.nn.Linear(3, 2, bias=False),
+                                      'writer':torch.nn.Linear(3, 2, bias=False).requires_grad_(False)})
+        parallel.broadcast_parameters(module)
+        frozen = module['writer'].weight.clone()
+        # Rank one owns a frozen text-only replay sample: no visual graph exists.
+        if rank == 0: (module['visual'](torch.ones(3)).sum()/2).backward()
+        parallel.sum_gradients(module, allow_unused=True)
+        torch.testing.assert_close(module['visual'].weight.grad, torch.full((2,3), .5))
+        assert module['writer'].weight.grad is None
+        torch.optim.AdamW([p for p in module.parameters() if p.requires_grad], lr=.01).step()
+        torch.testing.assert_close(module['writer'].weight, frozen, rtol=0, atol=0)
+        weights = [None,None];dist.all_gather_object(weights,module['visual'].weight.detach().tolist())
+        assert weights[0] == weights[1]
+    finally: dist.destroy_process_group()
+
+
+def test_frozen_text_replay_rank_participates_in_joint_visual_optimizer():
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1',0)); port=listener.getsockname()[1]
+    mp.spawn(visual_worker,args=(port,),nprocs=2,join=True)

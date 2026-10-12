@@ -10,6 +10,12 @@ from .record import manifest, write_json, load_checkpoint
 
 
 def main():
+    import sys
+    routes = {'visual-check': 'check', 'visual-train': 'train', 'visual-eval': 'eval',
+              'loop-sample': 'sample', 'visual-label-states': 'label-states'}
+    if len(sys.argv) > 1 and sys.argv[1] in routes:
+        from .visual_cli import main as visual_main
+        return visual_main([routes[sys.argv[1]], *sys.argv[2:]])
     parser = argparse.ArgumentParser(description='Frozen BAGEL independent Memory protocol (2026-10-11)')
     parser.add_argument('command', choices=['calibrate', 'train', 'caption', 'gen', 'trajectory', 'report', 'distill'])
     parser.add_argument('--model')

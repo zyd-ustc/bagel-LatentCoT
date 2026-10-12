@@ -128,6 +128,9 @@ class DiagnosticRuntime:
     def training_state(self, row, t, noise_seed):
         """Keep sampled epsilon/x0; trajectory states deliberately have no flow target."""
         from .flow_training import TrainingState
+        if row.get('label_kind') == 'target_observation_gap' and not (
+                self.config.get('source_prompt_policy') == 'deployment' and self.config.get('allow_target_prompt')):
+            raise ValueError('gap labels require an explicitly allowed goal prompt; neutral source has no target intent')
         if row.get('state'):
             x, flow, lengths, positions, meta = self.state(row, t, noise_seed)
             x0 = epsilon = None
