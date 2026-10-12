@@ -20,9 +20,9 @@
 |[report.py](../qwen_latent_cot/diagnostics/report.py)|四张结果表与盲评汇总|
 |[cli.py](../qwen_latent_cot/diagnostics/cli.py)|唯一执行入口、配置与C0门槛|
 
-当前保留C checkpoint；文本GEN读取与高噪声复查已完成，人工审查仅G-text有明显变化，其余组几乎相同。下一步优先实现GEN响应蒸馏，暂不进入C2；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；16卡GEN启动器为 `scripts/gen_npu.py`；每卡接收完整场景对和一个seed。`--distributed`仅用于训练。文本GEN未提供视觉checkpoint时不捕获未使用的视觉KV。GEN复现的数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
+当前保留C checkpoint；文本GEN读取与高噪声复查已完成，人工审查仅G-text有明显变化，其余组几乎相同。GEN响应蒸馏入口已实现，正式训练待运行，暂不进入C2；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；16卡GEN启动器为 `scripts/gen_npu.py`；每卡接收完整场景对和一个seed。`--distributed`仅用于训练。文本GEN未提供视觉checkpoint时不捕获未使用的视觉KV。GEN复现的数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
 
-当前没有hidden/KV对齐、教师logit KL、语义读出或GEN响应蒸馏。C1的caption KV是writer输入来源；不等于以其hidden作为蒸馏目标。后续扩展按[设计](design.md)新增teacher响应与损失，保留现有CE基线。
+当前已实现共享GEN query响应蒸馏；没有hidden/KV逐token对齐、教师logit KL或语义读出蒸馏。C1的caption KV是writer输入来源；不等于以其hidden作为蒸馏目标。`response.py`实现冻结query捕获、共同softmax响应损失及联合训练；`distill --distributed`为入口，保留现有CE基线。
 
 ## 2. 张量与冻结合同
 
@@ -76,3 +76,5 @@ Source-swap与Memory-swap在单样本确定性writer下共用donor解码，记�
 旧checkpoint/C0记录缺少修正配置或复述指令token时拒绝加载；旧结果不能与修正主表混合。协议标识`memory_topology_diagnostic_protocol_20261011`保留为现有配置/记录ID，与文档简短文件名无关。
 
 历史实现保留在older分支；清理清单见[归档](archive/cleanup.json)。实际验证与修正记录见[验证](validation.md)。
+
+响应训练checkpoint的stage为 `C1-read`，仅保存新增残差参数，可由现有caption/GEN入口读取。探针保存在 `query_rank_*.pt/query_validation.pt`，构造方式与图像哈希在 `probe_manifest.json`，训练及验证分别记录响应loss、caption NLL、逐层响应幅度/方向和自由caption。该入口不支持断点恢复。

@@ -71,7 +71,7 @@ def diagnose_gen(runtime, rows, output, text_checkpoint, visual_checkpoint, cont
                     'G-fixed': runtime.gen_arm(x, t, flow, zero, lengths, positions),
                     'G-neutral': runtime.gen_arm(x, t, flow, fixed, lengths, positions),
                     'G-text': runtime.velocity(x, t, supplemental_flow(runtime, flow, lengths, positions, row['caption']))}
-            load_checkpoint(text_checkpoint, runtime, 'C1')
+            load_checkpoint(text_checkpoint, runtime, ('C1', 'C1-read'))
             text_source = runtime.text(row['caption'])[0]
             text_bank = runtime.memory(text_source)
             arms['G-T'+runtime.writer.topology] = runtime.gen_arm(x, t, flow, text_bank, lengths, positions)

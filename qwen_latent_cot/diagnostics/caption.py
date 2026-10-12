@@ -143,7 +143,7 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
         raise ValueError('global effective_batch must be divisible by world size')
     if stage == 'C2':
         if parent:
-            load_checkpoint(parent, runtime, 'C1')
+            load_checkpoint(parent, runtime, ('C1', 'C1-read'))
         elif not scratch:
             raise ValueError('C2 requires its matching C1 checkpoint or explicit --scratch')
     elif parent or scratch:

@@ -113,7 +113,8 @@ def load_checkpoint(path, runtime, expected_stage=None):
                 'adapter_type', 'posterior_seed_policy', 'posterior_seed', 'training_state_sampling', 'fact_scoring'):
         if saved['config'].get(key) != runtime.config[key]:
             raise ValueError('checkpoint interface configuration mismatch: '+key)
-    if expected_stage and saved['stage'] != expected_stage:
+    allowed = (expected_stage,) if isinstance(expected_stage, str) else expected_stage
+    if allowed and saved['stage'] not in allowed:
         raise ValueError('checkpoint has incorrect training stage')
     runtime.writer.load_state_dict(saved['adapters'], strict=True)
     return saved

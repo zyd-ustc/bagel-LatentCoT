@@ -11,8 +11,9 @@ from .record import manifest, write_json, load_checkpoint
 
 def main():
     parser = argparse.ArgumentParser(description='Frozen BAGEL independent Memory protocol (2026-10-11)')
-    parser.add_argument('command', choices=['calibrate', 'train', 'caption', 'gen', 'trajectory', 'report'])
+    parser.add_argument('command', choices=['calibrate', 'train', 'caption', 'gen', 'trajectory', 'report', 'distill'])
     parser.add_argument('--model')
+    parser.add_argument('--query-data', help='independent verified train/val images for shared GEN queries')
     parser.add_argument('--data')
     parser.add_argument('--output', required=True)
     parser.add_argument('--runs', nargs='+', help='run directories to summarize for report')
@@ -29,8 +30,8 @@ def main():
     parser.add_argument('--c0-pass', help='calibration.json with manually verified C0 freedom-to-decode pass')
     parser.add_argument('--distributed', action='store_true', help='synchronize writer gradients across torchrun workers; effective_batch is global')
     args = parser.parse_args()
-    if args.distributed and args.command != 'train':
-        parser.error('--distributed is supported only for train')
+    if args.distributed and args.command not in ('train', 'distill'):
+        parser.error('--distributed is supported only for train/distill')
     if not args.distributed and int(os.environ.get('WORLD_SIZE', '1')) > 1:
         parser.error('torchrun training requires --distributed')
     if args.command == 'report':
@@ -49,9 +50,14 @@ def main():
     if config['steps'] <= 0 or config['effective_batch'] <= 0 or config['eval_every'] <= 0:
         raise ValueError('training budgets must be positive')
     rows = load_dataset(args.data)
+    query_rows = None
+    if args.command == 'distill':
+        if not args.query_data or not args.checkpoint or args.topology != 'C':
+            parser.error('distill requires --query-data, --checkpoint and --topology C')
+        query_rows = load_dataset(args.query_data)
     if any(not re.fullmatch(r'[A-Za-z0-9_-]+', r['sample_id']) for r in rows):
         raise ValueError('sample_id must be a safe filename identifier')
-    if args.command in ('train', 'gen'):
+    if args.command in ('train', 'gen', 'distill'):
         if not args.c0_pass:
             raise ValueError('first validate C0 free captions and provide --c0-pass calibration.json')
         c0 = json.loads(Path(args.c0_pass).read_text())
@@ -78,18 +84,26 @@ def main():
         shared = [run_manifest]
         dist.broadcast_object_list(shared, src=0)
         run_manifest = shared[0]
+    if query_rows is not None:
+        from .data import file_hash
+        run_manifest['query_dataset_hash'] = file_hash(args.query_data)
+        run_manifest['query_dataset_path'] = str(Path(args.query_data).resolve())
+        run_manifest['query_image_hashes'] = {r['image']: file_hash(r['image']) for r in query_rows if r.get('image')}
     run_manifest['distributed'] = dict(world_size=parallel.world_size(), global_effective_batch=config['effective_batch'],
                                        gradient_reduction='SUM_after_global_batch_loss_scaling', backend=dist.get_backend() if args.distributed else None)
     if parallel.rank() == 0:
         write_json(output/'manifest.json', run_manifest)
     runtime.native_files = run_manifest['model_files']
     try:
-        if args.command in ('train', 'gen'):
+        if args.command in ('train', 'gen', 'distill'):
             if c0.get('model_files') != run_manifest['model_files'] or c0.get('instruction') != config['c0_instruction'] or c0.get('instruction_token_ids') != runtime.c0_instruction_ids:
                 raise ValueError('C0 calibration does not match native model/tokenizer or decode instruction')
         if args.command == 'caption' and args.checkpoint:
             load_checkpoint(args.checkpoint, runtime)  # Explicit init controls are allowed.
-        if args.command == 'train':
+        if args.command == 'distill':
+            from .response import train
+            train(runtime, rows, query_rows, output, args.checkpoint)
+        elif args.command == 'train':
             from .caption import train
             train(runtime, rows, args.stage, output, args.checkpoint, args.scratch)
         else:

@@ -104,7 +104,7 @@ C1可使用预先缓存、与目标caption独立的冻结GEN query库，覆盖�
 
 推荐总损失：`L = L_read + λ_sem L_sem + λ_cap L_cap`。`L_cap`是当前已实现的caption交叉熵。后续仅在C上比较CE-only、read-only、read+sem，之后才增加CE辅助；系数由验证集与各项梯度量级选取，暂无已验证数值。
 
-当前执行顺序为：固定C1-C checkpoint → GEN读取校准（已完成）→ 实现C的GEN响应蒸馏（尚未实现）。用户人工审查发现G-text变化明显，其余组几乎相同，学生Memory的内容作用尚未成立，暂不进入C2。先不增加CE训练步数、恢复L消融或进入多轮采样；这不改变上表的长期阶段定义。
+当前执行顺序为：固定C1-C checkpoint → GEN读取校准（已完成）→ 运行C的GEN响应蒸馏（入口已实现，正式训练尚未运行）。用户人工审查发现G-text变化明显，其余组几乎相同，学生Memory的内容作用尚未成立，暂不进入C2。先不增加CE训练步数、恢复L消融或进入多轮采样；这不改变上表的长期阶段定义。
 
 C1文本源含答案，属于压缩校准；不能称视觉接地。C2学生不能读取caption或教师KV，只使用教师作为监督。训练caption decoder时仅可看到Memory、固定指令和已生成答案前缀。
 
@@ -135,3 +135,11 @@ $$
 已有人工观察：独立Memory在training-free时作用较弱；L/C差异不大；joint-micro多轮出现噪点。原始输出未在本轮复核，不写成原因已确定或质量已验证的结论。
 
 完整实验与继续条件见[实验](experiments.md)。当前代码只实现CE路径，映射与限制见[实现](implementation.md)。
+
+### 响应蒸馏首版实现
+
+`response.py`固定C拓扑，以C1 step 100初始化，仅更新28层rank 32残差。冻结基线GEN query来自与目标caption独立的图像库；训练使用12张图，验证使用复查中的4张图。训练caption沿用C1的64/8/8划分，未使用图像库caption作为训练目标。
+
+读出固定为第0/13/27层的attention逐head输出、每层64个图像query；共同prompt/self KV全部保留在同一softmax。基线query及self K的位置统一后移64，教师在原prompt后原生追加caption（含包装token最多64个），Memory占原prompt后16个位置。教师与学生共用Q/B/位置；导出Memory K仅在消费时旋转一次。该64位置间隔是局部探针布局，真实GEN仍沿用16槽消费，不能把探针loss当作端到端等价。
+
+损失为三层等权归一化响应MSE＋0.1×caption CE。0.1是首跑配置，不是验证过的最佳系数；本轮为read+CE，没有实现语义logit蒸馏。global batch 16，100步，lr=1e-5，每50步验证；按验证response＋0.1×NLL最小选择，并包含step 0，避免强行选退化checkpoint。caption自由输出和事实分另记，选中checkpoint不等于语义成功。
