@@ -15,7 +15,8 @@
 |语义读出对齐、GEN 响应蒸馏、语义状态去噪|设计方案，尚未实现|
 |工程验证|历史40项小模型测试通过；新增联合训练检查见验证文档|
 |真实 BAGEL C0|16卡完成16条；文本语义读取可用，严格匹配7/16，存在扩写|
-|真实 BAGEL 训练、接地与生成质量|C1/C2与生成质量尚未评测|
+|真实 BAGEL C1|L/C各100步已完成；保留C，验证字面事实分45.8%，颜色8/8；完整语义仍有错误|
+|当前下一步|固定C checkpoint做GEN颜色读取；C2与生成质量尚未评测|
 
 ## 快速开始
 
@@ -26,7 +27,7 @@ python -m pip install -e '.[dev]'
 memory-topology --help
 ```
 
-首次运行从[原生文本校准](docs/run.md#2-原生文本校准)开始。完整命令、核验数据格式和结果解读见下表。
+当前保留C，L暂停；选择依据与checkpoint见[验证](docs/validation.md#4-c1结果与拓扑选择)，下一步见[实验](docs/experiments.md#当前首跑c的颜色消费)。首次复现从[原生文本校准](docs/run.md#2-原生文本校准)开始。完整命令、核验数据格式和结果解读见下表。
 
 Ascend 实验使用 `loop-layer-NPU`，默认16卡并行。C0按样本分片；C1/C2通过 `torchrun --distributed` 同步新增writer梯度，原BAGEL冻结。
 
@@ -44,6 +45,6 @@ Ascend 实验使用 `loop-layer-NPU`，默认16卡并行。C0按样本分片；C
 
 ## 分支与许可
 
-`main` 与 `loop-layer-NPU` 共享诊断实现。`auto` 在 main 优先 CUDA，在 NPU 分支优先 NPU；显式设备选择优先。历史实现保留在 `older-1/older-2/older-3`。
+`main` 与 `loop-layer-NPU` 共享核心CE诊断；当前联合训练入口与最新实验记录维护在NPU分支。`auto` 在 main 优先 CUDA，在 NPU 分支优先 NPU；显式设备选择优先。历史实现保留在 `older-1/older-2/older-3`。
 
 代码采用 [Apache-2.0](LICENSE)。模型权重与外部数据使用各自许可证。

@@ -1,6 +1,6 @@
 # 实现
 
-状态：main 已实现CE诊断；蒸馏接口待扩展。更新：2026-10-12。
+状态：NPU分支C1联合训练已运行；GEN分片启动层与蒸馏待扩展。更新：2026-10-12。
 
 [返回 README](../README.md)
 
@@ -18,6 +18,8 @@
 |[record.py](../qwen_latent_cot/diagnostics/record.py)|manifest、checkpoint来源与冻结检查|
 |[report.py](../qwen_latent_cot/diagnostics/report.py)|四张结果表与盲评汇总|
 |[cli.py](../qwen_latent_cot/diagnostics/cli.py)|唯一执行入口、配置与C0门槛|
+
+当前保留C checkpoint做文本GEN读取；L实现继续保留。GEN入口支持只提供 `--text-checkpoint`，无需视觉模型；目前没有GEN多卡分片/汇总启动器，`--distributed`仅用于训练。下一步所需数据与分片合同见[实验](experiments.md#当前首跑c的颜色消费)。
 
 当前没有hidden/KV对齐、教师logit KL、语义读出或GEN响应蒸馏。C1的caption KV是writer输入来源；不等于以其hidden作为蒸馏目标。后续扩展按[设计](design.md)新增teacher响应与损失，保留现有CE基线。
 

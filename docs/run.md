@@ -1,6 +1,6 @@
 # 运行
 
-状态：适用于当前CE实现。更新：2026-10-12。
+状态：C1已完成并保留C；GEN首跑需准备数据与分片启动器。更新：2026-10-12。
 
 [返回 README](../README.md)
 
@@ -60,7 +60,7 @@ memory-topology calibrate --model "$MODEL" --data "$DATA" --device "$DEVICE" \
 
 ## 3. 训练与评测
 
-### modelarts-job：C1首跑
+### 已完成的C1首跑（仅供复现）
 
 C0已按[验证记录](validation.md)人工放行，范围仅为原生文本语义读取。首跑使用 [c1_pilot.json](../configs/c1_pilot.json) 与 [c1_text80.jsonl](../data/c1_text80.jsonl)：64/8/8条文本、100步、全局batch16、每50步验证。L/C依次各用16卡联合训练，只更新writer；每组处理1,600条训练样本。模板文本不代表图像核验数据。
 
@@ -76,53 +76,34 @@ tail -f "$OUT.log"
 
 结果分别位于 `$OUT/L`、`$OUT/C`。`train.jsonl`记录全局NLL、16卡全局样本和同步后梯度范数；验证与checkpoint仅由rank0写入。检查自由输出与错配事实，再决定是否扩展训练。此入口没有断点恢复。
 
-### 通用入口
+### 当前固定checkpoint与下一步
+
+后续只使用C，不重跑上面的L/C首跑脚本：
 
 ```bash
-# 2. 相同预算训练 C1-L/C；输出 init.pt、best.pt、last.pt。
-for TOPOLOGY in L C; do
-  python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=16 \
-    -m qwen_latent_cot.diagnostics.cli train --distributed \
-    --model "$MODEL" --data "$DATA" --device "$DEVICE" \
-    --stage C1 --topology "$TOPOLOGY" --c0-pass "$OUT/c0/calibration.json" \
-    --output "$OUT/c1_$TOPOLOGY"
-done
-
-# 3. 各自从 C1 的共同验证规则所选 checkpoint 迁移至 C2。
-for TOPOLOGY in L C; do
-  python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=16 \
-    -m qwen_latent_cot.diagnostics.cli train --distributed \
-    --model "$MODEL" --data "$DATA" --device "$DEVICE" \
-    --stage C2 --topology "$TOPOLOGY" --checkpoint "$OUT/c1_$TOPOLOGY/best.pt" \
-    --c0-pass "$OUT/c0/calibration.json" --output "$OUT/c2_$TOPOLOGY"
-done
-
-# 4. 测试集 Caption 对照；分别评估 init、best、last。
-for TOPOLOGY in L C; do
-  memory-topology caption --model "$MODEL" --data "$DATA" --device "$DEVICE" \
-    --stage C1 --topology "$TOPOLOGY" --checkpoint "$OUT/c1_$TOPOLOGY/init.pt" \
-    --output "$OUT/c1_init_test_$TOPOLOGY"
-  memory-topology caption --model "$MODEL" --data "$DATA" --device "$DEVICE" \
-    --stage C1 --topology "$TOPOLOGY" --checkpoint "$OUT/c1_$TOPOLOGY/best.pt" \
-    --output "$OUT/c1_test_$TOPOLOGY"
-  memory-topology caption --model "$MODEL" --data "$DATA" --device "$DEVICE" \
-    --stage C2 --topology "$TOPOLOGY" --checkpoint "$OUT/c2_$TOPOLOGY/best.pt" \
-    --output "$OUT/c2_test_$TOPOLOGY"
-done
-
-# 5. GEN 局部阶梯。原 prompt 保留，CFG 分支保持原生。
-for TOPOLOGY in L C; do
-  memory-topology gen --model "$MODEL" --data "$DATA" --device "$DEVICE" \
-    --topology "$TOPOLOGY" --text-checkpoint "$OUT/c1_$TOPOLOGY/best.pt" \
-    --visual-checkpoint "$OUT/c2_$TOPOLOGY/best.pt" \
-    --c0-pass "$OUT/c0/calibration.json" --output "$OUT/gen_$TOPOLOGY"
-done
-
-# 6. 合并相同模型、数据、源码和配置的结果，生成四张表。
-memory-topology report --runs "$OUT/c1_test_L" "$OUT/c1_test_C" \
-  "$OUT/c2_test_L" "$OUT/c2_test_C" "$OUT/gen_L" "$OUT/gen_C" \
-  --output "$OUT/report"
+export MODEL=/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT
+export C1_C=/root/outputs/c1_pilot_20261012_113553/C/best.pt
+export C0_PASS=/root/outputs/c0_text16_20261012_111241/calibration.json
 ```
+
+C为step 100，SHA256与选择原因见[验证](validation.md#4-c1结果与拓扑选择)。checkpoint保持不变，不覆盖原输出，不按GEN结果重选。
+
+下一步先准备[GEN颜色校准](experiments.md#当前首跑c的颜色消费)的16张核验图像与8个场景对。每个worker的数据必须包含一对及双方 `swap_id`，图像路径使用绝对路径或按分片文件位置正确解析。与其对应的worker配置保留默认接口参数和 `train_t`，仅将 `eval_t`设为 `[0.5,1.0]`、`noise_seeds`设为该worker的 `[0]`或 `[1]`；GEN入口跳过t=1，不额外采样。按 `pair_id × seed`分配16个worker，输出目录分别独立，汇总时按原场景对聚合。
+
+下面是**分片启动器内部的单worker模板**，不是16卡总启动命令。`PAIR_DATA/WORKER_CONFIG/WORKER_OUT`及16卡分片/汇总启动器尚待准备；C0启动器只支持16条文本，不能直接复用。
+
+```bash
+/root/venvs/bagel-NPU/bin/python -m qwen_latent_cot.diagnostics.cli gen \
+  --model "$MODEL" --data "$PAIR_DATA" --config "$WORKER_CONFIG" \
+  --device npu:0 --split test --topology C --text-checkpoint "$C1_C" \
+  --c0-pass "$C0_PASS" --output "$WORKER_OUT"
+```
+
+启动器为每个worker设置对应的 `ASCEND_RT_VISIBLE_DEVICES`，进程内部设备为 `npu:0`。GEN不传 `--distributed`、`--visual-checkpoint`或 `--continue-sampling`。先用速度、预测图与7组既有对照判断消费接口，结果与继续条件见[实验](experiments.md)。当前C1文本数据没有图像，不可直接作为GEN输入。
+
+### 后续C2（尚未启动）
+
+只有文本Memory在GEN颜色任务中产生合理语义作用、预测图未出现明显损伤后，才准备独立图像-caption训练/验证数据。C2沿用C拓扑，以 `$C1_C`初始化，caption仅用于监督。使用16卡联合训练，暂不恢复L或scratch组；GEN首轮校准数据不混入C2训练后再当独立测试。响应蒸馏若先成为下一步，需要实现损失入口后另给启动命令。
 
 ## 4. 轨迹与后续采样
 
