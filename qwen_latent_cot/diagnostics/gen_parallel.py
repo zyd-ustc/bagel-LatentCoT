@@ -33,15 +33,15 @@ def digest(path):
     return result.hexdigest()
 
 
-def prepare(data, config, output, model, checkpoint, c0):
+def prepare(data, config, output, model, checkpoint, c0, eval_t=None, noise_seeds=None, time_groups=1):
     from .data import load_dataset
     data = Path(data).resolve()
     if not data.is_file():
         raise FileNotFoundError(f'Missing verified color manifest: {data}; raw CoRT/edit manifests are not caption ground truth')
     rows = load_dataset(data)
-    if len(rows) != 16 or any(row['split'] != 'test' or row['label_type'] != 'clean'
+    if not rows or len(rows) % 2 or any(row['split'] != 'test' or row['label_type'] != 'clean'
                               or not row.get('image') or row.get('state') for row in rows):
-        raise ValueError('GEN color pilot requires exactly 16 verified clean test images, not trajectory states')
+        raise ValueError('GEN color pilot requires verified clean test image pairs, not trajectory states')
     pairing_modes = {row.get('pairing', 'controlled_color_pair') for row in rows}
     if len(pairing_modes) != 1 or not pairing_modes <= {'controlled_color_pair', 'unrelated_scene_mismatch'}:
         raise ValueError('dataset must declare one supported pairing mode')
@@ -53,8 +53,15 @@ def prepare(data, config, output, model, checkpoint, c0):
         if not row.get('pair_id') or not row.get('prompt'):
             raise ValueError('every color row requires pair_id and the same color-free pair prompt')
         groups.setdefault(row['pair_id'], []).append(row)
-    if len(groups) != 8:
-        raise ValueError('GEN pilot requires eight scene pairs')
+    times = list(eval_t if eval_t is not None else [0.5])
+    seeds = list(noise_seeds if noise_seeds is not None else [0, 1])
+    if not times or len(set(times)) != len(times) or any(not 0 < t < 1 for t in times):
+        raise ValueError('eval times must be distinct actual flow values between 0 and 1')
+    if not seeds or len(set(seeds)) != len(seeds) or not 1 <= time_groups <= len(times):
+        raise ValueError('distinct noise seeds and valid time groups are required')
+    buckets = [times[i*len(times)//time_groups:(i+1)*len(times)//time_groups] for i in range(time_groups)]
+    if len(groups)*len(seeds)*len(buckets) != 16:
+        raise ValueError('pair count times seed count times time groups must equal 16 workers')
     for pair in groups.values():
         if len(pair) != 2 or pair[0].get('swap_id') != pair[1]['sample_id'] or pair[1].get('swap_id') != pair[0]['sample_id']:
             raise ValueError('each pair must contain two reciprocal swap partners')
@@ -76,7 +83,7 @@ def prepare(data, config, output, model, checkpoint, c0):
     if calibration.get('passed') is not True:
         raise ValueError('C0 semantic readout gate has not been accepted')
     common = json.loads(Path(config).read_text())
-    common.update(eval_t=[0.5, 1.0], noise_seeds=[0, 1])
+    common.update(eval_t=times+[1.0], noise_seeds=seeds)
     checkpoint_hash = digest(checkpoint)
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -84,22 +91,23 @@ def prepare(data, config, output, model, checkpoint, c0):
     (output/'workers').mkdir()
     tasks = []
     for pair_id, pair in sorted(groups.items()):
-        for seed in (0, 1):
-            device = len(tasks)
-            name = f'device_{device:02d}'
-            shard = output/'inputs'/f'{name}.jsonl'
-            shard.write_text(''.join(json.dumps(row)+'\n' for row in pair))
-            worker_config = dict(common, noise_seeds=[seed])
-            config_path = output/'inputs'/f'{name}.json'
-            write_json(config_path, worker_config)
-            tasks.append(dict(device=device, pair_id=pair_id, seed=seed,
-                              sample_ids=[row['sample_id'] for row in pair],
-                              data=str(shard), config=str(config_path),
-                              output=str(output/'workers'/name)))
+        for seed in seeds:
+            for bucket in buckets:
+                device = len(tasks)
+                name = f'device_{device:02d}'
+                shard = output/'inputs'/f'{name}.jsonl'
+                shard.write_text(''.join(json.dumps(row)+'\n' for row in pair))
+                worker_config = dict(common, noise_seeds=[seed], eval_t=bucket+[1.0])
+                config_path = output/'inputs'/f'{name}.json'
+                write_json(config_path, worker_config)
+                tasks.append(dict(device=device, pair_id=pair_id, seed=seed, eval_t=bucket,
+                                  sample_ids=[row['sample_id'] for row in pair],
+                                  data=str(shard), config=str(config_path),
+                                  output=str(output/'workers'/name)))
     plan = dict(data=str(data), dataset_hash=digest(data), common_config=common,
                 model=str(Path(model).resolve()), checkpoint=str(Path(checkpoint).resolve()),
                 checkpoint_hash=checkpoint_hash, c0=str(Path(c0).resolve()), tasks=tasks,
-                samples=16, states=32, expected_records=224, topology='C', continuation=False, pairing=pairing)
+                samples=len(rows), states=len(rows)*len(times)*len(seeds), expected_records=len(rows)*len(times)*len(seeds)*len(ARMS), topology='C', continuation=False, pairing=pairing)
     write_json(output/'plan.json', plan)
     return plan
 
@@ -115,18 +123,20 @@ def aggregate(output, plan):
         if reference is not None and contract != reference:
             raise ValueError('workers used different models, source, capacity or checkpoints')
         reference = contract
-        expected_config = dict(plan['common_config'], noise_seeds=[task['seed']])
+        worker_times = task.get('eval_t', [0.5])
+        expected_config = dict(plan['common_config'], noise_seeds=[task['seed']], eval_t=worker_times+[1.0])
         if manifest['config'] != expected_config or manifest['topology'] != 'C' or not manifest['status'].startswith('executed'):
             raise ValueError('worker configuration/status differs from the GEN plan')
         if manifest['dataset_hash'] != digest(task['data']) or manifest['checkpoints']['text_checkpoint'] != plan['checkpoint_hash']:
             raise ValueError('worker dataset or retained checkpoint changed')
         rows = read_jsonl(worker/'gen.jsonl')
         keys = {(row['sample_id'], row['t'], row['noise_seed'], row['arm']) for row in rows}
-        expected = {(sample, 0.5, task['seed'], arm) for sample in task['sample_ids'] for arm in ARMS}
-        if len(rows) != 14 or keys != expected or any(row['frozen_guard'] != 'passed' for row in rows):
+        expected = {(sample, t, task['seed'], arm) for sample in task['sample_ids'] for t in worker_times for arm in ARMS}
+        if len(rows) != len(expected) or keys != expected or any(row['frozen_guard'] != 'passed' for row in rows):
             raise ValueError('worker did not produce every requested sample/arm at the frozen fixed state')
         for row in rows:
-            name = f"{row['sample_id']}_000_{row['arm']}_x0_hat.png"
+            state_index = worker_times.index(row["t"])
+            name = f"{row['sample_id']}_{state_index:03d}_{row['arm']}_x0_hat.png"
             image = worker/name
             if not image.is_file():
                 raise FileNotFoundError(image)
@@ -164,7 +174,7 @@ def aggregate(output, plan):
         writer = csv.writer(stream)
         writer.writerow(['blind_file', 'observed_color', 'unchanged_facts', 'quality', 'artifacts', 'notes'])
         writer.writerows([[row['blind_file'], '', '', '', '', ''] for row in mapping])
-    write_json(output/'summary.json', dict(samples=16, scene_pairs=8, states=32, records=len(records),
+    write_json(output/'summary.json', dict(samples=plan['samples'], scene_pairs=plan['samples']//2, states=plan['states'], records=len(records),
                topology='C', pairing=plan['pairing'], checkpoint_hash=plan['checkpoint_hash'], numeric_by_arm=numeric,
                frozen_guard='passed', continuation=False, image_kind='x0_hat',
                semantics='pending factual review; numeric sensitivity is not semantic success',
@@ -224,11 +234,14 @@ def main():
     parser.add_argument('--c0-pass', default='/root/outputs/c0_text16_20261012_111241/calibration.json')
     parser.add_argument('--config', default=str(root/'configs/c1_pilot.json'))
     parser.add_argument('--output', required=True)
+    parser.add_argument('--eval-t', type=float, nargs='+', default=[0.5])
+    parser.add_argument('--noise-seeds', type=int, nargs='+', default=[0, 1])
+    parser.add_argument('--time-groups', type=int, default=1, help='split each pair/seed across this many time buckets')
     parser.add_argument('--prepare-only', action='store_true', help='write shards and plan without loading BAGEL')
     args = parser.parse_args()
     data = args.data or str(Path(args.dataset_root)/'memory_gen_color16.jsonl')
-    plan = prepare(data, args.config, args.output, args.model, args.checkpoint, args.c0_pass)
-    print(f'Prepared 16 tasks, 32 states and 224 prediction images: {args.output}', flush=True)
+    plan = prepare(data, args.config, args.output, args.model, args.checkpoint, args.c0_pass, args.eval_t, args.noise_seeds, args.time_groups)
+    print(f'Prepared 16 tasks, {plan["states"]} states and {plan["expected_records"]} prediction images: {args.output}', flush=True)
     if not args.prepare_only:
         launch(Path(args.output).resolve(), plan)
 

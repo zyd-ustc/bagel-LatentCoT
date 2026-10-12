@@ -67,3 +67,20 @@ def test_missing_arm_cannot_be_reported_as_complete(tmp_path):
     with pytest.raises(ValueError,match='every requested'):
         aggregate(output,plan)
     assert not (output/'summary.json').exists()
+
+
+def test_three_times_partition_across_sixteen_workers(tmp_path):
+    output, original = setup_plan(tmp_path)
+    data = Path(original['data'])
+    rows = [json.loads(line) for line in data.read_text().splitlines()][:4]
+    data.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    plan = prepare(data, tmp_path/'config.json', tmp_path/'recheck', tmp_path/'model',
+                   tmp_path/'best.pt', tmp_path/'c0.json', [0.7, 0.8, 0.9], [0, 1, 2, 3], 2)
+    assert len(plan['tasks']) == 16
+    assert plan['samples'] == 4 and plan['states'] == 48 and plan['expected_records'] == 336
+    actual = [(sample, t, task['seed']) for task in plan['tasks']
+              for sample in task['sample_ids'] for t in task['eval_t']]
+    assert len(actual) == len(set(actual)) == 48
+    for task in plan['tasks']:
+        config = json.loads(Path(task['config']).read_text())
+        assert config['eval_t'] == task['eval_t']+[1.0]

@@ -131,3 +131,17 @@ C2-scratch 使用 `train --stage C2 --scratch`，省略 `--checkpoint`，两组�
 GEN 局部结果通过语义检查后，使用新输出目录加 `--continue-sampling` 做后续采样。每个 arm 只在选定节点读取一次 Memory，随后恢复原生。先按协议固定小规模数据及节点，避免默认展开所有 t×arm。匿名图像与 `blind_annotations.csv` 用于分别核验事实和画质；`blind_key.json` 不交给盲评者。
 
 默认配置为 [memory_topology.json](../configs/memory_topology.json)。训练上限是每组 5,000 optimizer steps、有效 batch 32，微批为 1；每 250 步验证。支持writer数据并行训练；尚不支持断点恢复。输出目录必须为空，失败和已完成运行不会被覆盖。
+
+### 三个噪声条件复查
+
+固定原C checkpoint，使用 `memory_gen_recheck4.jsonl`中的2个异场景swap对。16卡按2对×4个seed×2组t分配，各组为 `[0.7]`和 `[0.8,0.9]`。共4张图、48个状态、336张局部预测图；同图跨t保持相同noise seed。
+
+```bash
+OUT=/root/outputs/gen_recheck_C_t789_20261012
+nohup /root/venvs/bagel-NPU/bin/python -u scripts/gen_npu.py \
+  --data /data/zyd_workspace/bagel-LatentCoT/datasets/memory_gen_recheck4.jsonl \
+  --eval-t 0.7 0.8 0.9 --noise-seeds 0 1 2 3 --time-groups 2 \
+  --output "$OUT" > "$OUT.log" 2>&1 < /dev/null &
+```
+
+输出目录必须全新。本轮只复查现有7组条件，未续采样、未打开BAGEL参数。

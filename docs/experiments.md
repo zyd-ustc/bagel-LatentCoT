@@ -131,3 +131,9 @@ Caption decoder只能读取Memory、固定指令和答案前缀。教师强制�
 按2026-10-12的推进安排，从 `qwen_latent_cot_v3_adapted_20260816/manifests/cort36k_test.jsonl`流式采样16张终态图像，red/blue各8张，seed=20261012。只读取入选原图，不遍历解码大图像库。先目视核对图像，再写简短caption；源prompt单独保留，不直接作真值。
 
 这些图像来自不同场景。用共同prompt `An image.`，8个异场景swap对、2个噪声seed分配16卡，沿用C checkpoint、t=0.5和7组对照，产生224张局部预测图。清单标记 `pairing=unrelated_scene_mismatch`。人工比较原图、原生文本桥与学生Memory的作用、错配响应和伪影。异场景swap不能证明颜色独立控制；这轮不报告受控颜色成功率，也不启动C2。
+
+### t=0.7/0.8/0.9复查
+
+首轮人工审查认为图像看起来一致。原始PNG的32状态平均像素绝对差（0–255）：G-TC与G-swap-TC为0.539，G-text与G-base为1.864。前者未显示明显内容作用，教师文本在该节点也影响较弱。
+
+因此沿用首轮的sample_pair_01与sample_pair_04，共4张图，在actual t=0.7/0.8/0.9复查。4个noise seed配合2组t使用16卡，产生48状态、336张局部预测图。先检查教师文本是否产生可辨语义作用，再判断学生Memory。若高噪声仅增加伪影而教师仍无可辨作用，修订评测；不据此直接认定学生失败，也不进入C2。
