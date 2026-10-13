@@ -220,3 +220,11 @@ modelarts-job，`/root/outputs/visual_observe_full_20261012`，16卡C2-observe�
 工程核对：各组本图状态相同；12/12交换来源状态哈希与交换图正确组相符；12/12交换caption与交换图正确组相同；每个t下四张图的关闭来源caption相同。新增来源对照测试通过。
 
 2026-10-13，审查记录：正确来源组的caption在t较小时与图像的语义相关性较强；t>0.75后开始出现模板化文字和与图像无关的文字。
+
+## 16槽Memory浅层文生图入口
+
+2026-10-13接入已训练的连续Memory，使用C2-observe 1000步 `best.pt`。推理保留每条prompt的原生文本prefill；Memory使用固定中性文本初始化。GEN 0–7层在同一采样状态下重复运行，每遍重置GEN入口hidden。每次反馈从中性种子重新开始连续UND写入：UND 0–7层读取当前对应GEN KV，UND 8–27层继续以Memory自注意力更新。最终一遍GEN读取新Memory，GEN 8–27层仅运行一次。原生prompt KV保持原样，CFG无条件分支使用原生路径。
+
+本次R2/R3/R4表示浅层GEN总共运行2/3/4遍，对应1/2/3次Memory反馈。early10/20表示前10/20次采样更新启用循环。启动入口为 `scripts/shallow_memory_npu.sh`，默认 `data/prompts32.jsonl` 前16条、seed0、16卡各负责一个prompt，生成六个组合，共96张。分辨率512，原生50个时间节点、shift3、CFG4，执行49次采样更新。
+
+工程验证：59项本地测试通过。modelarts-job单卡加载上述checkpoint，分别执行R2/R3/R4的一个采样步并保存结果，输出 `/root/outputs/shallow_memory_smoke_20261013`。完整生成尚未执行。

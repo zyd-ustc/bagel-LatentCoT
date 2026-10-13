@@ -54,7 +54,7 @@ class VisualStudent(nn.Module):
         # Not part of optimizer, student state or broadcast parameter collection.
         object.__setattr__(self, 'text_teacher', teacher)
 
-    def write(self, source, t, *, source_off=False, visual=True, detach_source=True):
+    def write(self, source, t, *, source_off=False, visual=True, detach_source=True, source_layers=None):
         runtime = self.runtime
         positions = torch.arange(runtime.config['writer_position_start'],
                                  runtime.config['writer_position_start']+self.writer.slots,
@@ -63,7 +63,7 @@ class VisualStudent(nn.Module):
             return self.writer(runtime.seeds, source, positions, source_off,
                                source_kind='visual' if visual else 'text', t=t,
                                visual_adapter=self.visual if visual else None,
-                               detach_source=detach_source)
+                               detach_source=detach_source, source_layers=source_layers)
 
     @torch.no_grad()
     def teacher_bank(self, caption):

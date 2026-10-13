@@ -193,7 +193,7 @@ class MemoryWriter(nn.Module):
         self.to(device=decoder.embed_tokens.weight.device)
 
     def forward(self, seeds, source, positions, source_off=False, *, source_kind='text',
-                t=None, visual_adapter=None, detach_source=True):
+                t=None, visual_adapter=None, detach_source=True, source_layers=None):
         count = len(self.decoder.layers)
         if len(seeds) != count or len(source) != count:
             raise ValueError('seeds and source must cover ALL decoder layers')
@@ -218,7 +218,7 @@ class MemoryWriter(nn.Module):
                 if t is None or not 0 <= float(t) <= 1:
                     raise ValueError('visual writing requires actual t in [0, 1]')
                 query_adapter = lambda normalized, i=index: visual_adapter(i, normalized, t)
-            u = und_block(layer, h, rope, slot_lengths, None if source_off else origin,
+            u = und_block(layer, h, rope, slot_lengths, None if source_off or (source_layers is not None and index not in source_layers) else origin,
                           query_adapter=query_adapter)
             hidden = u + adapter(u)
             _, k, v = project(layer.self_attn, layer.input_layernorm(hidden))

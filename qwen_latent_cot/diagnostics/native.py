@@ -35,7 +35,7 @@ def text_source(bundle, texts):
 
 @contextmanager
 def capture_gen(decoder, conditional_cache, *, t=None, round_index=0,
-                positions=None, detach=True, source_policy='full_query'):
+                positions=None, detach=True, source_policy='full_query', layers=None):
     """Observe native normalized GEN input KV without mutating its layout.
 
     Capture only the conditional branch. GEN image queries retain native GEN
@@ -43,6 +43,7 @@ def capture_gen(decoder, conditional_cache, *, t=None, round_index=0,
     """
     if source_policy not in ('full_query', 'image_only'):
         raise ValueError('unknown GEN source policy')
+    selected_layers = tuple(range(len(decoder.layers))) if layers is None else tuple(layers)
     captured = {}; handles = []
     def observer(index):
         def hook(attention, args, kwargs):
@@ -73,9 +74,10 @@ def capture_gen(decoder, conditional_cache, *, t=None, round_index=0,
         return hook
     try:
         for i, layer in enumerate(decoder.layers):
-            handles.append(layer.self_attn.register_forward_pre_hook(observer(i), with_kwargs=True))
+            if i in selected_layers:
+                handles.append(layer.self_attn.register_forward_pre_hook(observer(i), with_kwargs=True))
         yield captured
-        if sorted(captured) != list(range(len(decoder.layers))):
+        if sorted(captured) != sorted(selected_layers):
             raise RuntimeError('native GEN source capture did not cover every layer')
     finally:
         for h in handles:
@@ -124,7 +126,7 @@ def free_caption(bundle, instruction_ids, prefix=None, start=0, max_tokens=96):
 
 
 @contextmanager
-def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_positions, masked=False):
+def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_positions, masked=False, *, wrap_decoder=True):
     """Keep native prompt; append 16 slots for ONE conditional decoder call.
 
     CFG branches remain native. G-layout reserves identical indices/positions
@@ -196,13 +198,14 @@ def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_pos
             return out, conditional_cache
         return call
     try:
-        decoder.forward_inference = MethodType(decoder_call, decoder)
+        if wrap_decoder:
+            decoder.forward_inference = MethodType(decoder_call, decoder)
         for i, layer in enumerate(decoder.layers):
             attn = layer.self_attn
             originals.append((attn, attn.forward_inference))
             attn.forward_inference = MethodType(attention_call(i, attn.forward_inference), attn)
         yield
-        if call_count != 1:
+        if wrap_decoder and call_count != 1:
             raise RuntimeError('Memory must be consumed exactly once')
     finally:
         decoder.forward_inference = original_decoder
