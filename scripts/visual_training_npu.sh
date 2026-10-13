@@ -2,7 +2,7 @@
 # E0 single-NPU first; all main visual/loop training and evaluation default 16 NPUs.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-MODE=${1:?usage: bash scripts/visual_training_npu.sh check|observe|joint|loop|eval|sample|label-states fresh_output [extra arguments]}
+MODE=${1:?usage: bash scripts/visual_training_npu.sh check|observe|joint|loop|eval|sample|label-states|source-review fresh_output [extra arguments]}
 RUN=${2:?fresh output directory required}
 shift 2
 [[ ! -e "$RUN" ]] || { echo 'Use a fresh output directory' >&2; exit 1; }
@@ -20,6 +20,7 @@ case "$MODE" in
   eval) COMMAND=eval; CONFIG=${VISUAL_STAGE_CONFIG:-visual_memory_pilot} ;;
   sample) COMMAND=sample; CONFIG=${VISUAL_STAGE_CONFIG:-memory_loop_r2} ;;
   label-states) COMMAND=label-states; CONFIG=visual_memory_pilot ;;
+  source-review) COMMAND=source-review; CONFIG=${VISUAL_STAGE_CONFIG:-visual_memory_pilot} ;;
   *) echo 'Unknown visual mode' >&2; exit 1 ;;
 esac
 CONFIG=${DIAGNOSTIC_CONFIG:-$ROOT/configs/$CONFIG.json}
@@ -34,7 +35,7 @@ ARGS=(-m qwen_latent_cot.diagnostics.visual_cli "$COMMAND" --device npu --model 
 if [[ "$COMMAND" == train ]]; then ARGS+=(--text-data "$TEXT_DATA"); fi
 if [[ -n ${VISUAL_PARENT:-} ]]; then ARGS+=(--checkpoint "$VISUAL_PARENT"); fi
 if [[ -n ${VISUAL_RESUME:-} ]]; then ARGS+=(--resume "$VISUAL_RESUME"); fi
-if [[ "$MODE" == joint || "$MODE" == loop || "$MODE" == eval || "$MODE" == sample ]]; then
+if [[ "$MODE" == joint || "$MODE" == loop || "$MODE" == eval || "$MODE" == sample || "$MODE" == source-review ]]; then
   [[ -n ${VISUAL_PARENT:-} || -n ${VISUAL_RESUME:-} ]] || { echo 'Set VISUAL_PARENT or VISUAL_RESUME to the selected visual checkpoint' >&2; exit 1; }
 fi
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}

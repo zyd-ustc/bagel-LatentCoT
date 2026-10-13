@@ -41,6 +41,28 @@ def test_visual_zero_and_off_restore_C_writer(lm):
         torch.testing.assert_close(a.values, c.values, rtol=0, atol=0)
 
 
+def test_source_caption_review_preserves_recipient_state_and_swaps_only_source(visual_runtime, tmp_path):
+    from qwen_latent_cot.diagnostics.source_review import source_review
+    runtime, row = visual_runtime
+    runtime.config['max_caption_tokens'] = 4
+    blue = tmp_path/'donor.png'; Image.new('RGB', (32,32), 'blue').save(blue)
+    donor = dict(row, sample_id='b', scene_id='b', family_id='b', image=str(blue),
+                 caption='a blue token', target_caption='a blue token', swap_id='a')
+    row = dict(row, swap_id='b')
+    student = VisualStudent(runtime)
+    result = source_review(student, [(row,.75,0),(donor,.75,0)], [row,donor], tmp_path/'review')
+    by = {(r['sample_id'],r['arm']):r for r in result}
+    assert len(result)==6
+    assert by['a','Correct']['state']==by['a','Source-swap']['state']
+    assert by['a','Source-swap']['source_state']==by['b','Correct']['source_state']
+    assert by['a','Correct']['state']['x_t_hash']!=by['a','Source-swap']['source_state']['x_t_hash']
+    assert by['a','Source-swap']['caption']['text']==by['b','Correct']['caption']['text']
+    assert by['a','Source-off']['caption']['text']==by['b','Source-off']['caption']['text']
+    assert all(not r['gen_memory_injection'] for r in result)
+    cost=json.loads((tmp_path/'review/execution.json').read_text())
+    assert cost['gen_entries']==4
+
+
 def test_paired_state_and_native_conditional_parity(visual_runtime):
     runtime, row = visual_runtime
     for t in (.25, .75, .9, 1.):

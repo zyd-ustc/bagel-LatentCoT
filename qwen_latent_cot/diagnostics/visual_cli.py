@@ -37,7 +37,7 @@ def load_input_rows(args, cfg):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['check', 'train', 'eval', 'sample', 'label-states'])
+    parser.add_argument('command', choices=['check', 'train', 'eval', 'sample', 'label-states', 'source-review'])
     parser.add_argument('--model', required=True)
     parser.add_argument('--data', required=True)
     parser.add_argument('--text-data')
@@ -57,6 +57,8 @@ def main(argv=None):
     parser.add_argument('--skip-validation', action='store_true', help='resource checks only; no selected best checkpoint')
     parser.add_argument('--eval-t', nargs='+', type=float)
     parser.add_argument('--noise-seeds', nargs='+', type=int)
+    parser.add_argument('--review-t', nargs='+', type=float, default=[.25, .75, .9],
+                        help='source-review states; leaves training evaluation policy unchanged')
     parser.add_argument('--rounds', choices=[1, 2], type=int)
     parser.add_argument('--images', action='store_true', help='save local x0/CFG prediction and blind review table')
     parser.add_argument('--continue-sampling', action='store_true', help='selected actual native node + complete native suffix')
@@ -84,8 +86,10 @@ def main(argv=None):
             parser.error('25% global replay requires --text-data with existing train/val captions')
         if stage != 'C2-observe' and not (args.checkpoint or args.resume):
             parser.error('joint/loop training must start from a selected visual parent')
-    if args.command in ('eval', 'sample') and not args.checkpoint:
+    if args.command in ('eval', 'sample', 'source-review') and not args.checkpoint:
         parser.error('evaluation requires --checkpoint')
+    if args.command == 'source-review' and any(not 0 <= t < 1 for t in args.review_t):
+        parser.error('source-review requires actual t in [0,1)')
     output = Path(args.output).resolve()
     if parallel.rank() == 0:
         if output.exists() and any(output.iterdir()):
@@ -137,6 +141,14 @@ def main(argv=None):
         elif args.command == 'check':
             from .flow_checks import check
             check(student, selected, output)
+        elif args.command == 'source-review':
+            from .source_review import source_review, summarize_source_review
+            tasks = [(row, t, seed) for row in selected for t in args.review_t for seed in cfg['noise_seeds']]
+            directory = output/f'rank_{parallel.rank():02d}' if args.distributed else output
+            source_review(student, tasks[parallel.rank()::parallel.world_size()], rows, directory)
+            parallel.barrier()
+            if parallel.rank() == 0:
+                summarize_source_review(output, args.checkpoint)
         else:
             # Family allocation keeps all variants of one scene on the same worker.
             families = sorted({row['family_id'] for row in selected})
