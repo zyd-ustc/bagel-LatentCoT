@@ -97,7 +97,7 @@ $$
 
 ## 5. 生成状态反馈闭环（已实现，语义与画质待验证）
 
-第1–4节描述已有文本方法；第5–9节的首版视觉query适配、完整GEN联合目标及R2反馈已在NPU分支实现。2026-10-12，Ascend E0数值与梯度检查通过；正式视觉训练、语义收益和最终画质尚未验证。实施依据为工作区配套文件 `artifacts/docs_reference/gen_memory_loop_training_plan_20261012.md`。启动入口与配置见[README](../README.md#视觉反馈训练npu)，实际检查见[实验记录](experiments.md#10-视觉闭环实现与ascend-e0)。
+第1–4节描述已有文本方法；第5–9节的首版视觉query适配、完整GEN联合目标及R2反馈已在NPU分支实现。Ascend E0检查、C2-observe 1000步训练及4图caption来源对照已执行；完整GEN联合训练、R2收益和最终画质尚未验证。实施依据为工作区配套文件 `artifacts/docs_reference/gen_memory_loop_training_plan_20261012.md`。实际推理流程见[推理](inference.md)，启动入口见[README](../README.md#视觉反馈训练npu)，实际结果见[实验记录](experiments.md#12-c2-observe及固定来源对照)。
 
 下一阶段有三个独立目标：
 

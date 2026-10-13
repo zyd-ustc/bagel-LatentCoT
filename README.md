@@ -4,11 +4,12 @@
 
 Memory以固定中性文本初始化，经过连续UND层更新，并在每层加入可训练的低秩残差。训练先使用Caption语义读出，再加入GEN注意力响应蒸馏。原prompt和全部BAGEL参数保留；只更新新增残差模块。
 
-最新人工审查：累计1100步响应训练后，在原4张图、t=0.9的局部预测对照中，**G-TC与G-text效果基本持平**。G-TC使用16槽文本Memory，G-text使用原生caption条件。这是所测样例的定性结果，未进行最终采样画质或视觉Memory评测。
+文本Memory人工审查：累计1100步响应训练后，在原4张图、t=0.9的局部预测对照中，**G-TC与G-text效果基本持平**。G-TC使用16槽文本Memory，G-text使用原生caption条件。这是所测样例的定性结果，未进行最终采样画质评测。视觉Memory来源对照见[实验记录](docs/experiments.md#12-c2-observe及固定来源对照)。
 
 ## 文档
 
 - [设计](docs/design.md)：连续Memory、中性初始化、低秩残差及两种已验证的文本训练方法及视觉反馈实现。
+- [推理](docs/inference.md)：来源捕获、连续UND写入、GEN消费、R1/R2循环、CFG及完整采样；含16卡命令和代码索引。
 - [实验](docs/experiments.md)：training-free探索、C0/C1、GEN对照与两轮响应训练的真实记录。
 
 ## 快速开始
