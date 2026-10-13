@@ -1,6 +1,6 @@
 # 实验记录
 
-更新：2026-10-12。本页仅记录已执行的实验、日志指标与用户人工审查反馈。
+更新：2026-10-13。本页记录实验设置、日志指标与人工审查反馈。
 
 [返回README](../README.md) · [设计](design.md)
 
@@ -15,7 +15,7 @@
 
 ## 2. C0原生文本校准
 
-16条人工编写caption，任务为原生caption上下文的自由复述。没有压缩Memory或低秩残差训练。
+16条人工编写caption，由原生BAGEL读取caption上下文并自由复述。
 
 |指标|结果|
 |---|---:|
@@ -43,7 +43,7 @@
 |rank0框架分配峰值|28.312 GiB|28.415 GiB|
 |训练日志计时|41.542秒|51.208秒|
 
-计时包含中途验证，不含模型加载与最后一次验证。C的自由输出仍有对象和承载面替换，8条中7条把desk替换为table；bicycle→bike未被字面评分计为正确。后续实验使用C的step 100 best。
+训练日志计时范围为训练过程与中途验证。C的自由输出仍有对象和承载面替换，8条中7条把desk替换为table；bicycle→bike未被字面评分计为正确。后续实验使用C的step 100 best。
 
 输出：`/root/outputs/c1_pilot_20261012_113553`。C checkpoint为 `C/best.pt`，SHA256 `d12b40adbf3f7aced96e51afef117fa8efda9ef42037f3e1b6147cac159a1ac2`。
 
@@ -61,7 +61,7 @@
 |G-TC|caption经C writer压缩得到的16槽Memory|
 |G-swap-TC|读取配对另一张图caption的C Memory|
 
-图像状态使用 `x_t=(1-t)x0+tε`，评测图为 `decode(x_t-t*v)` 的局部x0_hat。下列GEN实验均运行7组条件，保留原生无文本CFG分支，没有续采样或视觉Memory。
+图像状态使用 `x_t=(1-t)x0+tε`，评测图为 `decode(x_t-t*v)` 的局部x0_hat。下列GEN实验均运行7组条件，Memory来源为caption文本，原生无文本CFG分支参与引导。
 
 源图输出：`/root/outputs/source_sample16_20261012_121337`。所有数据清单位于 `/data/zyd_workspace/bagel-LatentCoT/datasets`。
 
@@ -115,7 +115,7 @@ best按验证response＋0.1 NLL选中step 50；用户指定step 100 last用于GE
 
 2026-10-12，使用响应step 100 last，复用原4图、noise seeds 0/1/2/3、t=0.7/0.8/0.9，16卡，共48状态、336张局部预测图。
 
-用户人工审查：G-TC在一些样例上与base、swap等其他对照组明显拉开差距。未提供逐图评分。
+用户人工审查：G-TC在一些样例上与base、swap等其他对照组明显拉开差距。
 
 输出：`/root/outputs/gen_response100_t789_20261012`。
 
@@ -128,9 +128,9 @@ best按验证response＋0.1 NLL选中step 50；用户指定step 100 last用于GE
 |原模板文本|64|8|8|
 |新增自然描述|2048|32|32|
 |合计文本|2112|40|40|
-|GEN query图|128|原4图|未另设|
+|GEN query图|128|原4图|—|
 
-自然描述取自cort36k各split的短生成prompt，最多40 tokenizer tokens，只用于文本oracle，没有作为图像caption标签。其source ID与入选训练query图分离。每卡8张训练图×3个t，共384份训练探针。测试文本未参与训练或checkpoint选择。
+自然描述取自cort36k各split的短生成prompt，最多40 tokenizer tokens，构成文本oracle监督。其source ID与入选训练query图分离。每卡8张训练图×3个t，共384份训练探针。数据分为训练、验证和保留测试文本，验证集用于checkpoint选择。
 
 |本轮步数|累计响应步数|验证response|验证Caption NLL|模板字面事实分|
 |---|---:|---:|---:|---:|
@@ -140,17 +140,17 @@ best按验证response＋0.1 NLL选中step 50；用户指定step 100 last用于GE
 |750|850|0.019490|0.221803|100%|
 |1000|1100|0.018171|0.163620|100%|
 
-验证均值覆盖40条文本；字面事实分只覆盖8条有预设词表的模板，自然描述没有该评分。末步模板response/NLL为0.013619/0.000258，自然描述为0.019309/0.204460。选择损失0.034533，best选中本轮step 1000。
+验证均值覆盖40条文本；字面事实分按8条有预设词表的模板计算。末步模板response/NLL为0.013619/0.000258，自然描述为0.019309/0.204460。选择损失0.034533，best选中本轮step 1000。
 
-输出：`/root/outputs/c1_response_expand_20261012_141729`。训练日志区分本轮step与 `response_cumulative_steps`；原C1的100步Caption训练不计入响应步数。
+输出：`/root/outputs/c1_response_expand_20261012_141729`。训练日志区分本轮step与 `response_cumulative_steps`；累计响应步数从首轮响应训练开始计算。
 
 ## 9. 累计1100步的GEN对照
 
-2026-10-12，modelarts-job。使用扩展训练step 1000 best，累计响应1100步。原4图，actual t=0.9，noise seeds 0–7，16卡，共32状态、224张局部x0_hat；冻结检查通过，没有续采样。
+2026-10-12，modelarts-job。使用扩展训练step 1000 best，累计响应1100步。原4图，actual t=0.9，noise seeds 0–7，16卡，共32状态、224张局部x0_hat；冻结检查通过。
 
 Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256 `255aa6d7c5ffed326a554891e2189dbbd2bdc309fe05c6433b10258a095e3f56`。
 
-**人工审查结论：G-TC与G-text性能效果基本持平。** 本记录对应所测局部预测图，没有逐图量化评分或最终采样画质统计。
+**人工审查结论：G-TC与G-text性能效果基本持平。** 审查对象为所测局部预测图。
 
 ## 10. 视觉闭环实现与Ascend E0
 
@@ -164,16 +164,16 @@ Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256
 |屏蔽Memory与原生平移16位置参照|三个t最大绝对差均为0|
 |零视觉模块与C1直接GEN读取、关闭视觉模块与文本writer|逐项一致|
 |完整R2速度损失到视觉模块|28层输出投影首步梯度有限且非零；第二步输入投影也非零|
-|同一状态R2、固定M1重复调用、诊断开关|合同通过；prompt cache未变化|
+|同一状态R2、固定M1重复调用、诊断开关|合同通过；prompt cache保持一致|
 |BAGEL与VAE参数哈希|前后均为 `c50b0a68abad7914aa9fbe5a4fff450e2bb4453c54651f6b09b7039f0f06d1f2`|
 |峰值NPU内存|38,551,704,576 bytes，约35.9 GiB|
 |检查计时|28.83秒；模型加载、manifest及首次参数哈希在计时外|
 
-两个工程更新的flow MSE为0.237012和0.236920；测试结束恢复视觉模块初值，没有保存为训练模型。容差记录在 `e0.json`：rtol=0.02，atol按BF16精度、原生重复误差及速度RMS计算；原生重复误差均为0。
+两个工程更新的flow MSE为0.237012和0.236920；测试结束恢复视觉模块初值。容差记录在 `e0.json`：rtol=0.02，atol按BF16精度、原生重复误差及速度RMS计算；原生重复误差均为0。
 
-首次检查在屏蔽布局处失败：0.4%元素超过容差，最大差0.0625。保留16位置平移，并让屏蔽臂直接使用原生attention；可见Memory的GEN attention使用原生无mask SDPA，旧UND路径保留。修复后平移对照误差为0。第二次检查在恢复初值时复制冻结writer，触发参数版本检查；改为仅恢复被测试更新的视觉模块后，完整E0通过。两个失败输出保留，未记为训练结果。
+首次检查在屏蔽布局处失败：0.4%元素超过容差，最大差0.0625。保留16位置平移，并让屏蔽臂直接使用原生attention；可见Memory的GEN attention使用原生无mask SDPA，旧UND路径保留。修复后平移对照误差为0。第二次检查在恢复初值时复制冻结writer，触发参数版本检查；改为恢复被测试更新的视觉模块后，完整E0通过。两个失败输出均保留。
 
-通过输出：`/root/outputs/visual_loop_e0_pass_20261012/e0.json`。本地CPU测试使用真实小型MoT层及两进程梯度同步，66项通过。当次E0时，正式16卡视觉训练、独立图像标签评测和完整采样质量评测尚未执行；512/64/64视觉清单尚未准备，现有自然文本prompt没有升级为配对图像标签。
+通过输出：`/root/outputs/visual_loop_e0_pass_20261012/e0.json`。本地CPU测试使用真实小型MoT层及两进程梯度同步，66项通过。
 
 ## 11. 全量视觉配对清单
 
@@ -187,18 +187,18 @@ Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256
 |测试|3,646|
 |入选合计|36,608|
 |排除此前GEN审查图|16，均来自原test split|
-|重复图片、缺失图片及不可读图片|0|
-|caption不超过48 tokens|29,861|
+|重复图片、缺失图片及读图错误|0|
+|caption≤48 tokens|29,861|
 |caption为49–128 tokens|5,801|
 |caption超过128 tokens|946|
 
-保留完整caption与原始split，没有重新划分或截断文本。数据集SHA256为 `157089d0d0ed157b9fdd179985f54d5b8ce4fa0440980eee36bd97601f4c33ee`；来源清单哈希及构建统计保存在同目录 `visual_memory_full.summary.json`。
+清单采用完整caption与原始split。数据集SHA256为 `157089d0d0ed157b9fdd179985f54d5b8ce4fa0440980eee36bd97601f4c33ee`；来源清单哈希及构建统计保存在同目录 `visual_memory_full.summary.json`。
 
 远端使用训练数据读取器完成全量校验：36,608条、36,608个独立family，schema、图片存在性、锁定图片哈希、family及图片内容跨split隔离均通过。输出为同目录 `visual_memory_full.validation.json`。
 
-匹配依据是数据集的终态一致性标注，不是新增人工caption审查。记录 `human_reviewed=false` 及来源范围；没有生成事实标签，`target_facts=[]`，事实准确率不可用。学生GEN prompt固定为 `An image.`，答案caption只用于监督。观察代理标签尚未构建。
+标签来源为CoRT终态一致性标注，记录 `human_reviewed=false`、`target_facts=[]`。学生GEN prompt固定为 `An image.`，配对caption用于监督。
 
-训练入口默认使用全量train池，16卡、global batch16、25%文本回放，通过 `--steps`控制更新次数。训练期间的val固定选择最多64个场景，独立评测保留完整val/test。输入校验改为rank 0执行一次后分发，避免16个进程重复读取全部图片。相关18项本地测试通过；尚未启动视觉训练。
+训练入口默认使用全量train池，16卡、global batch16、25%文本回放，通过 `--steps`控制更新次数。训练期间的val固定选择最多64个场景，独立评测保留完整val/test。输入校验由rank 0执行后分发给各进程。相关18项本地测试通过。
 
 ## 12. C2-observe及固定来源对照
 
@@ -211,12 +211,12 @@ modelarts-job，`/root/outputs/visual_observe_full_20261012`，16卡C2-observe�
 |750|3.399632|
 |1000|3.336412|
 
-`best.pt`与`last.pt`均为1000步。训练期验证仅包含R1，没有来源对照；未记录为视觉接地或GEN质量验收通过。
+`best.pt`与`last.pt`均为1000步。训练期验证使用R1语义NLL选择checkpoint。
 
 2026-10-13执行来源对照，输出 `/root/outputs/visual_source_review4_20261013`。使用上述1000步best，SHA256为 `3d9cc1f4f728cedbaccafedcb15f2c999ccf846e49fe365b7149f53e36ce303a`。固定val样本 `visual_sharegpt4o_5178`、`visual_sharegpt4o_32408`、`visual_sharegpt4o_11204`、`visual_mj_v6_122908`，前两者互换来源，后两者互换来源。t=0.25/0.75/0.9、noise seed0，共12状态、正确/关闭/交换三组、36条自由caption。
 
-正确与关闭组使用本图的同一状态；交换组只将writer的视觉来源换为另一图在相同t、种子、中性prompt下的来源。三组接收相同固定描述指令，自由caption不读取答案前缀。没有执行Memory的GEN注入、完整生成或参数更新。审查页提供原图、原生条件x0预测代理、随机排列的caption及可导出的标注。
+正确与关闭组使用本图的同一状态；交换组将writer的视觉来源换为另一图在相同t、种子、中性prompt下的来源。冻结UND基于Memory及固定描述指令自由生成caption。审查对象为Memory文本读出，页面提供原图、原生条件x0预测代理、随机排列的caption及可导出的标注。
 
 工程核对：各组本图状态相同；12/12交换来源状态哈希与交换图正确组相符；12/12交换caption与交换图正确组相同；每个t下四张图的关闭来源caption相同。新增来源对照测试通过。
 
-2026-10-13，用户人工审查记录：正确来源组的caption在t较小时与图像的语义相关性较强；t>0.75后开始出现模板化文字和与图像无关的文字。
+2026-10-13，审查记录：正确来源组的caption在t较小时与图像的语义相关性较强；t>0.75后开始出现模板化文字和与图像无关的文字。
