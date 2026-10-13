@@ -200,6 +200,40 @@ Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256
 
 训练入口默认使用全量train池，16卡、global batch16、25%文本回放，通过 `--steps`控制更新次数。训练期间的val固定选择最多64个场景，独立评测保留完整val/test。输入校验由rank 0执行后分发给各进程。相关18项本地测试通过。
 
+## 视觉读出与同状态反馈的对照臂
+
+下列对照在同一 $(x_t,t)$ 上比较 Memory 的来源或反馈，读出与速度的计算见[设计](design.md)。第 4 节的 G-base 至 G-swap-TC 仍是文本 Memory 的 GEN 条件对照，这里不重复。
+
+文本读出使用冻结 UND，上下文只有该臂的 Memory 和固定描述指令。
+
+|臂|来源|
+|---|---|
+|正确来源，Correct|本图在该状态的 GEN 来源|
+|关闭来源，Source-off|writer 不读取外部来源，只按 Memory 自身更新|
+|交换来源，Source-swap|另一张图在相同 prompt、$t$ 和种子下的 GEN 来源|
+
+同状态第二轮按反馈臂更换 writer 的输入。每轮仍从中性种子重写，固定臂除外。
+
+|臂|第二轮使用的材料|
+|---|---|
+|新反馈，R2-new|第一轮 GEN 消费 Memory 之后的来源|
+|旧反馈，R2-old|最初的原生 GEN 来源|
+|固定 Memory，R2-fixed|第一份 Memory，本轮不再重写|
+|交换反馈，R2-swap|另一张图在相同 prompt 与 $t$ 下、消费 Memory 后的 GEN 来源|
+
+R2-fixed 的条件速度与 R1 对齐，用来检查重复消费。交换臂要求供体与本图的 prompt 和 $t$ 相同。
+
+观察有四种出口：
+
+|观察|呈现|
+|---|---|
+|Memory caption|UND 从该臂 Memory 自由生成的文本|
+|局部预测|当前速度对应的 $\hat{x}_0=x_t-t\,v$，再经 VAE 解码|
+|续采样|选定时间节点注入该速度，其后沿原生采样后缀|
+|完整采样|反馈窗口内按该臂更新，窗口之后沿原生过程走到终点|
+
+来源提取阶段的原生预览使用 $v_{\mathrm{native}}$，与 caption 分属图像预测和文本读出。
+
 ## 12. C2-observe及固定来源对照
 
 modelarts-job，`/root/outputs/visual_observe_full_20261012`，16卡C2-observe完成1000步。训练期间只优化语义损失，read/gen权重为0；BAGEL、VAE、文本writer及教师冻结检查通过。固定64个val场景、4个种子，排除t=1后的1536个状态用于checkpoint选择。
