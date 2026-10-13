@@ -55,6 +55,8 @@ VISUAL_PARENT=/root/outputs/visual_joint_full/best.pt \
 
 视觉响应教师是独立冻结的1100步C1 writer，压缩为16槽；师生探针与真实消费均预留16位置。观察标签必须绑定实际t、noise seed和状态SHA256，未审查代理不进入确认指标。新checkpoint保存writer、视觉模块、冻结教师、优化器、随机状态和数据哈希；旧C1/C2接口保留。
 
+`source-review`只比较正确、关闭、交换视觉来源的Memory caption。固定状态分配给16个进程，不执行GEN注入或训练。运行后用 `python scripts/render_source_review.py <run目录>`生成盲审页；组别可揭示，标注可导出。原图与原生预测预览分别标明，预览不当作hidden真值。
+
 ## 许可
 
 代码采用[Apache-2.0](LICENSE)。模型权重与外部数据使用各自许可证。

@@ -199,3 +199,22 @@ Checkpoint：`/root/outputs/c1_response_expand_20261012_141729/best.pt`，SHA256
 匹配依据是数据集的终态一致性标注，不是新增人工caption审查。记录 `human_reviewed=false` 及来源范围；没有生成事实标签，`target_facts=[]`，事实准确率不可用。学生GEN prompt固定为 `An image.`，答案caption只用于监督。观察代理标签尚未构建。
 
 训练入口默认使用全量train池，16卡、global batch16、25%文本回放，通过 `--steps`控制更新次数。训练期间的val固定选择最多64个场景，独立评测保留完整val/test。输入校验改为rank 0执行一次后分发，避免16个进程重复读取全部图片。相关18项本地测试通过；尚未启动视觉训练。
+
+## 12. C2-observe及固定来源对照
+
+modelarts-job，`/root/outputs/visual_observe_full_20261012`，16卡C2-observe完成1000步。训练期间只优化语义损失，read/gen权重为0；BAGEL、VAE、文本writer及教师冻结检查通过。固定64个val场景、4个种子，排除t=1后的1536个状态用于checkpoint选择。
+
+|Step|验证R1语义NLL|
+|---:|---:|
+|250|3.579268|
+|500|3.469990|
+|750|3.399632|
+|1000|3.336412|
+
+`best.pt`与`last.pt`均为1000步。训练期验证仅包含R1，没有来源对照；未记录为视觉接地或GEN质量验收通过。
+
+2026-10-13执行来源对照，输出 `/root/outputs/visual_source_review4_20261013`。使用上述1000步best，SHA256为 `3d9cc1f4f728cedbaccafedcb15f2c999ccf846e49fe365b7149f53e36ce303a`。固定val样本 `visual_sharegpt4o_5178`、`visual_sharegpt4o_32408`、`visual_sharegpt4o_11204`、`visual_mj_v6_122908`，前两者互换来源，后两者互换来源。t=0.25/0.75/0.9、noise seed0，共12状态、正确/关闭/交换三组、36条自由caption。
+
+正确与关闭组使用本图的同一状态；交换组只将writer的视觉来源换为另一图在相同t、种子、中性prompt下的来源。三组接收相同固定描述指令，自由caption不读取答案前缀。没有执行Memory的GEN注入、完整生成或参数更新。审查页提供原图、原生条件x0预测代理、随机排列的caption及可导出的标注。
+
+工程核对：各组本图状态相同；12/12交换来源状态哈希与交换图正确组相符；12/12交换caption与交换图正确组相同；每个t下四张图的关闭来源caption相同。新增来源对照测试通过。人工审查尚未完成，没有写入语义质量结论。
