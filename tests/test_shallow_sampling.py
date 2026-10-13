@@ -39,3 +39,38 @@ def test_shallow_counts_cfg_cache_and_restoration(visual_runtime, passes):
     for i, (k, v) in enumerate(snapshot):
         torch.testing.assert_close(cache.key_cache[i], k, rtol=0, atol=0)
         torch.testing.assert_close(cache.value_cache[i], v, rtol=0, atol=0)
+
+
+def test_base_uses_native_velocity_without_memory(visual_runtime, monkeypatch):
+    import qwen_latent_cot.diagnostics.shallow_sampling as module
+    runtime, row = visual_runtime
+    student = VisualStudent(runtime)
+    runtime.config.update(sampler_steps=4, timestep_shift=3.)
+    monkeypatch.setattr(runtime, 'image', lambda x: x)
+    def unexpected(*args, **kwargs):
+        raise AssertionError('Base entered Memory loop')
+    monkeypatch.setattr(module, 'shallow_loop', unexpected)
+    image, records = module.sample(student, 'a red token', 0, 1, 0, steps=2)
+    assert torch.isfinite(image).all()
+    assert len(records) == 2 and all(r['und_layer_calls'] == 0 for r in records)
+
+
+def test_shared_random_selection_and_portable_page(tmp_path):
+    import json
+    from qwen_latent_cot.diagnostics.shallow_review import prepare, render
+    source = tmp_path/'prompts.jsonl'
+    source.write_text('\n'.join(json.dumps(dict(prompt=f'<prompt {i}>', prompt_id=str(i))) for i in range(32)))
+    output = tmp_path/'run'
+    plan = prepare(source, output, 16, [2,3,4], [10,20], 123)
+    indexes = [r['source_index'] for r in plan['rows']]
+    assert len(set(indexes)) == 16 and indexes != list(range(16))
+    assert json.loads((output/'selection.json').read_text()) == plan
+    again = prepare(source, tmp_path/'repeat', 16, [2,3,4], [10,20], 123)
+    assert again['rows'] == plan['rows']
+    for i in range(16):
+        for arm in ['base']+[f'early{e}_R{r}' for e in [10,20] for r in [2,3,4]]:
+            (output/f'p{i:02d}_{arm}.png').touch()
+    render(output)
+    page = (output/'index.html').read_text()
+    assert page.count('<img ') == 112
+    assert '&lt;prompt' in page and 'p00_base.png' in page

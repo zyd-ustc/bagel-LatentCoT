@@ -87,7 +87,7 @@ def sample(student, prompt, seed, passes, early, *, steps=None):
     for index, (current, following) in enumerate(zip(times, times[1:])):
         if steps is not None and index >= steps:
             break
-        active = index < early
+        active = passes > 1 and index < early
         with shallow_loop(student, flow, lengths, positions, current, passes) if active else nullcontext():
             _, velocity = runtime.velocity(x, current, flow)
         x = x-(current-following)*velocity
@@ -110,11 +110,25 @@ def main():
     parser.add_argument('--count', type=int, default=16)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--smoke-steps', type=int)
+    parser.add_argument('--selection-seed', type=int)
+    parser.add_argument('--prepare-only', action='store_true')
     args = parser.parse_args()
     rank = int(os.environ.get('LOCAL_RANK', 0))
     world = int(os.environ.get('WORLD_SIZE', 1))
     if any(r < 2 for r in args.passes) or any(e <= 0 for e in args.early):
         parser.error('passes must be >=2 and early windows must be positive')
+    from .shallow_review import prepare
+    if args.prepare_only:
+        prepare(args.prompts, args.output, args.count, args.passes, args.early, args.selection_seed)
+        return
+    output = Path(args.output)
+    plan_path = output/'selection.json'
+    if not plan_path.exists():
+        if world != 1:
+            raise ValueError('prepare the shared selection before launching workers')
+        prepare(args.prompts, args.output, args.count, args.passes, args.early, args.selection_seed)
+    plan = json.loads(plan_path.read_text())
+    rows = plan['rows']
     from ..bagel.accelerator import set_device
     device = set_device(f'npu:{rank}')
     saved = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -125,11 +139,6 @@ def main():
     runtime = DiagnosticRuntime(load_native(args.model, device, cfg['timestep_shift']), cfg, 'C')
     runtime.native_files = saved['native_files']
     student = initialize_student(runtime, args.text_checkpoint, args.checkpoint).eval()
-    rows = [json.loads(line) for line in Path(args.prompts).read_text().splitlines() if line.strip()][:args.count]
-    if len(rows) != args.count:
-        raise ValueError('prompt dataset has fewer rows than requested')
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
     metadata = dict(checkpoint=args.checkpoint, checkpoint_sha256=file_hash(args.checkpoint),
                     checkpoint_step=saved['step'], trained_source_prompt_policy=cfg['source_prompt_policy'],
                     inference_source_prompt_policy='native_prompt', slots=student.writer.slots,
@@ -137,21 +146,26 @@ def main():
                     writer_suffix='continuous self-attention', writer_reset='each_feedback',
                     gen_layer_window=[0, 7], rounds_meaning='total_shallow_passes',
                     seed=args.seed, sampling_config={k: cfg[k] for k in ('resolution','sampler_steps','timestep_shift','cfg_text_scale')},
-                    world_size=world, smoke_steps=args.smoke_steps)
+                    world_size=world, smoke_steps=args.smoke_steps, selection_seed=plan['selection_seed'])
     write_json(output/f'worker_{rank:02d}.json', metadata)
     for index in range(rank, len(rows), world):
         row = rows[index]
-        for early in args.early:
-            for passes in args.passes:
-                name = f'p{index:02d}_early{early}_R{passes}'
-                if (output/(name+'.png')).exists():
-                    raise FileExistsError(name)
-                image, nodes = sample(student, row['prompt'], args.seed, passes, early, steps=args.smoke_steps)
-                image.save(output/(name+'.png'))
-                write_json(output/(name+'.json'), dict(metadata, prompt_index=index,
-                           prompt_id=row.get('prompt_id'), prompt=row['prompt'], early=early,
-                           passes=passes, nodes=nodes))
-                print(f'Rank {rank}: saved {name}', flush=True)
+        arms = [(1, 0, 'base')] + [(r, e, f'early{e}_R{r}')
+                                    for e in plan['early'] for r in plan['passes']]
+        for passes, early, suffix in arms:
+            name = f'p{index:02d}_{suffix}'
+            if (output/(name+'.png')).exists():
+                raise FileExistsError(name)
+            image, nodes = sample(student, row['prompt'], args.seed, passes, early, steps=args.smoke_steps)
+            image.save(output/(name+'.png'))
+            write_json(output/(name+'.json'), dict(metadata, prompt_index=index,
+                       source_index=row['source_index'], arm=suffix,
+                       prompt_id=row.get('prompt_id'), prompt=row['prompt'], early=early,
+                       passes=passes, nodes=nodes))
+            print(f'Rank {rank}: saved {name}', flush=True)
+    if world == 1:
+        from .shallow_review import render
+        render(output)
 
 
 if __name__ == '__main__':
