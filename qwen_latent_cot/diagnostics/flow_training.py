@@ -18,9 +18,10 @@ class TrainingState:
     lengths: tuple
     positions: list
     metadata: dict
+    prompt_kv: tuple | None = None
 
     def flow_target(self):
-        if self.x0 is None or self.epsilon is None:
+        if self.x0 is None or self.epsilon is None or not self.metadata.get('flow_supervision', False):
             raise ValueError('trajectory has no paired epsilon-x0 flow target')
         return self.epsilon.float()-self.x0.float()
 

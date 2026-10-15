@@ -204,7 +204,9 @@ class MemoryWriter(nn.Module):
         hidden = seeds[0].detach()
         bank = []
         for index, (layer, adapter) in enumerate(zip(self.decoder.layers, self.adapters)):
-            if source[index].layer != index or source[index].lengths != lengths:
+            # Layer windows change token counts, never the packed sample count.
+            same_layout = len(source[index].lengths) == samples
+            if source[index].layer != index or not same_layout:
                 raise ValueError('source must preserve layer and sample layout')
             h = seeds[index].detach() if self.topology == 'L' else hidden
             if h.shape != seeds[0].shape or len(h) != sum(slot_lengths):

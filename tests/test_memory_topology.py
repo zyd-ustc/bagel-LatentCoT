@@ -249,14 +249,18 @@ def test_train_transfer_caption_and_gen_pipeline(runtime, tmp_path):
     train(runtime, rows, 'C1', c1)
     assert (c1/'best.pt').exists() and (c1/'last.pt').exists()
     c2 = tmp_path/'c2'; c2.mkdir()
-    train(runtime, rows, 'C2', c2, str(c1/'best.pt'))
-    assert (c2/'best.pt').exists()
+    # Historical C2 checkpoints remain diagnostic inputs; C2 training now has
+    # one implementation in visual_training (covered by test_visual_loop).
+    with pytest.raises(ValueError, match='visual training'):
+        train(runtime, rows, 'C2', c2, str(c1/'best.pt'))
+    from qwen_latent_cot.diagnostics.record import save_checkpoint
+    save_checkpoint(c2/'fixture.pt', runtime, 0, 'C2')
     cap = tmp_path/'caption'; cap.mkdir()
     evaluated = evaluate(runtime, rows[2:], 'C2', cap)
     assert {'Correct', 'Source-off', 'Source-swap', 'Memory-swap', 'Memory-masked', 'Pure-noise'} <= {r['arm'] for r in evaluated}
     runtime.config['eval_t'] = [.5]
     gen = tmp_path/'gen'; gen.mkdir()
-    diagnose_gen(runtime, rows[2:], gen, str(c1/'best.pt'), str(c2/'best.pt'), continuation=True)
+    diagnose_gen(runtime, rows[2:], gen, str(c1/'best.pt'), str(c2/'fixture.pt'), continuation=True)
     records = [json.loads(line) for line in (gen/'gen.jsonl').read_text().splitlines()]
     assert {'G-base', 'G-layout', 'G-fixed', 'G-neutral', 'G-text', 'G-TL', 'G-VL', 'G-swap-TL', 'G-swap-VL'} == {r['arm'] for r in records}
     assert (gen/'blind_annotations.csv').exists()
@@ -272,9 +276,9 @@ def test_train_transfer_caption_and_gen_pipeline(runtime, tmp_path):
     swap_rows = [r for r in evaluated if 'swap' in r['arm']]
     assert all(r['intervention_evidence_group'] == 'donor_bank_swap' for r in swap_rows)
     assert all(r['equivalent_to'] == 'Source-swap' for r in swap_rows if r['arm'] == 'Memory-swap')
-    train_records = [json.loads(line) for line in (c2/'train.jsonl').read_text().splitlines()]
+    train_records = [json.loads(line) for line in (c1/'train.jsonl').read_text().splitlines()]
     assert all(g['k_max'] > 0 and g['v_max'] > 0 for g in train_records[0]['memory_gradient_audit'])
-    assert train_records[0]['sampled_states'][0]['t'] in runtime.config['train_t']
+    assert train_records[0]['sampled_states'][0]['t'] is None
 
 
 def test_checkpoint_rejects_native_provenance_change(runtime, tmp_path):

@@ -1,7 +1,6 @@
 """Prompt-only generation with trained continuous Memory and shallow GEN passes."""
 import argparse
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -12,6 +11,7 @@ from .memory import rope_for
 from .record import write_json
 from .data import file_hash
 from .schedule import native_times
+from .feedback_source import prompt_source
 
 
 @contextmanager
@@ -19,7 +19,7 @@ def shallow_loop(student, flow, lengths, positions, t, passes, end_layer=8):
     """Reset GEN entrance each pass; reset neutral writer seeds each feedback.
 
     UND runs continuously through all layers. Only the shallow window supplies
-    GEN sources; the UND suffix uses self-attention. Final GEN suffix reads the
+    GEN sources; the UND suffix continues to read prompt. Final GEN suffix reads the
     final bank once. Unconditional CFG stays on its native path.
     """
     decoder = student.runtime.decoder
@@ -27,7 +27,10 @@ def shallow_loop(student, flow, lengths, positions, t, passes, end_layer=8):
         raise ValueError('require at least two passes and a valid shallow window')
     original = decoder.forward_inference
     cache = flow['past_key_values']
-    source_layers = tuple(range(end_layer))
+    prompt = prompt_source(flow, lengths, positions)
+    source_layers = tuple(student.runtime.config.get('source_layers', range(end_layer)))
+    if not source_layers or max(source_layers) >= end_layer:
+        raise ValueError('shallow pass must reach every trained source layer')
 
     def forward(self, **kwargs):
         if kwargs.get('mode') != 'gen' or kwargs.get('past_key_values') is not cache:
@@ -54,11 +57,8 @@ def shallow_loop(student, flow, lengths, positions, t, passes, end_layer=8):
                 for layer in decoder.layers[:limit]:
                     hidden, _ = layer(packed_query_sequence=hidden, **inputs)
             if iteration < passes-1:
-                # Writer validates full-depth layout; inactive origins are placeholders
-                # and are explicitly excluded from UND attention by source_layers.
-                source = tuple(captured[i] if i < end_layer else replace(captured[0], layer=i)
-                               for i in range(len(decoder.layers)))
-                bank = student.write(source, t, source_layers=source_layers)
+                bank = student.write(tuple(captured[i] for i in source_layers), t,
+                                     prompt=prompt, source_layers=source_layers)
         result = torch.zeros_like(hidden)
         ti, ii = kwargs['packed_text_indexes'], kwargs['packed_vae_token_indexes']
         result[ti] = decoder.norm(hidden[ti])
@@ -88,13 +88,15 @@ def sample(student, prompt, seed, passes, early, *, steps=None):
         if steps is not None and index >= steps:
             break
         active = passes > 1 and index < early
-        with shallow_loop(student, flow, lengths, positions, current, passes) if active else nullcontext():
+        end_layer = max(runtime.config.get('source_layers', range(min(8, len(runtime.decoder.layers)))))+1
+        with shallow_loop(student, flow, lengths, positions, current, passes, end_layer) if active else nullcontext():
             _, velocity = runtime.velocity(x, current, flow)
         x = x-(current-following)*velocity
         records.append(dict(step=index, t=current, next_t=following,
                             shallow_passes=passes if active else 1,
-                            conditional_gen_layer_calls=28+(passes-1)*8 if active else 28,
-                            und_layer_calls=(passes-1)*28 if active else 0))
+                            passes=passes if active else 1, feedback_updates=passes-1 if active else 0,
+                            conditional_gen_layer_calls=len(runtime.decoder.layers)+(passes-1)*end_layer if active else len(runtime.decoder.layers),
+                            und_layer_calls=(passes-1)*len(runtime.decoder.layers) if active else 0))
     return runtime.image(x), records
 
 
@@ -142,9 +144,9 @@ def main():
     metadata = dict(checkpoint=args.checkpoint, checkpoint_sha256=file_hash(args.checkpoint),
                     checkpoint_step=saved['step'], trained_source_prompt_policy=cfg['source_prompt_policy'],
                     inference_source_prompt_policy='native_prompt', slots=student.writer.slots,
-                    memory_initialization='fixed_neutral_prefill', writer_source_layers=list(range(8)),
-                    writer_suffix='continuous self-attention', writer_reset='each_feedback',
-                    gen_layer_window=[0, 7], rounds_meaning='total_shallow_passes',
+                    memory_initialization='fixed_neutral_prefill', writer_source_layers=cfg.get('source_layers', list(range(8))),
+                    writer_suffix='prompt and memory self-attention', writer_reset='each_feedback',
+                    gen_layer_window=cfg.get('source_layers', list(range(8))), rounds_meaning='total_GEN_passes',
                     seed=args.seed, sampling_config={k: cfg[k] for k in ('resolution','sampler_steps','timestep_shift','cfg_text_scale')},
                     world_size=world, smoke_steps=args.smoke_steps, selection_seed=plan['selection_seed'])
     write_json(output/f'worker_{rank:02d}.json', metadata)

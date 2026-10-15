@@ -105,7 +105,7 @@ def main():
                 seen_ids[sid] = split; seen_images[image_hash] = split
                 row = dict(sample_id='visual_' + sid, scene_id=sid, family_id=sid,
                     split=split, image=str(image), image_sha256=image_hash,
-                    image_width=width, image_height=height, prompt='An image.',
+                    image_width=width, image_height=height, prompt=caption,
                     label_kind='target_clean', label_type='clean', verified=True,
                     target_caption=caption, target_facts=[], caption_token_count=tokens,
                     label_origin='cort36k_terminal_consistency_annotation', human_reviewed=False,
@@ -127,7 +127,7 @@ def main():
         split_policy='source split unchanged; duplicate content priority test > val > train',
         image_policy='terminal image only; byte SHA256 deduplication',
         label_policy='source consistency labels; no new manual review; no invented fact annotations',
-        caption_policy='complete source prompt, no truncation; neutral student GEN prompt',
+        caption_policy='complete source prompt, no truncation; training stage chooses deployment/neutral GEN prompt',
         excluded_legacy_manifest=str(legacy) if legacy.exists() else None,
         fact_metrics='unavailable: target_facts is empty; use captions/NLL and image review',
         training_budget='all training pairs in pool; number of updates controlled by --steps')

@@ -38,6 +38,8 @@ class DiagnosticRuntime:
         with autocast_for(self.device):
             self.seeds = neutral_seeds(self.decoder, torch.tensor(ids, device=self.device))
         self.instruction_ids = self.prompt_ids(config['caption_instruction'])
+        self.feedback_instruction_ids = self.prompt_ids(
+            config.get('label_instructions', {}).get('feedback', config['caption_instruction']))
         self.c0_instruction_ids = self.prompt_ids(config['c0_instruction'])
         self._neutral_context = None
 
@@ -82,18 +84,39 @@ class DiagnosticRuntime:
         _, c, h, w = latent.shape
         return torch.einsum('chpwq->hwpqc', latent[0].reshape(c, h//p, p, w//p, p)).reshape(-1, p*p*c)
 
-    def flow_inputs(self, prompt):
-        cache, lengths, positions = self.prompt_context(prompt)
+    @torch.no_grad()
+    def flow_inputs(self, prompt, condition_images=()):
+        def prefix(text):
+            cache, lengths, positions = self.prompt_context(text) if text else (empty_cache(self.decoder), [0], [0])
+            for path in condition_images:
+                import numpy as np
+                size = self.config['resolution']
+                def transform(image):
+                    return torch.from_numpy(np.array(image.resize((size, size), Image.Resampling.BICUBIC))).permute(2, 0, 1).float()/127.5-1
+                with Image.open(path) as image:
+                    inputs, lengths, positions = self.model.prepare_vae_images(
+                        lengths, positions, [image.convert('RGB')], transform, self.bundle.token_ids)
+                inputs = device_inputs(inputs, self.device)
+                inputs['padded_images'] = inputs['padded_images'].to(next(self.bundle.vae.parameters()).dtype)
+                with seeded_context(self.device, self.image_posterior_seed(path)), autocast_for(self.device):
+                    cache = self.model.forward_cache_update_vae(self.bundle.vae, cache, **inputs)
+            return cache, lengths, positions
+        cache, lengths, positions = prefix(prompt)
         size = self.config['resolution']
-        # Native preparation samples unused initial noise; isolate that RNG.
         with seeded_context(self.device, 0):
             flow = self.model.prepare_vae_latent(lengths, positions, [(size, size)], self.bundle.token_ids)
         flow.pop('packed_init_noises')
-        flow = device_inputs(flow, self.device)
-        flow['past_key_values'] = cache
-        cfg = self.model.prepare_vae_latent_cfg([0], [0], [(size, size)])
+        flow = device_inputs(flow, self.device); flow['past_key_values'] = cache
+        # Text CFG removes P and retains the native image condition.
+        text_cache, text_lengths, text_positions = prefix('')
+        cfg = self.model.prepare_vae_latent_cfg(text_lengths, text_positions, [(size, size)])
         flow.update({k.replace('cfg_', 'cfg_text_', 1): v for k, v in device_inputs(cfg, self.device).items()})
-        flow['cfg_text_past_key_values'] = empty_cache(self.decoder)
+        flow['cfg_text_past_key_values'] = text_cache
+        if condition_images:
+            image_cache, image_lengths, image_positions = self.prompt_context(prompt)
+            cfg = self.model.prepare_vae_latent_cfg(image_lengths, image_positions, [(size, size)])
+            flow.update({k.replace('cfg_', 'cfg_img_', 1): v for k, v in device_inputs(cfg, self.device).items()})
+            flow['cfg_img_past_key_values'] = image_cache
         return flow, lengths, positions
 
     @torch.no_grad()
@@ -106,12 +129,16 @@ class DiagnosticRuntime:
                 raise ValueError('requested t/seed differs from trajectory metadata')
             if (saved.get('sampler_steps'), saved.get('timestep_shift')) != (self.config['sampler_steps'], self.config['timestep_shift']):
                 raise ValueError('trajectory native sampler grid differs from runtime configuration')
+            if saved.get('native_files') and saved['native_files'] != self.native_files:
+                raise ValueError('trajectory comes from a different native model')
             x = saved['x_t'].to(self.device)
             source = 'trajectory'; step = saved['step_index']; posterior_seed = None
             prompt = row['prompt']
         else:
             if row['label_type'] != 'clean' or not row.get('image'):
                 raise ValueError('controlled visual states require verified clean image labels')
+            if row.get('image_sha256') and row['image_sha256']!=file_hash(row['image']):
+                raise ValueError('image asset changed since corpus build')
             posterior_seed = self.image_posterior_seed(row['image'])
             x0 = self.encode_image(row['image'], posterior_seed)
             x = controlled_noise(x0, t, noise_seed)
@@ -121,50 +148,53 @@ class DiagnosticRuntime:
         metadata = dict(state_source=source, t=t, step_index=step, noise_seed=noise_seed,
                         posterior_seed=posterior_seed, posterior_seed_base=self.config['posterior_seed'],
                         posterior_seed_policy=self.config['posterior_seed_policy'], x_t_hash=tensor_hash(x),
-                        prompt=prompt, label_type=row['label_type'])
+                        prompt=prompt, label_type=row['label_type'],
+                        sampler_steps=self.config['sampler_steps'], timestep_shift=self.config['timestep_shift'])
+        if row.get('state'):
+            metadata.update({key:saved[key] for key in ('checkpoint_hash', 'requested_t', 'native_files') if key in saved})
         return x, flow, lengths, positions, metadata
 
     @torch.no_grad()
     def training_state(self, row, t, noise_seed):
-        """Keep sampled epsilon/x0; trajectory states deliberately have no flow target."""
+        """Task controls the prompt and label scope; only explicit targets permit flow."""
         from .flow_training import TrainingState
-        if not 0 <= float(t) <= 1:
-            raise ValueError('training state t must be the actual flow value in [0, 1]')
-        if row.get('label_kind') == 'target_observation_gap' and not (
-                self.config.get('source_prompt_policy') == 'deployment' and self.config.get('allow_target_prompt')):
-            raise ValueError('gap labels require an explicitly allowed goal prompt; neutral source has no target intent')
+        if not 0 <= float(t) <= 1: raise ValueError('actual flow time must be in [0,1]')
+        task = row.get('task', 'observe' if self.config.get('stage') == 'C2-observe' else 'feedback')
+        prompt = self.config['neutral_prompt'] if task == 'observe' and not row.get('state') else row['prompt']
+        conditions = row.get('condition_images', ())
+        for path,expected_hash in row.get('condition_sha256',{}).items():
+            if expected_hash!=file_hash(path):raise ValueError('condition asset changed since corpus build')
         if row.get('state'):
-            x, flow, lengths, positions, meta = self.state(row, t, noise_seed)
+            x, _, _, _, meta = self.state(row, t, noise_seed)
             x0 = epsilon = None
             saved = torch.load(row['state'], map_location='cpu', weights_only=True)
-            if saved.get('checkpoint_hash') != row.get('trajectory_checkpoint_hash'):
+            if row.get('trajectory_checkpoint_hash') and saved.get('checkpoint_hash') != row['trajectory_checkpoint_hash']:
                 raise ValueError('trajectory checkpoint provenance differs from label')
         else:
+            if row.get('image_sha256') and row['image_sha256']!=file_hash(row['image']):
+                raise ValueError('image asset changed since corpus build')
             posterior_seed = self.image_posterior_seed(row['image'])
             x0 = self.encode_image(row['image'], posterior_seed)
             generator = torch.Generator(device='cpu').manual_seed(noise_seed)
             epsilon = torch.randn(x0.shape, generator=generator, dtype=torch.float32).to(x0.device, x0.dtype)
             x = epsilon if t == 1 else (1-t)*x0+t*epsilon
-            if self.config.get('source_prompt_policy', 'neutral') == 'neutral':
-                prompt = self.config['neutral_prompt']
-            elif self.config.get('source_prompt_policy') == 'deployment' and self.config.get('allow_target_prompt'):
-                prompt = row['prompt']
-            else:
-                raise ValueError('deployment/target prompt requires explicit allow_target_prompt')
-            flow, lengths, positions = self.flow_inputs(prompt)
             meta = dict(state_source='controlled_paired', t=t, noise_seed=noise_seed,
                         posterior_seed=posterior_seed, posterior_seed_policy=self.config['posterior_seed_policy'],
-                        x_t_hash=tensor_hash(x), image_hash=file_hash(row['image']), prompt=prompt)
+                        x_t_hash=tensor_hash(x), image_hash=file_hash(row['image']))
+        flow, lengths, positions = self.flow_inputs(prompt, conditions)
+        prompt_kv = self.text(prompt)[0]
+        expected = row.get('state_hash', row.get('observation_state_hash'))
+        if expected and expected != tensor_hash(x): raise ValueError('label belongs to another x_t')
         if row.get('label_kind') in ('observation_proxy', 'target_observation_gap'):
-            if abs(float(row['t'])-t) > 1e-7 or row['noise_seed'] != noise_seed:
+            if abs(float(row['t'])-t)>1e-7 or row['noise_seed']!=noise_seed:
                 raise ValueError('observation label must match actual state t/noise seed')
-            if row['observation_state_hash'] != tensor_hash(x):
-                raise ValueError('observation label belongs to a different x_t')
-            if row.get('observation_image_hash') and meta.get('image_hash') != row['observation_image_hash']:
-                raise ValueError('observation image provenance differs')
-        meta.update(label_kind=row.get('label_kind', 'target_clean'), round=0,
-                    confirmed_label=row.get('confirmed_label', row.get('verified', False)))
-        return TrainingState(x, x0, epsilon, float(t), flow, lengths, positions, meta)
+        meta.update(prompt=prompt, task=task, condition_images=list(conditions),
+                    condition_hashes={p:file_hash(p) for p in conditions},
+                    flow_supervision=bool(row.get('flow_supervision', False)) and not row.get('state'),
+                    annotation=row.get('annotation', {}), round=0,
+                    label_kind=row.get('label_kind', 'target_clean'),
+                    sampler_steps=self.config['sampler_steps'], timestep_shift=self.config['timestep_shift'])
+        return TrainingState(x, x0, epsilon, float(t), flow, lengths, positions, meta, prompt_kv)
 
     @torch.no_grad()
     def velocity(self, x, t, flow):
@@ -178,7 +208,7 @@ class DiagnosticRuntime:
         try:
             with autocast_for(self.device):
                 final = self.model._forward_flow(x_t=x, timestep=timestep, **flow,
-                    cfg_text_scale=self.config['cfg_text_scale'], cfg_img_scale=1.,
+                    cfg_text_scale=self.config['cfg_text_scale'], cfg_img_scale=self.config.get('cfg_img_scale', 1.),
                     cfg_renorm_min=self.config['cfg_renorm_min'], cfg_renorm_type=self.config['cfg_renorm_type'])
         finally:
             handle.remove()

@@ -92,12 +92,13 @@ def attention_response(q, common_k, common_v, condition_k, condition_v):
     return packed_attention(q, keys, values, (len(q),), (len(keys),))
 
 
-def normalized_response_loss(student, teacher, floor=1e-8):
+def normalized_response_loss(student, teacher, floor=1e-8, baseline=None):
     teacher = teacher.detach().float()
-    return (student.float()-teacher).square().mean()/teacher.square().mean().clamp_min(floor)
+    increment = teacher if baseline is None else teacher-baseline.detach().float()
+    return (student.float()-teacher).square().mean()/increment.square().mean().clamp_min(floor)
 
 
-def response_loss(runtime, bank, teacher, probe, *, filter_weak_teacher=False):
+def response_loss(runtime, bank, teacher, probe, *, filter_weak_teacher=True):
     memory = consume_bank(runtime.decoder, bank, probe['prompt_positions'])
     losses = []; metrics = []
     for index in runtime.config['response_layers']:
@@ -109,11 +110,11 @@ def response_loss(runtime, bank, teacher, probe, *, filter_weak_teacher=False):
             baseline = packed_attention(q, k, v, (len(q),), (len(k),))
         mk, mv = memory[index].keys.to(q.dtype), memory[index].values.to(v.dtype)
         student = attention_response(q, k, v, mk, mv)
-        loss = normalized_response_loss(student, target, runtime.config['response_energy_floor'])
+        loss = normalized_response_loss(student, target, runtime.config['response_energy_floor'], baseline)
         teacher_energy = target.float().square().mean()
         condition_energy = (target-baseline).float().square().mean()
         weak = filter_weak_teacher and (float(teacher_energy) < runtime.config['response_energy_floor']
-                    or float(condition_energy) < runtime.config.get('response_condition_energy_min', 0.))
+                    or float(condition_energy) < runtime.config.get('response_condition_energy_min', runtime.config['response_energy_floor']))
         if weak:
             loss = loss * 0.
         losses.append(loss)

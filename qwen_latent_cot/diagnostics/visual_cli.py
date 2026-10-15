@@ -1,4 +1,4 @@
-"""NPU visual observation, joint GEN training and same-state R2 feedback."""
+"""GEN reading, executable feedback and same-state memory loop training."""
 import argparse
 import json
 import os
@@ -21,7 +21,7 @@ def load_input_rows(args, cfg):
                                 allow_unreviewed_proxy=cfg.get('allow_unreviewed_proxy', False))
             if any(not re.fullmatch(r'[A-Za-z0-9_-]+', row['sample_id']) for row in rows):
                 raise ValueError('sample_id must be a safe filename identifier')
-            text_rows = load_dataset(args.text_data) if args.text_data else []
+            text_rows = []
             result[0] = dict(rows=rows, text_rows=text_rows, error=None)
         except Exception as error:
             if parallel.world_size() == 1:
@@ -39,21 +39,23 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['check', 'train', 'eval', 'sample', 'label-states', 'source-review'])
     parser.add_argument('--model', required=True)
-    parser.add_argument('--data', required=True)
-    parser.add_argument('--text-data')
+    parser.add_argument('--data', help='small diagnostic JSONL only')
+    parser.add_argument('--corpus', help='verified indexed corpus for training')
     parser.add_argument('--config', default='configs/visual_memory_pilot.json')
     parser.add_argument('--output', required=True)
     parser.add_argument('--device', default='npu')
     parser.add_argument('--distributed', action='store_true')
     parser.add_argument('--topology', choices=['C'], default='C')
-    parser.add_argument('--stage', choices=['C2-observe', 'C2-joint', 'C3-loop'])
-    parser.add_argument('--checkpoint', help='visual parent/checkpoint; old C1 is migrated via --text-checkpoint')
-    parser.add_argument('--text-checkpoint', default='/root/outputs/c1_response_expand_20261012_141729/best.pt')
-    parser.add_argument('--resume', help='exact-stage version 2 optimizer/schedule checkpoint')
+    parser.add_argument('--stage', choices=['C2-observe', 'C2-feedback', 'C3-loop'])
+    parser.add_argument('--online-feedback', action='store_true', help='fresh BAGEL reflection for later C3 feedback rounds')
+    parser.add_argument('--checkpoint', help='visual parent/checkpoint; C1 initialization uses --writer-init')
+    parser.add_argument('--writer-init', help='optional historical C1 writer weights')
+    parser.add_argument('--text-checkpoint', help='optional frozen text teacher; validated with E1')
+    parser.add_argument('--resume', help='exact-stage format 3 optimizer/index schedule checkpoint')
     parser.add_argument('--c0-pass')
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='val')
     parser.add_argument('--steps', type=int, help='override budget, e.g. 20 for resource check')
-    parser.add_argument('--validation-max-families', type=int, help='fixed validation family budget; 0 uses all')
+    parser.add_argument('--validation-max-families', type=int, help='positive bounded validation family budget')
     parser.add_argument('--skip-validation', action='store_true', help='resource checks only; no selected best checkpoint')
     parser.add_argument('--eval-t', nargs='+', type=float)
     parser.add_argument('--noise-seeds', nargs='+', type=int)
@@ -68,24 +70,28 @@ def main(argv=None):
     cfg = json.loads(Path(args.config).read_text())
     if args.steps is not None: cfg['steps'] = args.steps
     if args.validation_max_families is not None:
-        if args.validation_max_families < 0:
-            parser.error('--validation-max-families must be nonnegative')
+        if args.validation_max_families <= 0:
+            parser.error('--validation-max-families must be positive')
         cfg['validation_max_families'] = args.validation_max_families
     if args.eval_t is not None: cfg['eval_t'] = args.eval_t
     if args.noise_seeds is not None: cfg['noise_seeds'] = args.noise_seeds
     stage = args.stage or cfg['stage']
+    cfg['stage'] = stage
+    if args.online_feedback: cfg['online_feedback'] = True
     if args.command == 'check' and args.distributed:
         parser.error('E0 runs on one NPU before formal 16-NPU training')
     if not args.distributed and int(os.environ.get('WORLD_SIZE', '1')) > 1:
         parser.error('torchrun requires --distributed')
     if args.distributed:
         args.device = str(parallel.initialize(args.device))
-    rows, text_rows = load_input_rows(args, cfg)
-    if args.command == 'train':
-        if int(cfg['effective_batch']*cfg['replay_fraction']) and not text_rows:
-            parser.error('25% global replay requires --text-data with existing train/val captions')
-        if stage != 'C2-observe' and not (args.checkpoint or args.resume):
-            parser.error('joint/loop training must start from a selected visual parent')
+    corpus=None; rows=[]
+    if args.command=='train':
+        if not args.corpus or args.data: parser.error('train requires --corpus; --data is diagnostic only')
+        from .corpus import Corpus
+        corpus=Corpus(args.corpus)
+    else:
+        if not args.data: parser.error('diagnostic commands require --data')
+        rows,_=load_input_rows(args,cfg)
     if args.command in ('eval', 'sample', 'source-review') and not args.checkpoint:
         parser.error('evaluation requires --checkpoint')
     if args.command == 'source-review' and any(not 0 <= t < 1 for t in args.review_t):
@@ -102,25 +108,26 @@ def main(argv=None):
     from .visual import validate_config
     runtime = DiagnosticRuntime(load_native(args.model, args.device, cfg['timestep_shift']), cfg, 'C')
     validate_config(runtime, stage)
-    run = manifest(runtime, args, args.data, rows=rows) if parallel.rank() == 0 else None
+    data_path = str(corpus.root/'manifest.json') if corpus else args.data
+    run = manifest(runtime, args, data_path, rows=rows) if parallel.rank() == 0 else None
     if parallel.world_size() > 1:
         import torch.distributed as dist
         shared = [run]; dist.broadcast_object_list(shared, src=0); run = shared[0]
     runtime.native_files = run['model_files']
-    runtime.data_hashes = dict(visual=file_hash(args.data), text=file_hash(args.text_data) if args.text_data else None)
+    runtime.data_hashes = dict(corpus=corpus.fingerprint) if corpus else dict(diagnostic=file_hash(args.data))
     if args.c0_pass:
         c0 = json.loads(Path(args.c0_pass).read_text())
         if c0.get('passed') is not True or c0.get('model_files') != runtime.native_files or c0.get('instruction_token_ids') != runtime.c0_instruction_ids:
             raise ValueError('C0 decoding calibration differs from frozen model/instruction')
     elif args.command == 'train':
         raise ValueError('training requires the existing approved --c0-pass calibration.json')
-    student = initialize_student(runtime, args.text_checkpoint, args.checkpoint)
+    student = initialize_student(runtime, args.writer_init, args.checkpoint, teacher_path=args.text_checkpoint)
     if parallel.rank() == 0:
         root = Path(__file__).resolve().parents[2]
         dirty = subprocess.check_output(['git', 'diff', 'HEAD'], cwd=root, text=True)
         (output/'source_dirty.diff').write_text(dirty)
         write_json(output/'config.json', cfg)
-        write_json(output/'locked_data.json', dict(rows=rows, text_rows=text_rows, hashes=runtime.data_hashes))
+        write_json(output/'locked_data.json', dict(corpus=corpus.manifest if corpus else None, diagnostic_rows=rows, hashes=runtime.data_hashes))
         run.update(stage=stage, visual_architecture=cfg['visual_architecture'],
                    text_teacher_path=args.text_checkpoint, text_teacher_hash=student.text_teacher_hash,
                    data_hashes=runtime.data_hashes, global_effective_batch=cfg['effective_batch'],
@@ -135,11 +142,13 @@ def main(argv=None):
         selected = [row for row in rows if row['split'] == args.split]
         if args.max_samples: selected = selected[:args.max_samples]
         if args.command == 'train':
-            from .visual import train
-            train(student, rows, text_rows, stage, output, args.checkpoint or args.text_checkpoint,
+            from .visual_training import train
+            train(student, corpus, stage, output, args.checkpoint or args.writer_init,
                   resume=args.resume, skip_validation=args.skip_validation)
         elif args.command == 'check':
             from .flow_checks import check
+            student.writer.requires_grad_(False)
+            selected=[dict(r,task='generation',flow_supervision=True) for r in selected if r.get('image') and not r.get('feedback') and not r.get('state')]
             check(student, selected, output)
         elif args.command == 'source-review':
             from .source_review import source_review, summarize_source_review
@@ -157,12 +166,15 @@ def main(argv=None):
             directory = output/f'rank_{parallel.rank():02d}' if args.distributed else output
             directory.mkdir(parents=True, exist_ok=True)
             if args.command == 'eval':
-                from .visual_evaluation import evaluate
+                from .visual_evaluation import evaluate, evaluate_feedback
                 # Swap partners are available even when the donor family is on another rank.
-                evaluate(student, local_rows, directory, donor_rows=rows,
-                         rounds=args.rounds or (2 if stage == 'C3-loop' else 1),
-                         save_images=args.images, continue_sampling=args.continue_sampling,
-                         layer_diagnostics=args.layer_diagnostics)
+                if stage == 'C2-observe':
+                    evaluate(student, local_rows, directory, donor_rows=rows, rounds=1,
+                             save_images=args.images, continue_sampling=args.continue_sampling,
+                             layer_diagnostics=args.layer_diagnostics)
+                else:
+                    evaluate_feedback(student, local_rows, directory,
+                                      updates=args.rounds or (2 if stage == 'C3-loop' else 1), donor_rows=selected)
             elif args.command == 'sample':
                 from .visual_evaluation import complete_sampling
                 for row in local_rows:
@@ -178,6 +190,7 @@ def main(argv=None):
         run.update(status='failed', failure=dict(type=type(error).__name__, message=str(error)))
         raise
     finally:
+        if corpus: corpus.close()
         if parallel.rank() == 0: write_json(output/'manifest.json', run)
         if args.distributed:
             import torch.distributed as dist

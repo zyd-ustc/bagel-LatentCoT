@@ -21,21 +21,36 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-LABEL_KINDS = ('target_clean', 'observation_proxy', 'target_observation_gap')
+LABEL_KINDS = ('target_clean', 'observation_proxy', 'target_observation_gap', 'feedback')
 
 
-def visual_label(row):
+def visual_label(row, *, c1_feedback=False):
     """Normalize new labels without upgrading unreviewed proxies to confirmations."""
     kind = row.get('label_kind', 'target_clean')
     if kind not in LABEL_KINDS:
         raise ValueError('unknown visual label_kind')
+    if kind == 'feedback' and not row.get('prompt'):
+        raise ValueError('feedback requires the original goal prompt')
     row = dict(row, label_kind=kind)
     row.setdefault('family_id', row.get('scene_id', row.get('image_id')))
     row.setdefault('scene_id', row.get('family_id'))
     row.setdefault('image_id', row.get('scene_id'))
     row.setdefault('prompt', 'An image.')
     row.setdefault('label_type', 'observed' if row.get('state') else 'clean')
-    if kind == 'target_clean':
+    if kind == 'feedback':
+        from .explicit_feedback import Feedback
+        from dataclasses import asdict
+        feedback = Feedback(**row['feedback'])
+        historical = feedback.origin == 'source_annotation' and c1_feedback and row.get('image') and not row.get('state')
+        if feedback.origin != 'manual_checked' and not historical:
+            raise ValueError('offline feedback training requires checked feedback')
+        row['caption'] = feedback.correction if not feedback.satisfied else 'No change is needed.'
+        row['feedback'] = asdict(feedback)
+        row.setdefault('facts', [])
+        row['confirmed_label'] = row.get('verified') is True and not historical
+        if row.get('state') and any(k not in row for k in ('t', 'noise_seed')):
+            raise ValueError('trajectory feedback needs actual t and noise_seed')
+    elif kind == 'target_clean':
         row.setdefault('target_caption', row.get('caption'))
         row.setdefault('target_facts', row.get('facts', []))
         row['caption'], row['facts'] = row['target_caption'], row['target_facts']
@@ -67,11 +82,11 @@ def visual_label(row):
     return row
 
 
-def load_dataset(path, *, visual=False, allow_unreviewed_proxy=False):
+def load_dataset(path, *, visual=False, allow_unreviewed_proxy=False, c1_feedback=False):
     root = Path(path).resolve().parent
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     if visual:
-        rows = [visual_label(row) for row in rows]
+        rows = [visual_label(row, c1_feedback=c1_feedback) for row in rows]
     ids = {}; families = {}; pairs = {}; image_splits = {}; image_hashes = {}
     for row in rows:
         if visual and not (row.get('image') or row.get('state')):
@@ -96,7 +111,7 @@ def load_dataset(path, *, visual=False, allow_unreviewed_proxy=False):
                 or not isinstance(fact.get('alternatives', []), list)
                 or not all(isinstance(a, str) and a.strip() for a in fact.get('alternatives', []))):
                 raise ValueError('facts require predetermined aliases and alternative assertions')
-        for key in ('image', 'state', 'observation_preview') if visual else ('image', 'state'):
+        for key in ('image', 'state', 'teacher', 'observation_preview') if visual else ('image', 'state'):
             if row.get(key):
                 row[key] = str((root / row[key]).resolve())
                 if not Path(row[key]).is_file():

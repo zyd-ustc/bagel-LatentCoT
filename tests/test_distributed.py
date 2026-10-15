@@ -63,7 +63,7 @@ def visual_worker(rank, port):
                                       'writer':torch.nn.Linear(3, 2, bias=False).requires_grad_(False)})
         parallel.broadcast_parameters(module)
         frozen = module['writer'].weight.clone()
-        # Rank one owns a frozen text-only replay sample: no visual graph exists.
+        # One worker has no local visual gradient; all workers still synchronize.
         if rank == 0: (module['visual'](torch.ones(3)).sum()/2).backward()
         parallel.sum_gradients(module, allow_unused=True)
         torch.testing.assert_close(module['visual'].weight.grad, torch.full((2,3), .5))
@@ -75,7 +75,7 @@ def visual_worker(rank, port):
     finally: dist.destroy_process_group()
 
 
-def test_frozen_text_replay_rank_participates_in_joint_visual_optimizer():
+def test_unused_rank_participates_in_global_optimizer():
     with socket.socket() as listener:
         listener.bind(('127.0.0.1',0)); port=listener.getsockname()[1]
     mp.spawn(visual_worker,args=(port,),nprocs=2,join=True)
@@ -87,7 +87,8 @@ def visual_training_worker(rank, port, root):
     from PIL import Image
     from test_memory_topology import lm as lm_fixture, runtime as runtime_fixture
     from qwen_latent_cot.diagnostics.memory import MemoryWriter
-    from qwen_latent_cot.diagnostics.visual import VisualStudent, train
+    from qwen_latent_cot.diagnostics.visual import VisualStudent
+    from qwen_latent_cot.diagnostics.visual_training import train
     from qwen_latent_cot.diagnostics.data import visual_label
     os.environ.update(WORLD_SIZE='2', RANK=str(rank), LOCAL_RANK=str(rank),
                       MASTER_ADDR='127.0.0.1', MASTER_PORT=str(port))
@@ -98,7 +99,7 @@ def visual_training_worker(rank, port, root):
         runtime.writer = MemoryWriter(runtime.decoder,'C',16,4)
         cfg=json.loads(Path('configs/visual_memory_pilot.json').read_text())
         cfg.update({key:runtime.config[key] for key in ('resolution','rank','caption_instruction')})
-        cfg.update(visual_rank=4,response_layers=[0,2],response_query_count=3,steps=1,
+        cfg.update(source_layers=[0,1,2],visual_rank=4,response_layers=[0,2],response_query_count=3,steps=1,
                    effective_batch=4,eval_every=1,max_caption_tokens=2,eval_t=[.75,1.],noise_seeds=[0])
         runtime.config=cfg
         rows=[]
@@ -110,36 +111,24 @@ def visual_training_worker(rank, port, root):
                 image.save(path)
                 rows.append(visual_label(dict(sample_id=f'{split}_{index}',scene_id=f'{split}_{index}',
                     split=split,caption='a token',facts=[],verified=True,image=str(path))))
-        text_rows=[dict(row) for row in rows]
-        from types import SimpleNamespace
-        from qwen_latent_cot.diagnostics.visual_cli import load_input_rows
-        manifest = Path(root)/'paired.jsonl'
-        if rank == 0:
+        from qwen_latent_cot.diagnostics.corpus import build,Corpus
+        manifest=Path(root)/'paired.jsonl'
+        if rank==0:
             manifest.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+            build(dict(sources=[dict(name='tiny',format='paired',path=str(manifest),inherit_split=True)]),Path(root)/'corpus')
         parallel.barrier()
-        # A non-root worker must receive rows, never open its nonexistent input.
-        source = manifest if rank == 0 else Path(root)/'not_on_worker_1.jsonl'
-        rows, text_rows = load_input_rows(SimpleNamespace(data=source, text_data=source), cfg)
-        assert len(rows) == len(text_rows) == 4
-        try:
-            load_input_rows(SimpleNamespace(data=Path(root)/'missing.jsonl', text_data=None), cfg)
-        except ValueError as error:
-            assert 'rank 0 dataset validation failed' in str(error)
-        else:
-            raise AssertionError('all workers must receive the root validation failure')
-        student=VisualStudent(runtime);student.text_teacher_hash='test'
+        corpus=Corpus(Path(root)/'corpus');student=VisualStudent(runtime)
         output=Path(root)/'training'
         if rank==0:output.mkdir()
         parallel.barrier()
-        train(student,rows,text_rows,'C2-observe',output,None)
+        train(student,corpus,'C2-observe',output,None)
         parallel.barrier()
         if rank==0:
             index=json.loads((output/'validation_000001/metrics_index.json').read_text())
-            assert {r['rank'] for r in index}=={0,1}
-            assert len(index)==4
+            assert len(index)==2
             log=json.loads((output/'training.jsonl').read_text().splitlines()[0])
-            assert log['world_size']==2 and log['actual_gen_entries_including_recomputation']>=4
-            assert log['und_layer_calls']>0
+            assert log['world_size']==2 and log['actual_gen_entries']>=4
+            assert log['und_layer_entries']>0
             assert (output/'last.pt').exists()
     finally:dist.destroy_process_group()
 

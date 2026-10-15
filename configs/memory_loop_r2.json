@@ -1,5 +1,5 @@
 {
-  "protocol": "visual_memory_loop_v1_20261012",
+  "protocol": "observe_feedback_indexed_v3",
   "slots": 16,
   "rank": 32,
   "resolution": 512,
@@ -24,12 +24,6 @@
     0.95,
     1.0
   ],
-  "train_t": [
-    0.25,
-    0.5,
-    0.75,
-    0.9
-  ],
   "steps": 500,
   "effective_batch": 16,
   "learning_rate": 1e-05,
@@ -43,7 +37,7 @@
   "cfg_renorm_type": "global",
   "sampler_steps": 50,
   "timestep_shift": 3.0,
-  "selection": "minimum_validation_R1_semantic_NLL_excluding_t1; quality acceptance separate",
+  "selection": "paired_final_image_review",
   "c0_instruction": "Repeat the preceding caption exactly. Do not describe a new image or add information.\n",
   "adapter_type": "linear_low_rank_v1",
   "training_state_sampling": "independent_uniform_v1",
@@ -60,36 +54,61 @@
   "stage": "C3-loop",
   "visual_architecture": "und_query_time_low_rank_v1",
   "visual_rank": 32,
-  "train_writer": false,
-  "label_interface_version": "visual_labels_v1",
+  "train_writer": true,
   "label_instructions": {
-    "target_clean": "Describe the image briefly. State objects, colors, counts, and spatial relations. If the evidence is unclear, say unknown.\n",
-    "observation_proxy": "Describe only what the current noisy image evidence supports. State visible objects, attributes, counts, and relations. For uncertain evidence, say unknown.\n",
-    "target_observation_gap": "Compare the target with the current image evidence. Describe missing or conflicting facts and state unknown when the evidence is unclear.\n"
+    "observe": "Describe what the image evidence supports. State objects, attributes, counts and spatial relations. Say unknown when evidence is unclear.\n",
+    "feedback": "Compare the current image evidence with the requested image. State a concise positive correction, or say no change is needed.\n"
   },
   "visual_source_policy": "full_query",
-  "source_prompt_policy": "neutral",
-  "allow_target_prompt": false,
   "allow_unreviewed_proxy": false,
   "response_teacher": "frozen_text_memory16",
-  "observation_response_teacher": false,
-  "replay_fraction": 0.25,
   "cross_round_gradients": false,
   "activation_checkpointing": true,
   "loop_active_updates": 20,
-  "trajectory_refresh_count": 0,
   "loss_weights": {
     "sem": 0.1,
-    "read": 1.0,
-    "gen": 1.0,
-    "keep": 0.1
+    "teacher": 1,
+    "flow": 1
   },
-  "text_teacher_sha256": "255aa6d7c5ffed326a554891e2189dbbd2bdc309fe05c6433b10258a095e3f56",
   "numeric_rtol": 0.02,
   "numeric_atol": 0.002,
   "response_filter_weak_teacher": true,
   "response_condition_energy_min": 1e-10,
-  "objective_gradient_audit_steps": [
-    1
-  ]
+  "source_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "feedback_updates": 2,
+  "online_feedback": true,
+  "noise_curriculum": [
+    {
+      "start_step": 1,
+      "observe_max_t": 0.25,
+      "endpoint_max_t": 0.25
+    }
+  ],
+  "noise_calibration": {
+    "observe_max_t": 0.25,
+    "endpoint_max_t": 0.25
+  },
+  "output_token_budgets": [
+    48,
+    128,
+    512
+  ],
+  "context_token_limit": 4096,
+  "task_mix": {
+    "observe": 0.15,
+    "endpoint": 0.4,
+    "generation": 0.3,
+    "trajectory": 0.1,
+    "conditional": 0.05
+  },
+  "validation_max_rows": 128
 }

@@ -11,8 +11,14 @@ from .numerics import autocast_for
 from ..bagel.accelerator import synchronize, reset_peak_memory_stats, max_memory_allocated
 
 
+def readout_instruction(runtime, row, stage):
+    if stage == 'C0':
+        return runtime.c0_instruction_ids
+    return runtime.feedback_instruction_ids if row.get('feedback') else runtime.instruction_ids
+
+
 def caption_result(runtime, row, prefix, start, stage):
-    instruction_ids = runtime.c0_instruction_ids if stage == 'C0' else runtime.instruction_ids
+    instruction_ids = readout_instruction(runtime, row, stage)
     synchronize(runtime.device)
     start_time = time.perf_counter()
     with autocast_for(runtime.device):
@@ -26,6 +32,16 @@ def caption_result(runtime, row, prefix, start, stage):
 
 
 def prepare_source(runtime, row, stage, t=None, seed=0):
+    if stage == 'C1' and row.get('feedback'):
+        from .feedback_source import prompt_source, compose_source
+        from .explicit_feedback import correction_source
+        flow, lengths, positions = runtime.flow_inputs(row['prompt'])
+        correction = row['feedback']['correction'] or 'No change is needed.'
+        extra, _, _ = correction_source(runtime, flow, lengths, positions, correction)
+        return compose_source(prompt_source(flow, lengths, positions), extra), dict(
+            state_source='prompt_and_correction', prompt=row['prompt'], correction=correction,
+            label_type=row['label_type'], feedback_origin=row['feedback'].get('origin', 'manual_checked'),
+            human_reviewed=row.get('human_reviewed'), confirmed_label=row.get('confirmed_label'))
     if stage in ('C0', 'C1'):
         source, inputs, positions = runtime.text(row['caption'])
         if max(positions) >= runtime.config['writer_position_start']:
@@ -96,7 +112,7 @@ def evaluate(runtime, rows, stage, output, controls=True):
                             caption_query_start=start, memory_masked=arm=='Memory-masked',
                             source_expert='GEN_native' if stage=='C2' else 'UND_native_text_oracle', **meta,
                             writer_seconds=writer_times.get(arm, 0.),
-                            instruction_token_ids=runtime.c0_instruction_ids if stage == 'C0' else runtime.instruction_ids,
+                            instruction_token_ids=readout_instruction(runtime, row, stage),
                             intervention_evidence_group='donor_bank_swap' if 'swap' in arm else arm,
                             equivalent_to='Source-swap' if arm == 'Memory-swap' else None,
                             **decoded[evidence_arm])
@@ -141,19 +157,16 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
     world, worker = parallel.world_size(), parallel.rank()
     if cfg['effective_batch'] % world:
         raise ValueError('global effective_batch must be divisible by world size')
-    if stage == 'C2':
-        if parent:
-            load_checkpoint(parent, runtime, ('C1', 'C1-read'))
-        elif not scratch:
-            raise ValueError('C2 requires its matching C1 checkpoint or explicit --scratch')
+    if stage != 'C1':
+        raise ValueError('visual training uses visual_training C2-observe/C2-feedback/C3-loop')
+    if parent and cfg.get('c1_feedback'):
+        load_checkpoint(parent, runtime, ('C1', 'C1-read'))
     elif parent or scratch:
-        raise ValueError('C1 starts from shared initialization, not a checkpoint')
-    pool = [r for r in rows if r['split'] == 'train' and r['label_type'] == 'clean']
-    val = [r for r in rows if r['split'] == 'val' and r['label_type'] == 'clean']
-    if not pool or not val or not any(r['facts'] for r in val):
+        raise ValueError('C1 caption starts from initialization; C1 feedback can warm-start from C1')
+    pool = [r for r in rows if r['split'] == 'train' and (r['label_type'] == 'clean' or r.get('feedback'))]
+    val = [r for r in rows if r['split'] == 'val' and (r['label_type'] == 'clean' or r.get('feedback'))]
+    if not pool or not val or (not cfg.get('c1_feedback') and not any(r['facts'] for r in val)):
         raise ValueError('training requires verified train/val pools and validation facts')
-    if stage == 'C2' and any(r.get('state') for r in pool+val):
-        raise ValueError('main C2 train/validation uses controlled clean states only')
     parallel.broadcast_parameters(runtime.writer)
     guard = FrozenGuard(runtime.model, runtime.bundle.vae)
     optimizer = torch.optim.AdamW(runtime.writer.parameters(), lr=cfg['learning_rate'], weight_decay=cfg['weight_decay'])
@@ -168,13 +181,13 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
     start_time = time.perf_counter()
     for step in range(1, cfg['steps']+1):
         optimizer.zero_grad(set_to_none=True)
-        losses = []; sampled_states = []; gradient_audit = None
+        losses = []; caption_losses = []; velocity_losses = []; sampled_states = []; gradient_audit = None
         for micro in range(cfg['effective_batch']):
             if cursor == len(order):
                 rng.shuffle(order); cursor = 0
             row = pool[order[cursor]]; cursor += 1
-            t = time_rng.choice(cfg['train_t']) if stage == 'C2' else None
-            seed = noise_rng.randrange(2**63-1); noise_index += 1
+            t = row.get('t', time_rng.choice(cfg['train_t'])) if row.get('feedback') else None
+            seed = row.get('noise_seed', noise_rng.randrange(2**63-1)); noise_index += 1
             # Every rank advances the same global schedule, but executes its own slice.
             if micro % world != worker:
                 continue
@@ -182,8 +195,14 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
             source, _ = prepare_source(runtime, row, stage, t, seed)
             with autocast_for(runtime.device):
                 bank = runtime.memory(source)
-                loss, _ = teacher_forcing(runtime.bundle, runtime.instruction_ids, runtime.answer_ids(row['caption']),
+                loss, _ = teacher_forcing(runtime.bundle, readout_instruction(runtime, row, stage), runtime.answer_ids(row['caption']),
                                           runtime.caption_prefix(bank), bank.slots)
+            caption_losses.append(float(loss.detach()))
+            velocity_loss = torch.zeros((), device=loss.device)
+            if cfg.get('feedback_velocity_weight', 0) and row.get('feedback'):
+                velocity_loss = correction_velocity_loss(runtime, row, bank, t, seed)
+                loss = loss + cfg['feedback_velocity_weight']*velocity_loss
+            velocity_losses.append(float(velocity_loss.detach()))
             if not torch.isfinite(loss):
                 raise FloatingPointError('non-finite training NLL')
             if step == 1 and micro == 0:
@@ -205,11 +224,13 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
         norm = torch.nn.utils.clip_grad_norm_(runtime.writer.parameters(), cfg['gradient_clip'], error_if_nonfinite=True)
         optimizer.step(); guard.check()
         synchronize(runtime.device)
-        loss_sum, sample_count = parallel.sum_statistics([sum(losses), len(losses)], runtime.device)
+        loss_sum, sample_count, caption_sum, velocity_sum = parallel.sum_statistics(
+            [sum(losses), len(losses), sum(caption_losses), sum(velocity_losses)], runtime.device)
         sampled_states = sorted(parallel.gather_samples(sampled_states), key=lambda item: item['global_micro'])
         if worker == 0:
             append_json(output/'train.jsonl', dict(step=step, sampled_states=sampled_states, memory_gradient_audit=gradient_audit,
-                        world_size=world, global_effective_batch=cfg['effective_batch'], nll=loss_sum/sample_count,
+                        world_size=world, global_effective_batch=cfg['effective_batch'], loss=loss_sum/sample_count,
+                        nll=caption_sum/sample_count, velocity_mse=velocity_sum/sample_count,
                         gradient_norm=float(norm), elapsed_seconds=time.perf_counter()-start_time,
                         rank0_peak_memory_bytes=max_memory_allocated(runtime.device)))
         if step % cfg['eval_every'] == 0 or step == cfg['steps']:
@@ -219,13 +240,14 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
                 scored = evaluate(runtime, val, stage, validation_path, controls=False)
                 primary = [r for r in scored if r['arm'] == 'Correct' and r.get('t') != 1]
                 accuracy = cluster_interval(primary, 'fact_accuracy')
-                if accuracy is None:
+                if accuracy is None and not cfg.get('c1_feedback'):
                     raise ValueError('validation has no known facts for checkpoint selection')
                 # Same rule/budget for L/C. Literal facts and NLL are saved separately.
-                score = (accuracy['mean'], -sum(r['nll'] for r in primary)/len(primary))
+                score = (accuracy['mean'] if accuracy else 0., -sum(r['nll'] for r in primary)/len(primary))
                 if score > best:
                     best = score; save_checkpoint(output/'best.pt', runtime, step, stage, parent)
-                    write_json(output/'selection.json', dict(step=step, rule=cfg['selection'], fact_accuracy=score[0], nll=-score[1]))
+                    write_json(output/'selection.json', dict(step=step, rule=cfg['selection'],
+                               fact_accuracy=accuracy['mean'] if accuracy else None, nll=-score[1]))
                 save_checkpoint(output/'last.pt', runtime, step, stage, parent)
                 torch.save(dict(optimizer=optimizer.state_dict(), step=step, rng=rng.getstate(), order=order,
                                 cursor=cursor, noise_index=noise_index, time_rng=time_rng.getstate(), noise_rng=noise_rng.getstate()), output/'optimizer.pt')
@@ -234,5 +256,32 @@ def train(runtime, rows, stage, output, parent=None, scratch=False):
     if worker == 0:
         write_json(output/'training_summary.json', dict(stage=stage, scratch=scratch, parent=parent,
                     world_size=world, global_effective_batch=cfg['effective_batch'],
-                    steps=cfg['steps'], best_validation_fact_accuracy=best[0], frozen_guard='passed',
+                    steps=cfg['steps'], best_validation_fact_accuracy=best[0] if any(r['facts'] for r in val) else None,
+                    frozen_guard='passed',
                     quality_status='not established by NLL or engineering checks'))
+
+
+def correction_velocity_loss(runtime, row, bank, t=None, seed=None):
+    """C1 P+C compression: native text and memory use their own legal positions."""
+    from dataclasses import replace
+    from .flow_training import conditional_gen
+    from .explicit_feedback import correction_source
+    t = row.get('t', runtime.config['train_t'][0]) if t is None else t
+    seed = row.get('noise_seed', 0) if seed is None else seed
+    state = runtime.training_state(row, t, seed)
+    # C1 uses the same deployment prompt even when its caption config is neutral.
+    flow, lengths, positions = runtime.flow_inputs(row['prompt'])
+    state = replace(state, flow=flow, lengths=lengths, positions=positions)
+    if row['feedback']['satisfied']:
+        from .explicit_feedback import shifted_layout
+        teacher_state = replace(state, flow=shifted_layout(flow, bank.slots))
+    else:
+        _, augmented, _ = correction_source(runtime, flow, lengths, positions, row['feedback']['correction'])
+        teacher_state = replace(state, flow=augmented,
+                                lengths=tuple(augmented['key_values_lens'].tolist()),
+                                positions=[int(augmented['packed_position_ids'][0])])
+    with torch.no_grad():
+        target = conditional_gen(runtime, teacher_state, capture=False).velocity
+    prediction = conditional_gen(runtime, state, bank, capture=False,
+                                 checkpoint_activations=runtime.config.get('activation_checkpointing', True)).velocity
+    return (prediction.float()-target.float()).square().mean()

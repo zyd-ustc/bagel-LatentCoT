@@ -16,7 +16,7 @@ from .gen import supplemental_flow
 
 
 def states_for(row, config):
-    if row.get('label_kind') in ('observation_proxy', 'target_observation_gap'):
+    if row.get('state') or row.get('label_kind') in ('observation_proxy', 'target_observation_gap'):
         return [(float(row['t']), int(row['noise_seed']))]
     return [(t, seed) for t in config['eval_t'] for seed in config['noise_seeds']]
 
@@ -80,7 +80,12 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
             base = conditional_gen(runtime, state)
             if fixed_source is None:
                 fixed_source = base.source; fixed_metadata = dict(state.metadata, sample_id=row['sample_id'])
-            loop = memory_loop(student, state, rounds, diagnostics=True)
+            if cfg.get('stage') == 'C2-observe':
+                from .loop_training import LoopOutput
+                bank = student.write(base.source, t)
+                loop = LoopOutput(base, [bank], [base], 1)
+            else:
+                loop = memory_loop(student, state, rounds, diagnostics=True)
             arms = {'R1': (loop.banks[0], loop.exits[0])}
             provenance = {'R1': dict(state.metadata, source_round=0),
                           'R2-new': dict(state.metadata, source_round=1),
@@ -116,7 +121,7 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                                            ('G-layout', neutral, True)]:
                     arms[name] = (bank, conditional_gen(runtime, state, bank, masked=masked, capture=False))
                 arms['R0'] = (neutral, base)
-                if row.get('target_caption'):
+                if row.get('target_caption') and student.text_teacher is not None:
                     teacher = student.teacher_bank(row['target_caption'])
                     arms['Target-C1-oracle'] = (teacher, conditional_gen(runtime, state, teacher, capture=False))
                     oracle_flow = supplemental_flow(runtime, state.flow, state.lengths, state.positions, row['target_caption'])
@@ -128,7 +133,11 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                     donor_state = runtime.training_state(donor, t, seed)
                     if (donor_state.metadata['prompt'], donor_state.t) != (state.metadata['prompt'], state.t):
                         raise ValueError('swap must preserve actual prompt and t')
-                    donor_loop = memory_loop(student, donor_state, 1, diagnostics=True)
+                    if cfg.get('stage') == 'C2-observe':
+                        donor_base = conditional_gen(runtime, donor_state)
+                        donor_loop = LoopOutput(donor_base, [student.write(donor_base.source, t)], [donor_base], 1)
+                    else:
+                        donor_loop = memory_loop(student, donor_state, 1, diagnostics=True)
                     provenance['Source-swap'] = dict(donor_state.metadata, sample_id=donor['sample_id'], source_round=0)
                     provenance['R2-swap'] = dict(donor_state.metadata, sample_id=donor['sample_id'], source_round=1)
                     bank = donor_loop.banks[0]
@@ -138,7 +147,7 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                                               donor_source=donor_loop.exits[0].source, diagnostics=True,
                                               donor_metadata=donor_state.metadata)
                         arms['R2-swap'] = (swapped.banks[-1], swapped.exits[-1])
-            teacher_caption = generation_caption(row, cfg)
+            teacher_caption = generation_caption(row, cfg) if student.text_teacher is not None else None
             probe = state_probe(runtime, state) if teacher_caption else None
             response_teacher = student.teacher_bank(teacher_caption) if teacher_caption else None
             for arm, (bank, prediction) in arms.items():
@@ -223,6 +232,56 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
 
 
 @torch.no_grad()
+def evaluate_feedback(student, rows, output, *, updates=1, donor_rows=None):
+    """Fixed states, full CFG suffixes and paired content controls; no NLL ranking."""
+    from .feedback_source import prompt_source
+    from .schedule import native_suffix
+    runtime = student.runtime; cfg = runtime.config
+    student.eval(); records = []
+    by_id = {r['sample_id']:r for r in (donor_rows if donor_rows is not None else rows)}
+    output.mkdir(parents=True, exist_ok=True)
+    fields = ['image', 'sample_id', 'arm', 'target_fact_fix', 'correct_fact_preservation', 'quality', 'notes']
+    with (output/'annotations.csv').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader()
+        for row in rows:
+            for t, seed in states_for(row, cfg):
+                if not row.get('state'):
+                    t = nearest_node(cfg, t)[1]
+                state = runtime.training_state(row, t, seed)
+                loop = memory_loop(student, state, updates, diagnostics=True)
+                arms = {'Base': None, 'New': loop.banks[-1]}
+                arms['Layout'] = student.writer.fixed_bank(runtime.seeds)
+                if updates > 1:
+                    for control in ('old', 'fixed'):
+                        arms[control.capitalize()] = memory_loop(student, state, updates, feedback=control).banks[-1]
+                p = state.prompt_kv if state.prompt_kv is not None else prompt_source(state.flow, state.lengths, state.positions)
+                arms['Source-off'] = student.write(loop.baseline.source, t, prompt=p, source_off=True)
+                donor = by_id.get(row.get('swap_id'))
+                if donor:
+                    ds = runtime.training_state(donor, donor.get('t',t), donor.get('noise_seed',seed))
+                    if ds.metadata['prompt'] != state.metadata['prompt'] or ds.t != t:
+                        raise ValueError('swap must preserve prompt and actual t')
+                    source = conditional_gen(runtime, ds).source
+                    arms['Source-swap'] = student.write(source, t, prompt=p)
+                if student.text_teacher is not None and row.get('feedback') and not row['feedback']['satisfied']:
+                    arms['Text-memory'] = student.teacher_bank(row['feedback']['correction'], state)
+                for arm, bank in arms.items():
+                    velocity = (runtime.velocity(state.x_t, t, state.flow) if bank is None else
+                                runtime.gen_arm(state.x_t, t, state.flow, bank, state.lengths, state.positions,
+                                                masked=arm=='Layout'))
+                    final = runtime.continue_once(state.x_t, t, velocity[1], state.flow, native_suffix(cfg, t))
+                    image = f"{row['sample_id']}_t{t:.8f}_s{seed}_{arm}.png"
+                    runtime.image(final).save(output/image)
+                    item = dict(sample_id=row['sample_id'], arm=arm, image=image, t=t, noise_seed=seed,
+                                prompt=state.metadata['prompt'], state_hash=state.metadata['x_t_hash'],
+                                passes=updates+1 if arm == 'New' else None,
+                                image_policy='single_node_then_native_suffix', quality_status='pending review')
+                    append_json(output/'final_images.jsonl', item); records.append(item)
+                    writer.writerow({key:item.get(key, '') for key in fields})
+    return records
+
+
+@torch.no_grad()
 def evaluate_text_keep(student, text_rows, visual_rows, output):
     runtime = student.runtime
     row = visual_rows[0]; t, seed = states_for(row, runtime.config)[0]
@@ -245,7 +304,13 @@ def complete_sampling(student, row, seed, rounds=2, arm='new', *, output=None):
     native. Each node uses final-round velocity for exactly ONE Euler update.
     """
     runtime = student.runtime; cfg = runtime.config
-    initial = runtime.training_state(row, 1., seed)
+    from .feedback_restart import initial_noise
+    from .flow_training import TrainingState
+    flow, lengths, positions = runtime.flow_inputs(row['prompt'])
+    x = initial_noise(runtime, flow, seed)
+    initial = TrainingState(x, None, None, 1., flow, lengths, positions,
+                            dict(prompt=row['prompt'], t=1., noise_seed=seed, x_t_hash=tensor_hash(x),
+                                 state_source='prompt_trajectory'))
     state = initial.x_t; times = native_times(cfg); records = []
     from ..bagel.accelerator import synchronize
     import time
@@ -275,7 +340,10 @@ def complete_sampling(student, row, seed, rounds=2, arm='new', *, output=None):
         runtime.image(state).save(output/(name+'.png'))
         write_json(output/(name+'.json'), dict(sample_id=row['sample_id'], family_id=row['family_id'],
                    seed=seed, arm=arm, rounds=rounds, policy='complete_memory_window_then_native',
-                   prompt=initial.metadata['prompt'], seconds=time.perf_counter()-start, nodes=records,
+                   prompt=initial.metadata['prompt'], initial_noise_hash=tensor_hash(initial.x_t),
+                   source_layers=cfg.get('source_layers'), passes=rounds+1 if arm!='base' else 1,
+                   feedback_updates=rounds if arm!='base' else 0,
+                   seconds=time.perf_counter()-start, nodes=records,
                    gen_calls=sum(r['gen_calls_including_cfg'] for r in records)))
     return state, records
 

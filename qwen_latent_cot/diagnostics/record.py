@@ -14,7 +14,7 @@ from ..bagel.accelerator import device_info
 
 class FrozenGuard:
     def __init__(self, *modules):
-        self.modules = modules
+        self.modules = tuple(module for module in modules if module is not None)
         self.reference = self.snapshot()
         self.check()
 
@@ -65,7 +65,7 @@ def manifest(runtime, args, data_path, *, rows=None):
                     (p.suffix in ('.json', '.safetensors') or p.name.startswith(('tokenizer', 'vocab', 'merges')))]
     result = dict(protocol=runtime.config['protocol'], config=runtime.config,
                   config_hash=file_hash(args.config), dataset_hash=file_hash(data_path),
-                  data_asset_hashes={str(p): file_hash(p) for p in sorted({r[k] for r in (load_dataset(data_path) if rows is None else rows) for k in ('image', 'state') if r.get(k)})},
+                  data_asset_hashes={str(p): file_hash(p) for p in sorted({r[k] for r in (load_dataset(data_path) if rows is None else rows) for k in ('image', 'state', 'teacher') if r.get(k)})},
                   timestamp_utc=datetime.now(timezone.utc).isoformat(), host=platform.node(), command=sys.argv,
                   model_path=str(native_root.resolve()), dataset_path=str(Path(data_path).resolve()),
                   config_path=str(Path(args.config).resolve()),
@@ -106,6 +106,13 @@ def save_checkpoint(path, runtime, step, stage, parent=None):
 
 def load_checkpoint(path, runtime, expected_stage=None):
     saved = torch.load(path, map_location=runtime.device, weights_only=True)
+    validate_checkpoint(saved, runtime, expected_stage)
+    runtime.writer.load_state_dict(saved['adapters'], strict=True)
+    return saved
+
+
+def validate_checkpoint(saved, runtime, expected_stage=None):
+    """Validate native model and writer capacity without modifying any weights."""
     if saved.get('native_files') != runtime.native_files:
         raise ValueError('checkpoint native model/tokenizer/VAE provenance differs')
     if (saved['topology'], saved['slots'], saved['rank'], saved['depth'], saved['seed_ids']) != (
@@ -118,5 +125,3 @@ def load_checkpoint(path, runtime, expected_stage=None):
     allowed = (expected_stage,) if isinstance(expected_stage, str) else expected_stage
     if allowed and saved['stage'] not in allowed:
         raise ValueError('checkpoint has incorrect training stage')
-    runtime.writer.load_state_dict(saved['adapters'], strict=True)
-    return saved

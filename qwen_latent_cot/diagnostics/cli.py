@@ -11,6 +11,12 @@ from .record import manifest, write_json, load_checkpoint
 
 def main():
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'feedback-export':
+        from .feedback_dataset import main as export_main
+        return export_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == 'explicit-feedback':
+        from .feedback_cli import main as feedback_main
+        return feedback_main(sys.argv[2:])
     routes = {'visual-check': 'check', 'visual-train': 'train', 'visual-eval': 'eval',
               'loop-sample': 'sample', 'visual-label-states': 'label-states'}
     if len(sys.argv) > 1 and sys.argv[1] in routes:
@@ -36,6 +42,8 @@ def main():
     parser.add_argument('--c0-pass', help='calibration.json with manually verified C0 freedom-to-decode pass')
     parser.add_argument('--distributed', action='store_true', help='synchronize writer gradients across torchrun workers; effective_batch is global')
     args = parser.parse_args()
+    if args.command == 'train' and args.stage == 'C2':
+        parser.error('C2 training uses visual-train --stage C2-observe/C2-feedback; C2 caption/gen are historical diagnostics')
     if args.distributed and args.command not in ('train', 'distill'):
         parser.error('--distributed is supported only for train/distill')
     if not args.distributed and int(os.environ.get('WORLD_SIZE', '1')) > 1:
@@ -55,7 +63,8 @@ def main():
         raise ValueError('first-round training excludes pure noise; evaluation must include it')
     if config['steps'] <= 0 or config['effective_batch'] <= 0 or config['eval_every'] <= 0:
         raise ValueError('training budgets must be positive')
-    rows = load_dataset(args.data)
+    rows = load_dataset(args.data, visual=config.get('c1_feedback', False),
+                        c1_feedback=config.get('c1_feedback', False))
     query_rows = None
     if args.command == 'distill':
         if not args.query_data or not args.checkpoint or args.topology != 'C':
