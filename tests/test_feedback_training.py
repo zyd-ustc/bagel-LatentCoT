@@ -10,7 +10,7 @@ from qwen_latent_cot.diagnostics.visual import VisualStudent
 from qwen_latent_cot.diagnostics.visual_objectives import training_objective
 from qwen_latent_cot.diagnostics.flow_training import conditional_gen, TrainingState
 from qwen_latent_cot.diagnostics.feedback_source import prompt_source, compose_source
-from qwen_latent_cot.diagnostics.explicit_feedback import Feedback, intervention_state
+from qwen_latent_cot.diagnostics.explicit_feedback import Feedback
 from qwen_latent_cot.diagnostics.data import visual_label
 from qwen_latent_cot.diagnostics.record import FrozenGuard
 
@@ -67,9 +67,14 @@ def test_prompt_visible_outside_window_and_off_keeps_prompt(visual_runtime):
 
 def test_saved_trajectory_has_teacher_target_and_no_fake_flow(visual_runtime, tmp_path):
     runtime,row = visual_runtime; configure(runtime); student = VisualStudent(runtime,runtime.writer)
-    x,t,flow,lengths,positions,meta = intervention_state(runtime,'target',3,.5)
-    path = tmp_path/'trajectory.pt'; torch.save(dict(meta,x_t=x,state_source='trajectory'),path)
-    row = feedback_row(dict(row,state=str(path),prompt='target',label_type='observed',t=t,noise_seed=3))
+    from qwen_latent_cot.diagnostics.feedback_dataset import collect_feedback_states
+    runtime.text_teacher_hash='test'
+    exported=collect_feedback_states(runtime,[feedback_row(dict(row,prompt='target',noise_seed=3))],tmp_path/'states',[1])
+    row=dict(exported[0],state=str(tmp_path/'states'/exported[0]['state']),task='feedback',
+             annotation={'origin':'manual_checked','scope':'state'},flow_supervision=False)
+    row.pop('teacher')
+    row=visual_label(row)
+    t=row['t']
     state = runtime.training_state(row,t,3)
     values,info = training_objective(student,row,state,'C2-feedback')
     assert state.x0 is None and state.epsilon is None

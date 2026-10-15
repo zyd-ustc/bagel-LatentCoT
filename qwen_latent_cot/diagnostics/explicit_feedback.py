@@ -1,21 +1,20 @@
-"""Single native-node explicit teacher and paired R2 feedback inference.
-
-All arms restart the saved x_t/t. Preview and final suffixes use the existing
-native sampler. No image-understanding KV or preview latent enters GEN.
-"""
+"""Complete BAGEL generation, text reflection and fixed-memory regeneration."""
 from dataclasses import asdict, dataclass, replace
 import html
 import json
 import time
 import torch
-from .native import capture_gen, cache_kv, device_inputs, empty_cache
+from .native import cache_kv, device_inputs, empty_cache
 from .gen import supplemental_flow
 from .feedback_source import prompt_source, write_feedback
 from .numerics import autocast_for
-from .schedule import native_times, native_suffix, nearest_node
-from .data import controlled_noise, tensor_hash, velocity_stats
+from .schedule import native_times
+from .data import tensor_hash
 from .record import FrozenGuard, write_json
 from ..bagel.accelerator import synchronize
+
+PROTOCOL = 'explicit_feedback'
+
 
 
 @dataclass(frozen=True)
@@ -46,6 +45,7 @@ class Feedback:
         if set(value) != {'observation', 'gap', 'correction', 'satisfied'}:
             raise ValueError('reflection must return the four declared JSON fields')
         return cls(**value, origin='bagel_auto', raw=raw)
+
 
 
 @torch.no_grad()
@@ -86,6 +86,7 @@ def reflect(runtime, preview, prompt, image_transform, max_tokens=384):
         raise
 
 
+
 @torch.no_grad()
 def correction_source(runtime, flow, lengths, positions, correction):
     """Native append on a clean prompt clone; extract only C, never duplicate P."""
@@ -101,45 +102,18 @@ def correction_source(runtime, flow, lengths, positions, correction):
     return source, augmented, count
 
 
+
 def shifted_layout(flow, count):
     layout = dict(flow)
     layout['packed_position_ids'] = flow['packed_position_ids']+count
     return layout
 
 
-def response_diagnostics(x, t, next_t, velocities):
-    """Separate content response from position-only effects, before/after CFG.
-
-    Nonzero response is sensitivity, not proof of correct final-image edits.
-    """
-    matched = {'Text': 'Layout-text', 'Text-memory': 'Layout-memory',
-               'Swapped-memory': 'Layout-memory', 'Implicit-memory': 'Layout-memory'}
-    dt = t-next_t
-    if dt <= 0:
-        raise ValueError('response diagnostics require a positive native Euler step')
-    records = {}
-    for arm, pair in velocities.items():
-        reference = matched.get(arm, 'Base')
-        # A strict satisfied bypass has no reserved layout or extra KV.
-        if reference not in velocities:
-            reference = 'Base'
-        baseline = velocities[reference]
-        delta = dt*(pair[1].float()-baseline[1].float())
-        records[arm] = dict(reference=reference,
-            conditional=velocity_stats(pair[0], baseline[0]), cfg=velocity_stats(pair[1], baseline[1]),
-            conditional_hash=tensor_hash(pair[0]), cfg_hash=tensor_hash(pair[1]),
-            first_step_delta_l2=float(delta.norm()),
-            first_step_delta_rms=float(delta.square().mean().sqrt()),
-            first_step_delta_over_x_norm=float(delta.norm()/x.float().norm().clamp_min(1e-12)))
-    return dict(dt=dt, remaining_euler_steps=None, arms=records,
-                interpretation='numerical response only; no semantic quality verdict')
-
 
 def image_diagnostics(images):
     """Measure final RGB content against the corresponding layout control."""
     import numpy as np
-    matched = {'Text': 'Layout-text', 'Text-memory': 'Layout-memory',
-               'Swapped-memory': 'Layout-memory', 'Implicit-memory': 'Layout-memory'}
+    matched = {'Text': 'Layout-text', 'Text-memory': 'Layout-memory'}
     out = {}
     for arm, image in images.items():
         prefix, _, kind = arm.rpartition('_')
@@ -157,161 +131,191 @@ def image_diagnostics(images):
     return out
 
 
+
+def validate_windows(config, early):
+    steps = len(native_times(config))-1
+    if not early or len(set(early)) != len(early) or any(type(n) is not int or not 0 < n <= steps for n in early):
+        raise ValueError('early windows must be distinct positive counts within the native Euler schedule')
+
+
+
 @torch.no_grad()
-def intervention_state(runtime, prompt, seed, requested_t):
-    """Prompt-only native prefix; no alternate x0/noise is introduced at R2."""
-    flow, lengths, positions = runtime.flow_inputs(prompt)
-    step, actual = nearest_node(runtime.config, requested_t)
+def initial_noise(runtime, flow, seed):
+    """Same CPU generator, float32 noise and patch layout as shallow sample()."""
+    size = runtime.config['resolution']//runtime.model.latent_downsample
     width = runtime.model.latent_channel*runtime.model.latent_patch_size**2
-    x = controlled_noise(torch.zeros(len(flow['packed_vae_token_indexes']), width,
-                                     device=runtime.device), 1, seed)
-    times = native_times(runtime.config)
-    for current, following in zip(times[:step], times[1:step+1]):
-        x = x-(current-following)*runtime.velocity(x, current, flow)[1]
-    return x, actual, flow, lengths, positions, dict(prompt=prompt, noise_seed=seed,
-        requested_t=requested_t, t=actual, step_index=step, x_t_hash=tensor_hash(x),
-        sampler_steps=runtime.config['sampler_steps'], timestep_shift=runtime.config['timestep_shift'])
+    if len(flow['packed_vae_token_indexes']) != size*size:
+        raise ValueError('native flow query and shallow-sampling latent layout differ')
+    generator = torch.Generator(device='cpu').manual_seed(seed)
+    return torch.randn(size*size, width, generator=generator).to(runtime.device)
+
 
 
 @torch.no_grad()
-def compare(runtime, x, t, flow, lengths, positions, *, feedback=None, reflector=None,
-            source_layers=None, student=None, donor=None, original_prompt=None, preview_kind='complete'):
-    """R1 full exit, isolated teacher preview, same-state Text/Memory/Implicit R2.
+def sample_fixed(runtime, initial, flow, lengths, positions, *, bank=None, early=0,
+                 masked=False, text_flow=None, position_shift=0):
+    """Repeat the native Euler loop; use the SAME bank for every active step."""
+    if bank is not None and text_flow is not None:
+        raise ValueError('choose one additional condition per sampling arm')
+    if masked and bank is None:
+        raise ValueError('masked layout requires a memory bank')
+    if bank is not None or text_flow is not None or position_shift:
+        validate_windows(runtime.config, [early])
+    elif early:
+        raise ValueError('native baseline has no intervention window')
+    state = initial.clone()
+    entrance_hash = tensor_hash(state)
+    records = []
+    times = native_times(runtime.config)
+    for index, (current, following) in enumerate(zip(times, times[1:])):
+        active = index < early
+        if active and bank is not None:
+            conditional, velocity = runtime.gen_arm(state, current, flow, bank, lengths, positions, masked=masked)
+        else:
+            inputs = flow
+            if active and text_flow is not None:
+                inputs = text_flow
+            elif active and position_shift:
+                inputs = dict(flow, packed_position_ids=flow['packed_position_ids']+position_shift)
+            conditional, velocity = runtime.velocity(state, current, inputs)
+        records.append(dict(step=index, t=current, next_t=following, feedback_active=active,
+            memory_visible=bool(active and bank is not None and not masked),
+            memory_masked=bool(active and masked), conditional_gen_passes=1,
+            conditional_gen_layer_calls=len(runtime.decoder.layers),
+            cfg_velocity_hash=tensor_hash(velocity), conditional_velocity_hash=tensor_hash(conditional),
+            cfg_velocity_norm=float(velocity.float().norm()), conditional_velocity_norm=float(conditional.float().norm())))
+        state = state-(current-following)*velocity
+    if tensor_hash(initial) != entrance_hash:
+        raise RuntimeError('generation mutated its shared initial noise')
+    return dict(latent=state, nodes=records, initial_noise_hash=entrance_hash,
+                initial_noise_shape=list(initial.shape), gen_passes_per_step=1,
+                active_updates=sum(r['feedback_active'] for r in records))
 
-    donor contains checked feedback and metadata (prompt, t, x_t_hash). A donor
-    with the same correction is recorded as non-discriminating swap evidence.
-    """
-    if runtime.writer.topology != 'C' or runtime.writer.slots != 16:
-        raise ValueError('explicit feedback requires continuous 16-slot writer')
-    if preview_kind not in ('complete', 'local_cfg'):
-        raise ValueError('unknown teacher preview kind')
-    if (feedback is None) == (reflector is None):
-        raise ValueError('select exactly one checked feedback or automatic reflector')
+
+
+@torch.no_grad()
+def generate_base(runtime, prompt, seed, initial=None):
+    flow, lengths, positions = runtime.flow_inputs(prompt)
+    expected = initial_noise(runtime, flow, seed)
+    if initial is None:
+        initial = expected
+    elif initial.shape != expected.shape or initial.dtype != expected.dtype or not torch.equal(initial, expected):
+        raise ValueError('saved initial noise differs from the declared seed/native layout')
     runtime.writer.eval().requires_grad_(False)
-    guarded = [runtime.model, runtime.bundle.vae, runtime.writer]
-    if student is not None:
-        student.eval().requires_grad_(False)
-        guarded.append(student)
-    guard = FrozenGuard(*guarded)
-    layers = tuple(range(len(runtime.decoder.layers))) if source_layers is None else tuple(source_layers)
-    if not layers or len(set(layers)) != len(layers) or any(i < 0 or i >= len(runtime.decoder.layers) for i in layers):
-        raise ValueError('invalid GEN source window')
-    original = x.clone(); state_hash = tensor_hash(x)
-    prompt = prompt_source(flow, lengths, positions)
-    remaining = native_suffix(runtime.config, t)
-    timings = {}
+    guard = FrozenGuard(runtime.model, runtime.bundle.vae, runtime.writer)
+    synchronize(runtime.device); start = time.perf_counter()
+    base = sample_fixed(runtime, initial, flow, lengths, positions)
+    synchronize(runtime.device); generation_seconds = time.perf_counter()-start
+    start = time.perf_counter()
+    image = runtime.image(base['latent'])
+    synchronize(runtime.device); decode_seconds = time.perf_counter()-start
+    guard.check()
+    return dict(prompt=prompt, seed=seed, initial=initial, flow=flow, lengths=lengths, positions=positions,
+                base=base, image=image, generation_seconds=generation_seconds, decode_seconds=decode_seconds)
+
+
+
+@torch.no_grad()
+def compare(runtime, prepared, *, early=(10, 20), feedback=None, reflector=None, text_control=False):
+    validate_windows(runtime.config, early)
+    if runtime.writer.topology != 'C' or runtime.writer.slots != 16:
+        raise ValueError('restart feedback requires continuous C1 memory with 16 slots')
+    if (feedback is None) == (reflector is None):
+        raise ValueError('choose exactly one checked feedback or automatic reflection')
+    runtime.writer.eval().requires_grad_(False)
+    guard = FrozenGuard(runtime.model, runtime.bundle.vae, runtime.writer)
+    initial = prepared['initial']; flow = prepared['flow']
+    lengths = prepared['lengths']; positions = prepared['positions']
+    timings = {'base_generation':prepared['generation_seconds'], 'base_decode':prepared['decode_seconds']}
     def measured(name, operation):
         synchronize(runtime.device); start = time.perf_counter()
         result = operation()
         synchronize(runtime.device); timings[name] = time.perf_counter()-start
         return result
-    def first_pass():
-        with capture_gen(runtime.decoder, flow['past_key_values'], t=t, layers=layers,
-                         positions=flow['packed_position_ids']) as captured:
-            velocity = runtime.velocity(x, t, flow)
-        return velocity, tuple(captured[i] for i in layers)
-    r1, gen_source = measured('r1_gen', first_pass)
-    # Always finish the native exit before decoding; never decode shallow hidden.
-    base_latent = measured('preview_suffix', lambda: runtime.continue_once(x, t, r1[1], flow, remaining))
-    base_image = measured('preview_decode', lambda: runtime.image(base_latent))
-    preview = base_image if preview_kind == 'complete' else measured('local_preview_decode', lambda: runtime.image(x-t*r1[1]))
     if reflector is not None:
-        feedback = measured('reflection', lambda: reflector(preview))
+        feedback = measured('reflection', lambda: reflector(prepared['image']))
     if not isinstance(feedback, Feedback):
         raise ValueError('reflection must return validated Feedback')
-    images = {'Base': base_image}; velocities = {'Base': r1}; banks = {}
-    counts = {'memory': 16, 'text': 0}; swap_discriminating = None; swap_details = None
-    def final_arm(name, velocity):
-        velocities[name] = velocity
-        latent = measured(name+'_suffix', lambda: runtime.continue_once(x, t, velocity[1], flow, remaining))
-        images[name] = measured(name+'_decode', lambda: runtime.image(latent))
-    if feedback.satisfied:
-        # Strict bypass: do not call a shifted/zero/neutral KV path.
-        images.update({'Text': base_image, 'Text-memory': base_image})
-        velocities.update({'Text': r1, 'Text-memory': r1})
-    else:
-        correction, augmented, count = measured('text_prefill', lambda: correction_source(runtime, flow, lengths, positions, feedback.correction))
-        counts['text'] = count
-        bank = measured('text_writer', lambda: write_feedback(runtime, prompt, correction))
-        banks['Text-memory'] = bank
-        fixed = runtime.writer.fixed_bank(runtime.seeds)
-        final_arm('Layout-memory', measured('Layout-memory_r2', lambda: runtime.gen_arm(x, t, flow, fixed, lengths, positions, masked=True)))
-        final_arm('Layout-text', measured('Layout-text_r2', lambda: runtime.velocity(x, t, shifted_layout(flow, count))))
-        final_arm('Text', measured('Text_r2', lambda: runtime.velocity(x, t, augmented)))
-        final_arm('Text-memory', measured('Text-memory_r2', lambda: runtime.gen_arm(x, t, flow, bank, lengths, positions)))
-        if donor is not None:
-            meta = donor['metadata']
-            if not original_prompt or (meta.get('prompt'), meta.get('t')) != (original_prompt, t) or not meta.get('x_t_hash') or meta['x_t_hash'] == state_hash:
-                raise ValueError('swap requires a different state at the same prompt/t')
-            donor_feedback = donor['feedback']
-            if donor_feedback.satisfied:
-                raise ValueError('swap donor must have a correction')
-            # Different strings do not prove different error types. Review the
-            # donor facts before treating this as evidence of state dependence.
-            swap_discriminating = False if donor_feedback.correction == feedback.correction else None
-            swap_details = dict(metadata=meta, feedback=asdict(donor_feedback),
-                                error_type_validation='pending human review')
-            source, _, _ = correction_source(runtime, flow, lengths, positions, donor_feedback.correction)
-            swapped = measured('swap_writer', lambda: write_feedback(runtime, prompt, source))
-            banks['Swapped-memory'] = swapped
-            final_arm('Swapped-memory', measured('Swapped-memory_r2', lambda: runtime.gen_arm(x, t, flow, swapped, lengths, positions)))
-    if student is not None:
-        if 'Layout-memory' not in images:
-            fixed = runtime.writer.fixed_bank(runtime.seeds)
-            final_arm('Layout-memory', measured('Layout-memory_r2', lambda: runtime.gen_arm(x, t, flow, fixed, lengths, positions, masked=True)))
-        bank = measured('implicit_writer', lambda: write_feedback(runtime, prompt, gen_source, layers=layers,
-                                writer=student.writer, visual_adapter=student.visual, t=t))
-        banks['Implicit-memory'] = bank
-        final_arm('Implicit-memory', measured('Implicit-memory_r2', lambda: runtime.gen_arm(x, t, flow, bank, lengths, positions)))
-    if tensor_hash(x) != state_hash or not torch.equal(x, original):
-        raise RuntimeError('preview/feedback changed the saved intervention state')
+    images = {'Base':prepared['image']}; arms = {'Base':prepared['base']}
+    prompt = prompt_source(flow, lengths, positions)
+    bank = None; count = 0
+    if not feedback.satisfied:
+        # Encode only reflection text on a clean original prompt cache. UND
+        # vision-session KV and the first generated image are never GEN inputs.
+        correction, augmented, count = measured('reflection_text_prefill', lambda:
+            correction_source(runtime, flow, lengths, positions, feedback.correction))
+        bank = measured('text_writer_once', lambda: write_feedback(runtime, prompt, correction))
+    for window in early:
+        name = f'early{window}_Text-memory'
+        if feedback.satisfied:
+            arms[name] = dict(prepared['base'], requested_early=window, strict_bypass=True)
+            images[name] = prepared['image']
+            continue
+        variants = [(f'early{window}_Layout-memory', dict(bank=bank, masked=True)),
+                    (name, dict(bank=bank))]
+        if text_control:
+            variants += [(f'early{window}_Layout-text', dict(position_shift=count)),
+                         (f'early{window}_Text', dict(text_flow=augmented))]
+        for arm, options in variants:
+            result = measured(arm+'_generation', lambda options=options:
+                sample_fixed(runtime, initial, flow, lengths, positions, early=window, **options))
+            times = native_times(runtime.config)
+            result.update(requested_early=window, active_time_range=[times[0], times[window]])
+            arms[arm] = result
+            images[arm] = measured(arm+'_decode', lambda: runtime.image(result['latent']))
+    entrance_hash = tensor_hash(initial)
+    if any(arm['initial_noise_hash'] != entrance_hash for arm in arms.values()):
+        raise RuntimeError('paired generations did not start at the identical initial noise')
     guard.check()
-    diagnostics = response_diagnostics(x, t, remaining[0], velocities)
-    diagnostics['remaining_euler_steps'] = len(remaining)
-    return dict(preview=preview, images=images, velocities=velocities, banks=banks,
-                feedback=feedback, timings=timings, token_counts=counts,
-                t=t, x_t_hash=state_hash, source_layers=layers, preview_kind=preview_kind,
-                continuation_times=[t]+remaining, bypass=feedback.satisfied,
-                swap_discriminating=swap_discriminating, swap_details=swap_details, frozen_guard='passed',
-                response_diagnostics=diagnostics)
+    return dict(protocol=PROTOCOL, feedback=feedback, images=images, arms=arms, bank=bank,
+        timings=timings, early=list(early), initial_noise_hash=entrance_hash,
+        correction_tokens=count, bypass=feedback.satisfied, frozen_guard='passed',
+        writer_updates=int(bank is not None), memory_policy='one fixed bank shared across all active steps/windows',
+        feedback_text=feedback.correction, sampling_times=native_times(runtime.config))
+
 
 
 def save_comparison(output, name, result, metadata):
-    result['preview'].save(output/(name+'_preview.png'))
     files = {}
     for arm, image in result['images'].items():
         files[arm] = name+'_'+arm+'.png'
         image.save(output/files[arm])
-    velocity_file = name+'_velocities.pt'
-    torch.save(dict(t=result['t'], x_t_hash=result['x_t_hash'],
-                    velocities={arm: dict(conditional=pair[0].detach().cpu(), cfg=pair[1].detach().cpu())
-                                for arm, pair in result['velocities'].items()}), output/velocity_file)
-    record = dict(metadata, **{k: result[k] for k in ('t', 'x_t_hash', 'source_layers', 'preview_kind',
-        'continuation_times', 'bypass', 'swap_discriminating', 'swap_details', 'frozen_guard', 'timings', 'token_counts')},
-        feedback=asdict(result['feedback']), preview=name+'_preview.png', images=files,
-        response_diagnostics=result['response_diagnostics'], final_image_diagnostics=image_diagnostics(result['images']),
-        velocity_file=velocity_file,
+    # Keep only scalar/hash trajectory evidence in JSON; final latents are not
+    # recycled into a subsequent generation.
+    arms = {arm:{key:value for key,value in item.items() if key != 'latent'}
+            for arm,item in result['arms'].items()}
+    bank_file = None
+    if result['bank'] is not None:
+        bank_file = name+'_memory.pt'
+        torch.save(dict(initial_noise_hash=result['initial_noise_hash'], feedback_text=result['feedback_text'],
+            slots=result['bank'].slots, topology=result['bank'].topology,
+            layers=[dict(layer=kv.layer, keys=kv.keys.cpu(), values=kv.values.cpu(),
+                         lengths=kv.lengths, rotated=kv.rotated) for kv in result['bank'].layers]), output/bank_file)
+    record = dict(metadata, **{key:result[key] for key in ('protocol','timings','early','initial_noise_hash',
+        'correction_tokens','bypass','frozen_guard','writer_updates','memory_policy','feedback_text','sampling_times')},
+        feedback=asdict(result['feedback']), base_image=files['Base'], images=files, arms=arms,
+        memory_file=bank_file, final_image_diagnostics=image_diagnostics(result['images']),
         semantic_quality='unverified; requires paired final-image annotation',
-        suffix_policy='single intervention followed by native original-prompt suffix')
+        suffix_policy='fixed memory for first early updates; original-prompt native GEN afterward',
+        shallow_loop=False, memory_refresh=False)
     write_json(output/(name+'.json'), record)
     return record
 
 
+
 def render_review(output, records):
-    parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>显式反馈配对审查</title>',
-             '<style>body{font-family:system-ui;margin:24px;background:#faf9f6;color:#222} '
-             '.images{display:flex;flex-wrap:wrap;gap:12px}figure{margin:0;width:260px} '
-             'img{width:100%}pre{white-space:pre-wrap}section{border-top:1px solid #bbb;padding:24px 0}</style>',
-             '<h1>显式反馈配对审查</h1><p>终图纠错、正确事实保持与质量均待人工评价。自动反馈与核对反馈分别审查。</p>']
-    for r in records:
-        parts += ['<section><h2>'+html.escape(r['sample_id'])+'</h2><p>'+html.escape(r['prompt'])+'</p>',
-                  '<pre>'+html.escape(json.dumps({k:r[k] for k in ('feedback','t','noise_seed','timings')}, ensure_ascii=False, indent=2))+'</pre><div class="images">']
-        for arm, file in [('R1 preview', r['preview']), *r['images'].items()]:
+    parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>显式反馈：相同噪声重新生成</title>',
+        '<style>body{font-family:system-ui;margin:24px;background:#faf9f6}.images{display:flex;flex-wrap:wrap;gap:12px} '
+        'figure{margin:0;width:300px}img{width:100%}pre{white-space:pre-wrap}section{border-top:1px solid #bbb;padding:20px 0}</style>',
+        '<h1>完整生成 → 图像理解反思 → 固定 memory → 相同噪声重新生成</h1>',
+        '<p>第二次生成在 early 窗口内使用同一份 memory。每个采样步只执行一次完整 GEN。终图纠错效果待人工评价。</p>']
+    for record in records:
+        parts += ['<section><h2>'+html.escape(record['sample_id'])+'</h2><p>'+html.escape(record['prompt'])+'</p>',
+            '<pre>'+html.escape(json.dumps({key:record[key] for key in ('noise_seed','initial_noise_hash','feedback','early','timings')},
+                                          ensure_ascii=False, indent=2))+'</pre><div class="images">']
+        for arm, file in record['images'].items():
             parts.append('<figure><img src="'+html.escape(file, quote=True)+'"><figcaption>'+html.escape(arm)+'</figcaption></figure>')
-        parts.append('</div>')
-        if 'response_diagnostics' in r:
-            parts.append('<details><summary>条件响应与终图差异（不代表纠错成功）</summary><pre>'+html.escape(
-                json.dumps({key:r[key] for key in ('response_diagnostics', 'final_image_diagnostics')}, ensure_ascii=False, indent=2))+'</pre></details>')
-        parts.append('</section>')
+        parts += ['</div><details><summary>采样窗口与逐步执行记录</summary><pre>'+html.escape(
+            json.dumps(record['arms'], ensure_ascii=False, indent=2))+'</pre></details></section>']
     parts.append('</html>')
     (output/'review.html').write_text('\n'.join(parts))

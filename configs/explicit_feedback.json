@@ -1,5 +1,5 @@
 {
-  "protocol": "explicit_feedback_restart_v2",
+  "protocol": "explicit_feedback",
   "early": [10, 20],
   "max_reflection_tokens": 384,
   "vit_max_image_size": 980,

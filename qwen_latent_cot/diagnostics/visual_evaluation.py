@@ -304,7 +304,7 @@ def complete_sampling(student, row, seed, rounds=2, arm='new', *, output=None):
     native. Each node uses final-round velocity for exactly ONE Euler update.
     """
     runtime = student.runtime; cfg = runtime.config
-    from .feedback_restart import initial_noise
+    from .explicit_feedback import initial_noise
     from .flow_training import TrainingState
     flow, lengths, positions = runtime.flow_inputs(row['prompt'])
     x = initial_noise(runtime, flow, seed)

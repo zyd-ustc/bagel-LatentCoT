@@ -1,8 +1,0 @@
-{
-  "protocol": "explicit_feedback_v1",
-  "preview_kind": "complete",
-  "source_layers": [0, 1, 2, 3, 4, 5, 6, 7],
-  "max_reflection_tokens": 384,
-  "vit_max_image_size": 980,
-  "vit_min_image_size": 224
-}

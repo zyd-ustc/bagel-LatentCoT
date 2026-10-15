@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from .explicit_feedback import Feedback, correction_source
 from .feedback_source import prompt_source, write_feedback
-from .feedback_restart import initial_noise
+from .explicit_feedback import initial_noise
 from .flow_training import TrainingState, conditional_gen
 from .schedule import native_times
 from .data import tensor_hash, file_hash
@@ -87,7 +87,7 @@ def main(argv=None):
     parser.add_argument('--device',default='auto')
     parser.add_argument('--output',required=True)
     args=parser.parse_args(argv)
-    from .feedback_restart_cli import load_rows
+    from .feedback_cli import load_rows
     rows=load_rows(args.data);cfg=json.loads(Path(args.config).read_text())
     from ..bagel.backbone import load_native
     from .runtime import DiagnosticRuntime

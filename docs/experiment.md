@@ -27,7 +27,7 @@
 
 R1/R2/R3/R4 表示同一采样状态内 GEN 共运行一至四遍，分别对应零至三次反馈。训练入口的 `feedback_updates` 表示反馈次数。旧视觉训练记录中的 R1/R2 出口分别对应一次、两次反馈后的速度；下文保留该历史日志名称。
 
-局部预测图使用当前速度形成的 x0 预测；单节点终图在一个节点注入反馈后完成原生后缀；窗口终图在指定外层时间窗口持续使用反馈。
+局部预测图使用当前速度形成的 x0 预测；窗口终图在指定外层时间窗口持续使用反馈。
 
 ## 2. 已执行：文本接口与生成响应
 
@@ -267,6 +267,12 @@ SHA256：`e7c3bce91f2d9ba2697fb06308d6eb6850aa463518a7d9a2e6d19c38ff2c1ed5`。�
 
 21 份新数据的 840 条既有审计样本均完成归一化。训练脚本语法与两个主入口的帮助命令通过检查。
 
+### 4.3 2026-10-15 显式反馈验证
+
+显式推理由 `explicit_feedback.py` 与 `feedback_cli.py` 完成：完整 Base、BAGEL 文字反思、固定 memory、相同初始噪声重生成。配置为 `explicit_feedback.json`，协议标识为 `explicit_feedback`。
+
+完整测试 112 项通过，耗时 10.70 秒。固定 memory 的采样、初始噪声、Base 和时间窗口计算保持一致。现有 16 样本、32 个 early 窗口结果通过图像与逐步记录审计。
+
 ## 5. 待执行：下一轮实验
 
 | 顺序 | 实验 | 起始设置 | 交付 |
@@ -369,9 +375,7 @@ python -m qwen_latent_cot.diagnostics.feedback_cli \
 
 模板保留精确 `initial_state`、prompt 与 seed，填写 observation、gap、correction 或 satisfied。每次输出使用新目录。
 
-单节点预览/返回实验使用 `configs/explicit_feedback_single_node.json`，模板保存 `state` 与实际 t；原生 Text、Text-memory、隐式 memory 和交换反馈从该状态继续。添加 `--visual-checkpoint` 选择学生，`swap_id` 指向同 P/t 的另一反馈样本。`preview_kind=local_cfg` 选择局部预测，`complete` 选择完整后缀。
-
-输出包括精确状态、采样节点、checkpoint 哈希、反馈文本、memory、条件与 CFG 速度、每步注入记录、分项时间、终图、`review.html` 和 `annotations.csv`。固定重生成使用 `*_initial.pt`，单节点实验使用 `*_state.pt`。
+输出包括精确初始噪声、采样节点、checkpoint 哈希、反馈文本、memory、条件与 CFG 速度的哈希及范数、每步注入记录、分项时间、终图、`review.html` 和 `annotations.csv`。初始噪声保存在 `*_initial.pt`。
 
 ### 6.2 Observe → Feedback → C3
 
@@ -400,7 +404,7 @@ Observe 使用可选的 C1 初始化。Feedback 默认教师速度项使用经�
 
 ### 6.3 评分与审计
 
-评分工具为 `scripts/score_explicit_feedback.py`；已有显式实验的评分状态为待执行。单节点速度与终图审计使用：
+评分工具为 `scripts/score_explicit_feedback.py`；已有显式实验的评分状态为待执行。固定 memory 的窗口与终图审计使用：
 
 ```bash
 python -m qwen_latent_cot.diagnostics.feedback_audit \
