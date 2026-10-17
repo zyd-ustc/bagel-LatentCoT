@@ -13,18 +13,19 @@ from ..bagel.accelerator import device_info
 
 
 class FrozenGuard:
-    def __init__(self, *modules):
+    def __init__(self, *modules, exclude_trainable=False):
         self.modules = tuple(module for module in modules if module is not None)
+        self.excluded = {id(p) for m in self.modules for p in m.parameters() if exclude_trainable and p.requires_grad}
         self.reference = self.snapshot()
         self.check()
 
     def snapshot(self):
-        return {(i, name): (id(p), p._version) for i, m in enumerate(self.modules) for name, p in m.named_parameters()}
+        return {(i, name): (id(p), p._version) for i, m in enumerate(self.modules) for name, p in m.named_parameters() if id(p) not in self.excluded}
 
     def check(self):
         if self.snapshot() != self.reference:
             raise RuntimeError('native parameter identity/version changed; stop interpreting results')
-        if any(p.requires_grad or p.grad is not None for m in self.modules for p in m.parameters()):
+        if any(p.requires_grad or p.grad is not None for m in self.modules for p in m.parameters() if id(p) not in self.excluded):
             raise RuntimeError('native parameters have enabled gradients; stop')
 
 
@@ -97,7 +98,7 @@ def manifest(runtime, args, data_path, *, rows=None):
 
 def save_checkpoint(path, runtime, step, stage, parent=None):
     torch.save(dict(adapters=runtime.writer.state_dict(), topology=runtime.writer.topology,
-                    slots=runtime.writer.slots, rank=runtime.writer.rank, depth=len(runtime.decoder.layers),
+                    slots=runtime.writer.slots, depth=len(runtime.decoder.layers),
                     seed_ids=runtime.seed_ids, config=runtime.config, step=step, stage=stage, parent=parent,
                     native_files=runtime.native_files,
                     response_cumulative_steps=getattr(runtime, 'response_cumulative_steps', 0),
@@ -115,11 +116,11 @@ def validate_checkpoint(saved, runtime, expected_stage=None):
     """Validate native model and writer capacity without modifying any weights."""
     if saved.get('native_files') != runtime.native_files:
         raise ValueError('checkpoint native model/tokenizer/VAE provenance differs')
-    if (saved['topology'], saved['slots'], saved['rank'], saved['depth'], saved['seed_ids']) != (
-        runtime.writer.topology, runtime.writer.slots, runtime.writer.rank, len(runtime.decoder.layers), runtime.seed_ids):
+    if (saved['topology'], saved['slots'], saved['depth'], saved['seed_ids']) != (
+        runtime.writer.topology, runtime.writer.slots, len(runtime.decoder.layers), runtime.seed_ids):
         raise ValueError('checkpoint topology/capacity/depth/initialization mismatch')
     for key in ('writer_position_start', 'caption_instruction', 'neutral_prompt', 'resolution',
-                'adapter_type', 'posterior_seed_policy', 'posterior_seed', 'training_state_sampling', 'fact_scoring'):
+                'writer_architecture', 'posterior_seed_policy', 'posterior_seed', 'training_state_sampling', 'fact_scoring'):
         if saved['config'].get(key) != runtime.config[key]:
             raise ValueError('checkpoint interface configuration mismatch: '+key)
     allowed = (expected_stage,) if isinstance(expected_stage, str) else expected_stage

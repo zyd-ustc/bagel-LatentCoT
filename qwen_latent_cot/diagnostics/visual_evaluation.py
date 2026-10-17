@@ -67,7 +67,7 @@ def observe_layers(runtime, cache):
 def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=False,
              continue_sampling=False, layer_diagnostics=False, donor_rows=None):
     runtime = student.runtime; cfg = runtime.config
-    guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher)
+    guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher, exclude_trainable=True)
     by_id = {r['sample_id']: r for r in (donor_rows if donor_rows is not None else rows)}; records = []; blind = []
     output.mkdir(parents=True, exist_ok=True)
     fixed_source = None; fixed_metadata = None
@@ -107,7 +107,7 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                 neutral = student.writer.fixed_bank(runtime.seeds)
                 zero = MemoryBank(tuple(KV(kv.layer, torch.zeros_like(kv.keys), torch.zeros_like(kv.values),
                                            kv.lengths, False) for kv in neutral.layers), 'fixed', neutral.slots)
-                provenance.update({'C1-direct-GEN': dict(state.metadata, source_round=0, visual_adapter=False),
+                provenance.update({'C1-direct-GEN': dict(state.metadata, source_round=0, writer_architecture=student.architecture),
                                    'Source-off': dict(source='ignored', t=t),
                                    'Fixed-source': fixed_metadata,
                                    'G-fixed': dict(source='zero_KV'),
@@ -155,7 +155,7 @@ def evaluate(student, rows, output, *, rounds=1, controls=True, save_images=Fals
                             split=row['split'], arm=arm, t=t, requested_t=requested_t, noise_seed=seed, round=prediction.round,
                             label_kind=row['label_kind'], confirmed_label=row['confirmed_label'],
                             state=state.metadata, source_provenance=provenance.get(arm), caption=semantic_result(runtime, row, bank),
-                            conditional_flow_mse=float(flow_mse(prediction, state)) if state.x0 is not None else None,
+                            conditional_flow_mse=float(flow_mse(prediction, state)) if state.metadata.get('flow_supervision') else None,
                             diagnostics=state_diagnostics(bank, loop.banks[0], prediction, base),
                             caption_probe='UND reads associated Memory bank; not a GEN image caption',
                             response_position_reserve=16, writer_position_start=cfg['writer_position_start'],

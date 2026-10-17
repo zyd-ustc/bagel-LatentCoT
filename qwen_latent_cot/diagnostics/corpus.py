@@ -1,18 +1,18 @@
-"""Streaming source normalization, disk-backed families, indexed task views."""
+"""Resolve explicit family splits, then normalize annotations and index tasks."""
 import argparse
 from collections import Counter, OrderedDict
 import hashlib
-import io
 import json
 import mmap
 from pathlib import Path
-import sqlite3
 import struct
-from PIL import Image
+import os
+import time
 
 REF = struct.Struct('<IQB')
 ROLES = ('observe_target', 'observe_input', 'generation', 'repair', 'hold', 'trajectory', 'conditional', 'observe_state')
-RANK = {'train': 0, 'val': 1, 'test': 2}
+FORMAT = 'annotation_index_v2'
+TOKEN_FIELDS = ('goal_prompt', 'target_caption', 'input_caption', 'edit_instruction', 'observed_caption')
 
 
 def json_records(path):
@@ -25,23 +25,25 @@ def json_records(path):
             for line in stream:
                 if line.strip(): yield json.loads(line)
             return
-        decoder = json.JSONDecoder(); buffer = ''; eof = False; need_value = True
+        decoder = json.JSONDecoder(); buffer = ''; position = 0; eof = False; need_value = True
         while True:
-            buffer = buffer.lstrip()
-            if buffer.startswith(']'):
-                if buffer[1:].strip() or stream.read().strip(): raise ValueError('trailing JSON array data')
+            while position < len(buffer) and buffer[position].isspace(): position += 1
+            if position < len(buffer) and buffer[position] == ']':
+                if buffer[position+1:].strip() or stream.read().strip(): raise ValueError('trailing JSON array data')
                 return
-            if not need_value and buffer.startswith(','):
-                buffer = buffer[1:].lstrip(); need_value = True
-            if buffer:
+            if not need_value and position < len(buffer) and buffer[position] == ',':
+                position += 1; need_value = True
+                continue
+            if position < len(buffer):
                 if not need_value: raise ValueError('missing JSON array comma')
-                try: value, end = decoder.raw_decode(buffer)
+                try: value, end = decoder.raw_decode(buffer, position)
                 except json.JSONDecodeError:
                     if eof: raise
                 else:
-                    yield value; buffer = buffer[end:]; need_value = False; continue
+                    yield value; position = end; need_value = False; continue
             if eof: raise ValueError('unterminated JSON array')
-            chunk = stream.read(1024 * 1024); eof = not chunk; buffer += chunk
+            chunk = stream.read(1024 * 1024); eof = not chunk
+            buffer = buffer[position:] + chunk; position = 0
 
 
 def clean_instruction(text):
@@ -58,7 +60,7 @@ def resolve_path(path, source, roots):
     path = str(path)
     for old, new in sorted(roots.items(), key=lambda item: -len(item[0])):
         if path.startswith(old): path = str(new) + path[len(old):]; break
-    return str((Path(source).parent / path).resolve())
+    return os.path.abspath(os.path.join(os.path.dirname(source), path))
 
 
 def normalized_records(row, source, roots):
@@ -70,8 +72,8 @@ def normalized_records(row, source, roots):
     namespace = source.get('family_namespace', name)
     family = str(row.get('source_sample_id', row.get('origin_sample_id', row.get('trajectory_id', row.get('family_id', sid)))))
     common = dict(record_id=f'{name}:{sid}', source=name, family_node=f'{namespace}:{family}',
-                  anchor=source.get('split', row.get('split') if source.get('inherit_split', False) else None),
-                  diagnostic=source.get('diagnostic', False), annotation=dict(origin='source_annotation', scope='endpoint'),
+                  anchor=source.get('split', row.get('origin_split', row.get('split')) if source.get('inherit_split', False) else None),
+                  diagnostic=source.get('diagnostic', False) or not source.get('enabled', True), annotation=dict(origin='source_annotation', scope='endpoint'),
                   edit_type=row.get('edit_type', ['other']), condition_kind='none',
                   original=dict(path=path, id=sid, annotation=row), input_images=[], input_caption='', target_image=None,
                   target_caption='', goal_prompt='', edit_instruction='', target_is_goal=False)
@@ -108,13 +110,13 @@ def normalized_records(row, source, roots):
         yield common; return
     if kind == 'cort':
         images = [relocate(p) for p in row.get('image_paths', [])]; steps = row.get('steps', [])
-        goal = row.get('prompt', '').strip()
+        goal = (row.get('prompt') or '').strip()
         if row.get('adapter_role') == 'stage12_stage2_visual_state_only':
             common.update(input_images=images, goal_prompt=goal, task_type='asset'); yield common; return
         terminal = bool(steps and images and len(steps)==len(images) and not steps[-1].get('fix') and
                         steps[-1].get('analysis', '').strip().lower() == 'the image matches the prompt.')
         for i, step in enumerate(steps):
-            correction = step.get('fix', '').strip()
+            correction = (step.get('fix') or '').strip()
             if correction and i < len(images):
                 yield dict(common, record_id=f'{name}:{sid}:step{i}', task_type='edit', goal_prompt=goal,
                            input_images=[images[i]], target_image=images[-1] if terminal else None,
@@ -187,43 +189,6 @@ def normalized_records(row, source, roots):
     raise ValueError('unknown source format: '+kind)
 
 
-class Families:
-    """SQLite union-find: memory usage does not grow with corpus size."""
-    def __init__(self, db):
-        self.db = db
-        db.execute('CREATE TABLE IF NOT EXISTS families(node TEXT PRIMARY KEY,parent TEXT NOT NULL,anchor INTEGER NOT NULL)')
-
-    def root(self, node):
-        self.db.execute('INSERT OR IGNORE INTO families VALUES(?,?,?)', (node, node, -1))
-        path = []
-        while True:
-            parent, anchor = self.db.execute('SELECT parent,anchor FROM families WHERE node=?', (node,)).fetchone()
-            if parent == node: break
-            path.append(node); node = parent
-        self.db.executemany('UPDATE families SET parent=? WHERE node=?', [(node, child) for child in path])
-        return node, anchor
-
-    def link(self, a, b):
-        a, ar = self.root(a); b, br = self.root(b)
-        if a == b: return
-        # Stable canonical root; path compression avoids unbounded chains.
-        parent, child = sorted((a, b))
-        self.db.execute('UPDATE families SET parent=? WHERE node=?', (parent, child))
-        self.db.execute('UPDATE families SET anchor=? WHERE node=?', (max(ar, br), parent))
-
-    def anchor(self, node, split):
-        if split is None: return
-        root, rank = self.root(node)
-        self.db.execute('UPDATE families SET anchor=? WHERE node=?', (max(rank, RANK[split]), root))
-
-    def resolve(self, node):
-        root, anchor = self.root(node)
-        key = hashlib.sha256(root.encode()).hexdigest()
-        split = ('train', 'val', 'test')[anchor] if anchor >= 0 else ('test' if int(key[:16], 16)%10000 < 10 else
-                'val' if int(key[:16], 16)%10000 < 20 else 'train')
-        return key, split
-
-
 class Shards:
     def __init__(self, root, limit):
         self.root = Path(root); self.root.mkdir(parents=True); self.limit = limit; self.files = []
@@ -242,45 +207,41 @@ class Shards:
             self.stream.close(); self.files[-1]['sha256'] = self.sha.hexdigest(); self.stream = None
 
 
-def build(registry, output, *, tokenizer=None, shard_size=100000, verify_assets=True):
-    registry = dict(registry); out = Path(output); out.mkdir(parents=True, exist_ok=False)
-    db = sqlite3.connect(out/'catalog.sqlite'); db.execute('PRAGMA journal_mode=WAL')
-    db.execute('CREATE TABLE assets(path TEXT PRIMARY KEY,valid INTEGER,sha TEXT,width INTEGER,height INTEGER)')
-    db.execute('CREATE TABLE view_keys(key TEXT PRIMARY KEY)')
-    db.execute('CREATE TABLE view_families(view TEXT,family TEXT,PRIMARY KEY(view,family))')
-    families = Families(db); staging = Shards(out/'staging', shard_size)
-    counts = Counter(); roots = registry.get('roots', {})
-    def asset(path):
-        found = db.execute('SELECT valid,sha,width,height FROM assets WHERE path=?', (path,)).fetchone()
-        if found: return dict(valid=bool(found[0]), sha256=found[1], width=found[2], height=found[3])
-        valid = False; sha = None; w = h = None
-        try:
-            if verify_assets:
-                data = Path(path).read_bytes()
-                with Image.open(io.BytesIO(data)) as im: w, h = im.size; im.verify()
-                sha = hashlib.sha256(data).hexdigest(); valid = True
-            else: valid = Path(path).is_file()
-        except (OSError, ValueError, SyntaxError): counts['invalid_assets'] += 1
-        db.execute('INSERT INTO assets VALUES(?,?,?,?,?)', (path, int(valid), sha, w, h))
-        if sha: families.link('asset:'+path, 'sha:'+sha)
-        return dict(valid=valid, sha256=sha, width=w, height=h)
+def family_anchors(registry):
+    """Collect explicit splits before aliases are indexed, regardless of source order."""
+    anchors = {}
     for source in registry['sources']:
+        if not source.get('split') and not source.get('inherit_split'): continue
         for raw in json_records(source['path']):
-            counts['raw:'+source['name']] += 1
-            for row in normalized_records(raw, source, roots):
-                node = row['family_node']; families.anchor(node, row['anchor']); row['assets'] = {}
-                for path in set(row['input_images']+[row['target_image']] if row['target_image'] else row['input_images']):
-                    if path:
-                        row['assets'][path] = asset(path); families.link(node, 'asset:'+path)
-                if tokenizer:
-                    row['tokens'] = {k:len(tokenizer(row.get(k, ''))) for k in ('goal_prompt','target_caption','input_caption','edit_instruction','observed_caption')}
-                staging.append(row); counts['normalized'] += 1
-                if counts['normalized'] % 1000 == 0: db.commit()
-        db.commit()
-    staging.close(); final = Shards(out/'records', shard_size); indexes = {}; handles = {}
+            for row in normalized_records(raw, source, registry.get('roots', {})):
+                node, split = row['family_node'], row['anchor']
+                if split is None: continue
+                if split not in ('train', 'val', 'test'): raise ValueError('unknown family split: '+str(split))
+                if node in anchors and anchors[node] != split:
+                    raise ValueError(f'conflicting explicit splits for family {node}: {anchors[node]} and {split}')
+                anchors[node] = split
+    return anchors
+
+
+def build(registry, output, *, tokenizer=None, batch_tokenizer=None, shard_size=100000,
+          batch_size=1024, progress_every=100000):
+    """Build every eligible annotation directly; never stat, open or hash image assets."""
+    registry = dict(registry); out = Path(output)
+    anchors = family_anchors(registry)
+    out.mkdir(parents=True, exist_ok=False)
+    records = Shards(out/'records', shard_size)
+    counts = Counter(); indexes = {}; handles = {}; start = time.monotonic()
+    roots = registry.get('roots', {})
+
+    def progress(source, raw_count, complete=False):
+        seconds = time.monotonic()-start
+        print(json.dumps(dict(event='source_complete' if complete else 'progress', source=source,
+              source_raw=raw_count, normalized=counts['normalized'],
+              indexed=sum(item['count'] for item in indexes.values()),
+              seconds=round(seconds, 1), rows_per_second=round(counts['normalized']/max(seconds,.001),1))), flush=True)
+
     def add(task, row, role, shard, offset):
-        budget = registry.get('context_token_limit', 4096)
-        lengths = row.get('tokens', {})
+        budget = registry.get('context_token_limit', 4096); lengths = row.get('tokens', {})
         output_tokens = 8 if role==4 or (role==5 and row['feedback'].get('satisfied')) else lengths.get('observed_caption' if role==7 else 'input_caption' if role==1 else 'edit_instruction' if role in (3,5) else 'target_caption', 0)
         prompt_tokens = lengths.get('edit_instruction',0) if role==6 and row['edit_instruction'] else lengths.get('goal_prompt',0)
         semantic = task in ('observe','endpoint','trajectory')
@@ -289,65 +250,79 @@ def build(registry, output, *, tokenizer=None, shard_size=100000, verify_assets=
             counts['context_ineligible:'+task] += 1; return
         if role==3 and lengths.get('goal_prompt',0)+output_tokens+64>=registry.get('writer_position_start',2048):
             counts['context_ineligible:'+task] += 1; return
-        if role==6 and not all(row['assets'].get(p,{}).get('valid') for p in row['input_images']):return
-        payload = dict(task=task, role=role, image=row['assets'].get(row['input_images'][0] if role in (1,3) else row['target_image'],{}).get('sha256'),
-                       state=row.get('state'), prompt=row['goal_prompt'], caption=row.get('observed_caption','') if role==7 else row['input_caption'] if role==1 else row['target_caption'],
-                       correction=row.get('feedback') if role==5 else row.get('observed_caption') if role==7 else row.get('edit_instruction') if role==3 else None,
-                       condition=[row['assets'].get(p,{}).get('sha256') for p in row['input_images']] if role==6 else [])
-        key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        if task == 'endpoint':
-            key = hashlib.sha256((key+row['episode_id']).encode()).hexdigest()
-        if db.execute('INSERT OR IGNORE INTO view_keys VALUES(?)', (key,)).rowcount == 0:
-            counts['duplicate_view'] += 1; return
         name = f'{task}/{row["source"]}/{row["split"]}.idx'
         if name not in handles:
             path = out/'views'/name; path.parent.mkdir(parents=True, exist_ok=True); handles[name] = path.open('wb')
             indexes[name] = dict(task=task, source=row['source'], split=row['split'], count=0, hash=hashlib.sha256())
-        db.execute('INSERT OR IGNORE INTO view_families VALUES(?,?)',(name,row['family_id']))
-        data = REF.pack(shard, offset, role); handles[name].write(data); indexes[name]['hash'].update(data); indexes[name]['count'] += 1
-    finalized = 0
-    for info in staging.files:
-        for row in json_records(out/'staging'/info['path']):
-            row['family_id'], row['split'] = families.resolve(row.pop('family_node'))
-            row['episode_id'] = hashlib.sha256(json.dumps([[row['assets'][p]['sha256'] for p in row['input_images']],row['assets'].get(row['target_image'],{}).get('sha256'),
-                row['goal_prompt'],row['edit_instruction']],sort_keys=True).encode()).hexdigest()
-            shard, offset = final.append(row)
-            finalized += 1
-            if finalized % 1000 == 0: db.commit()
-            if row['diagnostic']: continue
-            good = lambda p: bool(p and row['assets'].get(p, {}).get('valid'))
-            target_ok = good(row['target_image']); input_ok = bool(row['input_images'] and good(row['input_images'][0]))
-            if row.get('state') or row.get('bound_observation'):
-                if row['t']>=1 and not registry.get('pure_noise_trajectory',False):
-                    counts['pure_noise_diagnostic']+=1;continue
-                if row.get('state') and not Path(row['state']).is_file():continue
-                if row.get('feedback'):add('trajectory',row,5,shard,offset)
-                elif row.get('observed_caption'):add('observe',row,7,shard,offset)
-                continue
-            if target_ok and row['target_caption']: add('observe', row, 0, shard, offset)
-            if input_ok and row['input_caption']: add('observe', row, 1, shard, offset)
-            if target_ok and row['target_is_goal'] and row['goal_prompt'] and row['condition_kind']=='none':
-                add('generation', row, 2, shard, offset)
-                if row.get('is_noop') or (input_ok and row.get('feedback_available',True) and row['edit_instruction']):
-                    add('endpoint', row, 4, shard, offset)
-            if input_ok and row.get('feedback_available', True) and row['goal_prompt'] and row['edit_instruction']:
-                add('endpoint', row, 3, shard, offset)
-            if target_ok and input_ok:
-                instruction = row['edit_instruction'] or row['goal_prompt']
-                if instruction: add('conditional', row, 6, shard, offset)
-    final.close()
-    for handle in handles.values(): handle.close()
-    for name,item in indexes.items():
-        item['sha256'] = item.pop('hash').hexdigest()
-        item['families'] = db.execute('SELECT COUNT(*) FROM view_families WHERE view=?',(name,)).fetchone()[0]
-    db.execute('DROP TABLE view_keys');db.execute('DROP TABLE view_families')
-    db.commit(); db.execute('PRAGMA wal_checkpoint(TRUNCATE)'); db.close()
-    import shutil
-    shutil.rmtree(out/'staging')
-    manifest = dict(registry=registry, assets_verified=verify_assets, counts=dict(counts), shards=final.files,
-                    views=[dict(path=key, **v) for key,v in sorted(indexes.items())])
-    manifest['fingerprint'] = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
-    (out/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+'\n')
+        data = REF.pack(shard, offset, role)
+        handles[name].write(data); indexes[name]['hash'].update(data); indexes[name]['count'] += 1
+        counts['indexed:'+task] += 1
+
+    def append(row):
+        node = row.pop('family_node')
+        row['family_id'] = hashlib.sha256(node.encode()).hexdigest()
+        bucket = int(row['family_id'][:16],16)%10000
+        row.pop('anchor')
+        row['split'] = anchors.get(node) or ('test' if bucket<10 else 'val' if bucket<20 else 'train')
+        row['episode_id'] = hashlib.sha256(row['record_id'].encode()).hexdigest()
+        shard, offset = records.append(row); counts['normalized'] += 1
+        if row['diagnostic']: return
+        if row.get('state') or row.get('bound_observation'):
+            if row['t']>=1 and not registry.get('pure_noise_trajectory',False):
+                counts['pure_noise_diagnostic']+=1; return
+            if row.get('feedback'): add('trajectory',row,5,shard,offset)
+            elif row.get('observed_caption'): add('observe',row,7,shard,offset)
+            return
+        target = bool(row['target_image']); source = bool(row['input_images'])
+        if target and row['target_caption']: add('observe',row,0,shard,offset)
+        if source and row['input_caption']: add('observe',row,1,shard,offset)
+        if target and row['target_is_goal'] and row['goal_prompt'] and row['condition_kind']=='none':
+            add('generation',row,2,shard,offset)
+            if row.get('is_noop') or (source and row.get('feedback_available',True) and row['edit_instruction']):
+                add('endpoint',row,4,shard,offset)
+        if source and row.get('feedback_available',True) and row['goal_prompt'] and row['edit_instruction']:
+            add('endpoint',row,3,shard,offset)
+        if target and source and (row['edit_instruction'] or row['goal_prompt']):
+            add('conditional',row,6,shard,offset)
+
+    def flush(batch):
+        if tokenizer or batch_tokenizer:
+            texts = list(dict.fromkeys(row.get(key,'') for row in batch for key in TOKEN_FIELDS))
+            if batch_tokenizer:
+                lengths = batch_tokenizer(texts)
+            else:
+                lengths = [len(tokenizer(text)) for text in texts]
+            sizes = dict(zip(texts,lengths))
+            for row in batch: row['tokens'] = {key:sizes[row.get(key,'')] for key in TOKEN_FIELDS}
+        for row in batch: append(row)
+        batch.clear()
+
+    try:
+        for source in registry['sources']:
+            name = source['name']; batch = []; raw_count = 0
+            print(json.dumps(dict(event='source_start',source=name,path=source['path'])),flush=True)
+            for raw_count, raw in enumerate(json_records(source['path']),1):
+                counts['raw:'+name] += 1
+                for index,row in enumerate(normalized_records(raw,source,roots)):
+                    # Occurrence IDs retain repeated annotations as separate training examples.
+                    row['record_id'] += f':row{raw_count}:item{index}'
+                    batch.append(row)
+                    if len(batch)>=batch_size: flush(batch)
+                if progress_every and raw_count%progress_every==0:
+                    if batch: flush(batch)
+                    progress(name,raw_count)
+            if batch: flush(batch)
+            progress(name,raw_count,complete=True)
+    finally:
+        records.close()
+        for handle in handles.values(): handle.close()
+    for item in indexes.values(): item['sha256'] = item.pop('hash').hexdigest()
+    manifest = dict(format=FORMAT, registry=registry, image_access='training_only', deduplication='none',
+                    split_policy='explicit_family_anchors_v1',
+                    source_sampling='sqrt_task_records', counts=dict(counts), shards=records.files,
+                    views=[dict(path=key,**value) for key,value in sorted(indexes.items())])
+    manifest['fingerprint'] = hashlib.sha256(json.dumps(manifest,sort_keys=True).encode()).hexdigest()
+    (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n')
     return manifest
 
 
@@ -366,7 +341,7 @@ class TaskView:
 class Corpus:
     def __init__(self, root):
         self.root = Path(root); self.manifest = json.loads((self.root/'manifest.json').read_text()); self.handles = OrderedDict()
-        if not self.manifest['assets_verified']: raise ValueError('corpus assets have not been verified')
+        if self.manifest.get('format') != FORMAT: raise ValueError('rebuild corpus with the annotation index builder')
         self.views = [TaskView(self, info) for info in self.manifest['views'] if info['count']]
     @property
     def fingerprint(self): return self.manifest['fingerprint']
@@ -393,20 +368,19 @@ class Corpus:
             if all(position>=len(v) for v in views):break
         return result
     def materialize(self, row, role):
+        relocate=lambda path:resolve_path(path,row['original']['path'],self.manifest['registry'].get('roots',{}))
         task='observe' if role in (0,1,7) else 'feedback' if role in (3,4,5) else 'generation'
-        image = row['input_images'][0] if role in (1,3) else row['target_image']
+        image = relocate(row['input_images'][0] if role in (1,3) else row['target_image'])
         caption=row.get('observed_caption','') if role==7 else row['input_caption'] if role==1 else row['target_caption']
         result=dict(sample_id=hashlib.sha256(f'{row["record_id"]}:{role}'.encode()).hexdigest()[:24],
                     scene_id=row['family_id'], family_id=row['family_id'], pair_id=row['episode_id'], split=row['split'], source=row['source'],
                     task=task, image=image, prompt=row['goal_prompt'], caption=caption,
                     target_caption=row['target_caption'], facts=row.get('facts',[]), label_type='observed' if role in (5,7) else 'clean',
                     label_kind='feedback' if task=='feedback' else 'target_clean', annotation=row['annotation'],
-                    flow_supervision=role in (2,4,6), condition_images=row['input_images'] if role==6 else [],
+                    flow_supervision=role in (2,4,6), condition_images=[relocate(p) for p in row['input_images']] if role==6 else [],
                     condition_kind=row['condition_kind'] if role==6 else 'none', edit_type=row.get('edit_type',['other']),
                     output_tokens=8 if role==4 or (role==5 and row['feedback'].get('satisfied')) else row.get('tokens',{}).get('observed_caption' if role==7 else 'input_caption' if role==1 else 'edit_instruction' if role in (3,5) else 'target_caption',0),
                     verified=True, confirmed_label=row['annotation']['origin']=='manual_checked')
-        if image:result['image_sha256']=row['assets'][image]['sha256']
-        if role==6:result['condition_sha256']={p:row['assets'][p]['sha256'] for p in row['input_images']}
         if role==6:result['prompt']=row['edit_instruction'] or row['goal_prompt']
         if role in (3,4,5):
             feedback=row.get('feedback') if role==5 else dict(observation='',gap='',correction=row['edit_instruction'] if role==3 else '',
@@ -424,16 +398,18 @@ class Corpus:
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('command',choices=['build','inspect'])
     parser.add_argument('--registry');parser.add_argument('--output',required=True);parser.add_argument('--model')
-    parser.add_argument('--shard-size',type=int,default=100000);parser.add_argument('--metadata-only',action='store_true')
+    parser.add_argument('--shard-size',type=int,default=100000)
+    parser.add_argument('--batch-size',type=int,default=1024);parser.add_argument('--progress-every',type=int,default=100000)
     args=parser.parse_args(argv)
     if args.command=='inspect': print((Path(args.output)/'manifest.json').read_text());return
-    tokenizer=None
+    batch_tokenizer=None
     if args.model:
         from transformers import AutoTokenizer
-        native=AutoTokenizer.from_pretrained(args.model);tokenizer=lambda s:native.encode(s,add_special_tokens=False)
+        native=AutoTokenizer.from_pretrained(args.model)
+        batch_tokenizer=lambda texts:[len(ids) for ids in native(texts,add_special_tokens=False)['input_ids']]
     if not args.registry:parser.error('build requires --registry')
-    manifest=build(json.loads(Path(args.registry).read_text()),args.output,tokenizer=tokenizer,
-                   shard_size=args.shard_size,verify_assets=not args.metadata_only)
+    manifest=build(json.loads(Path(args.registry).read_text()),args.output,batch_tokenizer=batch_tokenizer,
+                   shard_size=args.shard_size,batch_size=args.batch_size,progress_every=args.progress_every)
     print(json.dumps(dict(counts=manifest['counts'],views=manifest['views'],fingerprint=manifest['fingerprint']),indent=2))
 
 

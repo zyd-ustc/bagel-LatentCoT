@@ -43,15 +43,18 @@ def test_endpoint_roles_have_distinct_flow_legality_and_shared_episode(tmp_path)
     assert 'order' not in saved;corpus.close()
 
 
-def test_placeholder_not_a_family_and_heldout_alias_overrides_train(tmp_path):
+def test_source_splits_are_preserved_without_merging_image_aliases(tmp_path):
     blank=image(tmp_path,'blank.png','black');a=image(tmp_path,'a.png','red');b=image(tmp_path,'b.png','blue')
     rows=[dict(id=str(i),image=[blank],image_gen=p,conversations=[{'from':'human','value':'Generate an image: a cup'},{'from':'gpt','value':'[TASK0]'}]) for i,p in enumerate((a,b))]
     data=tmp_path/'raw.json';data.write_text(json.dumps(rows))
     held=tmp_path/'held.jsonl';held.write_text(json.dumps(dict(sample_id='held',image=a,caption='a cup',split='test'))+'\n')
     root=tmp_path/'corpus';build(dict(sources=[dict(name='raw',format='unimoe',path=str(data),split='train'),dict(name='held',format='paired',path=str(held),diagnostic=True,inherit_split=True)]),root)
-    corpus=Corpus(root);train=corpus.groups('train',{'generation'});test=corpus.groups('test',{'generation'})
-    assert len(train[0])==len(test[0])==1
-    assert train[0][0]['family_id']!=test[0][0]['family_id'];corpus.close()
+    corpus=Corpus(root);train=corpus.groups('train',{'generation'})
+    assert len(train[0])==2 and not corpus.groups('test',{'generation'})
+    assert train[0][0]['family_id']!=train[0][1]['family_id']
+    assert corpus.manifest['image_access']=='training_only' and corpus.manifest['deduplication']=='none'
+    assert not (root/'catalog.sqlite').exists() and not (root/'staging').exists()
+    corpus.close()
 
 
 def test_streamed_array_crosses_chunk_boundary_and_rejects_truncation(tmp_path):
@@ -59,6 +62,49 @@ def test_streamed_array_crosses_chunk_boundary_and_rejects_truncation(tmp_path):
     path.write_text(json.dumps(rows,ensure_ascii=False));assert list(json_records(path))==rows
     path.write_text('[{"a":1}');
     with pytest.raises(ValueError):list(json_records(path))
+
+
+@pytest.mark.parametrize('split', ['val', 'test'])
+@pytest.mark.parametrize('anchor_first', [False, True])
+def test_family_aliases_inherit_explicit_split_in_either_source_order(tmp_path, split, anchor_first):
+    sources=[]
+    for name in ('original', 'alias'):
+        path=tmp_path/(name+'.jsonl')
+        row=dict(sample_id=name,source_sample_id='scene-0',image='missing.png',caption='a cup')
+        path.write_text((json.dumps(row)+'\n')*2)
+        source=dict(name=name,path=str(path),format='paired',family_namespace='shared')
+        if name=='original':source['split']=split
+        sources.append(source)
+    if not anchor_first:sources.reverse()
+    root=tmp_path/'corpus';build(dict(sources=sources),root)
+    corpus=Corpus(root)
+    try:
+        views=corpus.groups(split,{'generation'})
+        rows=[view[i] for view in views for i in range(len(view))]
+        assert len(rows)==4 and len({row['family_id'] for row in rows})==1
+        assert len({row['sample_id'] for row in rows})==4
+        assert {row['split'] for row in rows}=={split}
+        assert not corpus.groups('train')
+    finally:corpus.close()
+
+
+def test_conflicting_explicit_family_splits_do_not_publish_a_corpus(tmp_path):
+    path=tmp_path/'rows.jsonl'
+    path.write_text(''.join(json.dumps(dict(sample_id='scene-0',split=split,image='missing.png',caption='a cup'))+'\n'
+                            for split in ('train','test')))
+    root=tmp_path/'corpus'
+    with pytest.raises(ValueError,match='conflicting explicit splits for family shared:scene-0'):
+        build(dict(sources=[dict(name='source',path=str(path),format='paired',
+                                 family_namespace='shared',inherit_split=True)]),root)
+    assert not (root/'manifest.json').exists()
+
+
+def test_corpus_requires_rebuild_for_old_split_policy(tmp_path):
+    corpus=tiny_corpus(tmp_path);root=corpus.root;manifest=corpus.manifest;corpus.close()
+    manifest['format']='annotation_index_v1'
+    (root/'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError,match='rebuild corpus'):
+        Corpus(root)
 
 
 def test_high_noise_masks_and_curriculum_calibration():
@@ -77,7 +123,7 @@ def test_high_noise_masks_and_curriculum_calibration():
 
 def tiny_config(runtime,stage):
     cfg=json.loads(Path('configs/visual_memory_pilot.json' if stage=='C2-observe' else 'configs/visual_feedback.json').read_text())
-    cfg.update({k:runtime.config[k] for k in ('resolution','rank','visual_rank','caption_instruction')})
+    cfg.update({k:runtime.config[k] for k in ('resolution','caption_instruction')})
     cfg.update(stage=stage,source_layers=[0,1,2],steps=1,effective_batch=2,eval_every=1,sampler_steps=4,
                max_caption_tokens=2,output_token_budgets=[2],noise_seeds=[0],validation_max_rows=2,
                task_mix={'generation':1},loss_weights=dict(sem=1 if stage=='C2-observe' else 0,teacher=0,flow=0 if stage=='C2-observe' else 1))
@@ -157,11 +203,129 @@ def test_pure_noise_trajectory_stays_out_of_train_views(tmp_path):
     assert report['counts']['pure_noise_diagnostic']==1 and report['views']==[]
 
 
-def test_modified_asset_is_detected_before_training(visual_runtime,tmp_path):
+def test_indexed_training_reads_current_image_without_build_hash(visual_runtime,tmp_path):
     runtime,_=visual_runtime;tiny_config(runtime,'C2-feedback');corpus=tiny_corpus(tmp_path)
     row=corpus.groups('train',{'generation'})[0][0]
     Image.new('RGB',(32,32),'yellow').save(row['image'])
-    with pytest.raises(ValueError,match='asset changed'):runtime.training_state(row,.9,3)
+    assert 'image_sha256' not in row
+    state=runtime.training_state(row,.9,3)
+    assert state.x0 is not None
+    corpus.close()
+
+
+def test_annotation_index_does_not_access_images_and_keeps_duplicates(tmp_path,monkeypatch):
+    a=tmp_path/'missing.png';b=tmp_path/'invalid.png';b.write_text('not an image')
+    row=dict(id='duplicate',image=[str(a)],image_gen=str(b),input_caption='a red cup',output_caption='a blue cup',
+             conversations=[{'from':'human','value':'Make the cup blue.'},{'from':'gpt','value':'[TASK2]'}])
+    data=tmp_path/'edit.json';data.write_text(json.dumps([row,row]))
+    original_open,original_stat=Path.open,Path.stat
+    def annotation_open(path,*args,**kwargs):
+        assert path not in (a,b),'builder opened an image'
+        return original_open(path,*args,**kwargs)
+    def annotation_stat(path,*args,**kwargs):
+        assert path not in (a,b),'builder inspected an image'
+        return original_stat(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'open',annotation_open);monkeypatch.setattr(Path,'stat',annotation_stat)
+    calls=[]
+    def batch_tokenizer(texts):
+        calls.append(texts);return [len(text.split()) for text in texts]
+    root=tmp_path/'corpus';report=build(dict(sources=[dict(name='edit',format='unimoe',path=str(data),split='train')]),
+                                     root,batch_tokenizer=batch_tokenizer,batch_size=2)
+    corpus=Corpus(root)
+    assert len(calls)==1 and len(calls[0])==len(set(calls[0]))
+    assert report['counts']['normalized']==2
+    assert report['counts']['indexed:observe']==4 and report['counts']['indexed:endpoint']==4
+    view=corpus.groups('train',{'generation'})[0]
+    assert len(view)==2 and view[0]['sample_id']!=view[1]['sample_id']
+    assert view[0]['image']==view[1]['image']==str(b)
+    assert all('condition_sha256' not in v[0] for v in corpus.groups('train',{'conditional'}))
+    corpus.close()
+
+
+def test_cort_terminal_open_and_visual_only_records_enter_correct_views(tmp_path):
+    terminal=dict(sample_id='terminal',prompt='Two blue cups.',image_paths=['a.png','b.png'],
+                  steps=[dict(analysis='One red cup.',fix='Add a cup and make both blue.'),
+                         dict(analysis='The image matches the prompt.',fix=None)])
+    open_chain=dict(sample_id='open',origin_split='train',prompt='Three cups.',image_paths=['c.png','d.png'],
+                    steps=[dict(analysis='Two cups.',fix='Add a third cup.')])
+    visual=dict(sample_id='visual',prompt='Three cups.',image_paths=['e.png'],
+                adapter_role='stage12_stage2_visual_state_only',steps=[dict(analysis='Reflection disabled.')])
+    path=tmp_path/'cort.jsonl';path.write_text(''.join(json.dumps(row)+'\n' for row in (terminal,open_chain,visual)))
+    root=tmp_path/'corpus';report=build(dict(sources=[dict(name='cort',format='cort',path=str(path),split='train')]),root)
+    corpus=Corpus(root)
+    assert report['counts']['raw:cort']==3 and report['counts']['normalized']==4
+    observe=corpus.groups('train',{'observe'})[0]
+    assert len(observe)==2 and all(observe[i]['caption']=='Two blue cups.' for i in range(len(observe)))
+    endpoints=corpus.groups('train',{'endpoint'})[0]
+    repairs=[endpoints[i] for i in range(len(endpoints)) if not endpoints[i]['feedback']['satisfied']]
+    assert {r['caption'] for r in repairs}=={'Add a cup and make both blue.','Add a third cup.'}
+    assert any(r['image']==str(tmp_path/'c.png') and not r['flow_supervision'] for r in repairs)
+    assert len(corpus.groups('train',{'generation'})[0])==2
+    corpus.close()
+
+
+def test_registry_includes_all_cort_adapters_and_original_splits(tmp_path):
+    from scripts.prepare_training_corpus import registry_for
+    old=tmp_path/'old';base=old/'qwen_latent_cot_v3_adapted_20260816/manifests';base.mkdir(parents=True)
+    for name in ('cort36k_train.jsonl','cort36k_val.jsonl','cort36k_test.jsonl',
+                 'cort114_stage11_analysis_fix_train.jsonl','cort114_visual_states_train.jsonl','stage12_stage2_train.jsonl'):
+        (base/name).write_text('')
+    nofix=old/'cort_sft_133k/manifests';nofix.mkdir(parents=True);(nofix/'sharegpt4o_v3_nofix.jsonl').write_text('')
+    registry=registry_for(tmp_path/'new',old);sources={Path(s['path']).name:s for s in registry['sources']}
+    assert len(sources)==7 and sources['cort36k_val.jsonl']['split']=='val'
+    assert sources['stage12_stage2_train.jsonl']['split']=='train'
+    assert sources['sharegpt4o_v3_nofix.jsonl']['format']=='nofix'
+    source=sources['cort114_stage11_analysis_fix_train.jsonl']
+    row=next(normalized_records(dict(sample_id='x',origin_split='train',image_paths=['a'],prompt='a',
+                                    steps=[dict(fix='make blue')]),source,{}))
+    assert row['anchor']=='train'
+
+
+def test_entry_cort_uses_adapted_images_and_decodes_training_sample(tmp_path):
+    from scripts.prepare_training_corpus import registry_for
+    old=tmp_path/'datasets';entries=old/'entry_split';entries.mkdir(parents=True)
+    sid='unicot_selfrefl_4816'
+    folder=old/'qwen_latent_cot_v3_adapted_20260816/images/cort36k'/sid
+    folder.mkdir(parents=True);expected=image(folder,'img0.png','green')
+    row=dict(sample_id=sid,prompt='A durian.',steps=[dict(analysis='A durian.<|cort_end|>')])
+    (entries/'cort_sft_consis_36k_train.jsonl').write_text(json.dumps(row)+'\n')
+    registry=registry_for(tmp_path/'new',old)
+    root=tmp_path/'corpus';build(registry,root)
+    corpus=Corpus(root)
+    sample=next(v[0] for v in corpus.views if v.info['task']=='observe')
+    with Image.open(sample['image']) as decoded: decoded.load()
+    assert sample['image']==expected
+    corpus.close()
+
+
+def test_existing_corpus_relocates_images_from_manifest_roots(tmp_path):
+    old=tmp_path/'entry/images';target=tmp_path/'adapted/cort36k';target.mkdir(parents=True)
+    expected=image(target,'cup.png','blue')
+    path=tmp_path/'source.jsonl'
+    path.write_text(json.dumps(dict(sample_id='cup',image=str(old/'cup.png'),caption='A blue cup.',split='train'))+'\n')
+    root=tmp_path/'corpus';build(dict(sources=[dict(name='paired',format='paired',path=str(path),inherit_split=True)]),root)
+    manifest_path=root/'manifest.json';manifest=json.loads(manifest_path.read_text())
+    manifest['registry']['roots']={str(old)+'/':str(target)+'/'}
+    manifest_path.write_text(json.dumps(manifest))
+    corpus=Corpus(root);row=corpus.groups('train',{'observe'})[0][0]
+    with Image.open(row['image']) as decoded: decoded.load()
+    assert row['image']==expected
+    corpus.close()
+
+
+def test_disabled_legacy_images_stay_out_of_training_views(tmp_path):
+    missing=tmp_path/'missing.jsonl'
+    missing.write_text(json.dumps(dict(sample_id='missing',image='/unavailable/sharegpt4o/image.png',caption='A cup.'))+'\n')
+    available=tmp_path/'available.jsonl';valid=image(tmp_path,'cup.png','red')
+    available.write_text(json.dumps(dict(sample_id='available',image=valid,caption='A red cup.'))+'\n')
+    root=tmp_path/'corpus';build(dict(sources=[
+        dict(name='legacy',format='paired',path=str(missing),split='train',enabled=False),
+        dict(name='available',format='paired',path=str(available),split='train')]),root)
+    corpus=Corpus(root)
+    assert corpus.manifest['counts']['normalized']==2
+    assert {v.info['source'] for v in corpus.views}=={'available'}
+    sample=CoverageSampler(corpus,json.loads(Path('configs/visual_memory_pilot.json').read_text()),'C2-observe').next(1)[0]
+    with Image.open(sample['image']) as decoded: decoded.load()
     corpus.close()
 
 

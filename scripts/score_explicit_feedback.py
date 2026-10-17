@@ -4,7 +4,6 @@ Workers score whole prompt groups. Aggregation bootstraps paired prompt deltas;
 it never selects the best early window separately for each image.
 """
 import argparse
-import ast
 import hashlib
 import json
 import math
@@ -103,32 +102,8 @@ def summarize(rows):
 
 
 def scorer(judge, source, device):
-    import torch
-    if device.startswith('npu'):
-        import torch_npu
-        torch.npu.set_device(device)
-    from transformers import Qwen3VLForConditionalGeneration,AutoProcessor
-    processor=AutoProcessor.from_pretrained(judge,local_files_only=True)
-    model=Qwen3VLForConditionalGeneration.from_pretrained(judge,local_files_only=True,
-        dtype=torch.bfloat16,attn_implementation='sdpa').to(device).eval().requires_grad_(False)
-    tree=ast.parse(Path(source).read_text())
-    names={'return_numeric_string','construct_message_with_image','send_message_with_image','soft_tifa'}
-    functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
-    if {n.name for n in functions}!=names:raise ValueError('unexpected upstream GenEval2 functions')
-    namespace=dict(torch=torch,qwen_model=model,qwen_processor=processor)
-    exec(compile(ast.Module(body=functions,type_ignores=[]),source,'exec'),namespace)
-    original=namespace['send_message_with_image']; hard=[]
-    def trace(prompt,image_filepath,answer_list=None):
-        pred,prob=original(prompt,image_filepath,answer_list)
-        hard.append(int(pred.lower() in answer_list));return pred,prob
-    namespace['send_message_with_image']=trace
-    @torch.inference_mode()
-    def score(questions,path):
-        hard.clear();_,atoms=namespace['soft_tifa'](questions,path)
-        if any(not math.isfinite(v) or not -1e-6<=v<=1+1e-6 for v in atoms):
-            raise ValueError('upstream atom outside probability range; inspect raw answers')
-        return atoms,list(hard)
-    return score
+    from qwen_latent_cot.interaction.rewards import scorer as atom_scorer
+    return atom_scorer(judge, source, device)
 
 
 def main(argv=None):

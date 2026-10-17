@@ -8,8 +8,9 @@ import subprocess
 import torch
 from . import distributed as parallel
 from .data import load_dataset, file_hash
-from .record import manifest, write_json, append_json
-from .visual_record import initialize_student, load_visual_checkpoint
+from .record import manifest, write_json
+from .visual_record import initialize_student
+from .training_logging import configure_logging
 
 
 def load_input_rows(args, cfg):
@@ -40,23 +41,28 @@ def main(argv=None):
     parser.add_argument('command', choices=['check', 'train', 'eval', 'sample', 'label-states', 'source-review'])
     parser.add_argument('--model', required=True)
     parser.add_argument('--data', help='small diagnostic JSONL only')
-    parser.add_argument('--corpus', help='verified indexed corpus for training')
+    parser.add_argument('--corpus', help='annotation task indexes for training')
     parser.add_argument('--config', default='configs/visual_memory_pilot.json')
     parser.add_argument('--output', required=True)
     parser.add_argument('--device', default='npu')
     parser.add_argument('--distributed', action='store_true')
     parser.add_argument('--topology', choices=['C'], default='C')
-    parser.add_argument('--stage', choices=['C2-observe', 'C2-feedback', 'C3-loop'])
-    parser.add_argument('--online-feedback', action='store_true', help='fresh BAGEL reflection for later C3 feedback rounds')
+    parser.add_argument('--stage', choices=['C2-observe', 'C2-feedback'])
     parser.add_argument('--checkpoint', help='visual parent/checkpoint; C1 initialization uses --writer-init')
     parser.add_argument('--writer-init', help='optional historical C1 writer weights')
     parser.add_argument('--text-checkpoint', help='optional frozen text teacher; validated with E1')
-    parser.add_argument('--resume', help='exact-stage format 3 optimizer/index schedule checkpoint')
+    parser.add_argument('--resume', help='native UND format 4 optimizer/index checkpoint')
     parser.add_argument('--c0-pass')
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='val')
     parser.add_argument('--steps', type=int, help='override budget, e.g. 20 for resource check')
     parser.add_argument('--validation-max-families', type=int, help='positive bounded validation family budget')
+    parser.add_argument('--validation-max-rows', type=int, help='bounded validation row budget')
     parser.add_argument('--skip-validation', action='store_true', help='resource checks only; no selected best checkpoint')
+    parser.add_argument('--log-every', type=int, help='console interval; local JSONL and W&B record every step')
+    parser.add_argument('--wandb-mode', choices=['disabled','offline','online'], default='disabled')
+    parser.add_argument('--wandb-project', default=os.environ.get('WANDB_PROJECT','bagel-LatentCoT'))
+    parser.add_argument('--wandb-entity', default=os.environ.get('WANDB_ENTITY'))
+    parser.add_argument('--wandb-name', help='defaults to output directory name; each launch creates a new run')
     parser.add_argument('--eval-t', nargs='+', type=float)
     parser.add_argument('--noise-seeds', nargs='+', type=int)
     parser.add_argument('--review-t', nargs='+', type=float, default=[.25, .75, .9],
@@ -69,15 +75,24 @@ def main(argv=None):
     args = parser.parse_args(argv)
     cfg = json.loads(Path(args.config).read_text())
     if args.steps is not None: cfg['steps'] = args.steps
+    if args.log_every is not None:
+        if args.log_every <= 0: parser.error('--log-every must be positive')
+        cfg['log_every'] = args.log_every
+    if args.command != 'train' and args.wandb_mode != 'disabled':
+        parser.error('W&B tracking is configured for train')
     if args.validation_max_families is not None:
         if args.validation_max_families <= 0:
             parser.error('--validation-max-families must be positive')
         cfg['validation_max_families'] = args.validation_max_families
+    if args.validation_max_rows is not None:
+        if args.validation_max_rows <= 0: parser.error('--validation-max-rows must be positive')
+        cfg['validation_max_rows'] = args.validation_max_rows
     if args.eval_t is not None: cfg['eval_t'] = args.eval_t
     if args.noise_seeds is not None: cfg['noise_seeds'] = args.noise_seeds
     stage = args.stage or cfg['stage']
+    if args.command == 'train' and stage not in ('C2-observe', 'C2-feedback'):
+        parser.error('Generation training uses qwen_latent_cot.interaction.cli sft|rl')
     cfg['stage'] = stage
-    if args.online_feedback: cfg['online_feedback'] = True
     if args.command == 'check' and args.distributed:
         parser.error('E0 runs on one NPU before formal 16-NPU training')
     if not args.distributed and int(os.environ.get('WORLD_SIZE', '1')) > 1:
@@ -102,6 +117,9 @@ def main(argv=None):
             raise ValueError('use a fresh output directory')
         output.mkdir(parents=True, exist_ok=True)
     parallel.barrier()
+    logger = configure_logging(output)
+    logger.info('Loading model: command=%s stage=%s world_size=%d output=%s',
+                args.command, stage, parallel.world_size(), output)
     torch.manual_seed(cfg['seed'])
     from ..bagel.backbone import load_native
     from .runtime import DiagnosticRuntime
@@ -128,11 +146,11 @@ def main(argv=None):
         (output/'source_dirty.diff').write_text(dirty)
         write_json(output/'config.json', cfg)
         write_json(output/'locked_data.json', dict(corpus=corpus.manifest if corpus else None, diagnostic_rows=rows, hashes=runtime.data_hashes))
-        run.update(stage=stage, visual_architecture=cfg['visual_architecture'],
+        run.update(stage=stage, writer_architecture=cfg['writer_architecture'],
                    text_teacher_path=args.text_checkpoint, text_teacher_hash=student.text_teacher_hash,
                    data_hashes=runtime.data_hashes, global_effective_batch=cfg['effective_batch'],
-                   trainable={name:p.numel() for name,p in student.named_parameters() if p.requires_grad},
-                   response_teacher=cfg['response_teacher'], response_position_reserve=16,
+                   trainable={name:p.numel() for name,p in student.native_parameters().items() if p.requires_grad},
+                   memory_slots=student.writer.slots, loss_weights=cfg['loss_weights'],
                    source_policy=cfg['visual_source_policy'], cross_round_gradients=cfg['cross_round_gradients'],
                    git_status=subprocess.check_output(['git','status','--short'],cwd=root,text=True),
                    dirty_diff_hash=file_hash(output/'source_dirty.diff'),
@@ -144,7 +162,9 @@ def main(argv=None):
         if args.command == 'train':
             from .visual_training import train
             train(student, corpus, stage, output, args.checkpoint or args.writer_init,
-                  resume=args.resume, skip_validation=args.skip_validation)
+                  resume=args.resume, skip_validation=args.skip_validation,
+                  wandb_options=dict(mode=args.wandb_mode, project=args.wandb_project,
+                                     entity=args.wandb_entity, name=args.wandb_name))
         elif args.command == 'check':
             from .flow_checks import check
             student.writer.requires_grad_(False)
@@ -185,8 +205,9 @@ def main(argv=None):
                 from .visual_evaluation import collect_label_states
                 collect_label_states(runtime, local_rows, directory)
             parallel.barrier()
-        run['status'] = 'executed; engineering outputs only; quality acceptance requires actual paired evidence'
+        run['status'] = 'completed'
     except Exception as error:
+        logger.error('Run failed: %s: %s',type(error).__name__,error)
         run.update(status='failed', failure=dict(type=type(error).__name__, message=str(error)))
         raise
     finally:

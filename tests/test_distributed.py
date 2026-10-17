@@ -81,7 +81,7 @@ def test_unused_rank_participates_in_global_optimizer():
     mp.spawn(visual_worker,args=(port,),nprocs=2,join=True)
 
 
-def visual_training_worker(rank, port, root):
+def visual_training_worker(rank, port, root, tracking='disabled'):
     from pathlib import Path
     import json
     from PIL import Image
@@ -96,10 +96,10 @@ def visual_training_worker(rank, port, root):
     try:
         workspace = Path(root)/f'worker_{rank}'; workspace.mkdir()
         runtime = runtime_fixture.__wrapped__(lm_fixture.__wrapped__(), workspace)
-        runtime.writer = MemoryWriter(runtime.decoder,'C',16,4)
+        runtime.writer = MemoryWriter(runtime.decoder,'C',16)
         cfg=json.loads(Path('configs/visual_memory_pilot.json').read_text())
-        cfg.update({key:runtime.config[key] for key in ('resolution','rank','caption_instruction')})
-        cfg.update(source_layers=[0,1,2],visual_rank=4,response_layers=[0,2],response_query_count=3,steps=1,
+        cfg.update({key:runtime.config[key] for key in ('resolution','caption_instruction')})
+        cfg.update(source_layers=[0,1,2],response_layers=[0,2],response_query_count=3,steps=1,
                    effective_batch=4,eval_every=1,max_caption_tokens=2,eval_t=[.75,1.],noise_seeds=[0])
         runtime.config=cfg
         rows=[]
@@ -121,7 +121,8 @@ def visual_training_worker(rank, port, root):
         output=Path(root)/'training'
         if rank==0:output.mkdir()
         parallel.barrier()
-        train(student,corpus,'C2-observe',output,None)
+        train(student,corpus,'C2-observe',output,None,
+              wandb_options=dict(mode=tracking,project='bagel-training-tests'))
         parallel.barrier()
         if rank==0:
             index=json.loads((output/'validation_000001/metrics_index.json').read_text())
@@ -129,6 +130,12 @@ def visual_training_worker(rank, port, root):
             log=json.loads((output/'training.jsonl').read_text().splitlines()[0])
             assert log['world_size']==2 and log['actual_gen_entries']>=4
             assert log['und_layer_entries']>0
+            assert log['step_seconds']>0
+            assert (output/'logs/rank_00.log').exists() and (output/'logs/rank_01.log').exists()
+            assert len((output/'validation.jsonl').read_text().splitlines())==1
+            if tracking=='offline':
+                assert len(list(output.glob('wandb/offline-run-*/*.wandb')))==1
+                assert (output/'wandb.json').exists()
             assert (output/'last.pt').exists()
     finally:dist.destroy_process_group()
 
@@ -137,3 +144,11 @@ def test_visual_training_distributes_validation_families(tmp_path):
     with socket.socket() as listener:
         listener.bind(('127.0.0.1',0));port=listener.getsockname()[1]
     mp.spawn(visual_training_worker,args=(port,str(tmp_path)),nprocs=2,join=True)
+
+
+def test_distributed_training_creates_one_offline_wandb_run(tmp_path):
+    import pytest
+    pytest.importorskip('wandb')
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1',0));port=listener.getsockname()[1]
+    mp.spawn(visual_training_worker,args=(port,str(tmp_path),'offline'),nprocs=2,join=True)

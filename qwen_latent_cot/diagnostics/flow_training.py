@@ -34,7 +34,8 @@ class FlowOutput:
 
 
 def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
-                    round_index=0, detach_source=True, checkpoint_activations=False):
+                    round_index=0, detach_source=True, checkpoint_activations=False,
+                    adapter_scope=nullcontext, guidance=False):
     """Unwrap ONLY native no_grad; all time/position/norm/heads stay native.
 
     Checkpoint closure owns its contexts: backward recomputation re-enters the
@@ -52,7 +53,7 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
 
     def forward(x):
         context = (gen_memory_call(runtime.decoder, flow['past_key_values'], bank,
-                                   state.lengths, state.positions, masked)
+                                   state.lengths, state.positions, masked, adapter_scope=adapter_scope)
                    if bank is not None else nullcontext())
         observer = (capture_gen(runtime.decoder, flow['past_key_values'], t=state.t,
                                 round_index=round_index, positions=source_positions,
@@ -62,7 +63,7 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
         with context, observer as captured, autocast_for(runtime.device):
             velocity = native(runtime.model, x_t=x,
                               timestep=torch.full((len(x),), state.t, device=runtime.device),
-                              **flow, cfg_text_scale=1., cfg_img_scale=1.,
+                              **flow, cfg_text_scale=runtime.config['cfg_text_scale'] if guidance else 1., cfg_img_scale=1.,
                               cfg_renorm_min=runtime.config['cfg_renorm_min'],
                               cfg_renorm_type=runtime.config['cfg_renorm_type'])
         source = tuple(captured[i] for i in range(len(runtime.decoder.layers))) if capture else ()

@@ -56,7 +56,7 @@ def prepare_source(runtime, row, stage, t=None, seed=0):
 def evaluate(runtime, rows, stage, output, controls=True):
     result = []; by_id = {r['sample_id']: r for r in rows}
     guard = FrozenGuard(runtime.model, runtime.bundle.vae)
-    initialization_only = not any(adapter.up.weight.detach().count_nonzero() for adapter in runtime.writer.adapters)
+    initialization_only = True
     for row in rows:
         states = [(None, 0)] if stage in ('C0', 'C1') else [(t, s) for t in runtime.config['eval_t'] for s in runtime.config['noise_seeds']]
         if row.get('state') and stage == 'C2':

@@ -1,4 +1,4 @@
-"""Synchronous data parallelism for the small writer, never for frozen BAGEL."""
+"""Bucketed synchronous data parallelism for selected UND parameters."""
 import os
 from datetime import timedelta
 import torch
@@ -45,7 +45,7 @@ def sum_gradients(module, *, allow_unused=False):
     """Losses are divided by GLOBAL batch before backward; sum, do not average."""
     parameters = [p for p in module.parameters() if p.requires_grad]
     if allow_unused:
-        # A rank may contain text-only replay with a disabled visual branch.
+        # Task masks can leave a trainable branch unused on one rank.
         for parameter in parameters:
             if parameter.grad is None:
                 parameter.grad = torch.zeros_like(parameter)
@@ -53,19 +53,35 @@ def sum_gradients(module, *, allow_unused=False):
         raise RuntimeError('every writer parameter must receive a gradient')
     if world_size() == 1:
         return
-    flattened = torch.cat([parameter.grad.reshape(-1) for parameter in parameters])
-    dist.all_reduce(flattened, op=dist.ReduceOp.SUM)
-    offset = 0
+    bucket = []; size = 0
+    def reduce_bucket(items):
+        flattened = torch.cat([p.grad.reshape(-1) for p in items])
+        dist.all_reduce(flattened, op=dist.ReduceOp.SUM)
+        offset = 0
+        for parameter in items:
+            count = parameter.numel()
+            parameter.grad.copy_(flattened[offset:offset+count].view_as(parameter))
+            offset += count
     for parameter in parameters:
-        size = parameter.numel()
-        parameter.grad.copy_(flattened[offset:offset+size].view_as(parameter))
-        offset += size
+        count = parameter.numel()*parameter.element_size()
+        if bucket and size+count > 64*1024*1024:
+            reduce_bucket(bucket); bucket = []; size = 0
+        bucket.append(parameter); size += count
+    if bucket:
+        reduce_bucket(bucket)
 
 
 def sum_statistics(values, device):
     tensor = torch.tensor(values, dtype=torch.float32, device=device)
     if world_size() > 1:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.tolist()
+
+
+def max_statistics(values, device):
+    tensor = torch.tensor(values, dtype=torch.float32, device=device)
+    if world_size() > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
     return tensor.tolist()
 
 

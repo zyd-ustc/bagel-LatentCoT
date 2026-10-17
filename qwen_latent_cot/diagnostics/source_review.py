@@ -14,7 +14,7 @@ def source_review(student, tasks, rows, output):
     runtime = student.runtime
     student.eval().requires_grad_(False)
     guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher,
-                        student.writer, student.visual)
+                        student.writer)
     by_id = {row['sample_id']: row for row in rows}
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     counter = ExecutionCounter(runtime)

@@ -68,9 +68,32 @@ def test_shared_random_selection_and_portable_page(tmp_path):
     again = prepare(source, tmp_path/'repeat', 16, [2,3,4], [10,20], 123)
     assert again['rows'] == plan['rows']
     for i in range(16):
-        for arm in ['base']+[f'early{e}_R{r}' for e in [10,20] for r in [2,3,4]]:
+        for arm in [item['name'] for item in plan['arms']]:
             (output/f'p{i:02d}_{arm}.png').touch()
     render(output)
     page = (output/'index.html').read_text()
     assert page.count('<img ') == 112
     assert '&lt;prompt' in page and 'p00_base.png' in page
+
+
+
+def test_full_depth_matches_training_loop_and_full_window(visual_runtime, monkeypatch):
+    from qwen_latent_cot.diagnostics.loop_training import memory_loop
+    from qwen_latent_cot.diagnostics.shallow_sampling import sample, window
+    runtime,row=visual_runtime;student=VisualStudent(runtime).eval().requires_grad_(False)
+    runtime.config.update(sampler_steps=4)
+    state=runtime.training_state(row,.7,0)
+    with torch.no_grad():
+        expected=memory_loop(student,state,2).exits[-1].velocity
+        with shallow_loop(student,state.flow,state.lengths,state.positions,.7,3,end_layer=3):
+            actual,_=runtime.velocity(state.x_t,.7,state.flow)
+    torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+    monkeypatch.setattr(runtime,'image',lambda x:x)
+    full,nodes=sample(student,'a red token',0,2,'full',loop_layers=3)
+    numeric,_=sample(student,'a red token',0,2,3,loop_layers=3)
+    torch.testing.assert_close(full,numeric,rtol=0,atol=0)
+    _,short=sample(student,'a red token',0,2,2,loop_layers=1)
+    assert len(nodes)==3 and all(r['memory_active'] for r in nodes)
+    assert [r['memory_active'] for r in short]==[True,True,False]
+    assert all(r['und_layer_calls']==3 for r in short[:2])
+    assert [window(v) for v in ('early10','20','30','full')]==[10,20,30,'full']

@@ -98,7 +98,7 @@ class CoverageSampler:
             return row,t,seed
         task=max(self.weights,key=lambda k:self.weights[k]*(self.draws+1)-self.task_counts[k])
         indexes=self.by_task[task]
-        index=self.rng.choices(indexes,weights=[self.views[i].info['families']**.5 for i in indexes],k=1)[0]
+        index=self.rng.choices(indexes,weights=[len(self.views[i])**.5 for i in indexes],k=1)[0]
         view=self.views[index];n=len(view)
         cursor=self.cursors[index];a,b=self.transforms[index];position=(a*cursor+b)%n
         row=view[position];self.cursors[index]+=1

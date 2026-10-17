@@ -20,11 +20,11 @@ def prompt_source(flow, lengths, positions):
 
 
 def compose_source(prompt, extra, layers=None):
-    """P+G inside the selected window, P elsewhere; P+C uses every layer."""
+    """Prompt at every layer; extra KV at the selected GEN prefix layers."""
     count = len(prompt)
     selected = set(range(count) if layers is None else layers)
     if not selected or any(i < 0 or i >= count for i in selected):
-        raise ValueError('invalid writer source layer window')
+        raise ValueError('invalid source layer window')
     extra = {kv.layer: kv for kv in extra}
     if len(extra) < len(selected) or not selected <= extra.keys():
         raise ValueError('missing selected source layers')
@@ -53,9 +53,9 @@ def compose_source(prompt, extra, layers=None):
     return tuple(result)
 
 
-def write_feedback(runtime, prompt, extra, *, layers=None, visual_adapter=None, t=None,
+def write_feedback(runtime, prompt, extra, *, layers=None, t=None,
                    writer=None, detach_source=True):
-    """Single formal writer entrance. Text calls never enable visual residuals."""
+    """Single full-depth native UND writer entrance."""
     writer = runtime.writer if writer is None else writer
     if writer.topology != 'C' or writer.slots != 16:
         raise ValueError('formal feedback uses continuous UND and 16 slots')
@@ -64,5 +64,4 @@ def write_feedback(runtime, prompt, extra, *, layers=None, visual_adapter=None, 
                              runtime.config['writer_position_start']+writer.slots,
                              device=runtime.device)
     with autocast_for(runtime.device):
-        return writer(runtime.seeds, source, positions, source_kind='visual' if visual_adapter else 'text',
-                      visual_adapter=visual_adapter, t=t, detach_source=detach_source)
+        return writer(runtime.seeds, source, positions, source_kind='text', t=t, detach_source=detach_source)

@@ -40,7 +40,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True)
     parser.add_argument('--data', required=True, help='JSONL sample_id, original prompt, noise_seed; optional checked feedback')
-    parser.add_argument('--text-checkpoint', required=True, help='frozen continuous C1/C1-read checkpoint')
+    parser.add_argument('--text-checkpoint', required=True, help='native UND format 4 checkpoint')
     parser.add_argument('--config', default='configs/explicit_feedback.json')
     parser.add_argument('--device', default='auto')
     parser.add_argument('--output', required=True)
@@ -63,7 +63,7 @@ def main(argv=None):
     saved = torch.load(args.text_checkpoint, map_location='cpu', weights_only=True)
     config = dict(saved['config'])
     if saved['topology'] != 'C' or saved['slots'] != 16:
-        raise ValueError('restart feedback requires continuous C1 memory with 16 slots')
+        raise ValueError('restart feedback uses continuous UND memory with 16 slots')
     validate_windows(config, early)
     config.update(protocol=PROTOCOL, feedback_protocol=settings)
     from ..bagel.backbone import load_native
@@ -71,8 +71,9 @@ def main(argv=None):
     runtime = DiagnosticRuntime(load_native(args.model, args.device, config['timestep_shift']), config, 'C')
     run = manifest(runtime, args, args.data, rows=rows)
     runtime.native_files = run['model_files']
-    load_checkpoint(args.text_checkpoint, runtime, ('C1', 'C1-read'))
-    runtime.writer.eval().requires_grad_(False)
+    from .visual_record import initialize_student
+    student = initialize_student(runtime, visual_init=args.text_checkpoint).eval().requires_grad_(False)
+    runtime.writer.eval()
     sampler = {key:config[key] for key in SAMPLER_KEYS}
     run.update(protocol=PROTOCOL, inference_settings=settings, sampler_config=sampler,
         text_checkpoint_sha256=file_hash(args.text_checkpoint),

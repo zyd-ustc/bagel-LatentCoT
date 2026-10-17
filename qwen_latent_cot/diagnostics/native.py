@@ -1,5 +1,5 @@
 """Native text/source capture and temporary, single-call GEN consumption."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import MethodType
 import torch
@@ -95,7 +95,14 @@ def caption_logits(bundle, tokens, lengths, prefix, starts):
     positions = torch.cat([torch.arange(s, s+n, device=tokens.device) for s, n in zip(starts, lengths)])
     rope = rope_for(decoder, hidden, positions)
     for i, layer in enumerate(decoder.layers):
-        hidden = und_block(layer, hidden, rope, lengths, prefix[i] if prefix else None, causal=True)
+        source = prefix[i] if prefix else None
+        if getattr(layer, '_und_checkpointing', False) and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+            def block(value, layer=layer, source=source):
+                return und_block(layer, value, rope, lengths, source, causal=True)
+            hidden = checkpoint(block, hidden, use_reentrant=False)
+        else:
+            hidden = und_block(layer, hidden, rope, lengths, source, causal=True)
     return bundle.model.language_model.lm_head(decoder.norm(hidden)).float()
 
 
@@ -126,7 +133,8 @@ def free_caption(bundle, instruction_ids, prefix=None, start=0, max_tokens=96):
 
 
 @contextmanager
-def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_positions, masked=False, *, wrap_decoder=True):
+def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_positions, masked=False, *,
+                    wrap_decoder=True, adapter_scope=nullcontext):
     """Keep native prompt; append 16 slots for ONE conditional decoder call.
 
     CFG branches remain native. G-layout reserves identical indices/positions
@@ -155,6 +163,8 @@ def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_pos
                 raise ValueError('conditional prompt layout changed')
             chunks = kwargs['packed_query_position_ids'].split(qlens)
             kwargs['packed_query_position_ids'] = torch.cat([p+bank.slots for p in chunks])
+            with adapter_scope():
+                return original_decoder(**kwargs)
         return original_decoder(**kwargs)
 
     def attention_call(index, original):

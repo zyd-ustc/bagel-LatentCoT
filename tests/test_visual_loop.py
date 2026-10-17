@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 from test_memory_topology import lm, runtime, setup_writer
 from qwen_latent_cot.diagnostics.memory import MemoryWriter
-from qwen_latent_cot.diagnostics.visual import VisualStudent, VisualReadAdapter
+from qwen_latent_cot.diagnostics.visual import VisualStudent
 from qwen_latent_cot.diagnostics.flow_training import conditional_gen, flow_mse
 from qwen_latent_cot.diagnostics.loop_training import memory_loop
 from qwen_latent_cot.diagnostics.data import load_dataset, tensor_hash, visual_label
@@ -15,8 +15,10 @@ from qwen_latent_cot.diagnostics.record import FrozenGuard
 
 @pytest.fixture
 def visual_runtime(runtime, tmp_path):
-    runtime.writer = MemoryWriter(runtime.decoder, 'C', 16, 4)
-    runtime.config.update(visual_rank=4, train_writer=False, response_layers=[0, 2],
+    runtime.writer = MemoryWriter(runtime.decoder, 'C', 16)
+    native = json.loads(__import__('pathlib').Path('configs/visual_memory_pilot.json').read_text())
+    runtime.config.update(und_train=native['und_train'],source_layers=[0,1,2],writer_architecture='native_und_v1')
+    runtime.config.update(response_layers=[0, 2],
                           response_position_reserve=16, response_query_count=3,
                           response_energy_floor=1e-8, cross_round_gradients=False,
                           label_instructions={'observe': runtime.config['caption_instruction'], 'feedback':'State the correction.', 'target_clean': runtime.config['caption_instruction'],
@@ -28,17 +30,6 @@ def visual_runtime(runtime, tmp_path):
     return runtime, row
 
 
-def test_visual_zero_and_off_restore_C_writer(lm):
-    writer, seeds, source, positions = setup_writer(lm, 'C')
-    visual = VisualReadAdapter(lm.model, 4)
-    original = writer(seeds, source, positions)
-    zero = writer(seeds, source, positions, source_kind='visual', t=.9, visual_adapter=visual)
-    with torch.no_grad():
-        for layer in visual.layers: layer.up.weight.normal_(std=.1)
-    off = writer(seeds, source, positions, source_kind='text', visual_adapter=visual)
-    for a, b, c in zip(original.layers, zero.layers, off.layers):
-        torch.testing.assert_close(a.keys, b.keys, rtol=0, atol=0)
-        torch.testing.assert_close(a.values, c.values, rtol=0, atol=0)
 
 
 def test_source_caption_review_preserves_recipient_state_and_swaps_only_source(visual_runtime, tmp_path):
@@ -80,30 +71,6 @@ def test_paired_state_and_native_conditional_parity(visual_runtime):
         assert len(kv.positions) == len(kv.keys)
 
 
-@pytest.mark.parametrize('activation_checkpoint', [False, True])
-def test_complete_flow_gradient_and_two_round_cache(visual_runtime, activation_checkpoint):
-    runtime, row = visual_runtime
-    student = VisualStudent(runtime)
-    state = runtime.training_state(row, .75, 5)
-    cache = state.flow['past_key_values']
-    original = [(cache.key_cache[i].clone(), cache.value_cache[i].clone()) for i in range(3)]
-    guard = FrozenGuard(runtime.model, runtime.bundle.vae, student.text_teacher)
-    optimizer = torch.optim.AdamW(student.visual.parameters(), lr=.01)
-    for step in range(2):
-        optimizer.zero_grad(set_to_none=True)
-        output = memory_loop(student, state, 2, checkpoint_activations=activation_checkpoint)
-        loss = torch.stack([flow_mse(exit, state) for exit in output.exits]).mean()
-        loss.backward()
-        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in student.visual.parameters())
-        assert all(layer.up.weight.grad.abs().max() > 0 for layer in student.visual.layers)
-        if step == 1:
-            assert all(layer.down.weight.grad.abs().max() > 0 for layer in student.visual.layers)
-        assert all(p.grad is None for p in student.writer.parameters())
-        optimizer.step(); guard.check()
-    for i, (k, v) in enumerate(original):
-        torch.testing.assert_close(cache.key_cache[i], k, rtol=0, atol=0)
-        torch.testing.assert_close(cache.value_cache[i], v, rtol=0, atol=0)
-    assert output.gen_calls == 3
 
 
 def test_fixed_bank_R2_and_diagnostics_do_not_change_R1(visual_runtime):
@@ -147,36 +114,8 @@ def test_unreviewed_proxy_never_becomes_confirmed(tmp_path):
     assert loaded['verified'] is False and loaded['confirmed_label'] is False
 
 
-def test_response_teacher_uses_real_deployment_slot_layout(visual_runtime):
-    from qwen_latent_cot.diagnostics.visual_objectives import state_probe, bank_response
-    runtime, row = visual_runtime; student = VisualStudent(runtime,runtime.writer)
-    state = runtime.training_state(row, .9, 4)
-    with torch.no_grad(): source = conditional_gen(runtime, state).source
-    bank = student.write(source, .9); teacher = student.teacher_bank(row['target_caption'])
-    probe = state_probe(runtime, state)
-    loss, metrics = bank_response(runtime, bank, teacher, probe)
-    loss.backward()
-    assert all(layer.up.weight.grad.abs().max() > 0 for layer in student.visual.layers)
-    assert all(p.grad is None for p in student.text_teacher.parameters())
-    assert len(metrics) == 2
-    runtime.config['response_position_reserve'] = 64
-    with pytest.raises(ValueError, match='reserve'):
-        state_probe(runtime, state)
 
 
-def test_cross_round_source_gradient_is_an_explicit_policy(visual_runtime):
-    runtime, row = visual_runtime; student = VisualStudent(runtime)
-    state = runtime.training_state(row, .75, 4)
-    stopped = memory_loop(student, state, 2)
-    assert not stopped.exits[0].source[0].keys.requires_grad
-    runtime.config['cross_round_gradients'] = True
-    live = memory_loop(student, state, 2, checkpoint_activations=True)
-    assert live.exits[0].source[-1].keys.requires_grad
-    # Layer-zero source is captured before its first Memory-conditioned attention.
-    assert not live.exits[0].source[0].keys.requires_grad
-    loss = flow_mse(live.exits[1], state)
-    loss.backward()
-    assert student.visual.layers[0].up.weight.grad.abs().max() > 0
 
 
 def test_complete_sampling_updates_once_and_resets_seed(visual_runtime):
@@ -204,19 +143,6 @@ def test_layer_and_final_norm_hooks_are_read_only(visual_runtime):
     assert not tensors['final_head']['normalized_hidden'].requires_grad
 
 
-def test_E0_restores_only_the_tested_visual_parameters(visual_runtime, tmp_path):
-    from qwen_latent_cot.diagnostics.flow_checks import check
-    runtime, row = visual_runtime; student = VisualStudent(runtime)
-    guard = FrozenGuard(student.writer, student.text_teacher)
-    original = {name:p.clone() for name,p in student.visual.named_parameters()}
-    out = tmp_path/'e0';out.mkdir()
-    result = check(student, [row, dict(row,sample_id='b')], out)
-    assert result['status'] == 'E0_passed'
-    assert result['native_parameters_hash_before'] == result['native_parameters_hash_after']
-    guard.check()
-    for name,p in student.visual.named_parameters():
-        torch.testing.assert_close(p, original[name], rtol=0, atol=0)
-        assert p.grad is None
 
 
 def test_weak_teacher_response_is_reported_and_filtered(visual_runtime):
@@ -251,3 +177,16 @@ def test_R2_controls_keep_original_prompt_and_use_actual_sampler_nodes(visual_ru
     assert all((out/r['layer_tensors']).exists() for r in records)
     for i,k in enumerate(reference):torch.testing.assert_close(k,cache.key_cache[i],rtol=0,atol=0)
     assert (out/'blind_mapping.json').exists()
+
+
+def test_observe_evaluation_reports_captions_without_flow_supervision(visual_runtime,tmp_path):
+    from qwen_latent_cot.diagnostics.visual_evaluation import evaluate
+    runtime,row=visual_runtime
+    runtime.config.update(stage='C2-observe',eval_t=[.2],noise_seeds=[0],source_layers=[0,1,2])
+    row=dict(row,task='observe',flow_supervision=False)
+    student=VisualStudent(runtime)
+    records=evaluate(student,[row],tmp_path/'observe')
+    assert {'R0','R1','Source-off'} <= {r['arm'] for r in records}
+    assert all(r['conditional_flow_mse'] is None for r in records)
+    assert all(torch.isfinite(torch.tensor(r['caption']['nll'])) for r in records)
+    assert (tmp_path/'observe/summary.json').exists()

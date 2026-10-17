@@ -1,7 +1,6 @@
 {
   "protocol": "memory_topology_diagnostic_protocol_20261011",
   "slots": 16,
-  "rank": 32,
   "resolution": 512,
   "neutral_text": "The scene is available for a general description with neutral content and no specific objects attributes counts or spatial relations mentioned here.",
   "neutral_prompt": "An image.",
@@ -42,7 +41,6 @@
   "timestep_shift": 3.0,
   "selection": "minimum_validation_response_plus_weighted_caption_nll_including_initial_checkpoint",
   "c0_instruction": "Repeat the preceding caption exactly. Do not describe a new image or add information.\n",
-  "adapter_type": "linear_low_rank_v1",
   "training_state_sampling": "independent_uniform_v1",
   "posterior_seed_policy": "image_content_hash_v1",
   "fact_scoring": "locked_literal_assertion_v2",
@@ -60,5 +58,6 @@
   ],
   "response_caption_weight": 0.1,
   "response_energy_floor": 1e-08,
-  "response_images_per_rank": 8
+  "response_images_per_rank": 8,
+  "writer_architecture": "native_und_v1"
 }

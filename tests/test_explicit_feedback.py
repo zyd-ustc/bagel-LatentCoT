@@ -11,7 +11,7 @@ from dataclasses import replace
 
 def continuous(runtime):
     from qwen_latent_cot.diagnostics.memory import MemoryWriter
-    runtime.writer = MemoryWriter(runtime.decoder, 'C', 16, runtime.config['rank'])
+    runtime.writer = MemoryWriter(runtime.decoder, 'C', 16)
     return runtime
 
 

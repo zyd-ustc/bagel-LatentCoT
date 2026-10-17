@@ -1,0 +1,16 @@
+{
+  "rank": 16,
+  "alpha": 16,
+  "writer_lr": 0.000002,
+  "consumer_lr": 0.00001,
+  "weight_decay": 0.0,
+  "gradient_clip": 1.0,
+  "warmup_steps": 20,
+  "activation_checkpointing": true,
+  "global_batch": 16,
+  "early_steps": 20,
+  "steps": 500,
+  "save_steps": [100, 250, 500],
+  "val_images": 4,
+  "seed": 17
+}

@@ -2,40 +2,29 @@
 import random
 import numpy as np
 import torch
-from .record import load_checkpoint, validate_checkpoint
+from .record import validate_checkpoint
 from .data import file_hash
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 STAGES = ('C2-observe', 'C2-feedback', 'C3-loop')
 RESUME_KEYS = ('effective_batch', 'seed', 'loss_weights', 'learning_rate', 'weight_decay',
-               'gradient_clip', 'cross_round_gradients', 'train_writer', 'source_layers',
+               'gradient_clip', 'cross_round_gradients', 'und_train', 'source_layers',
                'feedback_updates', 'online_feedback', 'noise_curriculum', 'noise_calibration',
-               'task_mix', 'output_token_budgets', 'context_token_limit', 'label_instructions',
+               'task_mix', 'excluded_sources', 'output_token_budgets', 'context_token_limit', 'label_instructions',
                'sampler_steps', 'timestep_shift', 'resolution', 'activation_checkpointing')
 
 
 def initialize_student(runtime, writer_init=None, visual_init=None, *, teacher_path=None):
     from .visual import VisualStudent
-    from .memory import MemoryWriter
-    if writer_init: load_checkpoint(writer_init, runtime, ('C1', 'C1-read'))
-    teacher = None
-    if teacher_path:
-        saved = torch.load(teacher_path, map_location=runtime.device, weights_only=True)
-        validate_checkpoint(saved, runtime, ('C1', 'C1-read'))
-        expected = runtime.config.get('text_teacher_sha256')
-        if expected and file_hash(teacher_path) != expected: raise ValueError('text teacher SHA256 changed')
-        teacher = MemoryWriter(runtime.decoder, 'C', runtime.writer.slots, runtime.writer.rank)
-        teacher.load_state_dict(saved['adapters'], strict=True)
-    student = VisualStudent(runtime, teacher)
-    student.text_teacher_hash = file_hash(teacher_path) if teacher_path else None
+    if writer_init or teacher_path:
+        raise ValueError('native UND uses --checkpoint; historical residual checkpoints are removed')
+    student = VisualStudent(runtime)
     if visual_init:
-        saved = torch.load(visual_init, map_location=runtime.device, weights_only=True)
-        validate_checkpoint(saved, runtime, (*STAGES, 'C2-joint'))
-        # Historical checkpoints are weights only. No optimizer or teacher migration.
-        if saved['config'].get('visual_architecture') != student.visual.architecture:
-            raise ValueError('visual architecture differs')
-        student.visual.load_state_dict(saved['visual'], strict=True)
-        if not writer_init: student.writer.load_state_dict(saved['adapters'], strict=True)
+        saved = torch.load(visual_init, map_location='cpu', weights_only=True)
+        validate_checkpoint(saved, runtime, STAGES)
+        if saved.get('format_version') != FORMAT_VERSION:
+            raise ValueError('native UND requires checkpoint format 4')
+        student.load_native_state_dict(saved['und'])
     return student
 
 
@@ -47,10 +36,10 @@ def save_visual_checkpoint(path, student, step, stage, parent=None, optimizer=No
                numpy=dict(kind=n[0], keys=n[1].tolist(), position=n[2], has_gauss=n[3], cached_gauss=n[4]))
     if runtime.device.type != 'cpu':
         rng['accelerator_selected'] = getattr(torch, runtime.device.type).get_rng_state(runtime.device)
-    saved = dict(format_version=FORMAT_VERSION, adapters=student.writer.state_dict(), visual=student.visual.state_dict(),
+    saved = dict(format_version=FORMAT_VERSION, und=student.native_state_dict(),
                  text_teacher=student.text_teacher.state_dict() if student.text_teacher is not None else None,
                  text_teacher_hash=student.text_teacher_hash, stage=stage, step=step, config=runtime.config,
-                 topology='C', slots=student.writer.slots, rank=student.writer.rank, depth=len(runtime.decoder.layers),
+                 topology='C', slots=student.writer.slots, depth=len(runtime.decoder.layers),
                  seed_ids=runtime.seed_ids, native_files=runtime.native_files, parent=parent,
                  parent_hash=file_hash(parent) if parent else None,
                  data_hashes=getattr(runtime, 'data_hashes', None),
@@ -61,10 +50,10 @@ def save_visual_checkpoint(path, student, step, stage, parent=None, optimizer=No
 
 def load_visual_checkpoint(path, student, *, optimizer=None, resume=False, expected_stage=None):
     runtime = student.runtime
-    saved = torch.load(path, map_location=runtime.device, weights_only=True)
+    saved = torch.load(path, map_location='cpu', weights_only=True)
     validate_checkpoint(saved, runtime, STAGES)
     if saved.get('format_version') != FORMAT_VERSION:
-        raise ValueError('exact checkpoint loading requires format 3; use weight initialization for historical weights')
+        raise ValueError('native UND requires checkpoint format 4')
     if saved.get('text_teacher_hash') != student.text_teacher_hash:
         raise ValueError('independent text teacher provenance differs')
     teacher = student.text_teacher.state_dict() if student.text_teacher is not None else None
@@ -78,7 +67,7 @@ def load_visual_checkpoint(path, student, *, optimizer=None, resume=False, expec
         for key in RESUME_KEYS:
             if saved['config'].get(key) != runtime.config.get(key): raise ValueError('exact resume configuration differs: '+key)
         if saved.get('data_hashes') != getattr(runtime, 'data_hashes', None): raise ValueError('resume corpus fingerprint changed')
-    student.writer.load_state_dict(saved['adapters'], strict=True); student.visual.load_state_dict(saved['visual'], strict=True)
+    student.load_native_state_dict(saved['und'])
     if resume:
         optimizer.load_state_dict(saved['optimizer'])
         rng = saved['rng']; random.setstate(rng['python']); torch.set_rng_state(rng['torch'].cpu())

@@ -85,6 +85,15 @@ def training_objective(student, row, state, stage, *, policy=None, feedback_prov
         bank=student.write(source,state.t)
         values['sem']=semantic_loss(runtime,row,bank)
         return values,dict(passes=1,feedback_updates=0,gen_calls=1,rounds=[],masks=available.asdict())
+    if stage == 'C2-feedback':
+        if row['task'] != 'feedback' or not available.sem:
+            raise ValueError('C2 feedback requires a valid correction or hold label')
+        with torch.no_grad():
+            source = conditional_gen(runtime, state).source
+        bank = student.write(source, state.t, prompt=state.prompt_kv)
+        values['sem'] = semantic_loss(runtime, row, bank)
+        return values, dict(passes=1, feedback_updates=0, gen_calls=1, rounds=[],
+                            masks=available.asdict(), target_satisfied=row['feedback']['satisfied'])
     if not any(available.asdict().values()):raise ValueError('sample has no legal supervision at this noise level')
     updates=cfg.get('feedback_updates',2 if stage=='C3-loop' else 1)
     if updates>1 and row['task']=='feedback' and not available.flow and feedback_provider is None:

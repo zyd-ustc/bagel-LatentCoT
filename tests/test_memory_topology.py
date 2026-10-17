@@ -41,10 +41,10 @@ def source_for(lm, samples=1):
     return tuple(KV(i, cache.key_cache[i], cache.value_cache[i], (5,)*samples) for i in range(3)), cache
 
 
-def setup_writer(lm, topology='L', samples=1):
+def setup_writer(lm, topology='C', samples=1):
     source, _ = source_for(lm, samples)
     seeds = neutral_seeds(lm.model, torch.arange(16), samples)
-    writer = MemoryWriter(lm.model, topology, rank=4)
+    writer = MemoryWriter(lm.model, topology)
     return writer, seeds, source, torch.arange(20, 36).repeat(samples)
 
 
@@ -59,36 +59,8 @@ def test_neutral_seed_prefill_matches_native_inputs(lm):
     for ours, native in zip(seeds, captured): torch.testing.assert_close(ours, native, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize('topology', ['L', 'C'])
-def test_full_bank_post_block_readout_and_gradient(lm, topology):
-    writer, seeds, source, positions = setup_writer(lm, topology)
-    guard = FrozenGuard(lm)
-    bank = writer(seeds, source, positions)
-    assert len(bank.layers) == 3 and all(not kv.rotated for kv in bank.layers)
-    for kv in bank.layers: assert kv.keys.shape == (16, 2, 8)
-    bundle = SimpleNamespace(model=SimpleNamespace(language_model=lm))
-    loss, logits = teacher_forcing(bundle, [1, 2, 3], [7, 8, 9], consume_bank(lm.model, bank, [0]), 16)
-    loss.backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in writer.parameters())
-    assert all(adapter.up.weight.grad.abs().max() > 0 for adapter in writer.adapters)
-    before = {n: p.clone() for n, p in lm.named_parameters()}
-    torch.optim.AdamW(writer.parameters(), lr=.01).step()
-    guard.check()
-    for n, p in lm.named_parameters(): torch.testing.assert_close(p, before[n], rtol=0, atol=0)
 
 
-def test_topology_changes_only_hidden_propagation(lm):
-    l, seeds, source, positions = setup_writer(lm, 'L')
-    c = MemoryWriter(lm.model, 'C', rank=4); c.load_state_dict(l.state_dict())
-    lb, cb = l(seeds, source, positions), c(seeds, source, positions)
-    torch.testing.assert_close(lb.layers[0].keys, cb.layers[0].keys, rtol=0, atol=0)
-    assert not torch.equal(lb.layers[1].keys, cb.layers[1].keys)
-    # Alter layer zero adapter only. L layer one cannot change; C must change.
-    with torch.no_grad(): l.adapters[0].up.weight.fill_(.1); c.adapters[0].up.weight.fill_(.1)
-    ll, cc = l(seeds, source, positions), c(seeds, source, positions)
-    torch.testing.assert_close(lb.layers[1].keys, ll.layers[1].keys, rtol=0, atol=0)
-    assert not torch.equal(cb.layers[1].keys, cc.layers[1].keys)
-    assert sum(p.numel() for p in l.parameters()) == sum(p.numel() for p in c.parameters())
 
 
 def test_rope_once_and_same_layer_guard(lm):
@@ -229,7 +201,7 @@ def runtime(lm, tmp_path):
                eval_t=[.5, 1.], noise_seeds=[0], sampler_steps=4)
     bundle = SimpleNamespace(model=model, vae=VAE(), tokenizer=Tokenizer(), token_ids={
         'bos_token_id':1, 'eos_token_id':2, 'start_of_image':1, 'end_of_image':3}, model_path=str(tmp_path))
-    runtime = DiagnosticRuntime(bundle, cfg, 'L'); runtime.native_files = {'fake': 'engineering-only'}
+    runtime = DiagnosticRuntime(bundle, cfg, 'C'); runtime.native_files = {'fake': 'engineering-only'}
     return runtime
 
 
@@ -360,39 +332,8 @@ def test_cli_c0_manifest_serializes_native_vae_config(runtime, tmp_path, monkeyp
     assert not json.loads((output/'calibration.json').read_text())['passed']
     assert not any('build/' in name for name in record['source_hashes'])
 
-@pytest.mark.parametrize('path', ['keys', 'values'])
-@pytest.mark.parametrize('topology', ['L', 'C'])
-def test_caption_gradient_reaches_each_memory_path(lm, topology, path):
-    from qwen_latent_cot.diagnostics.memory import MemoryBank
-    writer, seeds, source, positions = setup_writer(lm, topology)
-    original = writer(seeds, source, positions)
-    for kv in original.layers:
-        getattr(kv, path).retain_grad()
-    bank = MemoryBank(tuple(KV(kv.layer,
-        kv.keys if path == 'keys' else kv.keys.detach(),
-        kv.values if path == 'values' else kv.values.detach(), kv.lengths, False)
-        for kv in original.layers), topology, 16)
-    loss, _ = teacher_forcing(SimpleNamespace(model=SimpleNamespace(language_model=lm)),
-                             [1, 2, 3], [7, 8, 9], consume_bank(lm.model, bank, [0]), 16)
-    loss.backward()
-    assert all(getattr(kv, path).grad is not None and getattr(kv, path).grad.abs().max() > 0
-               for kv in original.layers)
-    assert all(a.up.weight.grad is not None and a.up.weight.grad.abs().max() > 0 for a in writer.adapters)
 
 
-def test_chain_gradient_crosses_frozen_und_blocks(lm):
-    from qwen_latent_cot.diagnostics.memory import MemoryBank
-    writer, seeds, source, positions = setup_writer(lm, 'C')
-    # Only the last layer bank is connected: earlier adapters need downstream UND input gradients.
-    bank = writer(seeds, source, positions)
-    isolated = MemoryBank(tuple(KV(kv.layer, kv.keys if i == 2 else kv.keys.detach(),
-        kv.values if i == 2 else kv.values.detach(), kv.lengths, False)
-        for i, kv in enumerate(bank.layers)), 'C', 16)
-    loss, _ = teacher_forcing(SimpleNamespace(model=SimpleNamespace(language_model=lm)),
-                             [1, 2, 3], [7, 8, 9], consume_bank(lm.model, isolated, [0]), 16)
-    loss.backward()
-    assert writer.adapters[0].up.weight.grad.abs().max() > 0
-    assert all(p.grad is None and not p.requires_grad for p in lm.parameters())
 
 
 def test_literal_negation_is_local_to_assertion():
@@ -411,12 +352,6 @@ def test_c0_uses_own_repeat_instruction(runtime):
     assert runtime.config['c0_instruction'] != runtime.config['caption_instruction']
 
 
-def test_low_rank_residual_is_linear(lm):
-    from qwen_latent_cot.diagnostics.memory import LowRankResidual
-    adapter = LowRankResidual(32, 4)
-    with torch.no_grad(): adapter.up.weight.normal_()
-    x = torch.randn(16, 32)
-    torch.testing.assert_close(adapter(2*x), 2*adapter(x))
 
 
 def test_continuation_rejects_partial_first_step(runtime):

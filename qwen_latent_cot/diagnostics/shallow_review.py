@@ -6,15 +6,20 @@ import random
 import secrets
 
 
-def prepare(prompts, output, count, passes, early, selection_seed=None):
+def prepare(prompts, output, count, passes, early, selection_seed=None, loop_layers=('full',)):
     pool = [json.loads(line) for line in Path(prompts).read_text().splitlines() if line.strip()]
     if not 0 < count <= len(pool):
         raise ValueError('prompt count must fit the dataset')
     seed = secrets.randbits(63) if selection_seed is None else selection_seed
     indexes = random.Random(seed).sample(range(len(pool)), count)
     rows = [dict(pool[i], source_index=i) for i in indexes]
+    arms=[dict(name='base',passes=1,early=0,loop_layers='full')]
+    for e in early:
+        label='full' if e=='full' else f'early{e}'
+        arms.extend(dict(name=f'{label}_L{layer}_R{r}',passes=r,early=e,loop_layers=layer)
+                    for layer in loop_layers for r in passes)
     plan = dict(selection_seed=seed, source=str(Path(prompts).resolve()),
-                population=len(pool), count=count, passes=passes, early=early, rows=rows)
+                population=len(pool), count=count, passes=passes, early=early, loop_layers=list(loop_layers), arms=arms, rows=rows)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     (output/'selection.json').write_text(json.dumps(plan, ensure_ascii=False, indent=2)+'\n')
@@ -24,8 +29,7 @@ def prepare(prompts, output, count, passes, early, selection_seed=None):
 def render(output):
     output = Path(output)
     plan = json.loads((output/'selection.json').read_text())
-    arms = [('Base', 'base')] + [(f'early{e} · R{r}', f'early{e}_R{r}')
-                                for e in plan['early'] for r in plan['passes']]
+    arms=[('Base' if arm['name']=='base' else arm['name'],arm['name']) for arm in plan['arms']]
     parts = ['''<!doctype html><html lang="zh"><meta charset="utf-8">
 <title>16槽 Memory 文生图对照</title>
 <style>
@@ -40,7 +44,7 @@ small{color:#666}h3{line-height:1.5}
     for index, row in enumerate(plan['rows']):
         parts.append(f'<section><h3>{index+1}. {html.escape(row["prompt"])}</h3>')
         parts.append(f'<small>来源索引 {row["source_index"]} · {html.escape(str(row.get("prompt_id", "")))}</small>')
-        parts.append(f'<div class="scroll"><div class="grid" style="grid-template-columns:repeat({len(arms)},minmax(0,1fr))">')
+        parts.append(f'<div class="scroll"><div class="grid" style="grid-template-columns:repeat({len(arms)},minmax(240px,1fr))">')
         for label, suffix in arms:
             name = f'p{index:02d}_{suffix}.png'
             if not (output/name).is_file():

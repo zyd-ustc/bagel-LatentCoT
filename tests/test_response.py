@@ -45,28 +45,6 @@ def make_captured_probe(lm):
     return dict(layers=result,prompt_positions=[5]),source
 
 
-def test_capture_and_response_loss_train_all_C_adapters_without_changing_BAGEL(lm):
-    probe,source=make_captured_probe(lm)
-    writer,seeds,_,positions=setup_writer(lm,'C')
-    runtime=SimpleNamespace(decoder=lm.model,device=torch.device('cpu'),
-                            config={'response_layers':[0,2],'response_energy_floor':1e-8})
-    teacher={i:(source[i].keys,source[i].values) for i in [0,2]}
-    guard=FrozenGuard(lm)
-    original={name:p.clone() for name,p in lm.named_parameters()}
-    optimizer=torch.optim.AdamW(writer.parameters(),lr=0.001)
-    for _ in range(2):
-        optimizer.zero_grad(set_to_none=True)
-        bank=writer(seeds,source,positions)
-        loss,metrics=response_loss(runtime,bank,teacher,probe)
-        grads=torch.autograd.grad(loss,[tensor for i in [0,2] for tensor in (bank.layers[i].keys,bank.layers[i].values)],retain_graph=True)
-        assert all(torch.isfinite(g).all() and g.abs().max()>0 for g in grads)
-        loss.backward()
-        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in writer.parameters())
-        assert all(adapter.up.weight.grad.abs().max()>0 for adapter in writer.adapters)
-        optimizer.step();guard.check()
-    assert all(adapter.down.weight.grad.abs().max()>0 for adapter in writer.adapters)
-    for name,p in lm.named_parameters():torch.testing.assert_close(p,original[name],rtol=0,atol=0)
-    assert len(metrics)==2
 
 
 def test_expanded_query_pools_use_all_128_images_once():

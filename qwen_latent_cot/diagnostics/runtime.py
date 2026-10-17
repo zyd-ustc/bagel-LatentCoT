@@ -13,7 +13,7 @@ from .numerics import autocast_for
 
 class DiagnosticRuntime:
     def __init__(self, bundle, config, topology):
-        for key, expected in dict(adapter_type='linear_low_rank_v1',
+        for key, expected in dict(writer_architecture='native_und_v1',
                                   training_state_sampling='independent_uniform_v1',
                                   posterior_seed_policy='image_content_hash_v1',
                                   fact_scoring='locked_literal_assertion_v2').items():
@@ -34,7 +34,7 @@ class DiagnosticRuntime:
         if len(ids) != config['slots']:
             raise ValueError('neutral text must contain at least slots non-special tokens')
         self.seed_ids = ids
-        self.writer = MemoryWriter(self.decoder, topology, config['slots'], config['rank'])
+        self.writer = MemoryWriter(self.decoder, topology, config['slots'])
         with autocast_for(self.device):
             self.seeds = neutral_seeds(self.decoder, torch.tensor(ids, device=self.device))
         self.instruction_ids = self.prompt_ids(config['caption_instruction'])

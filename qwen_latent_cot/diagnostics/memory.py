@@ -1,4 +1,4 @@
-"""Independent frozen-UND Memory. Keys in MemoryBank are ALWAYS unrotated."""
+"""Native UND Memory. Keys in MemoryBank are ALWAYS unrotated."""
 from dataclasses import dataclass, replace
 from contextlib import nullcontext
 import torch
@@ -76,13 +76,10 @@ def rotate(states, rope):
     return (states * cos[:, None] + rotated * sin[:, None]).to(states.dtype)
 
 
-def project(attention, normalized, mode='und', text_indexes=None, image_indexes=None,
-            query_adapter=None):
+def project(attention, normalized, mode='und', text_indexes=None, image_indexes=None):
     """Native expert-specific Q/K/V and Q/K norms, before RoPE."""
     if mode == 'und':
         raw_q = attention.q_proj(normalized)
-        if query_adapter is not None:
-            raw_q = raw_q + query_adapter(normalized).to(raw_q.dtype)
         q = attention.q_norm(raw_q.view(-1, attention.num_heads, attention.head_dim))
         k = attention.k_norm(attention.k_proj(normalized).view(-1, attention.num_key_value_heads, attention.head_dim))
         v = attention.v_proj(normalized).view_as(k)
@@ -152,11 +149,11 @@ def join_prefix(source, keys, values, lengths):
     return torch.cat(merged_k), torch.cat(merged_v), tuple(a+b for a, b in zip(source.lengths, lengths))
 
 
-def und_block(layer, hidden, rope, lengths, source=None, *, causal=False, query_adapter=None):
+def und_block(layer, hidden, rope, lengths, source=None, *, causal=False):
     counter = getattr(layer, '_diagnostic_cost_counter', None)
     if counter is not None: counter.counts[2] += 1
     a = layer.self_attn
-    q, k, v = project(a, layer.input_layernorm(hidden), query_adapter=query_adapter)
+    q, k, v = project(a, layer.input_layernorm(hidden))
     q, k = rotate(q, rope), rotate(k, rope)
     klens = lengths
     if source is not None:
@@ -168,32 +165,18 @@ def und_block(layer, hidden, rope, lengths, source=None, *, causal=False, query_
     return hidden + layer.mlp(layer.post_attention_layernorm(hidden))
 
 
-class LowRankResidual(nn.Module):
-    def __init__(self, width, rank):
-        super().__init__()
-        self.down = nn.Linear(width, rank, bias=False)
-        self.up = nn.Linear(rank, width, bias=False)
-        nn.init.zeros_(self.up.weight)
-
-    def forward(self, hidden):
-        return self.up(self.down(hidden.to(self.down.weight.dtype))).to(hidden.dtype)
-
-
 class MemoryWriter(nn.Module):
-    """Own ONLY adapters; do not register the frozen decoder as trainable state."""
-    def __init__(self, decoder, topology='L', slots=16, rank=32):
+    """Continuous native UND computation; no additional trainable modules."""
+    def __init__(self, decoder, topology='C', slots=16):
         super().__init__()
-        if topology not in ('L', 'C') or slots <= 0 or rank <= 0:
-            raise ValueError('invalid Memory configuration')
-        self.topology, self.slots, self.rank = topology, slots, rank
+        if topology != 'C' or slots <= 0:
+            raise ValueError('Memory uses continuous UND with positive slot count')
+        self.topology, self.slots = topology, slots
         object.__setattr__(self, 'decoder', decoder)
-        decoder.eval().requires_grad_(False)
-        width = decoder.embed_tokens.weight.shape[1]
-        self.adapters = nn.ModuleList([LowRankResidual(width, rank) for _ in decoder.layers])
-        self.to(device=decoder.embed_tokens.weight.device)
+        self.activation_checkpointing = False
 
     def forward(self, seeds, source, positions, source_off=False, *, source_kind='text',
-                t=None, visual_adapter=None, detach_source=True, source_layers=None):
+                t=None, detach_source=True, source_layers=None, adapter_scope=nullcontext):
         count = len(self.decoder.layers)
         if len(seeds) != count or len(source) != count:
             raise ValueError('seeds and source must cover ALL decoder layers')
@@ -201,29 +184,33 @@ class MemoryWriter(nn.Module):
         samples = len(lengths); slot_lengths = (self.slots,) * samples
         if len(positions) != samples * self.slots:
             raise ValueError('writer positions must cover fixed slots')
+        if source_layers is not None and tuple(source_layers) != tuple(range(count)):
+            raise ValueError('Memory reads GEN at every UND layer')
         hidden = seeds[0].detach()
         bank = []
-        for index, (layer, adapter) in enumerate(zip(self.decoder.layers, self.adapters)):
+        for index, layer in enumerate(self.decoder.layers):
             # Layer windows change token counts, never the packed sample count.
             same_layout = len(source[index].lengths) == samples
             if source[index].layer != index or not same_layout:
                 raise ValueError('source must preserve layer and sample layout')
-            h = seeds[index].detach() if self.topology == 'L' else hidden
+            h = hidden
             if h.shape != seeds[0].shape or len(h) != sum(slot_lengths):
                 raise ValueError('invalid neutral seed shape')
             rope = rope_for(self.decoder, h, positions)
             origin = source[index].detached() if detach_source else source[index]
             if origin.positions and set(origin.positions).intersection(positions.tolist()):
                 raise ValueError('GEN source positions overlap writer slots')
-            query_adapter = None
-            if visual_adapter is not None and source_kind == 'visual':
-                if t is None or not 0 <= float(t) <= 1:
-                    raise ValueError('visual writing requires actual t in [0, 1]')
-                query_adapter = lambda normalized, i=index: visual_adapter(i, normalized, t)
-            u = und_block(layer, h, rope, slot_lengths, None if source_off or (source_layers is not None and index not in source_layers) else origin,
-                          query_adapter=query_adapter)
-            hidden = u + adapter(u)
-            _, k, v = project(layer.self_attn, layer.input_layernorm(hidden))
+            current_source = None if source_off else origin
+            def block(value, layer=layer, rope=rope, current_source=current_source):
+                with adapter_scope():
+                    return und_block(layer, value, rope, slot_lengths, current_source)
+            if self.activation_checkpointing and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+                hidden = checkpoint(block, h, use_reentrant=False)
+            else:
+                hidden = block(h)
+            with adapter_scope():
+                _, k, v = project(layer.self_attn, layer.input_layernorm(hidden))
             bank.append(KV(index, k, v, slot_lengths, False))
         return MemoryBank(tuple(bank), self.topology, self.slots)
 
