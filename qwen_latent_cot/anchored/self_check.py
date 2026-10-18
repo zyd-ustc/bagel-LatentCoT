@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache, Qwen2Config, Qwen2ForCausalLM
-from qwen_latent_cot.anchored.adapter import bound_residual
+from qwen_latent_cot.anchored.adapter import AnchoredReentryAdapter, bound_residual
 from qwen_latent_cot.anchored.config import LoopConfig
 from qwen_latent_cot.anchored.feedback import FeedbackState, intervene_feedback
 from qwen_latent_cot.anchored.legacy import refuse_legacy_checkpoint
@@ -321,7 +321,7 @@ def check_trained_observation_is_an_independent_copy():
     if any(parameter.requires_grad for parameter in observer.parameters()):
         raise AssertionError("observation copy is trainable")
     exported = loop.export_state()["model"]
-    if any("q_proj" in key or key.startswith("observer") for key in exported):
+    if any(key.startswith(("observer", "layers")) or "self_attn" in key for key in exported):
         raise AssertionError("ADSL checkpoint stored the observation readout")
 
 
@@ -594,13 +594,15 @@ def check_feedback_content_and_gen_only():
     with torch.no_grad():
         shuffled.load_state_dict(correct.state_dict())
         zeroed.load_state_dict(correct.state_dict())
-        # Memory projection starts at 1e-3. On a bf16 body that scale is below one ulp.
-        correct.adapter.m_down.weight.normal_(0, 1.0)
+        # The updater and the slot attention start near 1e-3. Widen them so a
+        # sample roll is visible in bf16 after the frozen body.
+        correct.updater.down.weight.normal_(0, 0.5)
+        correct.updater.up.weight.normal_(0, 0.5)
+        for name in ("q_proj", "k_proj", "v_proj", "mem_out"):
+            getattr(correct.adapter, name).weight.normal_(0, 0.5)
         correct.adapter.up.weight.normal_(0, 0.5)
-        shuffled.adapter.m_down.weight.copy_(correct.adapter.m_down.weight)
-        shuffled.adapter.up.weight.copy_(correct.adapter.up.weight)
-        zeroed.adapter.m_down.weight.copy_(correct.adapter.m_down.weight)
-        zeroed.adapter.up.weight.copy_(correct.adapter.up.weight)
+        shuffled.load_state_dict(correct.state_dict())
+        zeroed.load_state_dict(correct.state_dict())
         correct_out = correct.forward_branch(hidden, branch, train=False)
         shuffled_out = shuffled.forward_branch(hidden, branch, train=False)
         zero_out = zeroed.forward_branch(hidden, branch, train=False)
@@ -636,8 +638,11 @@ def check_gradients_and_frozen_native():
     if loop.gate.raw.grad is None or float(loop.gate.raw.grad.abs()) == 0.0:
         raise AssertionError("closed gate received no gradient")
     adapter_grad = loop.adapter.up.weight.grad
+    memory_grad = loop.adapter.mem_out.weight.grad
     if adapter_grad is not None and float(adapter_grad.abs().sum()) != 0.0:
         raise AssertionError("adapter received a gradient through a zero gate")
+    if memory_grad is not None and float(memory_grad.abs().sum()) != 0.0:
+        raise AssertionError("memory attention received a gradient through a zero gate")
     assert language_model.model.layers[1].self_attn.q_proj.weight.grad is None
     optimizer = torch.optim.SGD(loop.trainable_parameters(), lr=1.0)
     optimizer.step()
@@ -654,6 +659,8 @@ def check_gradients_and_frozen_native():
     opened.velocity.float().sum().backward()
     if loop.adapter.up.weight.grad is None or float(loop.adapter.up.weight.grad.abs().sum()) == 0.0:
         raise AssertionError("open gate did not train the adapter")
+    if loop.adapter.mem_out.weight.grad is None or float(loop.adapter.mem_out.weight.grad.abs().sum()) == 0.0:
+        raise AssertionError("open gate did not train the memory attention")
     if loop.updater.up.weight.grad is None or float(loop.updater.up.weight.grad.abs().sum()) == 0.0:
         raise AssertionError("open gate did not train the feedback update")
 
@@ -761,6 +768,79 @@ def replace_cache(branch, cache):
     )
 
 
+def check_image_tokens_address_memory_slots():
+    width = 8
+    adapter = AnchoredReentryAdapter(width, width).eval()
+    eye = torch.eye(width)
+    with torch.no_grad():
+        adapter.q_proj.weight.copy_(eye * 4)
+        adapter.k_proj.weight.copy_(eye * 4)
+        adapter.v_proj.weight.copy_(eye)
+        adapter.mem_out.weight.copy_(eye)
+        adapter.h_down.weight.zero_()
+        adapter.p_down.weight.zero_()
+        adapter.time_down.weight.zero_()
+        adapter.up.weight.zero_()
+
+    def packed(samples):
+        per = 3
+        text, vae = [], []
+        for sample in range(samples):
+            base = sample * per
+            text.append(base)
+            vae.extend((base + 1, base + 2))
+        return BranchContext(
+            name="cond",
+            query_lens=torch.tensor((per,) * samples, dtype=torch.int32),
+            packed_query_position_ids=torch.arange(per).repeat(samples),
+            packed_query_indexes=torch.arange(samples * per),
+            past_key_values=object(),
+            key_values_lens=torch.zeros(samples, dtype=torch.int32),
+            packed_key_value_indexes=torch.zeros(0, dtype=torch.long),
+            packed_text_indexes=torch.tensor(text, dtype=torch.long),
+            packed_vae_token_indexes=torch.tensor(vae, dtype=torch.long),
+            flow_time=0.9,
+        )
+
+    hidden = torch.zeros(3, width)
+    hidden[1, 0] = 1.0
+    hidden[2, 1] = 1.0
+    anchor = torch.zeros_like(hidden)
+    slots = torch.zeros(1, 2, width)
+    slots[0, 0, 0] = 1.0
+    slots[0, 1, 1] = 1.0
+    branch = packed(1)
+    state = FeedbackState(slots, "cond", 1, 0.9)
+    with torch.no_grad():
+        base = adapter(hidden, state, anchor, 0.9, branch)
+        if torch.allclose(base[1], base[2]):
+            raise AssertionError("two image tokens read the same memory mixture")
+        if float(base[0].abs().sum()) != 0.0:
+            raise AssertionError("a text token received a memory residual")
+        moved = slots.clone()
+        moved[0, 0, 2] = 4.0
+        shifted = adapter(hidden, FeedbackState(moved, "cond", 1, 0.9), anchor, 0.9, branch)
+        first = float((shifted[1] - base[1]).abs().sum())
+        second = float((shifted[2] - base[2]).abs().sum())
+        if first <= second * 2:
+            raise AssertionError(
+                f"slot 0 moved token 0 by {first} and token 1 by {second}"
+            )
+
+        hidden2 = hidden.repeat(2, 1)
+        anchor2 = torch.zeros_like(hidden2)
+        both = torch.zeros(2, 2, width)
+        both[0].copy_(slots[0])
+        both[1, 0, 3] = 5.0
+        both[1, 1, 4] = 5.0
+        branch2 = packed(2)
+        mixed = adapter(hidden2, FeedbackState(both, "cond", 1, 0.9), anchor2, 0.9, branch2)
+        cleared = both.clone()
+        cleared[1].zero_()
+        isolated = adapter(hidden2, FeedbackState(cleared, "cond", 1, 0.9), anchor2, 0.9, branch2)
+        _exact(mixed[:3], isolated[:3], "sample 0 memory read")
+
+
 def check_checkpoint_and_bound():
     language_model = tiny_language_model()
     loop = make_loop(language_model)
@@ -798,6 +878,7 @@ CHECKS = [
     check_feedback_content_and_gen_only,
     check_gradients_and_frozen_native,
     check_cfg_matches_bagel,
+    check_image_tokens_address_memory_slots,
     check_checkpoint_and_bound,
 ]
 

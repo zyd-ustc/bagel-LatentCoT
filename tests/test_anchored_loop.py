@@ -15,6 +15,7 @@ def test_anchored_contract():
     assert "trained_observation_is_an_independent_copy" in names
     assert "observation_source_mode_follows_the_training_config" in names
     assert "anchored_observation_reuses_native_pre_kv" in names
+    assert "image_tokens_address_memory_slots" in names
 
 
 def test_show_config():

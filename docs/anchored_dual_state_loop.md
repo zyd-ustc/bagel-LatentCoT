@@ -16,7 +16,13 @@ Pre is the native computation and is not run again. Body and Post are recomputed
 
 `observation_checkpoint` is required for `variant=dual`. Without it the loop refuses to read. `allow_unloaded_observer` exists only so the structural contract can run on a tiny model whose copy still holds native projections. That copy is not the verified reader. Matching the reference decoder shows that the copied projections compute the same slots. The trace shows that the anchored stitch reuses the native Pre KV objects. Neither check shows that the feedback improves the generated image. That question is the GEN-only versus dual-correct comparison, and the correct versus shuffled comparison.
 
-The adapter still mean-pools the memory slots onto the image tokens. Replacing that pool with image-to-slot cross-attention is a separate mechanism.
+Each image token reads the feedback slots with one-head cross-attention of width `rank`:
+
+```text
+delta_i = W_O Attn(W_Q H_i, W_K M, W_V M) + U(H_i, P_t, t)
+```
+
+`M` stays `[slots, hidden]`. A token can use one slot without giving that mixture to every other image token. Samples do not share slots. The anchor and the flow time remain on the low-rank path. Text rows stay zero, and the gate plus the RMS bound still write `gamma * Bound(delta)` onto the native body entry.
 
 `entry_scale = 0` returns the native velocity without a second body call. `force_full_zero_path` still runs the observer and the second body with a zero residual, which is the equivalence check. Training uses the learned gate tensor on scheduled steps so a Python zero does not block its gradient. The gate starts at zero; adapter and updater gradients open after the gate moves.
 
