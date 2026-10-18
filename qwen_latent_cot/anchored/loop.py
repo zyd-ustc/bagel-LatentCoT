@@ -19,8 +19,30 @@ from .native_path import (
     snapshot_cache,
     velocity_from_hidden,
 )
-from .observer import VerifiedUndObserver
+from .observer import TrainedObservationObserver
 from .schedule import in_loop_schedule
+
+
+def _observation_record(captured, pre_kv, body_kv, post_kv, *, round_index: int, keep: bool) -> dict:
+    """One reader input. ``_kept`` pins KV objects when intermediates are logged."""
+    def pinned(bucket):
+        return tuple(bucket[index] for index in sorted(bucket))
+
+    layers = sorted(captured)
+    pre_kept, body_kept, post_kept = pinned(pre_kv), pinned(body_kv), pinned(post_kv)
+    record = {
+        "round": round_index,
+        "kind": "full_native" if round_index == 0 else "anchored",
+        "layers": layers,
+        "experts": [captured[index].expert for index in layers],
+        "roles": [tuple(sorted(set(captured[index].token_roles))) for index in layers],
+        "pre_ptrs": [item.keys.data_ptr() for item in pre_kept],
+        "body_ptrs": [item.keys.data_ptr() for item in body_kept],
+        "post_ptrs": [item.keys.data_ptr() for item in post_kept],
+    }
+    if keep:
+        record["_kept"] = (pre_kept, body_kept, post_kept)
+    return record
 
 
 @dataclass
@@ -52,12 +74,18 @@ class AnchoredDualStateLoop(nn.Module):
         self.config = config
         hidden = decoder.config.hidden_size
         self.path = NativePathWrapper(decoder, config)
-        self.observer = VerifiedUndObserver(
-            decoder,
-            config.slots,
-            tuple(range(config.body_start, config.body_end)),
-            config.writer_position_start,
+        observer = TrainedObservationObserver(
+            decoder, config.slots, config.writer_position_start, config.seed_token_ids,
         )
+        observer.source_mode = config.observation_source_mode
+        if config.observation_checkpoint:
+            observer.load_checkpoint(
+                config.observation_checkpoint, source_mode=config.observation_source_mode,
+            )
+        # The reader is not an ADSL checkpoint tensor. Its trained copy is loaded
+        # from the observation checkpoint and must stay out of this module's state.
+        object.__setattr__(self, "observer", observer)
+        self.observation_trace = []
         self.updater = FeedbackStateUpdater(hidden, config.slots, config.rank)
         self.adapter = AnchoredReentryAdapter(hidden, config.rank)
         self.gate = EntryGate()
@@ -66,10 +94,13 @@ class AnchoredDualStateLoop(nn.Module):
     def freeze_native(self) -> None:
         self.decoder.eval()
         self.decoder.requires_grad_(False)
+        if getattr(self, "observer", None) is not None:
+            self.observer.freeze()
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.decoder.eval()
+        self.observer.freeze()
         return self
 
     def trainable_parameters(self):
@@ -84,6 +115,7 @@ class AnchoredDualStateLoop(nn.Module):
         return {
             "experiment": "anchored_dual_state_loop",
             "config": self.config.to_dict(),
+            "observation": self.observer.status(),
             "model": {key: value.detach().cpu() for key, value in self.state_dict().items()},
         }
 
@@ -123,7 +155,24 @@ class AnchoredDualStateLoop(nn.Module):
         velocity_head=None,
         train: bool | None = None,
     ) -> LoopOutput:
-        """One CFG branch at one ``(x_t, t)``. Rounds reuse that same anchor."""
+        """One CFG branch at one ``(x_t, t)``. Rounds reuse that same anchor.
+
+        Round 0 reads the full native forward. Its Pre, Body, and Post captures
+        exist so layers ``0 .. depth-1`` of full-query GEN KV are all present.
+        A later round is Anchored Observation, which keeps the native Pre KV
+        and replaces Body and Post with this round's recomputation:
+
+            O_{r+1} = UND(KV_Pre^{native}, KV_Body^{(r)}, KV_Post^{(r)})
+
+        Pre is not run again. On 28 layers with body ``[20, 28)``, Post is
+        empty, so the read is native Pre KV plus the recomputed Body KV.
+        """
+        if self.config.observation_source_mode != "gen_full_query":
+            raise RuntimeError(
+                "observation_source_mode prompt_and_gen is reserved and not wired. "
+                "The reader does not concatenate prompt KV onto GEN KV."
+            )
+        self.observation_trace = []
         self.freeze_native()
         self.assert_native_frozen()
         if flow_time is None:
@@ -137,11 +186,13 @@ class AnchoredDualStateLoop(nn.Module):
         lengths = branch.query_lens.detach().clone()
         cache_snapshot = snapshot_cache(branch.past_key_values) if self.config.verify_prompt_cache else None
         embeddings = self.path.rope(hidden, branch.packed_query_position_ids)
-        anchor = self.path.pre(hidden, branch, embeddings)
         need_capture = not self._fast_bypass(flow_time, step_index, num_steps, train=train)
-        captured_now = need_capture and self.config.variant == "dual"
-        body, captured = self.path.body(anchor, branch, embeddings, capture=captured_now)
-        native_hidden = self.path.post(body, branch, embeddings)
+        capture_reader = need_capture and self.config.variant == "dual"
+        pre_kv, body_kv, post_kv = {}, {}, {}
+        anchor = self.path.pre(hidden, branch, embeddings, pre_kv if capture_reader else None)
+        body = self.path.body(anchor, branch, embeddings, body_kv if capture_reader else None)
+        native_hidden = self.path.post(body, branch, embeddings, post_kv if capture_reader else None)
+        captured = {**pre_kv, **body_kv, **post_kv}
         native_velocity = velocity_from_hidden(native_hidden, branch.packed_vae_token_indexes, velocity_head)
         records = [tensor_record("native_velocity", native_velocity)]
         if not need_capture:
@@ -160,6 +211,15 @@ class AnchoredDualStateLoop(nn.Module):
         scale = self._scale(anchor, train=train)
         for round_index in range(self.config.correction_rounds):
             if self.config.variant == "dual":
+                if not self.observer.loaded and not self.config.allow_unloaded_observer:
+                    raise RuntimeError(
+                        "the dual-state reader has no trained observation checkpoint. "
+                        "A frozen copy of the native UND projections is not the verified readout."
+                    )
+                self.observation_trace.append(_observation_record(
+                    captured, pre_kv, body_kv, post_kv, round_index=round_index,
+                    keep=self.config.log_intermediates,
+                ))
                 observation = self.observer.read(current, captured, branch)
             elif self.config.variant == "gen_only":
                 observation = self.observer.zeros(samples, anchor)
@@ -187,7 +247,14 @@ class AnchoredDualStateLoop(nn.Module):
             capture_next = (
                 self.config.variant == "dual" and round_index + 1 < self.config.correction_rounds
             )
-            current, captured = self.path.body(entry, branch, embeddings, capture=capture_next)
+            if capture_next:
+                # Anchored Observation. Native Pre KV stays; Body and Post are this round.
+                body_kv, post_kv = {}, {}
+                current = self.path.body(entry, branch, embeddings, body_kv)
+                self.path.post(current, branch, embeddings, post_kv)
+                captured = {**pre_kv, **body_kv, **post_kv}
+            else:
+                current = self.path.body(entry, branch, embeddings)
             if self.config.log_intermediates:
                 records.append({
                     "round": round_index + 1,

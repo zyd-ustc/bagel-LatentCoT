@@ -12,6 +12,9 @@ def test_anchored_contract():
     assert "exact_bypass_and_cache" in names
     assert "cfg_matches_bagel" in names
     assert "gradients_and_frozen_native" in names
+    assert "trained_observation_is_an_independent_copy" in names
+    assert "observation_source_mode_follows_the_training_config" in names
+    assert "anchored_observation_reuses_native_pre_kv" in names
 
 
 def test_show_config():

@@ -1,17 +1,33 @@
-"""Side-branch UND read of GEN image KV. It never enters GEN attention."""
+"""Frozen copy of the trained UND observation readout.
+
+The C2 observation run proved a readout that starts from neutral-text
+embeddings, attends at every layer to full-query GEN KV, and uses the trained
+UND Q/K/V/O and Q/K norms. Those norms live on a copy. The native decoder that
+generates keeps its own weights. Layernorms, MLP, and token embeddings were
+not trained, so the reader uses those native modules directly.
+"""
 from __future__ import annotations
+
+import copy
+import hashlib
+from pathlib import Path
 
 import torch
 from torch import nn
 
 from ..diagnostics.memory import rope_for, und_block
+from ..diagnostics.visual import observation_readout_keys
+from ..diagnostics.visual_record import FORMAT_VERSION, STAGES
 from .native_path import BranchContext, sample_groups
+from .observation_source import require_source_mode
 
 
 OBSERVER_SPEC = {
-    "name": "verified_gen_hidden_to_und",
-    "source_policy": "image_only",
-    "expert": "gen",
+    "name": "trained_observation",
+    "source_policy": "full_query",
+    "layers": "all",
+    "query": "neutral_seed_embeddings",
+    "weights": "observation_checkpoint_copy",
     "prompt_kv_in_source": False,
     "writes_gen_attention": False,
     "same_layer": True,
@@ -19,52 +35,173 @@ OBSERVER_SPEC = {
 }
 
 
-class VerifiedUndObserver(nn.Module):
-    """Read image-only GEN KV with frozen UND blocks and return slot features.
+class _UndReadAttention(nn.Module):
+    """UND projections only. GEN experts stay on the native decoder."""
 
-    The source is the verified ``capture_gen(..., source_policy='image_only')``
-    record: GEN expert, same-layer, rotated, image tokens only. Query slots live
-    in this side branch. They are not added to the GEN token list.
-    """
-
-    def __init__(self, decoder, slots: int, source_layers: tuple[int, ...], position_start: int):
+    def __init__(self, source):
         super().__init__()
-        object.__setattr__(self, "decoder", decoder)
+        self.layer_idx = source.layer_idx
+        self.num_heads = source.num_heads
+        self.num_key_value_heads = source.num_key_value_heads
+        self.head_dim = source.head_dim
+        self.q_proj = copy.deepcopy(source.q_proj)
+        self.k_proj = copy.deepcopy(source.k_proj)
+        self.v_proj = copy.deepcopy(source.v_proj)
+        self.o_proj = copy.deepcopy(source.o_proj)
+        self.q_norm = copy.deepcopy(source.q_norm)
+        self.k_norm = copy.deepcopy(source.k_norm)
+
+
+class _UndReadLayer(nn.Module):
+    def __init__(self, source):
+        super().__init__()
+        # Untrained modules stay the native objects. Registering them here would
+        # try to reparent them away from the generation decoder.
+        object.__setattr__(self, "input_layernorm", source.input_layernorm)
+        object.__setattr__(self, "post_attention_layernorm", source.post_attention_layernorm)
+        object.__setattr__(self, "mlp", source.mlp)
+        self.self_attn = _UndReadAttention(source.self_attn)
+
+
+def observation_slots(
+    layers,
+    embed,
+    rope_decoder,
+    seed_token_ids,
+    captured,
+    hidden: torch.Tensor,
+    branch: BranchContext,
+    slots: int,
+    position_start: int,
+) -> torch.Tensor:
+    """Run the C2 observation writer and return the final slot hidden."""
+    if seed_token_ids is None or len(seed_token_ids) != slots:
+        raise RuntimeError("observation readout needs one neutral seed token per slot")
+    depth = len(layers)
+    if captured is None or tuple(sorted(captured)) != tuple(range(depth)):
+        raise ValueError("trained observation reads GEN KV at every layer")
+    groups = sample_groups(branch, hidden.shape[0])
+    samples = len(groups)
+    ids = torch.tensor(seed_token_ids, device=hidden.device, dtype=torch.long)
+    queries = embed(ids.repeat(samples))
+    positions = torch.arange(position_start, position_start + slots, device=hidden.device).repeat(samples)
+    rope = rope_for(rope_decoder, queries, positions)
+    lengths = (slots,) * samples
+    query_positions = set(positions.tolist())
+    for index, layer in enumerate(layers):
+        source = captured[index]
+        if source.layer != index or source.expert != "mixed_und_gen" or not source.rotated:
+            raise ValueError("observation source must be same-layer full-query rotated GEN KV")
+        if not source.token_roles or set(source.token_roles) - {"boundary", "image"} or "image" not in source.token_roles:
+            raise ValueError("observation source must be the GEN query, with image tokens and no prompt KV")
+        if not source.positions or set(source.positions) & query_positions:
+            raise ValueError("GEN source positions are missing or overlap observer slots")
+        if sum(source.lengths) != hidden.shape[0]:
+            raise ValueError("full-query source must cover the packed GEN query")
+        queries = und_block(layer, queries, rope, lengths, source, causal=False)
+    return queries.view(samples, slots, hidden.shape[-1])
+
+
+class TrainedObservationObserver(nn.Module):
+    """Independent frozen readout. ``loaded`` is false until a format-4 checkpoint is copied in."""
+
+    def __init__(self, decoder, slots: int, position_start: int, seed_token_ids=None):
+        super().__init__()
+        object.__setattr__(self, "_rope_owner", decoder)
+        object.__setattr__(self, "embed", decoder.embed_tokens)
+        self.layers = nn.ModuleList(_UndReadLayer(layer) for layer in decoder.layers)
         self.slots = slots
-        self.source_layers = tuple(source_layers)
         self.position_start = position_start
+        self.seed_token_ids = None if seed_token_ids is None else tuple(int(i) for i in seed_token_ids)
+        self.loaded = False
+        self.checkpoint_path = None
+        self.checkpoint_sha256 = None
+        self.stage = None
+        self.source_mode = None
+        self.trained_sources = None
+        self.parent = None
+        self.freeze()
+
+    def freeze(self) -> None:
+        self.eval()
+        self.requires_grad_(False)
 
     def zeros(self, samples: int, like: torch.Tensor) -> torch.Tensor:
         return like.new_zeros((samples, self.slots, like.shape[-1]))
 
+    def status(self) -> dict:
+        return {
+            "loaded": self.loaded,
+            "checkpoint": self.checkpoint_path,
+            "sha256": self.checkpoint_sha256,
+            "stage": self.stage,
+            "source_mode": self.source_mode,
+            "trained_sources": None if self.trained_sources is None else list(self.trained_sources),
+            "parent": self.parent,
+            "seed_token_ids": None if self.seed_token_ids is None else list(self.seed_token_ids),
+            "source_policy": OBSERVER_SPEC["source_policy"],
+            "layers": OBSERVER_SPEC["layers"],
+            "query": OBSERVER_SPEC["query"],
+            "prompt_kv_in_source": False,
+        }
+
+    def load_checkpoint(self, path: str | Path, *, source_mode: str = "gen_full_query") -> None:
+        """Copy trained UND projections. Native generation parameters are not written.
+
+        ``source_mode`` has to be the source this checkpoint's training config
+        actually used. A C2-feedback or C3 file whose tasks saw prompt KV is
+        refused here, before any tensor is copied.
+        """
+        path = Path(path)
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        if saved.get("format_version") != FORMAT_VERSION:
+            raise ValueError("observation reader requires native UND checkpoint format 4")
+        if saved.get("stage") not in STAGES:
+            raise ValueError("observation checkpoint stage is not C2-observe, C2-feedback, or C3-loop")
+        if saved.get("topology") != "C" or saved.get("slots") != self.slots or saved.get("depth") != len(self.layers):
+            raise ValueError("observation checkpoint topology, slots, or depth differ")
+        seed_ids = tuple(int(i) for i in saved["seed_ids"])
+        if len(seed_ids) != self.slots:
+            raise ValueError("observation seed length differs from slots")
+        if self.seed_token_ids is not None and self.seed_token_ids != seed_ids:
+            raise ValueError("configured seed tokens differ from the observation checkpoint")
+        provenance = require_source_mode(saved, source_mode)
+        und = saved.get("und")
+        if not isinstance(und, dict):
+            raise ValueError("observation checkpoint has no und state")
+        expected = observation_readout_keys(self.layers)
+        if set(und) != set(expected):
+            extra = sorted(set(und) - set(expected))
+            missing = sorted(set(expected) - set(und))
+            detail = extra[0] if extra else missing[0]
+            raise ValueError("observation checkpoint does not match the trained UND readout set: " + detail)
+        native_ptrs = {parameter.data_ptr() for parameter in self._rope_owner.parameters()}
+        targets = []
+        for key in expected:
+            layer_index = int(key.split(".")[1])
+            local = key[len(f"layers.{layer_index}."):]
+            parameter = self.layers[layer_index].get_parameter(local)
+            if parameter.data_ptr() in native_ptrs:
+                raise RuntimeError("refusing to write an observation tensor into the native decoder")
+            if parameter.shape != und[key].shape:
+                raise ValueError(f"observation tensor {key} has the wrong shape")
+            targets.append((parameter, und[key]))
+        with torch.no_grad():
+            for parameter, tensor in targets:
+                parameter.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.seed_token_ids = seed_ids
+        self.loaded = True
+        self.checkpoint_path = str(path)
+        self.checkpoint_sha256 = digest
+        self.stage = provenance["stage"]
+        self.source_mode = provenance["resolved_mode"]
+        self.trained_sources = tuple(provenance["trained_sources"])
+        self.parent = provenance["parent"]
+        self.freeze()
+
     def read(self, hidden: torch.Tensor, captured: dict, branch: BranchContext) -> torch.Tensor:
-        if captured is None:
-            raise ValueError("the UND observer needs image KV captured during the body")
-        if tuple(sorted(captured)) != self.source_layers:
-            raise ValueError("captured GEN layers do not match the fixed observer span")
-        groups = sample_groups(branch, hidden.shape[0])
-        samples = len(groups)
-        queries = hidden.new_zeros((samples * self.slots, hidden.shape[-1]))
-        for sample, group in enumerate(groups):
-            pooled = hidden[group["vae"]].mean(dim=0)
-            queries[sample * self.slots:(sample + 1) * self.slots] = pooled
-        positions = torch.arange(
-            self.position_start, self.position_start + self.slots, device=hidden.device,
-        ).repeat(samples)
-        rope = rope_for(self.decoder, queries, positions)
-        lengths = (self.slots,) * samples
-        query_positions = set(positions.tolist())
-        for index in self.source_layers:
-            source = captured[index]
-            if source.expert != "gen" or not source.rotated:
-                raise ValueError("observer source must be rotated GEN KV")
-            if tuple(source.token_roles) != ("image",) * len(source.keys):
-                raise ValueError("observer source must be image tokens only")
-            if not source.positions or set(source.positions) & query_positions:
-                raise ValueError("GEN source positions are missing or overlap observer slots")
-            if sum(source.lengths) != len(branch.packed_vae_token_indexes):
-                raise ValueError("observer source length is not the image-token count")
-            queries = und_block(
-                self.decoder.layers[index], queries, rope, lengths, source, causal=False,
-            )
-        return queries.view(samples, self.slots, hidden.shape[-1])
+        return observation_slots(
+            self.layers, self.embed, self._rope_owner, self.seed_token_ids, captured,
+            hidden, branch, self.slots, self.position_start,
+        )

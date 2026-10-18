@@ -15,6 +15,24 @@ UND_GROUPS = {
     'mlp_down_proj': 'mlp.down_proj',
 }
 
+# C2 observation trains these UND projections in place on the shared decoder.
+# The anchored reader copies this set onto its own modules. Layernorms, MLP,
+# and embeddings stay the frozen native tensors and are not part of the copy.
+OBSERVATION_READOUT_GROUPS = (
+    'q_proj', 'k_proj', 'v_proj', 'o_proj', 'q_norm', 'k_norm',
+)
+
+
+def observation_readout_keys(layers):
+    """Checkpoint keys for the UND tensors an observation run actually trains."""
+    keys = []
+    for index, layer in enumerate(layers):
+        for group in OBSERVATION_READOUT_GROUPS:
+            module = layer.get_submodule(UND_GROUPS[group])
+            for name, _parameter in module.named_parameters():
+                keys.append(f'layers.{index}.{UND_GROUPS[group]}.{name}')
+    return keys
+
 
 class VisualStudent(nn.Module):
     """Register selected original UND parameters; keep the native model shared."""

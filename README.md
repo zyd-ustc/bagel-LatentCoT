@@ -1,6 +1,6 @@
 # BAGEL-LatentCoT
 
-当前实验线是 **Anchored Dual-State Loop**。冻结原生 BAGEL。在同一个 flow 时间步里，GEN body 以原生入口加一个有界残差重入；UND 只从旁路读取 GEN 的图像 KV，不把 memory token 写进 GEN attention。`entry_scale = 0` 时速度与原生前向一致。
+当前实验线是 **Anchored Dual-State Loop**。冻结原生 BAGEL。在同一个 flow 时间步里，GEN body 以原生入口加一个有界残差重入。旁路读者是独立冻结的 Observation 读出：中性种子、全部层、full-query GEN KV，权重来自 Observation checkpoint 的拷贝，不写回生成模型，也不把 memory token 写进 GEN attention。输入模式由 checkpoint 的训练任务解析为 `gen_full_query`。`prompt_and_gen` 保留为名字，当前前向不会拼接 Prompt KV。第二轮读出是 Anchored Observation：复用原生 Pre KV，Body 与 Post 用本轮重算结果。`entry_scale = 0` 时速度与原生前向一致。
 
 ```bash
 python -m qwen_latent_cot.anchored.cli self-check

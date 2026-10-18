@@ -129,13 +129,14 @@ class NativePathWrapper:
         )
         return output.packed_query_sequence
 
-    def pre(self, hidden, branch, embeddings):
-        return self._run(hidden, branch, embeddings, 0, self.start, False)
+    def run_span(self, hidden, branch, embeddings, start, end, apply_final_norm, captured=None):
+        """Run one span and optionally collect its full-query GEN KV.
 
-    def body(self, hidden, branch, embeddings, *, capture: bool):
-        self.body_calls += 1
-        if not capture:
-            return self._run(hidden, branch, embeddings, self.start, self.end, False), None
+        Full-query keeps boundary tokens and image tokens. The caller stitches
+        Pre, Body, and Post to cover every layer. An empty span records nothing.
+        """
+        if captured is None:
+            return self._run(hidden, branch, embeddings, start, end, apply_final_norm)
         from ..diagnostics.native import capture_gen
         with capture_gen(
             self.decoder,
@@ -143,14 +144,22 @@ class NativePathWrapper:
             t=branch.flow_time,
             positions=branch.packed_query_position_ids,
             detach=not torch.is_grad_enabled(),
-            source_policy="image_only",
-            layers=range(self.start, self.end),
-        ) as captured:
-            output = self._run(hidden, branch, embeddings, self.start, self.end, False)
-        return output, captured
+            source_policy="full_query",
+            layers=range(start, end),
+        ) as span:
+            output = self._run(hidden, branch, embeddings, start, end, apply_final_norm)
+        captured.update(span)
+        return output
 
-    def post(self, hidden, branch, embeddings):
-        return self._run(hidden, branch, embeddings, self.end, len(self.decoder.layers), True)
+    def pre(self, hidden, branch, embeddings, captured=None):
+        return self.run_span(hidden, branch, embeddings, 0, self.start, False, captured)
+
+    def body(self, hidden, branch, embeddings, captured=None):
+        self.body_calls += 1
+        return self.run_span(hidden, branch, embeddings, self.start, self.end, False, captured)
+
+    def post(self, hidden, branch, embeddings, captured=None):
+        return self.run_span(hidden, branch, embeddings, self.end, len(self.decoder.layers), True, captured)
 
     def guard_layout(self, branch: BranchContext, hidden: torch.Tensor, positions, lengths, cache_snapshot):
         if hidden.shape[0] != positions.shape[0]:
