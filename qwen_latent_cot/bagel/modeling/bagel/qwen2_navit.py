@@ -1091,6 +1091,88 @@ class Qwen2Model(Qwen2PreTrainedModel):
             past_key_values=past_key_values,
         )
 
+    def forward_inference_span(
+        self,
+        packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
+        packed_query_position_ids: torch.Tensor,
+        packed_query_indexes: torch.Tensor,
+        past_key_values: Optional[NaiveCache] = None,
+        key_values_lens: Optional[torch.Tensor] = None,
+        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        update_past_key_values=True,
+        is_causal=True,
+        mode="und",
+        packed_vae_token_indexes=None,
+        packed_text_indexes=None,
+        layer_start: int = 0,
+        layer_end: Optional[int] = None,
+        apply_final_norm: bool = True,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> BaseNavitOutputWithPast:
+        """Run a layer span with the same kernels as ``forward_inference``.
+
+        RoPE is computed once on the original query when ``position_embeddings``
+        is provided, matching a full forward that shares one embedding across layers.
+        TaylorSeer is refused: its cache assumes a single increasing step.
+        """
+        if getattr(self, "enable_taylorseer", False):
+            raise RuntimeError("layer spans cannot run under TaylorSeer")
+        if layer_end is None:
+            layer_end = len(self.layers)
+        if not 0 <= layer_start <= layer_end <= len(self.layers):
+            raise ValueError("layer span is outside the decoder")
+
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
+            position_embeddings = (cos.squeeze(0), sin.squeeze(0))
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs.update(mode=mode)
+            if mode == "gen":
+                assert packed_vae_token_indexes is not None
+                assert packed_text_indexes is not None
+                extra_inputs.update(
+                    packed_vae_token_indexes=packed_vae_token_indexes,
+                    packed_text_indexes=packed_text_indexes,
+                )
+
+        for layer_idx in range(layer_start, layer_end):
+            # Call the inference kernel directly so a training-mode wrapper cannot
+            # flip these frozen layers onto forward_train.
+            packed_query_sequence, past_key_values = self.layers[layer_idx].forward_inference(
+                packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
+                packed_query_position_embeddings=position_embeddings,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=update_past_key_values,
+                is_causal=is_causal,
+                **extra_inputs,
+            )
+
+        if apply_final_norm:
+            if self.use_moe:
+                if mode == "und":
+                    packed_query_sequence = self.norm(packed_query_sequence)
+                elif mode == "gen":
+                    packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
+                    packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
+                    packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(
+                        packed_query_sequence[packed_vae_token_indexes]
+                    )
+                    packed_query_sequence = packed_query_sequence_
+            else:
+                packed_query_sequence = self.norm(packed_query_sequence)
+
+        return BaseNavitOutputWithPast(
+            packed_query_sequence=packed_query_sequence,
+            past_key_values=past_key_values,
+        )
+
 
 class Qwen2ForCausalLM(Qwen2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
@@ -1186,3 +1268,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         )
 
         return outputs
+
+    def forward_inference_span(self, *args, **kwargs):
+        return self.model.forward_inference_span(*args, **kwargs)

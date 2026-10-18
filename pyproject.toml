@@ -24,6 +24,7 @@ dependencies = [
 [project.scripts]
 memory-topology = "qwen_latent_cot.diagnostics.cli:main"
 bagel-interaction = "qwen_latent_cot.interaction.cli:main"
+anchored-loop = "qwen_latent_cot.anchored.cli:main"
 
 [project.optional-dependencies]
 tracking = ["wandb==0.22.3", "protobuf>=3.19,<5"]

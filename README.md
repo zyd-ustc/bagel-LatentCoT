@@ -1,10 +1,14 @@
 # BAGEL-LatentCoT
 
-通过连续 memory 连接 BAGEL 的理解与生成，让模型在图像生成过程中读取状态、形成反馈并更新生成预测。
+当前实验线是 **Anchored Dual-State Loop**。冻结原生 BAGEL。在同一个 flow 时间步里，GEN body 以原生入口加一个有界残差重入；UND 只从旁路读取 GEN 的图像 KV，不把 memory token 写进 GEN attention。`entry_scale = 0` 时速度与原生前向一致。
 
-生成专家（GEN）先计算当前状态的内部特征。理解专家（UND）结合目标文字写入连续 memory，第二遍 GEN 消费反馈，重新预测同一状态的速度。外层采样器据此推进图像。
+```bash
+python -m qwen_latent_cot.anchored.cli self-check
+```
 
-训练路线为 **Observe 初始化 → 交互监督微调（SFT）→ Flow-GRPO 强化学习（RL）**。SFT 联合训练 UND writer 与 GEN consumer，RL 根据终图奖励更新 consumer。
+配置见 `configs/anchored_dual_state_loop.json`，合同见 [Anchored Dual-State Loop](docs/anchored_dual_state_loop.md)。
+
+旧的 Observation → Memory writer → 生成 SFT 路线保留为诊断记录，训练入口默认锁住。复现历史训练时才设置 `BAGEL_ALLOW_LEGACY_MEMORY_SFT=1`。
 
 [方法设计](docs/design.md) · [实验与运行](docs/experiments.md) · [训练数据](docs/data.md) · [Benchmark](docs/benchmark.md)
 

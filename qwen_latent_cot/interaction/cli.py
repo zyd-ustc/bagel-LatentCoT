@@ -56,6 +56,9 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.command in ("sft", "rl"):
+        from ..anchored.legacy import refuse_legacy_memory_sft
+        refuse_legacy_memory_sft(f"interaction {args.command}")
     if args.command == 'export':
         from .data import export_candidates
         print(json.dumps(export_candidates(args.corpus, args.output, args.count, args.seed)))

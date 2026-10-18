@@ -42,6 +42,9 @@ def main():
     parser.add_argument('--c0-pass', help='calibration.json with manually verified C0 freedom-to-decode pass')
     parser.add_argument('--distributed', action='store_true', help='synchronize writer gradients across torchrun workers; effective_batch is global')
     args = parser.parse_args()
+    if args.command in ("train", "distill"):
+        from ..anchored.legacy import refuse_legacy_memory_sft
+        refuse_legacy_memory_sft(args.command)
     if args.command == 'train' and args.stage == 'C2':
         parser.error('C2 training uses visual-train --stage C2-observe/C2-feedback; C2 caption/gen are historical diagnostics')
     if args.distributed and args.command not in ('train', 'distill'):

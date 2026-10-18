@@ -73,6 +73,9 @@ def main(argv=None):
     parser.add_argument('--layer-diagnostics', action='store_true')
     parser.add_argument('--max-samples', type=int)
     args = parser.parse_args(argv)
+    if args.command == "train":
+        from ..anchored.legacy import refuse_legacy_memory_sft
+        refuse_legacy_memory_sft("visual-train")
     cfg = json.loads(Path(args.config).read_text())
     if args.steps is not None: cfg['steps'] = args.steps
     if args.log_every is not None:
