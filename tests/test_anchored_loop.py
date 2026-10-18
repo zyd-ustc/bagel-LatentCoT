@@ -16,6 +16,11 @@ def test_anchored_contract():
     assert "observation_source_mode_follows_the_training_config" in names
     assert "anchored_observation_reuses_native_pre_kv" in names
     assert "image_tokens_address_memory_slots" in names
+    assert "inference_reads_the_trained_gate" in names
+    assert "written_residual_respects_the_rms_cap" in names
+    assert "observation_query_follows_the_verified_writer" in names
+    assert "gen_only_does_not_carry_memory" in names
+    assert "round_velocities_and_supervision" in names
 
 
 def test_show_config():

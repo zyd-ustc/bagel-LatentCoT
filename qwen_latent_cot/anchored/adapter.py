@@ -32,11 +32,32 @@ def bound_residual(
     bounded = torch.zeros_like(delta)
     raw = delta[vae_indexes]
     reference = anchor[vae_indexes]
-    raw_rms = raw.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
-    ref_rms = reference.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
-    factor = (max_ratio * ref_rms / raw_rms.clamp_min(1e-6)).clamp(max=1.0)
+    # Floor the mean square before the square root. A zero residual then has a
+    # finite backward: sqrt(0) is not on the graph, and a closed gate stays exact.
+    raw_rms = raw.float().pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12).sqrt()
+    ref_rms = reference.float().pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12).sqrt()
+    factor = (max_ratio * ref_rms / raw_rms).clamp(max=1.0)
     bounded[vae_indexes] = (raw.float() * factor).to(dtype=delta.dtype)
     return bounded
+
+
+def written_residual(
+    delta: torch.Tensor,
+    scale: torch.Tensor,
+    anchor: torch.Tensor,
+    max_ratio: float,
+    vae_indexes: torch.Tensor,
+) -> torch.Tensor:
+    """Cap the residual after the gate, then cast once into the anchor dtype.
+
+    ``max_ratio`` applies to ``gamma * A_phi``, the tensor added at the body
+    entry. The product and the cap stay in float32. A zero gate therefore
+    adds an exact zero in bf16. A default-init product can still round to
+    zero at that cast; the cap is enforced on the value that is written.
+    """
+    scaled = scale.to(dtype=torch.float32) * delta.to(dtype=torch.float32)
+    capped = bound_residual(scaled, anchor.to(dtype=torch.float32), max_ratio, vae_indexes)
+    return capped.to(dtype=anchor.dtype)
 
 
 def slot_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
@@ -92,6 +113,22 @@ class AnchoredReentryAdapter(nn.Module):
             read = slot_attention(self.q_proj(image), self.k_proj(slots), self.v_proj(slots))
             context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
             delta[vae] = self.mem_out(read) + self.up(context)
+        return delta.to(dtype=restored)
+
+    def state_free_delta(self, hidden, anchor, flow_time: float, branch: BranchContext) -> torch.Tensor:
+        """``ΔH(H_r, P_t, t)`` on image tokens. Memory slots are not an input."""
+        groups = sample_groups(branch, anchor.shape[0])
+        restored = anchor.dtype
+        hidden = hidden.float()
+        anchor_f = anchor.float()
+        delta = torch.zeros_like(anchor_f)
+        clock = time_features(flow_time, self.time_width, anchor.device, torch.float32)
+        time_bias = self.time_down(clock)
+        for _sample, group in enumerate(groups):
+            vae = group["vae"]
+            image = self.norm_h(hidden[vae])
+            context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
+            delta[vae] = self.up(context)
         return delta.to(dtype=restored)
 
 

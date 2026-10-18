@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 
-from .adapter import AnchoredReentryAdapter, EntryGate, bound_residual
+from .adapter import AnchoredReentryAdapter, EntryGate, written_residual
 from .config import LoopConfig
 from .diagnostics import relative_change, tensor_record
 from .feedback import FeedbackState, FeedbackStateUpdater, intervene_feedback
@@ -56,13 +56,18 @@ class LoopOutput:
     corrected: bool
     entries: list = field(default_factory=list)
     records: list = field(default_factory=list)
+    # v^{(0)} is the native velocity. Later entries are the correction rounds.
+    round_velocities: list = field(default_factory=list)
+    round_deltas: list = field(default_factory=list)
+    round_observations: list = field(default_factory=list)
 
 
 class AnchoredDualStateLoop(nn.Module):
     """Native pass plus optional anchored corrections on one frozen decoder.
 
-    ``variant='dual'`` reads GEN hidden through the UND side branch.
-    ``variant='gen_only'`` keeps the same adapter capacity and drops that read.
+    ``variant='dual'`` reads GEN hidden through the UND side branch and carries ``M_r``.
+    ``variant='gen_only'`` repeats the body from ``P + ΔH(H_r, P_t, t)`` with no
+    memory state and no UND read.
     ``state_mode='direct_hidden'`` is the unsafe ablation, not the default.
     """
 
@@ -104,7 +109,22 @@ class AnchoredDualStateLoop(nn.Module):
         return self
 
     def trainable_parameters(self):
-        return [parameter for parameter in self.parameters() if parameter.requires_grad]
+        if self.config.variant != "gen_only":
+            return [parameter for parameter in self.parameters() if parameter.requires_grad]
+        # The state-free residual and the gate. Memory slots are not in this control.
+        prefixes = (
+            "gate.",
+            "adapter.norm_h.",
+            "adapter.norm_p.",
+            "adapter.h_down.",
+            "adapter.p_down.",
+            "adapter.time_down.",
+            "adapter.up.",
+        )
+        return [
+            parameter for name, parameter in self.named_parameters()
+            if parameter.requires_grad and name.startswith(prefixes)
+        ]
 
     def assert_native_frozen(self) -> None:
         live = [name for name, parameter in self.decoder.named_parameters() if parameter.requires_grad]
@@ -124,25 +144,30 @@ class AnchoredDualStateLoop(nn.Module):
         self.load_state_dict(blob["model"])
 
     def _scale(self, like: torch.Tensor, *, train: bool) -> torch.Tensor:
-        if train:
-            return self.gate()
-        if self.config.force_full_zero_path or self.config.entry_scale == 0.0:
+        # The full-zero path writes a constant zero. It does not read the gate.
+        if self.config.force_full_zero_path:
             return like.new_zeros(())
-        return like.new_tensor(self.config.entry_scale)
+        scale = self.gate()
+        if train:
+            return scale
+        return scale.detach()
 
     def _fast_bypass(self, flow_time, step_index, num_steps, *, train: bool) -> bool:
         # Out-of-schedule steps stay native, including during training.
-        # The learned gate is a tensor on the scheduled path so a Python zero
-        # cannot cut its gradient.
+        # A scheduled training step enters so the gate tensor keeps its gradient.
+        # Inference reads that same parameter. An exact zero may skip the
+        # second body. force_native_bypass skips even when the gate is open.
         if not in_loop_schedule(
             self.config, flow_time=flow_time, step_index=step_index, num_steps=num_steps,
         ):
+            return True
+        if self.config.force_native_bypass:
             return True
         if train:
             return False
         if self.config.force_full_zero_path:
             return False
-        return self.config.entry_scale == 0.0
+        return float(self.gate.raw.detach()) == 0.0
 
     def forward_branch(
         self,
@@ -166,6 +191,11 @@ class AnchoredDualStateLoop(nn.Module):
 
         Pre is not run again. On 28 layers with body ``[20, 28)``, Post is
         empty, so the read is native Pre KV plus the recomputed Body KV.
+
+        ``round_velocities[0]`` is the native velocity. Each correction appends
+        the velocity after that round's single post. The sampler uses the last
+        one. ``round_deltas`` and ``round_observations`` have one entry per
+        correction. A gen-only observation entry is ``None``.
         """
         if self.config.observation_source_mode != "gen_full_query":
             raise RuntimeError(
@@ -199,17 +229,25 @@ class AnchoredDualStateLoop(nn.Module):
             self.path.guard_layout(branch, hidden, positions, lengths, cache_snapshot)
             return LoopOutput(
                 native_velocity, native_velocity, anchor, body, None, None, False, [], records,
+                round_velocities=[native_velocity], round_deltas=[], round_observations=[],
             )
 
         samples = int(branch.query_lens.shape[0])
-        initial = self.updater.initial(samples, anchor, branch.name, flow_time)
-        state = initial
+        state = None
+        initial = None
+        if self.config.variant == "dual":
+            initial = self.updater.initial(samples, anchor, branch.name, flow_time)
+            state = initial
         current = body
         delta = None
         written = None
         entries = []
+        round_velocities = [native_velocity]
+        round_deltas = []
+        round_observations = []
         scale = self._scale(anchor, train=train)
         for round_index in range(self.config.correction_rounds):
+            observation = None
             if self.config.variant == "dual":
                 if not self.observer.loaded and not self.config.allow_unloaded_observer:
                     raise RuntimeError(
@@ -220,59 +258,70 @@ class AnchoredDualStateLoop(nn.Module):
                     captured, pre_kv, body_kv, post_kv, round_index=round_index,
                     keep=self.config.log_intermediates,
                 ))
-                observation = self.observer.read(current, captured, branch)
+                observation = self.observer.read(captured, branch)
+                state = self.updater(state, observation)
+                state = intervene_feedback(
+                    state, self.config.feedback_mode, initial=initial,
+                )
+                delta = self.adapter(current, state, anchor, flow_time, branch)
             elif self.config.variant == "gen_only":
-                observation = self.observer.zeros(samples, anchor)
+                # H_{r+1} = B(P + ΔH(H_r, P_t, t)). No M_r and no UND read.
+                delta = self.adapter.state_free_delta(current, anchor, flow_time, branch)
             else:
                 raise ValueError(self.config.variant)
-            state = self.updater(state, observation)
-            state = intervene_feedback(
-                state, self.config.feedback_mode, initial=initial,
-            )
-            delta = self.adapter(current, state, anchor, flow_time, branch)
-            delta = bound_residual(
-                delta, anchor, self.config.max_delta_rms_ratio, branch.packed_vae_token_indexes,
-            )
             if self.config.state_mode == "anchored":
-                # Keep the multiplier in the anchor dtype so a zero gate is an exact add of zero.
-                # The loss sees this written residual, so a closed gate blocks adapter gradients.
-                scale_cast = scale.to(dtype=anchor.dtype)
-                written = scale_cast * delta.to(dtype=anchor.dtype)
+                # Cap gamma * delta. The loss sees this written residual, so a
+                # closed gate blocks adapter gradients and still trains the gate.
+                written = written_residual(
+                    delta, scale, anchor, self.config.max_delta_rms_ratio,
+                    branch.packed_vae_token_indexes,
+                )
                 entry = anchor + written
             elif self.config.state_mode == "direct_hidden":
                 entry = current
             else:
                 raise ValueError(self.config.state_mode)
             entries.append(entry)
+            round_deltas.append(written if written is not None else delta)
+            round_observations.append(observation)
             capture_next = (
                 self.config.variant == "dual" and round_index + 1 < self.config.correction_rounds
             )
             if capture_next:
-                # Anchored Observation. Native Pre KV stays; Body and Post are this round.
+                # Same neutral-seed, full-depth reader. Body and Post KV here are
+                # recomputed from the anchored entry, so this source is not the
+                # verified C2 observation capture. Native Pre KV stays.
+                # One post both refreshes that KV and yields this round's velocity.
                 body_kv, post_kv = {}, {}
                 current = self.path.body(entry, branch, embeddings, body_kv)
-                self.path.post(current, branch, embeddings, post_kv)
+                posted = self.path.post(current, branch, embeddings, post_kv)
                 captured = {**pre_kv, **body_kv, **post_kv}
             else:
                 current = self.path.body(entry, branch, embeddings)
+                posted = self.path.post(current, branch, embeddings)
+            velocity = velocity_from_hidden(
+                posted, branch.packed_vae_token_indexes, velocity_head,
+            )
+            round_velocities.append(velocity)
             if self.config.log_intermediates:
-                records.append({
+                record = {
                     "round": round_index + 1,
                     "hidden": tensor_record("H", current),
-                    "feedback": tensor_record("M", state.value),
-                    "delta": tensor_record("delta", delta),
-                    "velocity_drift": None,
-                })
-        corrected_hidden = self.path.post(current, branch, embeddings)
-        velocity = velocity_from_hidden(
-            corrected_hidden, branch.packed_vae_token_indexes, velocity_head,
-        )
-        if self.config.log_intermediates and records:
-            records[-1]["velocity_drift"] = relative_change(velocity, native_velocity)
+                    "delta": tensor_record("delta", written if written is not None else delta),
+                    "velocity_drift": relative_change(velocity, native_velocity),
+                }
+                if observation is not None:
+                    record["observation"] = tensor_record("O", observation)
+                if state is not None:
+                    record["feedback"] = tensor_record("M", state.value)
+                records.append(record)
         self.path.guard_layout(branch, hidden, positions, lengths, cache_snapshot)
         return LoopOutput(
             velocity, native_velocity, anchor, current, written if written is not None else delta,
             state, True, entries, records,
+            round_velocities=round_velocities,
+            round_deltas=round_deltas,
+            round_observations=round_observations,
         )
 
     def predict_flow(

@@ -19,9 +19,13 @@ SOURCE_MODES = ("gen_full_query", "prompt_and_gen")
 class LoopConfig:
     """Controls one within-step correction loop.
 
-    ``entry_scale`` is the inference gate. ``0`` is the native bypass.
-    Training uses the learned gate parameter instead of this constant.
+    Training and inference both read the learned gate. ``force_native_bypass``
+    skips the loop on a scheduled step. ``force_full_zero_path`` runs the
+    observer and the second body and writes a zero residual. The two flags
+    are separate controls.
     ``[body_start, body_end)`` is a candidate span, not a proven optimum.
+    ``round_loss_weights`` gives each correction its own non-negative flow
+    weight. ``None`` supervises the final velocity only. The weights may differ.
     """
 
     enabled: bool = False
@@ -30,7 +34,6 @@ class LoopConfig:
     correction_rounds: int = 1
     schedule: str = "early"
     schedule_fraction: float = 0.35
-    entry_scale: float = 0.0
     max_delta_rms_ratio: float = 0.02
     observer: str = "trained_observation"
     observation_checkpoint: str | None = None
@@ -45,15 +48,21 @@ class LoopConfig:
     writer_position_start: int = 2048
     lambda_anchor: float = 0.01
     lambda_entry: float = 0.001
+    round_loss_weights: tuple[float, ...] | None = None
     log_intermediates: bool = False
+    force_native_bypass: bool = False
     force_full_zero_path: bool = False
     verify_prompt_cache: bool = True
 
     def __post_init__(self):
         if isinstance(self.seed_token_ids, list):
             self.seed_token_ids = tuple(int(token) for token in self.seed_token_ids)
+        if isinstance(self.round_loss_weights, list):
+            self.round_loss_weights = tuple(float(weight) for weight in self.round_loss_weights)
         if self.observation_checkpoint == "":
             self.observation_checkpoint = None
+        if self.force_native_bypass and self.force_full_zero_path:
+            raise ValueError("force_native_bypass and force_full_zero_path cannot both be set")
 
     def validate(self, depth: int) -> None:
         if not 0 <= self.body_start < self.body_end <= depth:
@@ -66,8 +75,8 @@ class LoopConfig:
             raise ValueError(f"unknown schedule {self.schedule}")
         if not 0.0 < self.schedule_fraction <= 1.0:
             raise ValueError("schedule_fraction must be in (0, 1]")
-        if self.entry_scale < 0.0:
-            raise ValueError("entry_scale must be non-negative")
+        if self.force_native_bypass and self.force_full_zero_path:
+            raise ValueError("force_native_bypass and force_full_zero_path cannot both be set")
         if self.max_delta_rms_ratio <= 0.0:
             raise ValueError("max_delta_rms_ratio must be positive")
         if self.observer not in OBSERVERS:
@@ -80,6 +89,8 @@ class LoopConfig:
             raise ValueError(f"unknown state mode {self.state_mode}")
         if self.variant not in VARIANTS:
             raise ValueError(f"unknown variant {self.variant}")
+        if self.variant == "gen_only" and self.feedback_mode != "correct":
+            raise ValueError("gen_only has no memory state to intervene on")
         if self.slots <= 0 or self.rank <= 0:
             raise ValueError("slots and rank must be positive")
         if self.seed_token_ids is not None and len(self.seed_token_ids) != self.slots:
@@ -88,15 +99,27 @@ class LoopConfig:
             raise ValueError("writer positions must be non-negative")
         if self.lambda_anchor < 0.0 or self.lambda_entry < 0.0:
             raise ValueError("loss weights must be non-negative")
+        if self.round_loss_weights is not None:
+            if len(self.round_loss_weights) != self.correction_rounds:
+                raise ValueError("round_loss_weights must contain one weight per correction round")
+            if any(weight < 0.0 for weight in self.round_loss_weights):
+                raise ValueError("round loss weights must be non-negative")
 
     def to_dict(self) -> dict:
         payload = asdict(self)
         if payload["seed_token_ids"] is not None:
             payload["seed_token_ids"] = list(payload["seed_token_ids"])
+        if payload["round_loss_weights"] is not None:
+            payload["round_loss_weights"] = list(payload["round_loss_weights"])
         return payload
 
     @classmethod
     def from_dict(cls, payload: dict) -> "LoopConfig":
+        if "entry_scale" in payload:
+            raise ValueError(
+                "entry_scale is removed. Inference reads the trained gate. "
+                "Use force_native_bypass or force_full_zero_path for those controls."
+            )
         known = {field for field in cls.__dataclass_fields__}
         unknown = set(payload) - known
         if unknown:

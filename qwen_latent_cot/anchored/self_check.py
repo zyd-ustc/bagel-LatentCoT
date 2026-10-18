@@ -7,8 +7,9 @@ from pathlib import Path
 import torch
 
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache, Qwen2Config, Qwen2ForCausalLM
-from qwen_latent_cot.anchored.adapter import AnchoredReentryAdapter, bound_residual
+from qwen_latent_cot.anchored.adapter import AnchoredReentryAdapter, bound_residual, written_residual
 from qwen_latent_cot.anchored.config import LoopConfig
+from qwen_latent_cot.anchored.diagnostics import round_velocity_report
 from qwen_latent_cot.anchored.feedback import FeedbackState, intervene_feedback
 from qwen_latent_cot.anchored.legacy import refuse_legacy_checkpoint
 from qwen_latent_cot.anchored.loop import AnchoredDualStateLoop
@@ -47,11 +48,12 @@ def tiny_language_model():
 def loop_config(**overrides) -> LoopConfig:
     payload = dict(
         enabled=True, body_start=1, body_end=2, correction_rounds=1, schedule="early",
-        schedule_fraction=0.35, entry_scale=0.0, max_delta_rms_ratio=0.02,
+        schedule_fraction=0.35, max_delta_rms_ratio=0.02,
         observer="trained_observation", allow_unloaded_observer=True, seed_token_ids=(1, 2, 3, 4),
         feedback_mode="correct", state_mode="anchored", variant="dual", slots=4, rank=4,
         writer_position_start=2048, lambda_anchor=0.01, lambda_entry=0.001,
-        log_intermediates=False, force_full_zero_path=False, verify_prompt_cache=True,
+        log_intermediates=False, force_native_bypass=False, force_full_zero_path=False,
+        verify_prompt_cache=True,
     )
     payload.update(overrides)
     return LoopConfig(**payload)
@@ -164,7 +166,7 @@ def check_exact_bypass_and_cache():
     language_model = tiny_language_model()
     hidden, branch = pack_case(language_model, prefix=2, seed=5)
     loop = make_loop(
-        language_model, entry_scale=1.0, max_delta_rms_ratio=1.0, force_full_zero_path=True,
+        language_model, max_delta_rms_ratio=1.0, force_full_zero_path=True,
     )
     with torch.no_grad():
         loop.adapter.up.weight.normal_(0, 0.5)
@@ -188,7 +190,7 @@ def check_exact_bypass_and_cache():
 def check_fast_bypass_skips_observer():
     language_model = tiny_language_model()
     hidden, branch = pack_case(language_model, seed=1)
-    loop = make_loop(language_model, entry_scale=0.0)
+    loop = make_loop(language_model)
 
     def fail_read(*args, **kwargs):
         raise AssertionError("fast bypass ran the observer")
@@ -201,13 +203,68 @@ def check_fast_bypass_skips_observer():
     assert loop.path.body_calls == 1
 
 
+def check_inference_reads_the_trained_gate():
+    language_model = tiny_language_model()
+    hidden, branch = pack_case(language_model, seed=13)
+    loop = make_loop(language_model, max_delta_rms_ratio=1.0)
+    try:
+        LoopConfig.from_dict({"entry_scale": 0.0, **loop.config.to_dict()})
+    except ValueError as error:
+        if "entry_scale" not in str(error):
+            raise
+    else:
+        raise AssertionError("entry_scale was still accepted")
+    try:
+        make_loop(language_model, force_native_bypass=True, force_full_zero_path=True)
+    except ValueError as error:
+        if "force_native_bypass" not in str(error):
+            raise
+    else:
+        raise AssertionError("native bypass and the full zero path were both accepted")
+
+    skipped = make_loop(language_model, force_native_bypass=True, max_delta_rms_ratio=1.0)
+    zero_path = make_loop(language_model, force_full_zero_path=True, max_delta_rms_ratio=1.0)
+    with torch.no_grad():
+        loop.adapter.up.weight.normal_(0, 0.5)
+        loop.gate.raw.fill_(0.4)
+        loop.path.body_calls = 0
+        low = loop.forward_branch(hidden, branch, train=False)
+        native = native_velocity(language_model, hidden, branch)
+        if loop.path.body_calls != 2:
+            raise AssertionError("inference with an open gate skipped the correction")
+        if torch.equal(low.velocity, native):
+            raise AssertionError("inference ignored a trained gate of 0.4")
+        loop.gate.raw.fill_(0.8)
+        high = loop.forward_branch(hidden, branch, train=False)
+        if torch.equal(high.velocity, native) or torch.equal(low.velocity, high.velocity):
+            raise AssertionError("inference gate scale did not change velocity")
+
+        skipped.load_state_dict(loop.state_dict())
+        skipped.path.body_calls = 0
+        bypass = skipped.forward_branch(hidden, branch, train=False)
+        train_skip = skipped.forward_branch(hidden, branch, train=True)
+    _exact(bypass.velocity, native, "native bypass ignores the trained gate")
+    _exact(train_skip.velocity, native, "native bypass during training")
+    if skipped.path.body_calls != 2:
+        raise AssertionError("force_native_bypass still ran a correction")
+    with torch.no_grad():
+        zero_path.load_state_dict(loop.state_dict())
+        zero_path.path.body_calls = 0
+        zeroed = zero_path.forward_branch(hidden, branch, train=False)
+    _exact(zeroed.velocity, native, "full zero path ignores the trained gate")
+    _exact(zeroed.entries[0], zeroed.anchor, "full zero path writes the anchor")
+    if zero_path.path.body_calls != 2:
+        raise AssertionError("force_full_zero_path skipped the second body")
+
+
 def check_schedule_direction_changes_velocity():
     language_model = tiny_language_model()
     early_hidden, early_branch = pack_case(language_model, seed=9, flow_time=0.95)
     late_hidden, late_branch = pack_case(language_model, seed=9, flow_time=0.1)
-    loop = make_loop(language_model, entry_scale=1.0, max_delta_rms_ratio=1.0)
+    loop = make_loop(language_model, max_delta_rms_ratio=1.0)
     with torch.no_grad():
         loop.adapter.up.weight.normal_(0, 0.5)
+        loop.gate.raw.fill_(1.0)
         early = loop.forward_branch(early_hidden, early_branch, train=False)
         late = loop.forward_branch(late_hidden, late_branch, train=False)
         native = native_velocity(language_model, early_hidden, early_branch)
@@ -220,7 +277,7 @@ def check_schedule_direction_changes_velocity():
 def check_rounds_share_the_same_anchor():
     language_model = tiny_language_model()
     hidden, branch = pack_case(language_model, seed=4)
-    loop = make_loop(language_model, correction_rounds=2, force_full_zero_path=True, entry_scale=1.0)
+    loop = make_loop(language_model, correction_rounds=2, force_full_zero_path=True)
     with torch.no_grad():
         output = loop.forward_branch(hidden, branch, train=False)
     assert len(output.entries) == 2
@@ -262,10 +319,10 @@ def check_trained_observation_is_an_independent_copy():
     loop.path.body(hidden, branch, embeddings, captured)
     loop.path.post(hidden, branch, embeddings, captured)
     with torch.no_grad():
-        copied = observer.read(hidden, captured, branch)
+        copied = observer.read(captured, branch)
         native = observation_slots(
             decoder.layers, decoder.embed_tokens, decoder, observer.seed_token_ids, captured,
-            hidden, branch, observer.slots, observer.position_start,
+            branch, observer.slots, observer.position_start,
         )
     _exact(copied, native, "unloaded copy matches the native readout")
 
@@ -305,7 +362,7 @@ def check_trained_observation_is_an_independent_copy():
     if torch.equal(observer.layers[0].self_attn.q_proj.weight, native_q):
         raise AssertionError("observation load left the copied projection unchanged")
     with torch.no_grad():
-        loaded = observer.read(hidden, captured, branch)
+        loaded = observer.read(captured, branch)
     if torch.equal(loaded, native):
         raise AssertionError("loaded readout still matches the native UND weights")
     clone = copy.deepcopy(language_model).eval()
@@ -315,7 +372,7 @@ def check_trained_observation_is_an_independent_copy():
             parameter.copy_(tensor.to(dtype=parameter.dtype))
         matched = observation_slots(
             clone.model.layers, clone.model.embed_tokens, clone.model, observer.seed_token_ids, captured,
-            hidden, branch, observer.slots, observer.position_start,
+            branch, observer.slots, observer.position_start,
         )
     _exact(loaded, matched, "loaded readout matches a decoder carrying the same UND copy")
     if any(parameter.requires_grad for parameter in observer.parameters()):
@@ -566,8 +623,9 @@ def check_direct_hidden_is_opt_in():
     assert loop_config().state_mode == "anchored"
     language_model = tiny_language_model()
     hidden, branch = pack_case(language_model, seed=6)
-    direct = make_loop(language_model, state_mode="direct_hidden", entry_scale=1.0, max_delta_rms_ratio=1.0)
+    direct = make_loop(language_model, state_mode="direct_hidden", max_delta_rms_ratio=1.0)
     with torch.no_grad():
+        direct.gate.raw.fill_(1.0)
         output = direct.forward_branch(hidden, branch, train=False)
     if torch.equal(output.entries[0], output.anchor):
         raise AssertionError("direct-hidden ablation used the native anchor")
@@ -577,20 +635,16 @@ def check_feedback_content_and_gen_only():
     language_model = tiny_language_model()
     hidden, branch = pack_case(language_model, samples=2, seed=8)
     dual = make_loop(language_model, force_full_zero_path=True)
-    alone = make_loop(language_model, variant="gen_only", force_full_zero_path=True)
     with torch.no_grad():
         first = dual.forward_branch(hidden, branch, train=False)
         shifted = hidden.clone()
         shifted[branch.packed_vae_token_indexes] += 1
         second = dual.forward_branch(shifted, branch, train=False)
-        gen_first = alone.forward_branch(hidden, branch, train=False)
-        gen_second = alone.forward_branch(shifted, branch, train=False)
     if torch.allclose(first.feedback.value, second.feedback.value):
         raise AssertionError("dual feedback ignored GEN hidden")
-    _exact(gen_first.feedback.value, gen_second.feedback.value, "gen-only feedback")
-    correct = make_loop(language_model, feedback_mode="correct", entry_scale=1.0, max_delta_rms_ratio=1.0)
-    shuffled = make_loop(language_model, feedback_mode="shuffled", entry_scale=1.0, max_delta_rms_ratio=1.0)
-    zeroed = make_loop(language_model, feedback_mode="zero", entry_scale=1.0, max_delta_rms_ratio=1.0)
+    correct = make_loop(language_model, feedback_mode="correct", max_delta_rms_ratio=1.0)
+    shuffled = make_loop(language_model, feedback_mode="shuffled", max_delta_rms_ratio=1.0)
+    zeroed = make_loop(language_model, feedback_mode="zero", max_delta_rms_ratio=1.0)
     with torch.no_grad():
         shuffled.load_state_dict(correct.state_dict())
         zeroed.load_state_dict(correct.state_dict())
@@ -601,6 +655,7 @@ def check_feedback_content_and_gen_only():
         for name in ("q_proj", "k_proj", "v_proj", "mem_out"):
             getattr(correct.adapter, name).weight.normal_(0, 0.5)
         correct.adapter.up.weight.normal_(0, 0.5)
+        correct.gate.raw.fill_(1.0)
         shuffled.load_state_dict(correct.state_dict())
         zeroed.load_state_dict(correct.state_dict())
         correct_out = correct.forward_branch(hidden, branch, train=False)
@@ -664,19 +719,242 @@ def check_gradients_and_frozen_native():
     if loop.updater.up.weight.grad is None or float(loop.updater.up.weight.grad.abs().sum()) == 0.0:
         raise AssertionError("open gate did not train the feedback update")
 
-    dual = make_loop(language_model, force_full_zero_path=False, entry_scale=1.0, max_delta_rms_ratio=1.0)
+    dual = make_loop(language_model, force_full_zero_path=False, max_delta_rms_ratio=1.0)
     leaf3 = hidden.detach().clone().requires_grad_(True)
     feedback = dual.forward_branch(leaf3, branch, train=True).feedback.value
     feedback.sum().backward()
     if leaf3.grad is None or float(leaf3.grad.abs().sum()) == 0.0:
         raise AssertionError("feedback does not depend on GEN hidden")
 
-    gen_only = make_loop(language_model, variant="gen_only", entry_scale=1.0, max_delta_rms_ratio=1.0)
-    leaf4 = hidden.detach().clone().requires_grad_(True)
-    gen_feedback = gen_only.forward_branch(leaf4, branch, train=True).feedback.value
-    gen_feedback.sum().backward()
-    if leaf4.grad is not None and float(leaf4.grad.abs().sum()) != 0.0:
-        raise AssertionError("gen-only feedback depends on GEN hidden")
+
+def check_gen_only_does_not_carry_memory():
+    language_model = tiny_language_model()
+    hidden, branch = pack_case(language_model, samples=2, seed=16)
+    try:
+        make_loop(language_model, variant="gen_only", feedback_mode="shuffled")
+    except ValueError as error:
+        if "memory" not in str(error):
+            raise
+    else:
+        raise AssertionError("gen-only accepted a memory intervention")
+
+    loop = make_loop(language_model, variant="gen_only", correction_rounds=2, max_delta_rms_ratio=1.0)
+
+    def fail_read(*_args, **_kwargs):
+        raise AssertionError("gen-only read UND")
+
+    def fail_update(*_args, **_kwargs):
+        raise AssertionError("gen-only updated memory")
+
+    def fail_memory_adapter(*_args, **_kwargs):
+        raise AssertionError("gen-only called the memory adapter")
+
+    loop.observer.read = fail_read
+    loop.updater.forward = fail_update
+    loop.adapter.forward = fail_memory_adapter
+    other = make_loop(language_model, variant="gen_only", correction_rounds=2, max_delta_rms_ratio=1.0)
+    with torch.no_grad():
+        loop.adapter.up.weight.normal_(0, 0.5)
+        loop.gate.raw.fill_(1.0)
+        loop.path.body_calls = 0
+        output = loop.forward_branch(hidden, branch, train=False)
+        other.load_state_dict(loop.state_dict())
+        other.adapter.mem_out.weight.normal_(0, 0.5)
+        other.adapter.q_proj.weight.normal_(0, 0.5)
+        other.updater.up.weight.normal_(0, 0.5)
+        shifted = other.forward_branch(hidden, branch, train=False)
+    if output.feedback is not None or shifted.feedback is not None:
+        raise AssertionError("gen-only returned a memory state")
+    if loop.observation_trace or other.observation_trace:
+        raise AssertionError("gen-only recorded an UND observation")
+    if loop.path.body_calls != 1 + loop.config.correction_rounds:
+        raise AssertionError("gen-only did not repeat the body")
+    if torch.equal(output.velocity, output.native_velocity):
+        raise AssertionError("state-free correction did not change velocity")
+    _exact(shifted.velocity, output.velocity, "memory weights changed gen-only velocity")
+    names = [name for name, _parameter in loop.named_parameters() if _parameter.requires_grad and name.startswith(("updater.", "adapter.mem_out.", "adapter.q_proj."))]
+    trained = {name for name, _parameter in loop.named_parameters() if any(parameter is _parameter for parameter in loop.trainable_parameters())}
+    if any(name in trained for name in names):
+        raise AssertionError("gen-only training includes memory parameters")
+    leaf = hidden.detach().clone().requires_grad_(True)
+    opened = loop.forward_branch(leaf, branch, train=True)
+    opened.velocity.float().sum().backward()
+    if loop.adapter.up.weight.grad is None or float(loop.adapter.up.weight.grad.abs().sum()) == 0.0:
+        raise AssertionError("gen-only open gate did not train the state-free residual")
+    if loop.adapter.mem_out.weight.grad is not None or loop.updater.up.weight.grad is not None:
+        raise AssertionError("gen-only trained memory")
+
+
+def _grad_mass(value) -> float:
+    if value is None:
+        return 0.0
+    return float(value.detach().abs().sum())
+
+
+def check_round_velocities_and_supervision():
+    language_model = tiny_language_model()
+    hidden, branch = pack_case(language_model, seed=17)
+    try:
+        make_loop(language_model, correction_rounds=2, round_loss_weights=(1.0,))
+    except ValueError as error:
+        if "one weight" not in str(error):
+            raise
+    else:
+        raise AssertionError("a short round weight tuple was accepted")
+    try:
+        make_loop(language_model, correction_rounds=2, round_loss_weights=(1.0, -0.1))
+    except ValueError as error:
+        if "non-negative" not in str(error):
+            raise
+    else:
+        raise AssertionError("a negative round weight was accepted")
+    payload = loop_config(correction_rounds=2).to_dict()
+    payload["round_loss_weights"] = [1.0, 0.25]
+    uneven = LoopConfig.from_dict(payload)
+    uneven.validate(len(language_model.model.layers))
+    if uneven.round_loss_weights != (1.0, 0.25):
+        raise AssertionError("unequal round weights were not kept")
+
+    zero_path = make_loop(
+        language_model, correction_rounds=2, force_full_zero_path=True, log_intermediates=True,
+    )
+    with torch.no_grad():
+        zeroed = zero_path.forward_branch(hidden, branch, train=False)
+    if (
+        len(zeroed.round_velocities) != 3
+        or len(zeroed.round_deltas) != 2
+        or len(zeroed.round_observations) != 2
+    ):
+        raise AssertionError("two corrections did not return v0, v1, and v2")
+    for index, velocity in enumerate(zeroed.round_velocities):
+        _exact(velocity, zeroed.native_velocity, f"zero-path velocity {index}")
+    _exact(zeroed.velocity, zeroed.round_velocities[-1], "sampler velocity is the last round")
+    observation_shape = (
+        int(branch.query_lens.shape[0]), zero_path.config.slots, zeroed.anchor.shape[-1],
+    )
+    for observation in zeroed.round_observations:
+        if not isinstance(observation, torch.Tensor) or tuple(observation.shape) != observation_shape:
+            raise AssertionError("dual round observation is missing")
+    for delta in zeroed.round_deltas:
+        _exact(delta, torch.zeros_like(zeroed.anchor), "zero-path written residual")
+    drifts = [record["velocity_drift"] for record in zeroed.records if "round" in record]
+    if drifts != [0.0, 0.0]:
+        raise AssertionError(f"logged round drift was {drifts}")
+
+    bypass = make_loop(language_model)
+    with torch.no_grad():
+        skipped = bypass.forward_branch(hidden, branch, train=False)
+    if len(skipped.round_velocities) != 1 or skipped.round_deltas or skipped.round_observations:
+        raise AssertionError("fast bypass did not keep only the native velocity")
+    _exact(skipped.round_velocities[0], skipped.native_velocity, "bypass v0")
+
+    gen = make_loop(
+        language_model, variant="gen_only", correction_rounds=2, force_full_zero_path=True,
+    )
+
+    def fail_read(*_args, **_kwargs):
+        raise AssertionError("gen-only read UND while recording observations")
+
+    gen.observer.read = fail_read
+    with torch.no_grad():
+        gen_out = gen.forward_branch(hidden, branch, train=False)
+    if gen_out.round_observations != [None, None] or len(gen_out.round_velocities) != 3:
+        raise AssertionError("gen-only round records were incomplete")
+    for velocity in gen_out.round_velocities:
+        _exact(velocity, gen_out.native_velocity, "gen-only zero-path velocity")
+
+    far = torch.full((4, 4), 3.0)
+    near = torch.ones(4, 4)
+    base = torch.zeros(4, 4)
+    improved = round_velocity_report([far, near, base], base)
+    if not all(item["error_fell"] and not item["error_rose"] for item in improved["corrections"]):
+        raise AssertionError("a round that moves toward the target was marked as a rise")
+    amplified = round_velocity_report([base, near, far], base)
+    if any(item["error_fell"] for item in amplified["corrections"]) or not amplified["corrections"][1]["error_rose"]:
+        raise AssertionError("a round that moves away from the target was marked as a correction")
+    if not (amplified["drift"][2] > amplified["drift"][1] > amplified["drift"][0]):
+        raise AssertionError("drift did not grow across amplifying rounds")
+
+    loop = make_loop(language_model, correction_rounds=2, max_delta_rms_ratio=1.0)
+    with torch.no_grad():
+        loop.adapter.up.weight.normal_(0, 0.5)
+        loop.updater.up.weight.normal_(0, 0.5)
+        loop.gate.raw.fill_(1.0)
+
+    def supervise(weights):
+        loop.zero_grad(set_to_none=True)
+        leaf = hidden.detach().clone().requires_grad_(True)
+        output = loop.forward_branch(leaf, branch, train=True)
+        for velocity in output.round_velocities:
+            velocity.retain_grad()
+        loss, parts = anchored_loss(
+            output.velocity, target, output.native_velocity, output.delta, output.anchor,
+            branch.packed_vae_token_indexes, lambda_anchor=0.0, lambda_entry=0.0,
+            round_velocities=output.round_velocities, round_loss_weights=weights,
+        )
+        loss.backward()
+        return output, loss, parts
+
+    target = torch.randn_like(hidden[branch.packed_vae_token_indexes])
+    first, first_loss, _parts = supervise((1.0, 0.0))
+    if torch.equal(first.round_velocities[1], first.round_velocities[0]):
+        raise AssertionError("first correction matched the native velocity")
+    if torch.equal(first.round_velocities[2], first.round_velocities[1]):
+        raise AssertionError("second correction matched the first velocity")
+    _exact(first.velocity, first.round_velocities[2], "final velocity")
+    _exact(first.delta, first.round_deltas[-1], "last written residual")
+    if not first.round_velocities[1].requires_grad or not first.round_deltas[0].requires_grad:
+        raise AssertionError("round tensors left the training graph")
+    moved = round_velocity_report(first.round_velocities, first.round_velocities[1].detach())
+    if not moved["corrections"][0]["error_fell"] or not moved["corrections"][1]["error_rose"]:
+        raise AssertionError("round 2 versus round 1 was not visible in the velocity report")
+    mse1 = (first.round_velocities[1].float() - target.float()).pow(2).mean()
+    if not torch.equal(first_loss, mse1):
+        raise AssertionError("a weight of (1, 0) did not keep only the first correction")
+    if _grad_mass(first.round_velocities[1].grad) == 0.0 or first.round_velocities[2].grad is not None:
+        raise AssertionError("the first-round weight supervised another velocity")
+
+    second, second_loss, parts = supervise((0.0, 1.0))
+    mse2 = (second.round_velocities[2].float() - target.float()).pow(2).mean()
+    if not torch.equal(second_loss, mse2):
+        raise AssertionError("a weight of (0, 1) did not keep only the last correction")
+    if second.round_velocities[1].grad is not None or _grad_mass(second.round_velocities[2].grad) == 0.0:
+        raise AssertionError("the last-round weight supervised another velocity")
+    if "mse_0" not in parts or "error_fell_2" not in parts or "error_rose_1" not in parts:
+        raise AssertionError("per-round error flags were missing from the loss report")
+
+    mixed, mixed_loss, _parts = supervise((1.0, 0.25))
+    expected = (
+        (mixed.round_velocities[1].float() - target.float()).pow(2).mean()
+        + 0.25 * (mixed.round_velocities[2].float() - target.float()).pow(2).mean()
+    )
+    if not torch.equal(mixed_loss, expected):
+        raise AssertionError("unequal round weights did not match the weighted sum")
+    try:
+        anchored_loss(
+            mixed.velocity, target, mixed.native_velocity, mixed.delta, mixed.anchor,
+            branch.packed_vae_token_indexes, lambda_anchor=0.0, lambda_entry=0.0,
+            round_velocities=mixed.round_velocities[:2], round_loss_weights=(1.0, 0.0),
+        )
+    except ValueError as error:
+        if "round_loss_weights" not in str(error):
+            raise
+    else:
+        raise AssertionError("a short velocity list was accepted")
+
+    loop.zero_grad(set_to_none=True)
+    leaf = hidden.detach().clone().requires_grad_(True)
+    output = loop.forward_branch(leaf, branch, train=True)
+    for velocity in output.round_velocities:
+        velocity.retain_grad()
+    default_loss, _parts = anchored_loss(
+        output.velocity, target, output.native_velocity, output.delta, output.anchor,
+        branch.packed_vae_token_indexes, lambda_anchor=0.0, lambda_entry=0.0,
+    )
+    default_loss.backward()
+    final_mse = (output.velocity.float() - target.float()).pow(2).mean()
+    if not torch.equal(default_loss, final_mse) or output.round_velocities[1].grad is not None:
+        raise AssertionError("the default flow loss supervised an earlier round")
 
 
 def check_cfg_matches_bagel():
@@ -723,7 +1001,7 @@ def check_cfg_matches_bagel():
             flow_time=0.8,
         )
 
-    loop = make_loop(language_model, enabled=True, entry_scale=0.0)
+    loop = make_loop(language_model, enabled=True)
     with torch.no_grad():
         ours = loop.predict_flow(
             bagel, x_t, timestep, text_ids, text_index, vae_index, vae_pos, seqlens,
@@ -864,19 +1142,144 @@ def check_checkpoint_and_bound():
     assert float(bounded[1].float().pow(2).mean().sqrt()) <= 0.02 * float(anchor[1].float().pow(2).mean().sqrt()) + 1e-5
 
 
+def _rms_ratio(residual: torch.Tensor, reference: torch.Tensor) -> float:
+    residual = residual.float()
+    reference = reference.float()
+    numerator = residual.pow(2).mean(dim=-1).sqrt()
+    denominator = reference.pow(2).mean(dim=-1).sqrt().clamp_min(1e-6)
+    return float((numerator / denominator).max())
+
+
+def check_written_residual_respects_the_rms_cap():
+    """The cap applies to gamma * delta. Widened weights make bf16 movement visible.
+
+    The default 1e-3 adapter initialization is checked only for the cap and for
+    entering the loop. A matching native velocity there is a bf16 rounding fact.
+    """
+    language_model = tiny_language_model()
+    hidden, branch = pack_case(language_model, seed=14)
+    ratio = 0.02
+    loop = make_loop(language_model, max_delta_rms_ratio=ratio)
+    seen = {}
+    original = loop.adapter.forward
+
+    def record(hidden, feedback, anchor, flow_time, branch):
+        delta = original(hidden, feedback, anchor, flow_time, branch)
+        seen["delta"] = delta.detach().clone()
+        return delta
+
+    loop.adapter.forward = record
+    with torch.no_grad():
+        loop.adapter.up.weight.normal_(0, 0.5)
+        loop.gate.raw.fill_(4.0)
+        output = loop.forward_branch(hidden, branch, train=False)
+    vae = branch.packed_vae_token_indexes
+    raw = seen["delta"]
+    capped = written_residual(raw, loop.gate.raw.detach(), output.anchor, ratio, vae)
+    _exact(output.delta, capped, "loop writes Bound(gamma * delta)")
+    _exact(output.entries[0], output.anchor + output.delta, "entry is anchor plus the written residual")
+    written_ratio = _rms_ratio(output.delta[vae], output.anchor[vae])
+    if written_ratio > ratio * 1.05:
+        raise AssertionError(f"written residual ratio {written_ratio} exceeded {ratio}")
+    before_gate = bound_residual(raw.float(), output.anchor.float(), ratio, vae)
+    old = loop.gate.raw.detach().float() * before_gate.float()
+    old_ratio = _rms_ratio(old[vae], output.anchor[vae].float())
+    if old_ratio <= ratio * 2:
+        raise AssertionError("bounding before the gate stayed inside the cap, so this fixture misses the order")
+    zero = written_residual(raw, torch.zeros((), dtype=torch.float32), output.anchor, ratio, vae)
+    _exact(zero, torch.zeros_like(output.anchor), "zero gate writes bf16 zero")
+    _exact(output.anchor + zero, output.anchor, "zero gate add")
+
+    plain = make_loop(language_model, max_delta_rms_ratio=ratio)
+    with torch.no_grad():
+        plain.gate.raw.fill_(1.0)
+        plain.path.body_calls = 0
+        plain_out = plain.forward_branch(hidden, branch, train=False)
+    if plain.path.body_calls != 2:
+        raise AssertionError("default-init open gate skipped the correction")
+    plain_ratio = _rms_ratio(plain_out.delta[vae], plain_out.anchor[vae])
+    if plain_ratio > ratio * 1.05:
+        raise AssertionError(f"default-init written ratio {plain_ratio} exceeded {ratio}")
+
+
+def check_observation_query_follows_the_verified_writer():
+    from qwen_latent_cot.anchored import observer as observer_module
+    from qwen_latent_cot.diagnostics.memory import neutral_seeds, rope_for, und_block
+
+    language_model = tiny_language_model()
+    hidden, branch = pack_case(language_model, seed=15)
+    loop = make_loop(language_model, force_full_zero_path=True)
+    decoder = language_model.model
+    observer = loop.observer
+    embeddings = loop.path.rope(hidden, branch.packed_query_position_ids)
+    captured = {}
+    with torch.no_grad():
+        loop.path.pre(hidden, branch, embeddings, captured)
+        loop.path.body(hidden, branch, embeddings, captured)
+        loop.path.post(hidden, branch, embeddings, captured)
+    calls = []
+    real = observer_module.und_block
+
+    def spy(layer, queries, rope, lengths, source=None, *, causal=False):
+        calls.append((None if source is None else source.layer, queries.detach().clone()))
+        return real(layer, queries, rope, lengths, source, causal=causal)
+
+    observer_module.und_block = spy
+    try:
+        with torch.no_grad():
+            slots = observation_slots(
+                observer.layers, observer.embed, decoder, observer.seed_token_ids, captured,
+                branch, observer.slots, observer.position_start,
+            )
+    finally:
+        observer_module.und_block = real
+    depth = len(decoder.layers)
+    if [layer for layer, _ in calls] != list(range(depth)):
+        raise AssertionError("observation query did not enter every UND layer")
+    if len(calls) == loop.config.body_end - loop.config.body_start:
+        raise AssertionError("observation query used the GEN body span")
+    ids = torch.tensor(observer.seed_token_ids, dtype=torch.long)
+    with torch.no_grad():
+        seeds = neutral_seeds(decoder, ids)
+        _exact(calls[0][1], seeds[0], "observation query is the neutral seed embedding")
+        reference = seeds[0]
+        positions = torch.arange(observer.position_start, observer.position_start + observer.slots)
+        lengths = (observer.slots,)
+        for index, layer in enumerate(observer.layers):
+            rope = rope_for(decoder, reference, positions)
+            reference = und_block(layer, reference, rope, lengths, captured[index], causal=False)
+    _exact(slots, reference.view(1, observer.slots, -1), "observation recurrence matches the C2 writer")
+    body_only = {index: captured[index] for index in range(loop.config.body_start, loop.config.body_end)}
+    try:
+        observation_slots(
+            observer.layers, observer.embed, decoder, observer.seed_token_ids, body_only,
+            branch, observer.slots, observer.position_start,
+        )
+    except ValueError as error:
+        if "every layer" not in str(error):
+            raise
+    else:
+        raise AssertionError("body-layer KV was accepted as the observation source")
+
+
 CHECKS = [
     check_schedule,
     check_span_matches_native,
     check_exact_bypass_and_cache,
     check_fast_bypass_skips_observer,
+    check_inference_reads_the_trained_gate,
     check_schedule_direction_changes_velocity,
     check_rounds_share_the_same_anchor,
     check_trained_observation_is_an_independent_copy,
+    check_observation_query_follows_the_verified_writer,
     check_observation_source_mode_follows_the_training_config,
     check_anchored_observation_reuses_native_pre_kv,
     check_direct_hidden_is_opt_in,
     check_feedback_content_and_gen_only,
+    check_gen_only_does_not_carry_memory,
+    check_round_velocities_and_supervision,
     check_gradients_and_frozen_native,
+    check_written_residual_respects_the_rms_cap,
     check_cfg_matches_bagel,
     check_image_tokens_address_memory_slots,
     check_checkpoint_and_bound,

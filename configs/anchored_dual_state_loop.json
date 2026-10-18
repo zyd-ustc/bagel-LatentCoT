@@ -8,7 +8,6 @@
   "correction_rounds": 1,
   "schedule": "early",
   "schedule_fraction": 0.35,
-  "entry_scale": 0.0,
   "max_delta_rms_ratio": 0.02,
   "observer": "trained_observation",
   "observation_checkpoint": null,
@@ -23,7 +22,9 @@
   "writer_position_start": 2048,
   "lambda_anchor": 0.01,
   "lambda_entry": 0.001,
+  "round_loss_weights": null,
   "log_intermediates": false,
+  "force_native_bypass": false,
   "force_full_zero_path": false,
   "verify_prompt_cache": true
 }

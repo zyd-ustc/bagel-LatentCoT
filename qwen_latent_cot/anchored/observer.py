@@ -69,23 +69,29 @@ def observation_slots(
     rope_decoder,
     seed_token_ids,
     captured,
-    hidden: torch.Tensor,
     branch: BranchContext,
     slots: int,
     position_start: int,
 ) -> torch.Tensor:
-    """Run the C2 observation writer and return the final slot hidden."""
+    """Run the verified C2 observation recurrence and return the final slot hidden.
+
+    The query is the neutral seed embedding, the tensor ``neutral_seeds``
+    stores before layer 0. Every UND layer attends to that layer's full-query
+    GEN KV. GEN body hidden is not an input, and the GEN body span is not the
+    layer subset. A later ADSL round may pass recomputed Body and Post KV
+    through this same recurrence; that source is a separate combination.
+    """
     if seed_token_ids is None or len(seed_token_ids) != slots:
         raise RuntimeError("observation readout needs one neutral seed token per slot")
     depth = len(layers)
     if captured is None or tuple(sorted(captured)) != tuple(range(depth)):
         raise ValueError("trained observation reads GEN KV at every layer")
-    groups = sample_groups(branch, hidden.shape[0])
+    sequence = int(branch.query_lens.sum())
+    groups = sample_groups(branch, sequence)
     samples = len(groups)
-    ids = torch.tensor(seed_token_ids, device=hidden.device, dtype=torch.long)
+    ids = torch.tensor(seed_token_ids, device=branch.query_lens.device, dtype=torch.long)
     queries = embed(ids.repeat(samples))
-    positions = torch.arange(position_start, position_start + slots, device=hidden.device).repeat(samples)
-    rope = rope_for(rope_decoder, queries, positions)
+    positions = torch.arange(position_start, position_start + slots, device=queries.device).repeat(samples)
     lengths = (slots,) * samples
     query_positions = set(positions.tolist())
     for index, layer in enumerate(layers):
@@ -96,10 +102,11 @@ def observation_slots(
             raise ValueError("observation source must be the GEN query, with image tokens and no prompt KV")
         if not source.positions or set(source.positions) & query_positions:
             raise ValueError("GEN source positions are missing or overlap observer slots")
-        if sum(source.lengths) != hidden.shape[0]:
+        if sum(source.lengths) != sequence:
             raise ValueError("full-query source must cover the packed GEN query")
+        rope = rope_for(rope_decoder, queries, positions)
         queries = und_block(layer, queries, rope, lengths, source, causal=False)
-    return queries.view(samples, slots, hidden.shape[-1])
+    return queries.view(samples, slots, queries.shape[-1])
 
 
 class TrainedObservationObserver(nn.Module):
@@ -200,8 +207,8 @@ class TrainedObservationObserver(nn.Module):
         self.parent = provenance["parent"]
         self.freeze()
 
-    def read(self, hidden: torch.Tensor, captured: dict, branch: BranchContext) -> torch.Tensor:
+    def read(self, captured: dict, branch: BranchContext) -> torch.Tensor:
         return observation_slots(
             self.layers, self.embed, self._rope_owner, self.seed_token_ids, captured,
-            hidden, branch, self.slots, self.position_start,
+            branch, self.slots, self.position_start,
         )
