@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON=${MODEL_PYTHON:-/data/zyd_workspace/bagel-LatentCoT/venvs/bagel-NPU/bin/python}
 MODEL=${MODEL_PATH:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}
-PROMPTS=${SAMPLE_PROMPTS:?jsonl with one {"prompt": ...} per line}
+PROMPTS=${SAMPLE_PROMPTS:?set SAMPLE_PROMPTS to the prompt jsonl}
 OUT=${SAMPLE_OUTPUT:?output directory on shared /data}
 GEN=${GEN_ONLY_CHECKPOINT:?gen_only_step_000400.pt}
 DUAL=${DUAL_CHECKPOINT:?dual_step_000600.pt}
