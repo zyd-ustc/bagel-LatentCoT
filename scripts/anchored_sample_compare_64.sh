@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # 64 cards, one comparison strip each. Same seed on every arm and every card.
-# The strip has four columns: prompt text, native, gen_only step 400,
-# dual step 600 at one correction round.
+# This entry is qwen_latent_cot.anchored.sample_compare. It does not call
+# scripts/gen_npu.py and it does not load a MemoryBank.
+# generate_image owns the Euler loop. Loop arms replace _forward_flow with
+# AnchoredDualStateLoop.predict_flow for that call only.
+# Columns: prompt, native, gen_only_400, dual_600, dual_shuffled,
+# |dual-native|x10, |dual-gen|x10.
+# OBSERVATION_CHECKPOINT is passed as --observation-checkpoint.
 # Inference does not form a process group. Each visible card is one process.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

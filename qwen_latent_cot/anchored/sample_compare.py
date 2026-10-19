@@ -1,13 +1,16 @@
-"""Same-seed Euler samples: native, GEN-only step 400, and dual step 600.
+"""Same-seed samples through ``Bagel.generate_image``.
 
-One process draws one prompt. The three arms share the initial noise and the
-prompt KV. Inside the trained window the loop replaces ``_forward_flow`` with
-``predict_flow`` at one correction round. Steps outside that window stay on
-the native velocity. This writes images. It does not score them.
+One process draws one prompt. Native keeps ``_forward_flow``. GEN-only, dual,
+and dual-shuffled temporarily replace that method with
+``AnchoredDualStateLoop.predict_flow``. The Euler update stays inside
+``generate_image``. Shuffled packs the prompt with one fixed donor so the
+existing batch roll has two samples, then keeps only the prompt image.
+This writes images and amplified differences. It does not score quality.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -20,7 +23,9 @@ from .loop import AnchoredDualStateLoop
 from .native_path import BranchContext
 
 
-ARMS = ("native", "gen_only_400", "dual_600_1round")
+ARMS = ("native", "gen_only_400", "dual_600", "dual_shuffled")
+# Fixed second sample for the batch roll. Its picture is discarded.
+SHUFFLE_DONOR_PROMPT = "A plain white ceramic plate on a gray table."
 
 
 def euler_nodes(steps: int, shift: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -59,39 +64,42 @@ def load_prompts(path: Path) -> list[str]:
     return prompts
 
 
-def _prompt_cache(model, tokenizer, token_ids, prompt: str, device):
+def _text_cache(model, tokenizer, token_ids, prompts: list[str], device):
     from ..diagnostics.native import device_inputs, empty_cache
     from ..diagnostics.numerics import autocast_for
 
     decoder = model.language_model.model
-    if prompt:
-        inputs, lengths, positions = model.prepare_prompts(
-            [0], [0], [prompt], tokenizer, token_ids,
-        )
-        cache = empty_cache(decoder)
-        moved = device_inputs(inputs, device)
-        with autocast_for(device):
-            cache = model.forward_cache_update_text(cache, **moved)
-        return cache, lengths, positions
-    return empty_cache(decoder), [0], [0]
+    count = len(prompts)
+    if not any(prompts):
+        return empty_cache(decoder), [0] * count, [0] * count
+    if not all(prompts):
+        raise ValueError("a packed text cache is either all prompts or all empty")
+    inputs, lengths, positions = model.prepare_prompts(
+        [0] * count, [0] * count, prompts, tokenizer, token_ids,
+    )
+    cache = empty_cache(decoder)
+    with autocast_for(device):
+        cache = model.forward_cache_update_text(cache, **device_inputs(inputs, device))
+    return cache, lengths, positions
 
 
-def flow_for_prompt(bundle, prompt: str, resolution: int, device) -> dict:
-    """Conditional prompt cache plus an empty-text CFG branch. No image condition."""
+def flow_for_prompts(bundle, prompts: list[str], resolution: int, device) -> dict:
+    """Conditional prompt caches plus an empty-text CFG branch. No image condition."""
     from ..diagnostics.native import device_inputs
 
     model = bundle.model
-    cache, lengths, positions = _prompt_cache(
-        model, bundle.tokenizer, bundle.token_ids, prompt, device,
+    sizes = [(resolution, resolution)] * len(prompts)
+    cache, lengths, positions = _text_cache(
+        model, bundle.tokenizer, bundle.token_ids, prompts, device,
     )
-    flow = model.prepare_vae_latent(lengths, positions, [(resolution, resolution)], bundle.token_ids)
+    flow = model.prepare_vae_latent(lengths, positions, sizes, bundle.token_ids)
     flow.pop("packed_init_noises")
     flow = device_inputs(flow, device)
     flow["past_key_values"] = cache
-    text_cache, text_lengths, text_positions = _prompt_cache(
-        model, bundle.tokenizer, bundle.token_ids, "", device,
+    text_cache, text_lengths, text_positions = _text_cache(
+        model, bundle.tokenizer, bundle.token_ids, [""] * len(prompts), device,
     )
-    cfg = model.prepare_vae_latent_cfg(text_lengths, text_positions, [(resolution, resolution)])
+    cfg = model.prepare_vae_latent_cfg(text_lengths, text_positions, sizes)
     flow.update({
         key.replace("cfg_", "cfg_text_", 1): value
         for key, value in device_inputs(cfg, device).items()
@@ -100,91 +108,177 @@ def flow_for_prompt(bundle, prompt: str, resolution: int, device) -> dict:
     return flow
 
 
-def _branches(flow: dict, flow_time: float) -> dict[str, BranchContext]:
-    """``cond`` and ``cfg_text``. Image CFG is off, so there is no third branch."""
+def flow_for_prompt(bundle, prompt: str, resolution: int, device) -> dict:
+    return flow_for_prompts(bundle, [prompt], resolution, device)
+
+
+def forward_flow_branches(call: dict) -> dict[str, BranchContext]:
+    """Map one ``Bagel._forward_flow`` call onto ``predict_flow`` branches.
+
+    Text and image rows stay the conditional layout, matching ``_forward_flow``.
+    A CFG branch is built only when its scale is above 1, which is also when
+    the native method runs that extra forward. Image CFG is absent for T2I.
+    """
+    flow_time = float(call["timestep"].reshape(-1)[0])
     shared = dict(
-        query_lens=flow["packed_seqlens"],
-        packed_text_indexes=flow["packed_text_indexes"],
-        packed_vae_token_indexes=flow["packed_vae_token_indexes"],
+        query_lens=call["packed_seqlens"],
+        packed_text_indexes=call["packed_text_indexes"],
+        packed_vae_token_indexes=call["packed_vae_token_indexes"],
         flow_time=flow_time,
     )
-    cond = BranchContext(
-        name="cond",
-        packed_query_position_ids=flow["packed_position_ids"],
-        packed_query_indexes=flow["packed_indexes"],
-        past_key_values=flow["past_key_values"],
-        key_values_lens=flow["key_values_lens"],
-        packed_key_value_indexes=flow["packed_key_value_indexes"],
-        **shared,
-    )
-    cfg_text = BranchContext(
-        name="cfg_text",
-        packed_query_position_ids=flow["cfg_text_packed_position_ids"],
-        packed_query_indexes=flow["cfg_text_packed_query_indexes"],
-        past_key_values=flow["cfg_text_past_key_values"],
-        key_values_lens=flow["cfg_text_key_values_lens"],
-        packed_key_value_indexes=flow["cfg_text_packed_key_value_indexes"],
-        **shared,
-    )
-    return {"cond": cond, "cfg_text": cfg_text}
+    branches = {
+        "cond": BranchContext(
+            name="cond",
+            packed_query_position_ids=call["packed_position_ids"],
+            packed_query_indexes=call["packed_indexes"],
+            past_key_values=call["past_key_values"],
+            key_values_lens=call["key_values_lens"],
+            packed_key_value_indexes=call["packed_key_value_indexes"],
+            **shared,
+        ),
+    }
+    if call.get("cfg_text_scale", 1.0) > 1.0:
+        branches["cfg_text"] = BranchContext(
+            name="cfg_text",
+            packed_query_position_ids=call["cfg_text_packed_position_ids"],
+            packed_query_indexes=call["cfg_text_packed_query_indexes"],
+            past_key_values=call["cfg_text_past_key_values"],
+            key_values_lens=call["cfg_text_key_values_lens"],
+            packed_key_value_indexes=call["cfg_text_packed_key_value_indexes"],
+            **shared,
+        )
+    if call.get("cfg_img_scale", 1.0) > 1.0:
+        branches["cfg_img"] = BranchContext(
+            name="cfg_img",
+            packed_query_position_ids=call["cfg_img_packed_position_ids"],
+            packed_query_indexes=call["cfg_img_packed_query_indexes"],
+            past_key_values=call["cfg_img_past_key_values"],
+            key_values_lens=call["cfg_img_key_values_lens"],
+            packed_key_value_indexes=call["cfg_img_packed_key_value_indexes"],
+            **shared,
+        )
+    return branches
 
 
-def _native_velocity(model, flow, x, flow_time, cfg_text_scale, cfg_renorm_type, cfg_renorm_min):
-    timestep = torch.full((x.shape[0],), flow_time, device=x.device)
-    return model._forward_flow(
-        x_t=x,
-        timestep=timestep,
-        packed_vae_token_indexes=flow["packed_vae_token_indexes"],
-        packed_vae_position_ids=flow["packed_vae_position_ids"],
-        packed_text_ids=flow["packed_text_ids"],
-        packed_text_indexes=flow["packed_text_indexes"],
-        packed_indexes=flow["packed_indexes"],
-        packed_position_ids=flow["packed_position_ids"],
-        packed_seqlens=flow["packed_seqlens"],
-        key_values_lens=flow["key_values_lens"],
-        past_key_values=flow["past_key_values"],
-        packed_key_value_indexes=flow["packed_key_value_indexes"],
-        cfg_renorm_min=cfg_renorm_min,
-        cfg_renorm_type=cfg_renorm_type,
-        cfg_text_scale=cfg_text_scale,
-        cfg_text_packed_position_ids=flow["cfg_text_packed_position_ids"],
-        cfg_text_packed_query_indexes=flow["cfg_text_packed_query_indexes"],
-        cfg_text_key_values_lens=flow["cfg_text_key_values_lens"],
-        cfg_text_past_key_values=flow["cfg_text_past_key_values"],
-        cfg_text_packed_key_value_indexes=flow["cfg_text_packed_key_value_indexes"],
-        cfg_img_scale=1.0,
-    )
+@contextmanager
+def attach_predict_flow(model, loop):
+    """Point ``generate_image``'s velocity call at ``loop.predict_flow``.
 
+    ``generate_image`` keeps the 50-step Euler update. The replacement is
+    removed on the way out, including when sampling raises.
+    """
+    original = model._forward_flow
 
-def _loop_velocity(loop, model, flow, x, flow_time, cfg_text_scale, cfg_renorm_type, cfg_renorm_min):
-    timestep = torch.full((x.shape[0],), flow_time, device=x.device)
-    return loop.predict_flow(
-        model,
-        x,
+    def _anchored_forward_flow(
+        x_t,
         timestep,
-        flow["packed_text_ids"],
-        flow["packed_text_indexes"],
-        flow["packed_vae_token_indexes"],
-        flow["packed_vae_position_ids"],
-        flow["packed_seqlens"],
-        _branches(flow, flow_time),
-        cfg_text_scale=cfg_text_scale,
+        packed_vae_token_indexes,
+        packed_vae_position_ids,
+        packed_text_ids,
+        packed_text_indexes,
+        packed_indexes,
+        packed_position_ids,
+        packed_seqlens,
+        key_values_lens,
+        past_key_values,
+        packed_key_value_indexes,
+        cfg_renorm_min=0.0,
+        cfg_renorm_type="global",
+        cfg_text_scale=1.0,
+        cfg_text_packed_position_ids=None,
+        cfg_text_packed_query_indexes=None,
+        cfg_text_key_values_lens=None,
+        cfg_text_past_key_values=None,
+        cfg_text_packed_key_value_indexes=None,
         cfg_img_scale=1.0,
-        cfg_renorm_min=cfg_renorm_min,
-        cfg_renorm_type=cfg_renorm_type,
-        train=False,
-    )
+        cfg_img_packed_position_ids=None,
+        cfg_img_packed_query_indexes=None,
+        cfg_img_key_values_lens=None,
+        cfg_img_past_key_values=None,
+        cfg_img_packed_key_value_indexes=None,
+        cfg_type="parallel",
+        **_cache,
+    ):
+        del cfg_type, _cache
+        branches = forward_flow_branches({
+            "timestep": timestep,
+            "packed_vae_token_indexes": packed_vae_token_indexes,
+            "packed_text_indexes": packed_text_indexes,
+            "packed_indexes": packed_indexes,
+            "packed_position_ids": packed_position_ids,
+            "packed_seqlens": packed_seqlens,
+            "key_values_lens": key_values_lens,
+            "past_key_values": past_key_values,
+            "packed_key_value_indexes": packed_key_value_indexes,
+            "cfg_text_scale": cfg_text_scale,
+            "cfg_text_packed_position_ids": cfg_text_packed_position_ids,
+            "cfg_text_packed_query_indexes": cfg_text_packed_query_indexes,
+            "cfg_text_key_values_lens": cfg_text_key_values_lens,
+            "cfg_text_past_key_values": cfg_text_past_key_values,
+            "cfg_text_packed_key_value_indexes": cfg_text_packed_key_value_indexes,
+            "cfg_img_scale": cfg_img_scale,
+            "cfg_img_packed_position_ids": cfg_img_packed_position_ids,
+            "cfg_img_packed_query_indexes": cfg_img_packed_query_indexes,
+            "cfg_img_key_values_lens": cfg_img_key_values_lens,
+            "cfg_img_past_key_values": cfg_img_past_key_values,
+            "cfg_img_packed_key_value_indexes": cfg_img_packed_key_value_indexes,
+        })
+        return loop.predict_flow(
+            model,
+            x_t,
+            timestep,
+            packed_text_ids,
+            packed_text_indexes,
+            packed_vae_token_indexes,
+            packed_vae_position_ids,
+            packed_seqlens,
+            branches,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
+            cfg_renorm_min=cfg_renorm_min,
+            cfg_renorm_type=cfg_renorm_type,
+            train=False,
+        )
+
+    model._forward_flow = _anchored_forward_flow
+    try:
+        yield
+    finally:
+        model._forward_flow = original
 
 
-def sample_arm(model, flow, noise, nodes, dts, velocity_fn, device) -> torch.Tensor:
+def generate_latents(model, flow: dict, noise: torch.Tensor, args, device):
+    """One ``generate_image`` call. The Euler step is ``x - v * dt`` inside Bagel."""
     from ..diagnostics.numerics import autocast_for
 
-    state = noise.to(device)
-    for flow_time, dt in zip(nodes.tolist(), dts.tolist()):
-        with torch.inference_mode(), autocast_for(device):
-            velocity = velocity_fn(state, float(flow_time))
-        state = state - velocity.to(state.dtype) * dt
-    return state
+    with torch.inference_mode(), autocast_for(device):
+        unpacked = model.generate_image(
+            packed_text_ids=flow["packed_text_ids"],
+            packed_text_indexes=flow["packed_text_indexes"],
+            packed_init_noises=noise.to(device),
+            packed_vae_position_ids=flow["packed_vae_position_ids"],
+            packed_vae_token_indexes=flow["packed_vae_token_indexes"],
+            packed_seqlens=flow["packed_seqlens"],
+            packed_position_ids=flow["packed_position_ids"],
+            packed_indexes=flow["packed_indexes"],
+            past_key_values=flow["past_key_values"],
+            key_values_lens=flow["key_values_lens"],
+            packed_key_value_indexes=flow["packed_key_value_indexes"],
+            num_timesteps=args.sampler_steps,
+            timestep_shift=args.timestep_shift,
+            cfg_renorm_min=args.cfg_renorm_min,
+            cfg_renorm_type=args.cfg_renorm_type,
+            cfg_interval=(0.0, 1.0),
+            cfg_text_scale=args.cfg_text_scale,
+            cfg_text_packed_query_indexes=flow["cfg_text_packed_query_indexes"],
+            cfg_text_packed_position_ids=flow["cfg_text_packed_position_ids"],
+            cfg_text_past_key_values=flow["cfg_text_past_key_values"],
+            cfg_text_key_values_lens=flow["cfg_text_key_values_lens"],
+            cfg_text_packed_key_value_indexes=flow["cfg_text_packed_key_value_indexes"],
+            cfg_img_scale=1.0,
+            enable_taylorseer=False,
+        )
+    return unpacked
 
 
 def decode_latent(bundle, latent: torch.Tensor, resolution: int, device) -> Image.Image:
@@ -204,6 +298,30 @@ def decode_latent(bundle, latent: torch.Tensor, resolution: int, device) -> Imag
     return Image.fromarray(array)
 
 
+def _rgb(image: Image.Image) -> torch.Tensor:
+    import numpy as np
+
+    return torch.from_numpy(np.asarray(image, dtype=np.float32))
+
+
+def mean_absolute_difference(left: Image.Image, right: Image.Image) -> float:
+    if left.size != right.size:
+        raise ValueError("difference images differ in size")
+    return float((_rgb(left) - _rgb(right)).abs().mean())
+
+
+def difference_heatmap(left: Image.Image, right: Image.Image, gain: float = 10.0) -> Image.Image:
+    """Per-pixel mean |left - right|, multiplied by ``gain``, drawn black-red-yellow-white."""
+    if left.size != right.size:
+        raise ValueError("heatmap images differ in size")
+    level = ((_rgb(left) - _rgb(right)).abs().mean(dim=-1) * gain / 255.0).clamp(0, 1)
+    red = (level * 3).clamp(0, 1)
+    green = (level * 3 - 1).clamp(0, 1)
+    blue = (level * 3 - 2).clamp(0, 1)
+    rgb = torch.stack((red, green, blue), dim=-1).mul(255).byte().numpy()
+    return Image.fromarray(rgb)
+
+
 def _wrap_prompt(draw: ImageDraw.ImageDraw, prompt: str, width: int) -> list[str]:
     lines: list[str] = []
     line = ""
@@ -220,9 +338,9 @@ def _wrap_prompt(draw: ImageDraw.ImageDraw, prompt: str, width: int) -> list[str
 
 
 def comparison_strip(prompt: str, panels: list[tuple[str, Image.Image]]) -> Image.Image:
-    """Four columns: the prompt, then native, gen_only_400, and dual_600 at one round."""
-    if len(panels) != 3:
-        raise ValueError("the strip is the prompt plus the three named arms")
+    """Prompt column, then one column per panel. Panels carry their own labels."""
+    if not panels:
+        raise ValueError("the strip needs at least one image")
     text_w = 300
     label_h = 32
     image_h = panels[0][1].height
@@ -242,11 +360,11 @@ def comparison_strip(prompt: str, panels: list[tuple[str, Image.Image]]) -> Imag
     return canvas
 
 
-def _apply_arm(loop, blob, variant: str) -> None:
+def _apply_arm(loop, blob, variant: str, feedback_mode: str) -> None:
     loop.load_state(blob)
     loop.config.variant = variant
     loop.config.correction_rounds = 1
-    loop.config.feedback_mode = "correct"
+    loop.config.feedback_mode = feedback_mode
     loop.config.force_native_bypass = False
     loop.config.force_full_zero_path = False
     loop.config.validate(len(loop.decoder.layers))
@@ -310,37 +428,41 @@ def main(argv: list[str] | None = None) -> None:
                 f"stage {blob.get('stage')} step {blob.get('step')}"
             )
     flow = flow_for_prompt(bundle, prompt, args.resolution, device)
-    nodes, dts = euler_nodes(args.sampler_steps, args.timestep_shift)
+    nodes, _dts = euler_nodes(args.sampler_steps, args.timestep_shift)
     noise = initial_noise(
         int(flow["packed_vae_token_indexes"].shape[0]),
         bundle.model.latent_channel * bundle.model.latent_patch_size ** 2,
         args.seed,
     )
+    donor_flow = flow_for_prompts(
+        bundle, [prompt, SHUFFLE_DONOR_PROMPT], args.resolution, device,
+    )
+    donor_noise = torch.cat((noise, noise), dim=0)
+    if donor_flow["packed_vae_token_indexes"].shape[0] != donor_noise.shape[0]:
+        raise RuntimeError("shuffled pack does not have two copies of the prompt latent")
     args.output.mkdir(parents=True, exist_ok=True)
-    images = []
 
-    def native_fn(state, flow_time):
-        return _native_velocity(
-            bundle.model, flow, state, flow_time,
-            args.cfg_text_scale, args.cfg_renorm_type, args.cfg_renorm_min,
-        )
+    def one_image(flow_inputs, packed_noise, use_loop: bool) -> Image.Image:
+        context = attach_predict_flow(bundle.model, loop) if use_loop else nullcontext()
+        with context:
+            unpacked = generate_latents(bundle.model, flow_inputs, packed_noise, args, device)
+        return decode_latent(bundle, unpacked[0], args.resolution, device)
 
-    latent = sample_arm(bundle.model, flow, noise, nodes, dts, native_fn, device)
-    images.append(("native", decode_latent(bundle, latent, args.resolution, device)))
-    for blob, variant, title in (
-        (gen_blob, "gen_only", "gen_only_400"),
-        (dual_blob, "dual", "dual_600_1round"),
-    ):
-        _apply_arm(loop, blob, variant)
-
-        def loop_fn(state, flow_time, _loop=loop):
-            return _loop_velocity(
-                _loop, bundle.model, flow, state, flow_time,
-                args.cfg_text_scale, args.cfg_renorm_type, args.cfg_renorm_min,
-            )
-
-        latent = sample_arm(bundle.model, flow, noise, nodes, dts, loop_fn, device)
-        images.append((title, decode_latent(bundle, latent, args.resolution, device)))
+    native = one_image(flow, noise, False)
+    _apply_arm(loop, gen_blob, "gen_only", "correct")
+    gen_only = one_image(flow, noise, True)
+    _apply_arm(loop, dual_blob, "dual", "correct")
+    dual = one_image(flow, noise, True)
+    _apply_arm(loop, dual_blob, "dual", "shuffled")
+    shuffled = one_image(donor_flow, donor_noise, True)
+    images = [
+        ("native", native),
+        ("gen_only_400", gen_only),
+        ("dual_600", dual),
+        ("dual_shuffled", shuffled),
+        ("|dual-native|x10", difference_heatmap(dual, native)),
+        ("|dual-gen|x10", difference_heatmap(dual, gen_only)),
+    ]
     strip = comparison_strip(f"[{rank:02d}] {prompt}", images)
     image_path = args.output / f"rank_{rank:02d}.png"
     strip.save(image_path)
@@ -350,12 +472,18 @@ def main(argv: list[str] | None = None) -> None:
         "prompt": prompt,
         "seed": args.seed,
         "arms": [name for name, _image in images],
+        "sampler": "Bagel.generate_image",
+        "loop_velocity": "AnchoredDualStateLoop.predict_flow",
         "sampler_steps": args.sampler_steps,
         "euler_updates": int(nodes.shape[0]),
         "updates_inside_u_0.15_0.65": steps_inside(nodes),
         "correction_rounds": 1,
         "cfg_text_scale": args.cfg_text_scale,
         "cfg_img_scale": 1.0,
+        "shuffle_donor_prompt": SHUFFLE_DONOR_PROMPT,
+        "mean_abs_dual_native": mean_absolute_difference(dual, native),
+        "mean_abs_dual_gen_only": mean_absolute_difference(dual, gen_only),
+        "heatmap_gain": 10.0,
         "image": str(image_path),
     }
     (args.output / f"rank_{rank:02d}.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
