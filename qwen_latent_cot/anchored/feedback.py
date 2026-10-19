@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -49,30 +50,37 @@ def _small_linear(in_features: int, out_features: int, *, std: float = PROJECTIO
 
 
 class FeedbackStateUpdater(nn.Module):
-    """``M_{r+1} = U_phi(M_r, O_r)``. The state is not written into GEN tokens."""
+    """``M_{r+1} = base + U_phi(base + O_r)``. The state is not written into GEN tokens.
+
+    A zero state, which is the initialization, uses the observation as ``base``.
+    Later rounds keep that state and add a pre-norm residual, so the update does
+    not replace the previous magnitude with a normalized vector.
+    """
 
     def __init__(self, hidden: int, slots: int, rank: int):
         super().__init__()
         self.slots = slots
-        self.slots_embed = nn.Parameter(torch.empty(slots, hidden))
-        nn.init.normal_(self.slots_embed, std=1e-3)
-        self.norm_m = RMSNorm(hidden)
-        self.norm_o = RMSNorm(hidden)
+        self.hidden = hidden
+        self.norm = RMSNorm(hidden)
         self.down = _small_linear(hidden, rank)
         self.up = _small_linear(rank, hidden, std=OUTPUT_INIT_STD)
 
     def initial(self, samples: int, like: torch.Tensor, branch: str, flow_time: float) -> FeedbackState:
-        value = self.slots_embed.to(device=like.device, dtype=like.dtype).expand(samples, -1, -1)
-        # expand shares storage; later in-place intervention must not hit the parameter.
-        return FeedbackState(value.contiguous(), branch, 0, float(flow_time))
+        value = torch.zeros(samples, self.slots, self.hidden, device=like.device, dtype=like.dtype)
+        return FeedbackState(value, branch, 0, float(flow_time))
 
     def forward(self, state: FeedbackState, observation: torch.Tensor) -> FeedbackState:
         if observation.shape != state.value.shape:
             raise ValueError("observation and feedback slots have different shapes")
-        restored = state.value.dtype
-        delta = self.up(self.down(self.norm_o(observation.float())))
-        value = self.norm_m(state.value.float()) + delta
-        return FeedbackState(value.to(dtype=restored), state.branch, state.round_index + 1, state.flow_time)
+        obs_f = observation.float()
+        state_f = state.value.float()
+        # The whole initial state is zero. One sample being zero does not count.
+        empty = state_f.detach().abs().max().item() == 0.0
+        base = obs_f if empty else state_f
+        joint = self.norm(base + obs_f)
+        delta = self.up(F.silu(self.down(joint)))
+        value = (base + delta).to(dtype=state.value.dtype)
+        return FeedbackState(value, state.branch, state.round_index + 1, state.flow_time)
 
 
 def intervene_feedback(

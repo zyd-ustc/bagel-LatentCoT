@@ -179,6 +179,7 @@ class AnchoredDualStateLoop(nn.Module):
         num_steps: int | None = None,
         velocity_head=None,
         train: bool | None = None,
+        feedback_donor: FeedbackState | None = None,
     ) -> LoopOutput:
         """One CFG branch at one ``(x_t, t)``. Rounds reuse that same anchor.
 
@@ -195,7 +196,9 @@ class AnchoredDualStateLoop(nn.Module):
         ``round_velocities[0]`` is the native velocity. Each correction appends
         the velocity after that round's single post. The sampler uses the last
         one. ``round_deltas`` and ``round_observations`` have one entry per
-        correction. A gen-only observation entry is ``None``.
+        correction. A gen-only observation entry is ``None``. While the module
+        is training, a later round detaches the previous body hidden before the
+        adapter. The feedback state is passed through unchanged.
         """
         if self.config.observation_source_mode != "gen_full_query":
             raise RuntimeError(
@@ -209,6 +212,8 @@ class AnchoredDualStateLoop(nn.Module):
             flow_time = branch.flow_time
         if flow_time is None:
             raise ValueError("flow time is required")
+        if feedback_donor is not None and self.config.feedback_mode != "shuffled":
+            raise ValueError("a feedback donor is only used when feedback_mode is shuffled")
         flow_time = float(flow_time)
         if train is None:
             train = torch.is_grad_enabled() and any(parameter.requires_grad for parameter in self.parameters())
@@ -250,6 +255,10 @@ class AnchoredDualStateLoop(nn.Module):
         boundary = self.config.body_start
         for round_index in range(self.config.correction_rounds):
             observation = None
+            # The previous body activation is not a residual target. Stop it
+            # from accumulating into this round's adapter gradient. Memory
+            # state stays attached and is still passed into the adapter.
+            adapter_hidden = current.detach() if round_index > 0 and self.training else current
             if self.config.variant == "dual":
                 if not self.observer.loaded and not self.config.allow_unloaded_observer:
                     raise RuntimeError(
@@ -290,12 +299,12 @@ class AnchoredDualStateLoop(nn.Module):
                     self.observation_trace[0]["boundary_entropy"] = native_entropy
                 state = self.updater(state, observation)
                 state = intervene_feedback(
-                    state, self.config.feedback_mode, initial=initial,
+                    state, self.config.feedback_mode, initial=initial, donor=feedback_donor,
                 )
-                delta = self.adapter(current, state, anchor, flow_time, branch)
+                delta = self.adapter(adapter_hidden, state, anchor, flow_time, branch)
             elif self.config.variant == "gen_only":
                 # H_{r+1} = B(P + ΔH(H_r, P_t, t)). No M_r and no UND read.
-                delta = self.adapter.state_free_delta(current, anchor, flow_time, branch)
+                delta = self.adapter.state_free_delta(adapter_hidden, anchor, flow_time, branch)
             else:
                 raise ValueError(self.config.variant)
             if self.config.state_mode == "anchored":

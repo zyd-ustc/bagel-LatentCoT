@@ -1,6 +1,6 @@
 """GEN-only flow training on 64 devices. Native BAGEL stays frozen.
 
-Each card holds the frozen generator and one or more caption-image pairs.
+Each card holds the frozen generator and one or more image-prompt pairs.
 The step trains the state-free residual and the gate. Memory slots and the
 UND reader are not in the optimizer. Sampling times stay inside the loop
 schedule, so a closed gate still receives a gradient.
@@ -26,7 +26,6 @@ from ..diagnostics.native import device_inputs, empty_cache, text_source
 from ..diagnostics.numerics import autocast_for
 from ..diagnostics.record import FrozenGuard, write_json
 from ..diagnostics.schedule import native_times
-from ..interaction.data import PairSampler, load_pairs
 from .schedule import in_loop_schedule
 
 
@@ -124,6 +123,65 @@ def scheduled_flow_times(config: LoopConfig, sampler_steps: int, timestep_shift:
     return selected
 
 
+def schedule_time_window(config: LoopConfig) -> tuple[float, float]:
+    """BAGEL ``t`` interval for an ``interval`` schedule.
+
+    Progress is ``u = 1 - t``. The default ``u ∈ [0.15, 0.65]`` is
+    ``t ∈ [0.35, 0.85]``.
+    """
+    if config.schedule != "interval":
+        raise ValueError("training samples the interval schedule")
+    t_min = 1.0 - float(config.schedule_end)
+    t_max = 1.0 - float(config.schedule_start)
+    if not 0.0 <= t_min < t_max <= 1.0:
+        raise ValueError("interval schedule does not map to a flow-time window")
+    return t_min, t_max
+
+
+def shift_unit_into_window(
+    unit: torch.Tensor,
+    shift: float,
+    t_min: float,
+    t_max: float,
+) -> torch.Tensor:
+    """Map uniform pre-shift units into shifted ``t`` inside ``[t_min, t_max]``.
+
+    The native map is ``t = shift * u / (1 + (shift - 1) * u)``. Units are
+    drawn on the preimage of that window, so every shifted time lands inside
+    it. The result is clamped back into the window.
+    """
+    low = float(t_min)
+    high = float(t_max)
+    scale = float(shift)
+    if scale <= 0.0:
+        raise ValueError("timestep_shift must be positive")
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError("timestep window must satisfy 0 <= t_min < t_max <= 1")
+    u_min = low / (scale - (scale - 1.0) * low)
+    u_max = high / (scale - (scale - 1.0) * high)
+    if not 0.0 <= u_min < u_max <= 1.0:
+        raise ValueError("shifted timestep window is invalid")
+    u = u_min + (u_max - u_min) * unit.to(dtype=torch.float32)
+    times = (scale * u) / (1.0 + (scale - 1.0) * u)
+    return times.clamp(low, high)
+
+
+def sample_timesteps(
+    batch_size: int,
+    *,
+    timestep_shift: float,
+    device: torch.device,
+    generator: torch.Generator | None = None,
+    t_min: float = 0.35,
+    t_max: float = 0.85,
+) -> torch.Tensor:
+    """Shifted flow times. Every draw is inside ``[t_min, t_max]``."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    unit = torch.rand((batch_size,), generator=generator, dtype=torch.float32)
+    return shift_unit_into_window(unit, timestep_shift, t_min, t_max).to(device=device)
+
+
 def correction_loss(loop: AnchoredDualStateLoop, output, target: torch.Tensor, vae_indexes: torch.Tensor):
     return anchored_loss(
         output.velocity, target, output.native_velocity, output.delta, output.anchor, vae_indexes,
@@ -199,7 +257,7 @@ def paired_latents(x0: torch.Tensor, flow_time: float, noise_seed: int) -> tuple
     return latent, epsilon.float() - x0.float()
 
 
-def forward_correction(loop, model, latent, flow_time: float, flow: dict):
+def forward_correction(loop, model, latent, flow_time: float, flow: dict, *, train: bool = True, feedback_donor=None):
     branch = conditional_branch(flow, flow_time)
     hidden = pack_flow_hidden(
         model, latent, torch.full((latent.shape[0],), flow_time, device=latent.device),
@@ -209,7 +267,8 @@ def forward_correction(loop, model, latent, flow_time: float, flow: dict):
     device = latent.device if isinstance(latent.device, torch.device) else torch.device(latent.device)
     with autocast_for(device):
         return loop.forward_branch(
-            hidden, branch, flow_time=flow_time, velocity_head=model.llm2vae, train=True,
+            hidden, branch, flow_time=flow_time, velocity_head=model.llm2vae, train=train,
+            feedback_donor=feedback_donor,
         )
 
 
@@ -236,6 +295,8 @@ def place_optimizer_state(optimizer) -> None:
 def load_checkpoint(path: str | Path, loop, optimizer, sampler) -> int:
     blob = torch.load(path, map_location="cpu", weights_only=False)
     refuse_legacy_checkpoint(blob)
+    if blob.get("trainer") == "anchored_curriculum":
+        raise ValueError("this checkpoint belongs to the two-stage curriculum")
     if blob.get("variant") != "gen_only":
         raise ValueError("resume requires a gen_only checkpoint")
     loop.load_state(blob)
@@ -245,7 +306,7 @@ def load_checkpoint(path: str | Path, loop, optimizer, sampler) -> int:
     return int(blob["step"])
 
 
-def train_gen_only(loop, bundle, rows, train: GenOnlyTrainConfig, output: Path, *, resume: str | None = None) -> None:
+def train_gen_only(loop, bundle, pairs, train: GenOnlyTrainConfig, output: Path, *, resume: str | None = None) -> None:
     from ..bagel.accelerator import max_memory_allocated, reset_peak_memory_stats, synchronize
     from ..diagnostics.training_logging import configure_logging
 
@@ -255,20 +316,20 @@ def train_gen_only(loop, bundle, rows, train: GenOnlyTrainConfig, output: Path, 
     output = Path(output)
     parameters = select_gen_only_parameters(loop)
     loop.train()
+    sampler = pairs
     if resume:
-        sampler = PairSampler(rows, train.seed)
         optimizer = torch.optim.AdamW(parameters, lr=train.learning_rate, weight_decay=train.weight_decay)
         start = load_checkpoint(resume, loop, optimizer, sampler)
         select_gen_only_parameters(loop)
     else:
         parallel.broadcast_parameters(loop)
-        sampler = PairSampler(rows, train.seed)
         optimizer = torch.optim.AdamW(parameters, lr=train.learning_rate, weight_decay=train.weight_decay)
         start = 0
     bundle.model.eval()
     bundle.vae.eval()
     guard = FrozenGuard(bundle.model, bundle.vae)
     times = scheduled_flow_times(loop.config, train.sampler_steps, train.timestep_shift)
+    t_min, t_max = schedule_time_window(loop.config)
     logger = configure_logging(output)
     reset_peak_memory_stats(bundle.model.language_model.model.embed_tokens.weight.device)
     started_at = time.perf_counter()
@@ -281,7 +342,12 @@ def train_gen_only(loop, bundle, rows, train: GenOnlyTrainConfig, output: Path, 
             "loop": loop.config.to_dict(),
             "train": train.to_dict(),
             "scheduled_flow_times": times,
-            "train_pairs": len(rows),
+            "time_sampling": "shifted_interval",
+            "time_window": [t_min, t_max],
+            "train_pairs": sampler.pair_count,
+            "text_field": sampler.text_field,
+            "source_kind": sampler.source_kind,
+            "corpus_fingerprint": sampler.fingerprint,
             "trainable": sum(parameter.numel() for parameter in parameters),
         })
     parallel.barrier()
@@ -289,9 +355,15 @@ def train_gen_only(loop, bundle, rows, train: GenOnlyTrainConfig, output: Path, 
         step_started = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         batch = sampler.take(train.global_batch)
+        generator = torch.Generator()
+        generator.manual_seed(sampler.rng.randrange(2**31))
+        flow_times = sample_timesteps(
+            len(batch), timestep_shift=train.timestep_shift, device=device,
+            generator=generator, t_min=t_min, t_max=t_max,
+        )
         draws = [
-            (sampler.rng.choice(times), sampler.rng.randrange(2**63 - 1))
-            for _ in batch
+            (float(flow_times[index]), sampler.rng.randrange(2**63 - 1))
+            for index in range(len(batch))
         ]
         totals = [0.0, 0.0, 0.0]
         for index in range(parallel.rank(), train.global_batch, parallel.world_size()):
@@ -304,6 +376,8 @@ def train_gen_only(loop, bundle, rows, train: GenOnlyTrainConfig, output: Path, 
             latent, target = paired_latents(x0, flow_time, noise_seed)
             flow = conditional_flow(bundle, row["caption"], train.resolution)
             output = forward_correction(loop, bundle.model, latent, flow_time, flow)
+            if not output.corrected:
+                raise RuntimeError("training flow time fell outside the correction window")
             loss, parts = correction_loss(
                 loop, output, target, flow["packed_vae_token_indexes"],
             )

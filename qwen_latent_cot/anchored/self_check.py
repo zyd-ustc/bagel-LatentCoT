@@ -26,7 +26,7 @@ from qwen_latent_cot.anchored.feedback import (
 )
 from qwen_latent_cot.anchored.legacy import refuse_legacy_checkpoint
 from qwen_latent_cot.anchored.loop import AnchoredDualStateLoop
-from qwen_latent_cot.anchored.loss import anchored_loss
+from qwen_latent_cot.anchored.loss import anchored_loss, focal_flow_loss
 from qwen_latent_cot.anchored.native_path import BranchContext
 from qwen_latent_cot.anchored.observer import observation_slots
 from qwen_latent_cot.anchored.schedule import in_loop_schedule, selected_steps
@@ -1035,15 +1035,15 @@ def check_round_velocities_and_supervision():
     moved = round_velocity_report(first.round_velocities, first.round_velocities[1].detach())
     if not moved["corrections"][0]["error_fell"] or not moved["corrections"][1]["error_rose"]:
         raise AssertionError("round 2 versus round 1 was not visible in the velocity report")
-    mse1 = (first.round_velocities[1].float() - target.float()).pow(2).mean()
-    if not torch.equal(first_loss, mse1):
+    flow1 = focal_flow_loss(first.round_velocities[1], target, first.native_velocity)
+    if not torch.equal(first_loss, flow1):
         raise AssertionError("a weight of (1, 0) did not keep only the first correction")
     if _grad_mass(first.round_velocities[1].grad) == 0.0 or first.round_velocities[2].grad is not None:
         raise AssertionError("the first-round weight supervised another velocity")
 
     second, second_loss, parts = supervise((0.0, 1.0))
-    mse2 = (second.round_velocities[2].float() - target.float()).pow(2).mean()
-    if not torch.equal(second_loss, mse2):
+    flow2 = focal_flow_loss(second.round_velocities[2], target, second.native_velocity)
+    if not torch.equal(second_loss, flow2):
         raise AssertionError("a weight of (0, 1) did not keep only the last correction")
     if second.round_velocities[1].grad is not None or _grad_mass(second.round_velocities[2].grad) == 0.0:
         raise AssertionError("the last-round weight supervised another velocity")
@@ -1052,8 +1052,8 @@ def check_round_velocities_and_supervision():
 
     mixed, mixed_loss, _parts = supervise((1.0, 0.25))
     expected = (
-        (mixed.round_velocities[1].float() - target.float()).pow(2).mean()
-        + 0.25 * (mixed.round_velocities[2].float() - target.float()).pow(2).mean()
+        focal_flow_loss(mixed.round_velocities[1], target, mixed.native_velocity)
+        + 0.25 * focal_flow_loss(mixed.round_velocities[2], target, mixed.native_velocity)
     )
     if not torch.equal(mixed_loss, expected):
         raise AssertionError("unequal round weights did not match the weighted sum")
@@ -1079,8 +1079,8 @@ def check_round_velocities_and_supervision():
         branch.packed_vae_token_indexes, lambda_anchor=0.0, lambda_entry=0.0,
     )
     default_loss.backward()
-    final_mse = (output.velocity.float() - target.float()).pow(2).mean()
-    if not torch.equal(default_loss, final_mse) or output.round_velocities[1].grad is not None:
+    final_flow = focal_flow_loss(output.velocity, target, output.native_velocity)
+    if not torch.equal(default_loss, final_flow) or output.round_velocities[1].grad is not None:
         raise AssertionError("the default flow loss supervised an earlier round")
 
 

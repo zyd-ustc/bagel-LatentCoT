@@ -12,7 +12,10 @@ from qwen_latent_cot.anchored.gen_only_train import (
     correction_loss,
     require_gen_only_loop,
     require_sixty_four,
+    sample_timesteps,
+    schedule_time_window,
     scheduled_flow_times,
+    shift_unit_into_window,
     select_gen_only_parameters,
 )
 from qwen_latent_cot.anchored.legacy import refuse_legacy_checkpoint
@@ -57,6 +60,20 @@ def test_scheduled_times_stay_inside_the_loop_window():
     assert not in_loop_schedule(config, flow_time=0.95)
     assert in_loop_schedule(config, flow_time=0.6)
     assert any(not in_loop_schedule(config, flow_time=float(value)) for value in grid)
+    t_min, t_max = schedule_time_window(config)
+    assert t_min == pytest.approx(0.35) and t_max == pytest.approx(0.85)
+    ends = shift_unit_into_window(torch.tensor([0.0, 1.0]), 3.0, t_min, t_max)
+    assert ends[0].item() == pytest.approx(t_min)
+    assert ends[1].item() == pytest.approx(t_max)
+    generator = torch.Generator().manual_seed(17)
+    drawn = sample_timesteps(
+        2048, timestep_shift=3.0, device=torch.device("cpu"), generator=generator,
+        t_min=t_min, t_max=t_max,
+    )
+    assert drawn.shape == (2048,)
+    assert float(drawn.min()) >= t_min - 1e-6
+    assert float(drawn.max()) <= t_max + 1e-6
+    assert all(in_loop_schedule(config, flow_time=float(value)) for value in drawn[::128])
 
 
 def test_gen_only_step_trains_the_gate_and_leaves_memory_out():

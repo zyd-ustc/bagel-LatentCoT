@@ -1,0 +1,35 @@
+{
+  "global_batch": 64,
+  "weight_decay": 0.0,
+  "gradient_clip": 1.0,
+  "seed": 17,
+  "resolution": 512,
+  "sampler_steps": 50,
+  "timestep_shift": 3.0,
+  "posterior_seed": 0,
+  "lambda_improve": 1.0,
+  "improvement_margin": 1e-4,
+  "val_images": 128,
+  "stages": [
+    {
+      "name": "gen_only",
+      "steps": 400,
+      "learning_rate": 1e-4,
+      "output_learning_rate": 2e-5,
+      "warmup_steps": 20,
+      "correction_rounds": 1,
+      "second_round_at": null,
+      "save_steps": [200, 400]
+    },
+    {
+      "name": "dual",
+      "steps": 600,
+      "learning_rate": 1e-4,
+      "output_learning_rate": 2e-5,
+      "warmup_steps": 20,
+      "correction_rounds": 1,
+      "second_round_at": 301,
+      "save_steps": [300, 600]
+    }
+  ]
+}

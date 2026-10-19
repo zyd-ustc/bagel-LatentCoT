@@ -11,8 +11,9 @@ from .feedback import OUTPUT_INIT_STD, RMSNorm, _small_linear
 from .native_path import BranchContext, sample_groups
 
 
-# Backward scale used while |gamma| is smaller than this value. The forward
-# product still uses the true gate, so an exact zero writes an exact zero.
+# Backward scale used while the nonnegative gate is below this value. The
+# forward product uses max(gamma, 0), so a zero or negative gate writes an
+# exact zero.
 GATE_WARMUP_SCALE = 1e-3
 
 
@@ -47,25 +48,38 @@ def bound_residual(
     return bounded
 
 
-def _gated_product(scale: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
-    """Float32 ``gamma * delta``. The forward value is the true product.
+def _nonnegative_gate(gamma: torch.Tensor) -> torch.Tensor:
+    """Forward scale is ``max(gamma, 0)``.
 
-    A zero gate therefore stays an exact zero. While ``gamma`` requires grad
-    and its absolute value is below ``GATE_WARMUP_SCALE``, the adapter
-    backward uses that warmup scale and the gate's sign. Exact zero uses the
-    positive scale. The gate backward still multiplies by ``delta``. A
-    detached or frozen scale is a plain product, so ``force_full_zero_path``
-    does not train the adapter.
+    The backward stays the identity, including below zero and at the zero
+    initialization. A negative parameter can move back above zero, and the
+    residual it multiplies does not change sign.
+    """
+    forward = torch.where(gamma < 0, gamma.new_zeros(()), gamma)
+    if not gamma.requires_grad:
+        return forward
+    restore = torch.where(gamma < 0, gamma - gamma.detach(), gamma.new_zeros(()))
+    return forward + restore
+
+
+def _gated_product(scale: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+    """Float32 ``max(gamma, 0) * delta``. The forward value is that product.
+
+    A zero or negative gate writes an exact zero. While the gate requires
+    grad and the nonnegative scale is below ``GATE_WARMUP_SCALE``, the adapter
+    backward uses that positive floor. The gate backward still multiplies by
+    ``delta``. A detached or frozen scale is a plain product, so
+    ``force_full_zero_path`` does not train the adapter.
     """
     gamma = scale.to(dtype=torch.float32).reshape(())
     values = delta.to(dtype=torch.float32)
-    if not (torch.is_grad_enabled() and gamma.requires_grad):
-        return gamma * values
-    detached = gamma.detach()
-    sign = torch.where(detached == 0, detached.new_ones(()), detached.sign())
+    nonnegative = _nonnegative_gate(gamma)
+    if not (torch.is_grad_enabled() and nonnegative.requires_grad):
+        return nonnegative * values
+    detached = nonnegative.detach()
     warmup = detached.new_tensor(GATE_WARMUP_SCALE)
-    surrogate = torch.where(detached.abs() < GATE_WARMUP_SCALE, sign * warmup, detached).detach()
-    return values * surrogate + values.detach() * (gamma - surrogate)
+    surrogate = torch.where(detached < GATE_WARMUP_SCALE, warmup, detached).detach()
+    return values * surrogate + values.detach() * (nonnegative - surrogate)
 
 
 def written_residual(

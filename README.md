@@ -1,12 +1,12 @@
 # BAGEL-LatentCoT
 
-当前实验线是 **Anchored Dual-State Loop**。冻结原生 BAGEL。在同一个 flow 时间步里，GEN body 以原生入口加一个有界残差重入。旁路读者是独立冻结的 Observation 读出：中性种子、全部层、full-query GEN KV，权重来自 Observation checkpoint 的拷贝，不写回生成模型，也不把 memory token 写进 GEN attention。输入模式由 checkpoint 的训练任务解析为 `gen_full_query`。`prompt_and_gen` 保留为名字，当前前向不会拼接 Prompt KV。第二轮读出是 Anchored Observation：复用原生 Pre KV，Body 与 Post 用本轮重算结果。读者从进入 Body 的隐状态继续，Pre 层不重算；交界层的注意力熵记在 observation trace 上，只表示拼接处是否跳变。图像 token 用 4 头 Cross-Attention 按内容读取各个 Memory slot，总宽度仍是 rank，每个头在打分前对 Q、K 做 RMSNorm，再经残差门控写回 Body 入口。写入量是 `Bound(gamma * delta)`，上界作用在 Gate 之后的残差上。训练和推理都读取可学习 gate。gate 精确为 0 时写入仍是精确 0，速度与原生前向一致。训练在 |γ| 小于 1e-3 时用直线估计把损失梯度传给 adapter，gate 的梯度仍乘 float32 残差。`force_native_bypass` 与 `force_full_zero_path` 是独立的实验开关。Observer 的 query 是中性种子嵌入，并经过全部 UND 层；Body 区间只决定 GEN 重入位置。`gen_only` 对照重复 GEN body，残差只依赖当前 hidden 和原生入口，不携带 Memory，也不读取 UND。两轮修正返回完整的 \(v^{(0)}, v^{(1)}, v^{(2)}\)，以及每一轮的写入残差和观测。默认损失只监督最后一轮速度。`round_loss_weights` 可以给每一轮单独的非负权重。`round_velocity_report` 记录每一轮相对目标的误差是下降还是上升，以及相对原生速度的漂移。默认修正窗口是进度 `u ∈ [0.15, 0.65]`（`t ∈ [0.35, 0.85]`），更早的高噪声步保持原生前向。Body 区间仍是候选 `[20, 28)`。
+当前实验线是 **Anchored Dual-State Loop**。冻结原生 BAGEL。在同一个 flow 时间步里，GEN body 以原生入口加一个有界残差重入。旁路读者是独立冻结的 Observation 读出：中性种子、全部层、full-query GEN KV，权重来自 Observation checkpoint 的拷贝，不写回生成模型，也不把 memory token 写进 GEN attention。输入模式由 checkpoint 的训练任务解析为 `gen_full_query`。`prompt_and_gen` 保留为名字，当前前向不会拼接 Prompt KV。第二轮读出是 Anchored Observation：复用原生 Pre KV，Body 与 Post 用本轮重算结果。读者从进入 Body 的隐状态继续，Pre 层不重算；交界层的注意力熵记在 observation trace 上，只表示拼接处是否跳变。图像 token 用 4 头 Cross-Attention 按内容读取各个 Memory slot，总宽度仍是 rank，每个头在打分前对 Q、K 做 RMSNorm，再经残差门控写回 Body 入口。写入量是 `Bound(gamma * delta)`，上界作用在 Gate 之后的残差上。训练和推理都读取可学习 gate。gate 精确为 0 时写入仍是精确 0，速度与原生前向一致。训练在 gate 小于 1e-3 时，adapter 的反向缩放是正的 1e-3，前向仍乘 max(gate, 0)，gate 的梯度仍乘 float32 残差。负的 gate 写成精确 0，不会把这个缩放翻成负数。`force_native_bypass` 与 `force_full_zero_path` 是独立的实验开关。Observer 的 query 是中性种子嵌入，并经过全部 UND 层；Body 区间只决定 GEN 重入位置。`gen_only` 对照重复 GEN body，残差只依赖当前 hidden 和原生入口，不携带 Memory，也不读取 UND。两轮修正返回完整的 \(v^{(0)}, v^{(1)}, v^{(2)}\)，以及每一轮的写入残差和观测。默认损失只监督最后一轮速度。`round_loss_weights` 可以给每一轮单独的非负权重。`round_velocity_report` 记录每一轮相对目标的误差是下降还是上升，以及相对原生速度的漂移。默认修正窗口是进度 `u ∈ [0.15, 0.65]`（`t ∈ [0.35, 0.85]`），更早的高噪声步保持原生前向。Body 区间仍是候选 `[20, 28)`。
 
 ```bash
 python -m qwen_latent_cot.anchored.cli self-check
 ```
 
-GEN-only 的 64 卡训练入口是 `scripts/anchored_gen_only_64.sh`。四个节点各 16 张卡。它只更新无状态残差和 gate。
+GEN-only 的 64 卡训练入口是 `scripts/anchored_gen_only_64.sh`。四个实例各 16 张卡，平台在每个实例上执行同一条命令。部署见 [GEN-only 64 卡部署](docs/anchored_gen_only_64.md)。它只更新无状态残差和 gate。`GEN_ONLY_TRAIN` 可以是现有 annotation index 目录：只取 generation 的 train 视图，条件文本是和图片配对的 `goal_prompt`。两阶段日程是 `scripts/anchored_train_64.sh`：先 400 步 GEN-only，再 600 步 Dual，说明见 [两阶段日程](docs/anchored_curriculum_64.md)。这条日程还在本地，训练没有启动。
 
 配置见 `configs/anchored_dual_state_loop.json`，合同见 [Anchored Dual-State Loop](docs/anchored_dual_state_loop.md)。
 

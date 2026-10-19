@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON=${MODEL_PYTHON:-/data/zyd_workspace/bagel-LatentCoT/venvs/bagel-NPU/bin/python}
 MODEL=${MODEL_PATH:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}
-TRAIN=${GEN_ONLY_TRAIN:?caption-image train jsonl with absolute image paths}
+TRAIN=${GEN_ONLY_TRAIN:?caption-image jsonl, or the annotation-index corpus directory}
 RUN=${RUN_DIR:?fresh output directory}
 LOOP_CONFIG=${GEN_ONLY_LOOP_CONFIG:-$ROOT/configs/anchored_gen_only.json}
 TRAIN_CONFIG=${GEN_ONLY_TRAIN_CONFIG:-$ROOT/configs/anchored_gen_only_train.json}
