@@ -1,7 +1,7 @@
 """Within-step anchored loop. The sampler does not advance inside a round."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 from torch import nn
@@ -19,7 +19,7 @@ from .native_path import (
     snapshot_cache,
     velocity_from_hidden,
 )
-from .observer import TrainedObservationObserver
+from .observer import TrainedObservationObserver, boundary_attention_entropy
 from .schedule import in_loop_schedule
 
 
@@ -246,6 +246,8 @@ class AnchoredDualStateLoop(nn.Module):
         round_deltas = []
         round_observations = []
         scale = self._scale(anchor, train=train)
+        reader_prefix = None
+        boundary = self.config.body_start
         for round_index in range(self.config.correction_rounds):
             observation = None
             if self.config.variant == "dual":
@@ -254,11 +256,38 @@ class AnchoredDualStateLoop(nn.Module):
                         "the dual-state reader has no trained observation checkpoint. "
                         "A frozen copy of the native UND projections is not the verified readout."
                     )
-                self.observation_trace.append(_observation_record(
+                record = _observation_record(
                     captured, pre_kv, body_kv, post_kv, round_index=round_index,
                     keep=self.config.log_intermediates,
-                ))
-                observation = self.observer.read(captured, branch)
+                )
+                self.observation_trace.append(record)
+                pre_ptrs = record["pre_ptrs"]
+                if round_index == 0:
+                    observation, reader_prefix = self.observer.read_with_boundary(
+                        captured, branch, boundary,
+                    )
+                    reader_prefix = replace(reader_prefix, pre_ptrs=tuple(pre_ptrs))
+                else:
+                    # Pre KV is unchanged, so the reader state entering the body
+                    # is unchanged. Resume there. The stitched Body and Post KV
+                    # are still a different source from the C2 capture.
+                    observation = self.observer.read_from_boundary(
+                        captured, branch, reader_prefix, pre_ptrs,
+                    )
+                    native_entropy = boundary_attention_entropy(
+                        self.observer.layers[boundary], reader_prefix.queries, self.decoder,
+                        reader_prefix.positions, reader_prefix.lengths, reader_prefix.native_boundary,
+                    )
+                    anchored_entropy = boundary_attention_entropy(
+                        self.observer.layers[boundary], reader_prefix.queries, self.decoder,
+                        reader_prefix.positions, reader_prefix.lengths, captured[boundary],
+                    )
+                    record["boundary_layer"] = boundary
+                    record["boundary_entropy"] = anchored_entropy
+                    record["boundary_entropy_native"] = native_entropy
+                    record["boundary_entropy_delta"] = anchored_entropy - native_entropy
+                    self.observation_trace[0]["boundary_layer"] = boundary
+                    self.observation_trace[0]["boundary_entropy"] = native_entropy
                 state = self.updater(state, observation)
                 state = intervene_feedback(
                     state, self.config.feedback_mode, initial=initial,
@@ -270,8 +299,8 @@ class AnchoredDualStateLoop(nn.Module):
             else:
                 raise ValueError(self.config.variant)
             if self.config.state_mode == "anchored":
-                # Cap gamma * delta. The loss sees this written residual, so a
-                # closed gate blocks adapter gradients and still trains the gate.
+                # Cap gamma * delta. A zero gate writes an exact zero. Training
+                # warmup still carries a residual gradient to the adapter.
                 written = written_residual(
                     delta, scale, anchor, self.config.max_delta_rms_ratio,
                     branch.packed_vae_token_indexes,

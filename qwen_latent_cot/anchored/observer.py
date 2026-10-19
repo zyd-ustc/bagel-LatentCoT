@@ -9,13 +9,14 @@ not trained, so the reader uses those native modules directly.
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 
 import torch
 from torch import nn
 
-from ..diagnostics.memory import rope_for, und_block
+from ..diagnostics.memory import join_prefix, project, rope_for, rotate, und_block
 from ..diagnostics.visual import observation_readout_keys
 from ..diagnostics.visual_record import FORMAT_VERSION, STAGES
 from .native_path import BranchContext, sample_groups
@@ -63,6 +64,58 @@ class _UndReadLayer(nn.Module):
         self.self_attn = _UndReadAttention(source.self_attn)
 
 
+@dataclass(frozen=True)
+class ReaderPrefix:
+    """Hidden state entering the first GEN body layer after the native Pre KV.
+
+    Later rounds reuse it because those Pre objects do not change. ``queries``
+    is detached: the prefix has no ADSL parameters. ``native_boundary`` is the
+    KV the first read attended at that layer.
+    """
+
+    queries: torch.Tensor
+    positions: torch.Tensor
+    lengths: tuple[int, ...]
+    boundary: int
+    native_boundary: object
+    pre_ptrs: tuple[int, ...] = ()
+
+
+def _seed_queries(embed, seed_token_ids, branch: BranchContext, slots: int, position_start: int):
+    if seed_token_ids is None or len(seed_token_ids) != slots:
+        raise RuntimeError("observation readout needs one neutral seed token per slot")
+    sequence = int(branch.query_lens.sum())
+    samples = len(sample_groups(branch, sequence))
+    ids = torch.tensor(seed_token_ids, device=branch.query_lens.device, dtype=torch.long)
+    queries = embed(ids.repeat(samples))
+    positions = torch.arange(position_start, position_start + slots, device=queries.device).repeat(samples)
+    return queries, positions, (slots,) * samples, samples, sequence
+
+
+def _attend(layers, rope_decoder, queries, positions, lengths, captured, sequence: int, start: int, end: int):
+    """Same-layer recurrence. ``start == end`` keeps ``queries`` unchanged."""
+    query_positions = set(positions.tolist())
+    for index in range(start, end):
+        layer = layers[index]
+        source = captured[index]
+        if source.layer != index or source.expert != "mixed_und_gen" or not source.rotated:
+            raise ValueError("observation source must be same-layer full-query rotated GEN KV")
+        if not source.token_roles or set(source.token_roles) - {"boundary", "image"} or "image" not in source.token_roles:
+            raise ValueError("observation source must be the GEN query, with image tokens and no prompt KV")
+        if not source.positions or set(source.positions) & query_positions:
+            raise ValueError("GEN source positions are missing or overlap observer slots")
+        if sum(source.lengths) != sequence:
+            raise ValueError("full-query source must cover the packed GEN query")
+        rope = rope_for(rope_decoder, queries, positions)
+        queries = und_block(layer, queries, rope, lengths, source, causal=False)
+    return queries
+
+
+def _require_full_capture(captured, depth: int) -> None:
+    if captured is None or tuple(sorted(captured)) != tuple(range(depth)):
+        raise ValueError("trained observation reads GEN KV at every layer")
+
+
 def observation_slots(
     layers,
     embed,
@@ -81,32 +134,100 @@ def observation_slots(
     layer subset. A later ADSL round may pass recomputed Body and Post KV
     through this same recurrence; that source is a separate combination.
     """
-    if seed_token_ids is None or len(seed_token_ids) != slots:
-        raise RuntimeError("observation readout needs one neutral seed token per slot")
     depth = len(layers)
-    if captured is None or tuple(sorted(captured)) != tuple(range(depth)):
-        raise ValueError("trained observation reads GEN KV at every layer")
-    sequence = int(branch.query_lens.sum())
-    groups = sample_groups(branch, sequence)
-    samples = len(groups)
-    ids = torch.tensor(seed_token_ids, device=branch.query_lens.device, dtype=torch.long)
-    queries = embed(ids.repeat(samples))
-    positions = torch.arange(position_start, position_start + slots, device=queries.device).repeat(samples)
-    lengths = (slots,) * samples
-    query_positions = set(positions.tolist())
-    for index, layer in enumerate(layers):
-        source = captured[index]
-        if source.layer != index or source.expert != "mixed_und_gen" or not source.rotated:
-            raise ValueError("observation source must be same-layer full-query rotated GEN KV")
-        if not source.token_roles or set(source.token_roles) - {"boundary", "image"} or "image" not in source.token_roles:
-            raise ValueError("observation source must be the GEN query, with image tokens and no prompt KV")
-        if not source.positions or set(source.positions) & query_positions:
-            raise ValueError("GEN source positions are missing or overlap observer slots")
-        if sum(source.lengths) != sequence:
-            raise ValueError("full-query source must cover the packed GEN query")
-        rope = rope_for(rope_decoder, queries, positions)
-        queries = und_block(layer, queries, rope, lengths, source, causal=False)
+    _require_full_capture(captured, depth)
+    queries, positions, lengths, samples, sequence = _seed_queries(
+        embed, seed_token_ids, branch, slots, position_start,
+    )
+    queries = _attend(layers, rope_decoder, queries, positions, lengths, captured, sequence, 0, depth)
     return queries.view(samples, slots, queries.shape[-1])
+
+
+def observation_with_prefix(
+    layers,
+    embed,
+    rope_decoder,
+    seed_token_ids,
+    captured,
+    branch: BranchContext,
+    slots: int,
+    position_start: int,
+    boundary: int,
+) -> tuple[torch.Tensor, ReaderPrefix]:
+    """Full recurrence, plus the hidden state entering ``boundary``.
+
+    The returned slots match ``observation_slots``. ``boundary`` is the first
+    GEN body layer. Layers before it attend only to native Pre KV.
+    """
+    depth = len(layers)
+    if not 0 <= boundary < depth:
+        raise ValueError("reader prefix boundary is outside the decoder")
+    _require_full_capture(captured, depth)
+    queries, positions, lengths, samples, sequence = _seed_queries(
+        embed, seed_token_ids, branch, slots, position_start,
+    )
+    entering = _attend(layers, rope_decoder, queries, positions, lengths, captured, sequence, 0, boundary)
+    final = _attend(layers, rope_decoder, entering, positions, lengths, captured, sequence, boundary, depth)
+    prefix = ReaderPrefix(
+        entering.detach(), positions.detach(), lengths, boundary, captured[boundary],
+    )
+    return final.view(samples, slots, final.shape[-1]), prefix
+
+
+def observation_from_prefix(
+    layers,
+    rope_decoder,
+    prefix: ReaderPrefix,
+    captured,
+    branch: BranchContext,
+    slots: int,
+    pre_ptrs: tuple[int, ...],
+) -> torch.Tensor:
+    """Continue a cached prefix. Layers before ``prefix.boundary`` do not run."""
+    depth = len(layers)
+    if tuple(pre_ptrs) != tuple(prefix.pre_ptrs):
+        raise RuntimeError(
+            "anchored observation prefix KV changed; the cached reader state belongs to the native Pre KV"
+        )
+    _require_full_capture(captured, depth)
+    sequence = int(branch.query_lens.sum())
+    samples = len(sample_groups(branch, sequence))
+    if prefix.queries.shape[0] != samples * slots:
+        raise ValueError("cached reader state does not match this packed branch")
+    final = _attend(
+        layers, rope_decoder, prefix.queries, prefix.positions, prefix.lengths,
+        captured, sequence, prefix.boundary, depth,
+    )
+    return final.view(samples, slots, final.shape[-1])
+
+
+def boundary_attention_entropy(layer, queries, rope_decoder, positions, lengths, source) -> float:
+    """Mean attention entropy at one reader layer. A measurement, not a verdict.
+
+    The scores follow the same Q/K, RoPE, source join, and head grouping as
+    ``und_block``. Comparing the native and stitched sources at the first body
+    layer shows whether that boundary jumps. It does not show that the stitch
+    matches the C2 training distribution.
+    """
+    with torch.no_grad():
+        rope = rope_for(rope_decoder, queries, positions)
+        attention = layer.self_attn
+        query, key, value = project(attention, layer.input_layernorm(queries))
+        query, key = rotate(query, rope), rotate(key, rope)
+        key, _value, key_lengths = join_prefix(source, key, value, lengths)
+        groups = query.shape[1] // key.shape[1]
+        scale = query.shape[-1] ** -0.5
+        query_offset = key_offset = 0
+        terms = []
+        for query_count, key_count in zip(lengths, key_lengths):
+            left = query[query_offset:query_offset + query_count].float().transpose(0, 1)
+            right = key[key_offset:key_offset + key_count].float().transpose(0, 1)
+            right = right.repeat_interleave(groups, 0)
+            weights = torch.softmax(torch.matmul(left, right.transpose(-1, -2)) * scale, dim=-1)
+            terms.append(-(weights * weights.clamp_min(1e-12).log()).sum(dim=-1))
+            query_offset += query_count
+            key_offset += key_count
+        return float(torch.cat([term.reshape(-1) for term in terms]).mean())
 
 
 class TrainedObservationObserver(nn.Module):
@@ -211,4 +332,17 @@ class TrainedObservationObserver(nn.Module):
         return observation_slots(
             self.layers, self.embed, self._rope_owner, self.seed_token_ids, captured,
             branch, self.slots, self.position_start,
+        )
+
+    def read_with_boundary(self, captured: dict, branch: BranchContext, boundary: int):
+        """First read. Slots match ``read``; the prefix enters the body layer."""
+        return observation_with_prefix(
+            self.layers, self.embed, self._rope_owner, self.seed_token_ids, captured,
+            branch, self.slots, self.position_start, boundary,
+        )
+
+    def read_from_boundary(self, captured: dict, branch: BranchContext, prefix: ReaderPrefix, pre_ptrs):
+        """Later read. Pre layers are not run."""
+        return observation_from_prefix(
+            self.layers, self._rope_owner, prefix, captured, branch, self.slots, tuple(pre_ptrs),
         )

@@ -48,8 +48,14 @@ def test_scheduled_times_stay_inside_the_loop_window():
     config = LoopConfig.from_json(ROOT / "configs/anchored_gen_only.json")
     selected = scheduled_flow_times(config, 50, 3.0)
     grid = native_times({"sampler_steps": 50, "timestep_shift": 3.0})
+    assert config.schedule == "interval"
+    assert config.schedule_start == 0.15 and config.schedule_end == 0.65
     assert selected
     assert all(in_loop_schedule(config, flow_time=value) for value in selected)
+    assert all(0.35 - 1e-6 <= float(value) <= 0.85 + 1e-6 for value in selected)
+    assert any(float(value) > 0.85 for value in grid)
+    assert not in_loop_schedule(config, flow_time=0.95)
+    assert in_loop_schedule(config, flow_time=0.6)
     assert any(not in_loop_schedule(config, flow_time=float(value)) for value in grid)
 
 
@@ -61,13 +67,12 @@ def test_gen_only_step_trains_the_gate_and_leaves_memory_out():
     names = {name for name, parameter in loop.named_parameters() if parameter.requires_grad}
     assert any(name.startswith("gate.") for name in names)
     assert any(name.startswith("adapter.up.") for name in names)
-    assert not any(name.startswith(("adapter.mem_out.", "adapter.q_proj.", "updater.")) for name in names)
-    # Default std 1e-3 often vanishes in bf16 on this tiny decoder. The wider
-    # weights only make the closed-gate gradient visible. Training keeps 1e-3.
-    with torch.no_grad():
-        loop.adapter.up.weight.normal_(0, 0.5)
+    assert not any(name.startswith((
+        "adapter.mem_out.", "adapter.q_proj.", "adapter.q_norm.", "adapter.k_norm.", "updater.",
+    )) for name in names)
     loop.train()
     output = loop.forward_branch(hidden, branch, flow_time=0.9, train=True)
+    assert torch.equal(output.delta, torch.zeros_like(output.delta))
     target = torch.randn_like(output.velocity)
     loss, parts = correction_loss(loop, output, target, branch.packed_vae_token_indexes)
     assert "error_fell_1" in parts
@@ -76,8 +81,10 @@ def test_gen_only_step_trains_the_gate_and_leaves_memory_out():
     assert not missing
     with torch.no_grad():
         assert float(loop.gate.raw.grad.abs().sum()) > 0
-        assert float(loop.adapter.up.weight.grad.abs().sum()) == 0
+        assert float(loop.adapter.up.weight.grad.abs().sum()) > 0
     assert loop.adapter.mem_out.weight.grad is None
+    assert loop.adapter.q_norm.weight.grad is None
+    assert loop.adapter.k_norm.weight.grad is None
     assert loop.updater.up.weight.grad is None
     blob = loop.export_state()
     blob["variant"] = "gen_only"

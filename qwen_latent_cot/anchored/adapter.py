@@ -6,8 +6,14 @@ import math
 import torch
 from torch import nn
 
-from .feedback import RMSNorm, _small_linear
+from .config import SLOT_HEADS
+from .feedback import OUTPUT_INIT_STD, RMSNorm, _small_linear
 from .native_path import BranchContext, sample_groups
+
+
+# Backward scale used while |gamma| is smaller than this value. The forward
+# product still uses the true gate, so an exact zero writes an exact zero.
+GATE_WARMUP_SCALE = 1e-3
 
 
 def time_features(flow_time: float, width: int, device, dtype) -> torch.Tensor:
@@ -41,6 +47,27 @@ def bound_residual(
     return bounded
 
 
+def _gated_product(scale: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+    """Float32 ``gamma * delta``. The forward value is the true product.
+
+    A zero gate therefore stays an exact zero. While ``gamma`` requires grad
+    and its absolute value is below ``GATE_WARMUP_SCALE``, the adapter
+    backward uses that warmup scale and the gate's sign. Exact zero uses the
+    positive scale. The gate backward still multiplies by ``delta``. A
+    detached or frozen scale is a plain product, so ``force_full_zero_path``
+    does not train the adapter.
+    """
+    gamma = scale.to(dtype=torch.float32).reshape(())
+    values = delta.to(dtype=torch.float32)
+    if not (torch.is_grad_enabled() and gamma.requires_grad):
+        return gamma * values
+    detached = gamma.detach()
+    sign = torch.where(detached == 0, detached.new_ones(()), detached.sign())
+    warmup = detached.new_tensor(GATE_WARMUP_SCALE)
+    surrogate = torch.where(detached.abs() < GATE_WARMUP_SCALE, sign * warmup, detached).detach()
+    return values * surrogate + values.detach() * (gamma - surrogate)
+
+
 def written_residual(
     delta: torch.Tensor,
     scale: torch.Tensor,
@@ -51,37 +78,73 @@ def written_residual(
     """Cap the residual after the gate, then cast once into the anchor dtype.
 
     ``max_ratio`` applies to ``gamma * A_phi``, the tensor added at the body
-    entry. The product and the cap stay in float32. A zero gate therefore
-    adds an exact zero in bf16. A default-init product can still round to
-    zero at that cast; the cap is enforced on the value that is written.
+    entry. The product uses the float32 residual, then the cap, then one
+    cast. A zero gate adds an exact zero in the anchor dtype. A small gate
+    can still round that product to a bf16 zero. The cap is enforced on the
+    value that is written.
     """
-    scaled = scale.to(dtype=torch.float32) * delta.to(dtype=torch.float32)
+    scaled = _gated_product(scale, delta)
     capped = bound_residual(scaled, anchor.to(dtype=torch.float32), max_ratio, vae_indexes)
     return capped.to(dtype=anchor.dtype)
 
 
-def slot_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-    """Each image token attends over that sample's memory slots."""
+def slot_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    num_heads: int,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+) -> torch.Tensor:
+    """Each image token attends over that sample's slots in several subspaces.
+
+    ``query``, ``key``, and ``value`` already have total width ``rank``. That
+    width is split into ``num_heads`` of dimension ``rank // num_heads``.
+    Each head normalizes its own query and key before the scores, so a large
+    projection magnitude does not scale the logits. Heads keep separate slot
+    weights and the result is concatenated back to width ``rank``.
+    """
     if query.ndim != 2 or key.ndim != 2 or key.shape != value.shape:
         raise ValueError("slot attention expects [tokens, width] queries and [slots, width] memory")
-    if query.shape[-1] != key.shape[-1] or key.shape[0] == 0:
+    width = query.shape[-1]
+    if width != key.shape[-1] or key.shape[0] == 0:
         raise ValueError("slot attention width or slot count is invalid")
-    scores = query @ key.transpose(0, 1) * (query.shape[-1] ** -0.5)
-    return torch.softmax(scores, dim=-1) @ value
+    if num_heads < 1 or width % num_heads != 0:
+        raise ValueError(f"slot attention rank {width} must be divisible by num_heads {num_heads}")
+    head_dim = width // num_heads
+    if q_norm.weight.numel() != head_dim or k_norm.weight.numel() != head_dim:
+        raise ValueError("Q/K RMSNorm width must equal the head dimension")
+    tokens = query.shape[0]
+    slots = key.shape[0]
+    q = q_norm(query.reshape(tokens, num_heads, head_dim)).permute(1, 0, 2)
+    k = k_norm(key.reshape(slots, num_heads, head_dim)).permute(1, 0, 2)
+    v = value.reshape(slots, num_heads, head_dim).permute(1, 0, 2)
+    scores = torch.matmul(q, k.transpose(-1, -2)) * (head_dim ** -0.5)
+    weights = torch.softmax(scores, dim=-1)
+    mixed = torch.matmul(weights, v)
+    return mixed.permute(1, 0, 2).reshape(tokens, width)
 
 
 class AnchoredReentryAdapter(nn.Module):
     """``A_phi(H_r, M_r, P_t, t) -> delta`` on image tokens only.
 
-    Memory stays a set of slots. Image token ``i`` reads them with one-head
-    cross-attention, ``W_O Attn(W_Q H_i, W_K M, W_V M)``. The anchor and the
-    flow time stay on the low-rank path and are added to that read. Text rows
-    stay zero. The gate and the RMS bound sit outside this module.
+    Memory stays a set of slots. Image token ``i`` reads them with multi-head
+    cross-attention of total width ``rank``, ``W_O Attn(W_Q H_i, W_K M, W_V M)``.
+    ``W_Q``, ``W_K``, ``W_V``, and ``W_O`` keep that width. The attention splits
+    it into ``SLOT_HEADS`` heads and applies RMSNorm to each head's query and
+    key. The anchor and the flow time stay on the low-rank path and are added
+    to that read. Text rows stay zero. The gate and the RMS bound sit outside
+    this module.
     """
 
     def __init__(self, hidden: int, rank: int, time_width: int = 32):
         super().__init__()
+        if rank % SLOT_HEADS != 0:
+            raise ValueError(f"rank {rank} must be divisible by {SLOT_HEADS} slot heads")
         self.rank = rank
+        self.num_heads = SLOT_HEADS
+        self.head_dim = rank // SLOT_HEADS
         self.time_width = time_width
         self.norm_h = RMSNorm(hidden)
         self.norm_m = RMSNorm(hidden)
@@ -89,15 +152,16 @@ class AnchoredReentryAdapter(nn.Module):
         self.q_proj = _small_linear(hidden, rank)
         self.k_proj = _small_linear(hidden, rank)
         self.v_proj = _small_linear(hidden, rank)
-        self.mem_out = _small_linear(rank, hidden)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.mem_out = _small_linear(rank, hidden, std=OUTPUT_INIT_STD)
         self.h_down = _small_linear(hidden, rank)
         self.p_down = _small_linear(hidden, rank)
         self.time_down = _small_linear(time_width, rank)
-        self.up = _small_linear(rank, hidden)
+        self.up = _small_linear(rank, hidden, std=OUTPUT_INIT_STD)
 
     def forward(self, hidden, feedback, anchor, flow_time: float, branch: BranchContext) -> torch.Tensor:
         groups = sample_groups(branch, anchor.shape[0])
-        restored = anchor.dtype
         hidden = hidden.float()
         anchor_f = anchor.float()
         memory_value = feedback.value.float()
@@ -110,15 +174,17 @@ class AnchoredReentryAdapter(nn.Module):
             vae = group["vae"]
             image = self.norm_h(hidden[vae])
             slots = self.norm_m(memory_value[sample])
-            read = slot_attention(self.q_proj(image), self.k_proj(slots), self.v_proj(slots))
+            read = slot_attention(
+                self.q_proj(image), self.k_proj(slots), self.v_proj(slots),
+                num_heads=self.num_heads, q_norm=self.q_norm, k_norm=self.k_norm,
+            )
             context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
             delta[vae] = self.mem_out(read) + self.up(context)
-        return delta.to(dtype=restored)
+        return delta
 
     def state_free_delta(self, hidden, anchor, flow_time: float, branch: BranchContext) -> torch.Tensor:
         """``ΔH(H_r, P_t, t)`` on image tokens. Memory slots are not an input."""
         groups = sample_groups(branch, anchor.shape[0])
-        restored = anchor.dtype
         hidden = hidden.float()
         anchor_f = anchor.float()
         delta = torch.zeros_like(anchor_f)
@@ -129,7 +195,7 @@ class AnchoredReentryAdapter(nn.Module):
             image = self.norm_h(hidden[vae])
             context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
             delta[vae] = self.up(context)
-        return delta.to(dtype=restored)
+        return delta
 
 
 class EntryGate(nn.Module):

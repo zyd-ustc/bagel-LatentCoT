@@ -35,9 +35,16 @@ class RMSNorm(nn.Module):
         return (hidden * scale * self.weight.float()).to(dtype=restored)
 
 
-def _small_linear(in_features: int, out_features: int) -> nn.Linear:
+# Earlier projections stay small. Output projections are larger so the float32
+# residual is nonzero on the first step, while the written product can still
+# underflow bf16 until the gate grows.
+PROJECTION_INIT_STD = 1e-3
+OUTPUT_INIT_STD = 1e-2
+
+
+def _small_linear(in_features: int, out_features: int, *, std: float = PROJECTION_INIT_STD) -> nn.Linear:
     layer = nn.Linear(in_features, out_features, bias=False)
-    nn.init.normal_(layer.weight, std=1e-3)
+    nn.init.normal_(layer.weight, std=std)
     return layer
 
 
@@ -52,7 +59,7 @@ class FeedbackStateUpdater(nn.Module):
         self.norm_m = RMSNorm(hidden)
         self.norm_o = RMSNorm(hidden)
         self.down = _small_linear(hidden, rank)
-        self.up = _small_linear(rank, hidden)
+        self.up = _small_linear(rank, hidden, std=OUTPUT_INIT_STD)
 
     def initial(self, samples: int, like: torch.Tensor, branch: str, flow_time: float) -> FeedbackState:
         value = self.slots_embed.to(device=like.device, dtype=like.dtype).expand(samples, -1, -1)

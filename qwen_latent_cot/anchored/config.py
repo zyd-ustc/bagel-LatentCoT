@@ -7,10 +7,13 @@ from pathlib import Path
 
 
 FEEDBACK_MODES = ("correct", "zero", "mean", "shuffled", "frozen")
-SCHEDULES = ("early", "mid", "late", "uniform")
+SCHEDULES = ("early", "mid", "late", "uniform", "interval")
 STATE_MODES = ("anchored", "direct_hidden")
 VARIANTS = ("dual", "gen_only")
 OBSERVERS = ("trained_observation",)
+# Slot cross-attention splits `rank` across this many heads. The projection
+# width stays `rank`; each head has dimension rank // SLOT_HEADS.
+SLOT_HEADS = 4
 # prompt_and_gen is accepted as a name and refused when a loop tries to run it.
 SOURCE_MODES = ("gen_full_query", "prompt_and_gen")
 
@@ -24,6 +27,9 @@ class LoopConfig:
     observer and the second body and writes a zero residual. The two flags
     are separate controls.
     ``[body_start, body_end)`` is a candidate span, not a proven optimum.
+    The default schedule is ``interval`` on progress ``u = 1 - t``, from
+    ``schedule_start`` to ``schedule_end``. ``early``, ``mid``, ``late``, and
+    ``uniform`` still use ``schedule_fraction``.
     ``round_loss_weights`` gives each correction its own non-negative flow
     weight. ``None`` supervises the final velocity only. The weights may differ.
     """
@@ -32,8 +38,10 @@ class LoopConfig:
     body_start: int = 20
     body_end: int = 28
     correction_rounds: int = 1
-    schedule: str = "early"
+    schedule: str = "interval"
     schedule_fraction: float = 0.35
+    schedule_start: float = 0.15
+    schedule_end: float = 0.65
     max_delta_rms_ratio: float = 0.02
     observer: str = "trained_observation"
     observation_checkpoint: str | None = None
@@ -75,6 +83,8 @@ class LoopConfig:
             raise ValueError(f"unknown schedule {self.schedule}")
         if not 0.0 < self.schedule_fraction <= 1.0:
             raise ValueError("schedule_fraction must be in (0, 1]")
+        if not 0.0 <= self.schedule_start < self.schedule_end <= 1.0:
+            raise ValueError("schedule interval must satisfy 0 <= start < end <= 1")
         if self.force_native_bypass and self.force_full_zero_path:
             raise ValueError("force_native_bypass and force_full_zero_path cannot both be set")
         if self.max_delta_rms_ratio <= 0.0:
@@ -93,6 +103,8 @@ class LoopConfig:
             raise ValueError("gen_only has no memory state to intervene on")
         if self.slots <= 0 or self.rank <= 0:
             raise ValueError("slots and rank must be positive")
+        if self.rank % SLOT_HEADS != 0:
+            raise ValueError(f"rank must be divisible by {SLOT_HEADS} slot heads")
         if self.seed_token_ids is not None and len(self.seed_token_ids) != self.slots:
             raise ValueError("seed_token_ids must contain one token per observation slot")
         if self.writer_position_start < 0:

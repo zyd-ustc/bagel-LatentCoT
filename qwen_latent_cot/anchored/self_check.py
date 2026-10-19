@@ -7,10 +7,23 @@ from pathlib import Path
 import torch
 
 from qwen_latent_cot.bagel.modeling.bagel.qwen2_navit import NaiveCache, Qwen2Config, Qwen2ForCausalLM
-from qwen_latent_cot.anchored.adapter import AnchoredReentryAdapter, bound_residual, written_residual
-from qwen_latent_cot.anchored.config import LoopConfig
+from qwen_latent_cot.anchored.adapter import (
+    GATE_WARMUP_SCALE,
+    AnchoredReentryAdapter,
+    EntryGate,
+    bound_residual,
+    slot_attention,
+    written_residual,
+)
+from qwen_latent_cot.anchored.config import SLOT_HEADS, LoopConfig
 from qwen_latent_cot.anchored.diagnostics import round_velocity_report
-from qwen_latent_cot.anchored.feedback import FeedbackState, intervene_feedback
+from qwen_latent_cot.anchored.feedback import (
+    OUTPUT_INIT_STD,
+    PROJECTION_INIT_STD,
+    FeedbackState,
+    FeedbackStateUpdater,
+    intervene_feedback,
+)
 from qwen_latent_cot.anchored.legacy import refuse_legacy_checkpoint
 from qwen_latent_cot.anchored.loop import AnchoredDualStateLoop
 from qwen_latent_cot.anchored.loss import anchored_loss
@@ -47,8 +60,10 @@ def tiny_language_model():
 
 def loop_config(**overrides) -> LoopConfig:
     payload = dict(
+        # Keep the early prefix here. Contract forwards use t=0.9, and the
+        # shipped default interval leaves that noise step on the native pass.
         enabled=True, body_start=1, body_end=2, correction_rounds=1, schedule="early",
-        schedule_fraction=0.35, max_delta_rms_ratio=0.02,
+        schedule_fraction=0.35, schedule_start=0.15, schedule_end=0.65, max_delta_rms_ratio=0.02,
         observer="trained_observation", allow_unloaded_observer=True, seed_token_ids=(1, 2, 3, 4),
         feedback_mode="correct", state_mode="anchored", variant="dual", slots=4, rank=4,
         writer_position_start=2048, lambda_anchor=0.01, lambda_entry=0.001,
@@ -147,6 +162,53 @@ def check_schedule():
     except ValueError:
         return
     raise AssertionError("uniform schedule accepted a raw flow time")
+
+
+def check_default_interval_skips_pure_noise():
+    """Shipped configs correct u in [0.15, 0.65]. t > 0.85 stays native."""
+    bare = LoopConfig()
+    if (bare.schedule, bare.schedule_start, bare.schedule_end) != ("interval", 0.15, 0.65):
+        raise AssertionError("default schedule left the mid-early interval")
+    if bare.body_start != 20 or bare.body_end != 28:
+        raise AssertionError("default body span drifted")
+    root = Path(__file__).resolve().parents[2]
+    for name in ("anchored_dual_state_loop.json", "anchored_gen_only.json"):
+        loaded = LoopConfig.from_json(root / "configs" / name)
+        if (loaded.schedule, loaded.schedule_start, loaded.schedule_end) != ("interval", 0.15, 0.65):
+            raise AssertionError(f"{name} left the mid-early interval")
+        if loaded.body_start != 20 or loaded.body_end != 28:
+            raise AssertionError(f"{name} body span drifted")
+    window = LoopConfig(schedule="interval", schedule_start=0.15, schedule_end=0.65, enabled=True)
+    assert in_loop_schedule(window, flow_time=0.85)
+    assert in_loop_schedule(window, flow_time=0.6)
+    assert in_loop_schedule(window, flow_time=0.35)
+    assert not in_loop_schedule(window, flow_time=0.95)
+    assert not in_loop_schedule(window, flow_time=0.2)
+    assert in_loop_schedule(window, step_index=3, num_steps=21)
+    assert in_loop_schedule(window, step_index=13, num_steps=21)
+    assert not in_loop_schedule(window, step_index=0, num_steps=21)
+    assert not in_loop_schedule(window, step_index=14, num_steps=21)
+    try:
+        LoopConfig(schedule_start=0.7, schedule_end=0.2, body_start=0, body_end=1).validate(1)
+    except ValueError as error:
+        if "interval" not in str(error):
+            raise
+    else:
+        raise AssertionError("a reversed schedule interval was accepted")
+
+    language_model = tiny_language_model()
+    noise_hidden, noise_branch = pack_case(language_model, seed=9, flow_time=0.95)
+    mid_hidden, mid_branch = pack_case(language_model, seed=9, flow_time=0.6)
+    loop = make_loop(language_model, schedule="interval", max_delta_rms_ratio=1.0)
+    with torch.no_grad():
+        loop.adapter.up.weight.normal_(0, 0.5)
+        loop.gate.raw.fill_(1.0)
+        noise = loop.forward_branch(noise_hidden, noise_branch, train=False)
+        mid = loop.forward_branch(mid_hidden, mid_branch, train=False)
+        native = native_velocity(language_model, mid_hidden, mid_branch)
+    _exact(noise.velocity, noise.native_velocity, "pure noise stays on the native pass")
+    if torch.equal(mid.velocity, native):
+        raise AssertionError("mid-early interval did not run the correction")
 
 
 def check_span_matches_native():
@@ -619,6 +681,65 @@ def check_anchored_observation_reuses_native_pre_kv():
         raise AssertionError("gen-only recorded an UND observation")
 
 
+def check_anchored_reader_reuses_the_prefix_hidden():
+    """The second read skips Pre layers and matches a full rerun on the stitch."""
+    import qwen_latent_cot.anchored.observer as observer_module
+    from dataclasses import replace as replace_kv
+
+    language_model = tiny_language_model()
+    hidden, branch = pack_case(language_model, seed=12)
+    loop = make_loop(language_model, correction_rounds=2, force_full_zero_path=True)
+    seen = []
+    real = observer_module.und_block
+
+    def wrapped(layer, *args, **kwargs):
+        seen.append(layer.self_attn.layer_idx)
+        return real(layer, *args, **kwargs)
+
+    observer_module.und_block = wrapped
+    try:
+        with torch.no_grad():
+            loop.forward_branch(hidden, branch, train=False)
+    finally:
+        observer_module.und_block = real
+    depth = len(language_model.model.layers)
+    boundary = loop.config.body_start
+    if seen != list(range(depth)) + list(range(boundary, depth)):
+        raise AssertionError(f"second read reran the prefix layers: {seen}")
+    first, second = loop.observation_trace
+    if second.get("boundary_layer") != boundary or first.get("boundary_entropy") != second.get("boundary_entropy_native"):
+        raise AssertionError("boundary entropy was not recorded from the cached prefix")
+    if second["boundary_entropy_delta"] != 0.0:
+        raise AssertionError("zero residual changed the boundary attention entropy")
+
+    decoder = language_model.model
+    observer = loop.observer
+    embeddings = loop.path.rope(hidden, branch.packed_query_position_ids)
+    captured = {}
+    loop.path.pre(hidden, branch, embeddings, captured)
+    loop.path.body(hidden, branch, embeddings, captured)
+    loop.path.post(hidden, branch, embeddings, captured)
+    with torch.no_grad():
+        slots, prefix = observer.read_with_boundary(captured, branch, boundary)
+        prefix = replace_kv(prefix, pre_ptrs=tuple(item.keys.data_ptr() for item in (captured[i] for i in range(boundary))))
+        full = observer.read(captured, branch)
+    _exact(slots, full, "prefix snapshot matches the full first read")
+    stitched = dict(captured)
+    body = stitched[boundary]
+    stitched[boundary] = replace_kv(body, keys=body.keys + 0.5, values=body.values - 0.25)
+    with torch.no_grad():
+        resumed = observer.read_from_boundary(stitched, branch, prefix, prefix.pre_ptrs)
+        rerun = observer.read(stitched, branch)
+    _exact(resumed, rerun, "cached prefix matches a full rerun on stitched KV")
+    try:
+        observer.read_from_boundary(stitched, branch, prefix, tuple(range(boundary)))
+    except RuntimeError as error:
+        if "prefix KV" not in str(error):
+            raise
+    else:
+        raise AssertionError("a changed Pre KV pointer reused the cached reader state")
+
+
 def check_direct_hidden_is_opt_in():
     assert loop_config().state_mode == "anchored"
     language_model = tiny_language_model()
@@ -690,14 +811,18 @@ def check_gradients_and_frozen_native():
         lambda_entry=loop.config.lambda_entry,
     )
     loss.backward()
+    _exact(output.delta, torch.zeros_like(output.delta), "zero gate writes bf16 zero while training")
     if loop.gate.raw.grad is None or float(loop.gate.raw.grad.abs()) == 0.0:
         raise AssertionError("closed gate received no gradient")
     adapter_grad = loop.adapter.up.weight.grad
     memory_grad = loop.adapter.mem_out.weight.grad
-    if adapter_grad is not None and float(adapter_grad.abs().sum()) != 0.0:
-        raise AssertionError("adapter received a gradient through a zero gate")
-    if memory_grad is not None and float(memory_grad.abs().sum()) != 0.0:
-        raise AssertionError("memory attention received a gradient through a zero gate")
+    updater_grad = loop.updater.up.weight.grad
+    if adapter_grad is None or float(adapter_grad.abs().sum()) == 0.0:
+        raise AssertionError("zero-gate warmup did not train the adapter")
+    if memory_grad is None or float(memory_grad.abs().sum()) == 0.0:
+        raise AssertionError("zero-gate warmup did not train the memory attention")
+    if updater_grad is None or float(updater_grad.abs().sum()) == 0.0:
+        raise AssertionError("zero-gate warmup did not train the feedback update")
     assert language_model.model.layers[1].self_attn.q_proj.weight.grad is None
     optimizer = torch.optim.SGD(loop.trainable_parameters(), lr=1.0)
     optimizer.step()
@@ -772,7 +897,9 @@ def check_gen_only_does_not_carry_memory():
     if torch.equal(output.velocity, output.native_velocity):
         raise AssertionError("state-free correction did not change velocity")
     _exact(shifted.velocity, output.velocity, "memory weights changed gen-only velocity")
-    names = [name for name, _parameter in loop.named_parameters() if _parameter.requires_grad and name.startswith(("updater.", "adapter.mem_out.", "adapter.q_proj."))]
+    names = [name for name, _parameter in loop.named_parameters() if _parameter.requires_grad and name.startswith((
+        "updater.", "adapter.mem_out.", "adapter.q_proj.", "adapter.q_norm.", "adapter.k_norm.",
+    ))]
     trained = {name for name, _parameter in loop.named_parameters() if any(parameter is _parameter for parameter in loop.trainable_parameters())}
     if any(name in trained for name in names):
         raise AssertionError("gen-only training includes memory parameters")
@@ -1096,7 +1223,9 @@ def check_image_tokens_address_memory_slots():
         if float(base[0].abs().sum()) != 0.0:
             raise AssertionError("a text token received a memory residual")
         moved = slots.clone()
-        moved[0, 0, 2] = 4.0
+        # Stay inside the head that separates the two tokens. A new coordinate
+        # in an unqueried head is mixed uniformly into every image token.
+        moved[0, 0, 1] = 4.0
         shifted = adapter(hidden, FeedbackState(moved, "cond", 1, 0.9), anchor, 0.9, branch)
         first = float((shifted[1] - base[1]).abs().sum())
         second = float((shifted[2] - base[2]).abs().sum())
@@ -1117,6 +1246,82 @@ def check_image_tokens_address_memory_slots():
         cleared[1].zero_()
         isolated = adapter(hidden2, FeedbackState(cleared, "cond", 1, 0.9), anchor2, 0.9, branch2)
         _exact(mixed[:3], isolated[:3], "sample 0 memory read")
+
+
+def check_slot_heads_keep_separate_slot_weights():
+    """Four heads share the rank width. QK RMSNorm keeps each head's slot mix soft."""
+    rank = 8
+    hidden = 16
+    head_dim = rank // SLOT_HEADS
+    adapter = AnchoredReentryAdapter(hidden, rank).eval()
+    if adapter.num_heads != SLOT_HEADS or adapter.head_dim != head_dim:
+        raise AssertionError("slot attention did not split rank into 4 heads")
+    if adapter.q_proj.weight.shape != (rank, hidden) or adapter.mem_out.weight.shape != (hidden, rank):
+        raise AssertionError("multi-head projections changed the total width")
+    if adapter.q_norm.weight.numel() != head_dim or adapter.k_norm.weight.numel() != head_dim:
+        raise AssertionError("Q/K RMSNorm is not the head dimension")
+    try:
+        AnchoredReentryAdapter(hidden, rank + 2)
+    except ValueError as error:
+        if "divisible" not in str(error):
+            raise
+    else:
+        raise AssertionError("rank not divisible by the head count was accepted")
+    try:
+        LoopConfig(rank=rank + 2, body_start=0, body_end=1).validate(1)
+    except ValueError as error:
+        if "divisible" not in str(error):
+            raise
+    else:
+        raise AssertionError("config accepted a rank the slot heads cannot split")
+
+    query = torch.zeros(1, rank)
+    key = torch.zeros(2, rank)
+    value = torch.zeros(2, rank)
+    query[0, 0] = 1.0
+    query[0, head_dim] = 1.0
+    key[0, 0] = 1.0
+    key[1, head_dim] = 1.0
+    value[0, 0] = 3.0
+    value[1, head_dim] = 5.0
+    grown = 50.0
+    with torch.no_grad():
+        read = slot_attention(
+            query, key, value, num_heads=adapter.num_heads, q_norm=adapter.q_norm, k_norm=adapter.k_norm,
+        )
+        scaled = slot_attention(
+            query * grown, key * grown, value,
+            num_heads=adapter.num_heads, q_norm=adapter.q_norm, k_norm=adapter.k_norm,
+        )
+        q = adapter.q_norm(query.reshape(1, SLOT_HEADS, head_dim)).permute(1, 0, 2)
+        k = adapter.k_norm(key.reshape(2, SLOT_HEADS, head_dim)).permute(1, 0, 2)
+        weights = torch.softmax(torch.matmul(q, k.transpose(-1, -2)) * (head_dim ** -0.5), dim=-1)
+        raw_q = (query * grown).reshape(1, SLOT_HEADS, head_dim).permute(1, 0, 2)
+        raw_k = (key * grown).reshape(2, SLOT_HEADS, head_dim).permute(1, 0, 2)
+        raw = torch.softmax(torch.matmul(raw_q, raw_k.transpose(-1, -2)) * (head_dim ** -0.5), dim=-1)
+    if not torch.allclose(scaled, read, rtol=1e-4, atol=1e-4):
+        raise AssertionError("QK RMSNorm changed the read when projections grew")
+    if float(weights[0, 0, 0]) <= float(weights[0, 0, 1]) or float(weights[1, 0, 1]) <= float(weights[1, 0, 0]):
+        raise AssertionError("heads did not attend different slots")
+    if torch.allclose(weights[0, 0], weights[1, 0]):
+        raise AssertionError("two heads used the same slot mixture")
+    if float(weights.max()) > 0.95:
+        raise AssertionError("QK RMSNorm left a near one-hot slot route")
+    if float(raw[0, 0].max()) < 0.99 or float(raw[1, 0].max()) < 0.99:
+        raise AssertionError("the unnormalized scores did not collapse")
+    if abs(float(read[0, 0]) - float(weights[0, 0, 0]) * 3.0) > 1e-4:
+        raise AssertionError("head 0 did not carry slot 0")
+    if abs(float(read[0, head_dim]) - float(weights[1, 0, 1]) * 5.0) > 1e-4:
+        raise AssertionError("head 1 did not carry slot 1")
+    leaf = query.detach().clone().requires_grad_(True)
+    trained = slot_attention(
+        leaf, key, value, num_heads=adapter.num_heads, q_norm=adapter.q_norm, k_norm=adapter.k_norm,
+    )
+    trained.sum().backward()
+    if adapter.q_norm.weight.grad is None or float(adapter.q_norm.weight.grad.abs().sum()) == 0.0:
+        raise AssertionError("Q RMSNorm received no gradient")
+    if adapter.k_norm.weight.grad is None or float(adapter.k_norm.weight.grad.abs().sum()) == 0.0:
+        raise AssertionError("K RMSNorm received no gradient")
 
 
 def check_checkpoint_and_bound():
@@ -1153,8 +1358,8 @@ def _rms_ratio(residual: torch.Tensor, reference: torch.Tensor) -> float:
 def check_written_residual_respects_the_rms_cap():
     """The cap applies to gamma * delta. Widened weights make bf16 movement visible.
 
-    The default 1e-3 adapter initialization is checked only for the cap and for
-    entering the loop. A matching native velocity there is a bf16 rounding fact.
+    The default initialization is checked for the cap and for entering the loop.
+    A matching native velocity there is a bf16 rounding fact.
     """
     language_model = tiny_language_model()
     hidden, branch = pack_case(language_model, seed=14)
@@ -1262,8 +1467,65 @@ def check_observation_query_follows_the_verified_writer():
         raise AssertionError("body-layer KV was accepted as the observation source")
 
 
+def check_zero_gate_warmup_keeps_a_float32_residual():
+    """A subnormal-bf16 delta still trains the gate, and the forward write stays zero."""
+    anchor = torch.randn(4, 8, dtype=torch.bfloat16)
+    # Below the bf16 subnormal floor, still nonzero in the float32 product.
+    delta = torch.full((4, 8), 1e-41, requires_grad=True)
+    if float(delta.detach().abs().sum()) == 0.0 or torch.count_nonzero(delta.detach().to(torch.bfloat16)) != 0:
+        raise AssertionError("fixture must stay nonzero in float32 and cast to bf16 zero")
+    gate = EntryGate()
+    vae = torch.tensor([1, 2])
+    target = torch.randn(2, 8)
+    written = written_residual(delta, gate(), anchor, 1.0, vae)
+    _exact(written, torch.zeros_like(anchor), "warmup forward is bf16 zero")
+    (written[vae].float() - target).pow(2).mean().backward()
+    if gate.raw.grad is None or float(gate.raw.grad.abs()) == 0.0:
+        raise AssertionError("bf16-underflow delta gave the gate no gradient")
+    if delta.grad is None or float(delta.grad.abs().sum()) == 0.0:
+        raise AssertionError("zero-gate warmup gave the residual no gradient")
+
+    frozen = delta.detach().clone().requires_grad_(True)
+    plain = written_residual(frozen, torch.zeros(()), anchor, 1.0, vae)
+    (plain[vae].float() - target).pow(2).mean().backward()
+    if frozen.grad is None or float(frozen.grad.abs().sum()) != 0.0:
+        raise AssertionError("detached zero warmed the residual")
+
+    opened_delta = torch.randn(4, 8, requires_grad=True)
+    opened_gate = EntryGate()
+    with torch.no_grad():
+        opened_gate.raw.fill_(0.2)
+    opened = written_residual(opened_delta, opened_gate(), anchor, 1.0, vae)
+    manual_delta = opened_delta.detach().clone().requires_grad_(True)
+    manual_scale = torch.tensor(0.2, dtype=torch.float32, requires_grad=True)
+    manual = bound_residual(manual_scale * manual_delta, anchor.float(), 1.0, vae).to(dtype=anchor.dtype)
+    _exact(opened, manual, "warmup matches the true product once the gate has opened")
+    (opened[vae].float() - target).pow(2).mean().backward()
+    (manual[vae].float() - target).pow(2).mean().backward()
+    if not torch.allclose(opened_delta.grad, manual_delta.grad):
+        raise AssertionError("open-gate residual gradient differed from the true product")
+    if not torch.allclose(opened_gate.raw.grad, manual_scale.grad):
+        raise AssertionError("open-gate gradient differed from the true product")
+
+    torch.manual_seed(0)
+    adapter = AnchoredReentryAdapter(128, 32)
+    updater = FeedbackStateUpdater(128, 4, 32)
+    output_layers = (adapter.up.weight, adapter.mem_out.weight, updater.up.weight)
+    early_layers = (adapter.h_down.weight, adapter.q_proj.weight, updater.down.weight)
+    with torch.no_grad():
+        for weight in output_layers:
+            if abs(float(weight.std()) - OUTPUT_INIT_STD) > 2e-3:
+                raise AssertionError("output projection init left std 1e-2")
+        for weight in early_layers:
+            if abs(float(weight.std()) - PROJECTION_INIT_STD) > 2e-4:
+                raise AssertionError("early projection init left std 1e-3")
+    if float(gate.raw.detach()) != 0.0 or GATE_WARMUP_SCALE != 1e-3:
+        raise AssertionError("gate warmup constants drifted")
+
+
 CHECKS = [
     check_schedule,
+    check_default_interval_skips_pure_noise,
     check_span_matches_native,
     check_exact_bypass_and_cache,
     check_fast_bypass_skips_observer,
@@ -1274,14 +1536,17 @@ CHECKS = [
     check_observation_query_follows_the_verified_writer,
     check_observation_source_mode_follows_the_training_config,
     check_anchored_observation_reuses_native_pre_kv,
+    check_anchored_reader_reuses_the_prefix_hidden,
     check_direct_hidden_is_opt_in,
     check_feedback_content_and_gen_only,
     check_gen_only_does_not_carry_memory,
     check_round_velocities_and_supervision,
     check_gradients_and_frozen_native,
+    check_zero_gate_warmup_keeps_a_float32_residual,
     check_written_residual_respects_the_rms_cap,
     check_cfg_matches_bagel,
     check_image_tokens_address_memory_slots,
+    check_slot_heads_keep_separate_slot_weights,
     check_checkpoint_and_bound,
 ]
 
