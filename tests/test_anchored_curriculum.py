@@ -7,8 +7,11 @@ import torch
 from qwen_latent_cot.anchored.anchored_train import (
     TRAINER,
     AnchoredTrainConfig,
+    MEM_OUT_HANDOFF_SCALE,
     apply_stage_parameters,
+    residual_ratio,
     correction_rounds_for,
+    prepare_dual_handoff,
     load_checkpoint,
     require_stage2_reader,
     stage1_val_flags,
@@ -75,10 +78,26 @@ def test_stage_parameters_keep_the_residual_and_add_slot_attention():
     assert any(name.startswith("adapter.up.") for name in names)
     assert not any(name.startswith(("updater.", "adapter.q_proj.", "adapter.mem_out.")) for name in names)
     groups = {group["name"]: group for group in first}
-    assert any(parameter is loop.adapter.up.weight for parameter in groups["output"]["params"])
-    assert any(parameter is loop.gate.raw for parameter in groups["base"]["params"])
+
+    def holds_first(group, parameter):
+        return any(item is parameter for item in groups[group]["params"])
+
+    assert holds_first("output", loop.adapter.up.weight)
+    assert holds_first("gate", loop.gate.raw)
+    assert not holds_first("base", loop.gate.raw)
+    assert not holds_first("output", loop.gate.raw)
     assert groups["output"]["base_lr"] == pytest.approx(2e-5)
     assert groups["base"]["base_lr"] == pytest.approx(1e-4)
+    assert groups["gate"]["base_lr"] == pytest.approx(5e-3)
+    assert groups["gate"]["lr"] == pytest.approx(5e-3)
+    assert groups["gate"]["weight_decay"] == 0.0
+    optimizer = torch.optim.AdamW(first, weight_decay=0.0)
+    for group in optimizer.param_groups:
+        group["lr"] = group["base_lr"] * 0.05
+    warmed = {group["name"]: group for group in optimizer.param_groups}
+    assert warmed["gate"]["lr"] == pytest.approx(5e-3 * 0.05)
+    assert warmed["base"]["lr"] == pytest.approx(1e-4 * 0.05)
+    assert warmed["gate"]["weight_decay"] == 0.0
     second = apply_stage_parameters(loop, AnchoredTrainConfig.from_json(
         ROOT / "configs/anchored_curriculum_train.json",
     ).stages[1])
@@ -93,6 +112,7 @@ def test_stage_parameters_keep_the_residual_and_add_slot_attention():
         "adapter.q_norm.", "adapter.k_norm.", "adapter.norm_m.",
     )) for name in live)
     grouped = {group["name"]: group for group in second}
+    assert "gate" not in grouped
 
     def holds(group, parameter):
         return any(item is parameter for item in grouped[group]["params"])
@@ -109,6 +129,35 @@ def test_stage_parameters_keep_the_residual_and_add_slot_attention():
     assert not loop.adapter.q_proj.weight.requires_grad
     assert loop.gate.raw.requires_grad
     assert loop.config.variant == "gen_only"
+
+
+def test_residual_ratio_uses_image_tokens_and_floors_the_anchor():
+    delta = torch.zeros(4, 2)
+    anchor = torch.ones(4, 2)
+    delta[1:3] = 0.5
+    delta[0] = 100.0
+    indexes = torch.tensor([1, 2])
+    assert residual_ratio(delta, anchor, indexes) == pytest.approx(0.5)
+    assert residual_ratio(torch.zeros(2, 2), anchor[:2], torch.tensor([0, 1])) == 0.0
+    assert residual_ratio(None, anchor, indexes) == 0.0
+    assert residual_ratio(torch.ones(2, 2), torch.full((2, 2), 1e-9), torch.tensor([0, 1])) == pytest.approx(1e6)
+
+
+def test_dual_handoff_shrinks_only_the_untrained_memory_output():
+    loop = make_loop(variant="gen_only", max_delta_rms_ratio=1.0)
+    with torch.no_grad():
+        loop.gate.raw.fill_(0.15)
+    memory = loop.adapter.mem_out.weight.detach().clone()
+    residual = loop.adapter.up.weight.detach().clone()
+    updater = loop.updater.up.weight.detach().clone()
+    prepare_dual_handoff(loop, 300)
+    assert torch.equal(loop.adapter.mem_out.weight, memory)
+    prepare_dual_handoff(loop, 0)
+    assert torch.equal(loop.adapter.mem_out.weight, memory * MEM_OUT_HANDOFF_SCALE)
+    assert MEM_OUT_HANDOFF_SCALE == 0.01
+    assert torch.equal(loop.adapter.up.weight, residual)
+    assert torch.equal(loop.updater.up.weight, updater)
+    assert float(loop.gate.raw.detach()) == pytest.approx(0.15)
 
 
 def test_stage2_reader_path_is_required_and_stays_gen_full_query(tmp_path):

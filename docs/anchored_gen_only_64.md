@@ -104,13 +104,13 @@ bash /data/zyd_workspace/bagel-LatentCoT/code/bagel-LatentCoT-anchored/scripts/a
 | `MASTER_TRAIN_INDEX` | 默认 `0`，即 `VC_WORKER_HOSTS` 的第一项 |
 | `NPROC_PER_NODE` | 默认 `16`。改成别的数会使世界大小离开 64，脚本会退出 |
 
-默认训练配置是 500 步、全局 batch 64、学习率 `1e-5`、weight decay 0、梯度裁剪 1、warmup 20、保存步 100 / 250 / 500、种子 17、分辨率 512、采样 50 步、timestep shift 3.0。全局 batch 必须是 64 的正倍数。
+默认训练配置是 500 步、全局 batch 64、基础学习率 `1e-5`、weight decay 0、梯度裁剪 1、warmup 20、保存步 100 / 250 / 500、种子 17、分辨率 512、采样 50 步、timestep shift 3.0。全局 batch 必须是 64 的正倍数。标量 `gate.raw` 仍从 0 初始化，单独一组，学习率是 `max(1e-5 × 50, 5e-4) = 5e-4`，这一组的 weight decay 是 0。warmup 乘的是这一组自己的学习率。这不保证 gate 落到某个区间。
 
 循环配置是 `variant=gen_only`、`correction_rounds=1`、最终速度损失。生效窗口是进度 `u ∈ [0.15, 0.65]`，也就是 `t ∈ [0.35, 0.85]`。训练按原生 timestep shift 在这个窗口里连续抽 `t`，每一次都会进入修正。推理仍走 50 步原生网格，窗口外的节点保持原生前向。Body 区间仍是候选 `[20, 28)`。
 
 ## 跑起来之后看哪里
 
-rank 0 在 `RUN_DIR` 写 `run.json`、`train.jsonl` 和 `step_XXXXXX.pt`。`run.json` 里的 `time_window` 是训练抽样区间。`scheduled_flow_times` 是落在这个窗口里的原生采样节点，供推理对照。`train.jsonl` 每一行有 loss、flow、`rounds_error_fell`、gate、梯度范数和学习率。
+rank 0 在 `RUN_DIR` 写 `run.json`、`train.jsonl` 和 `step_XXXXXX.pt`。`run.json` 里的 `time_window` 是训练抽样区间。`scheduled_flow_times` 是落在这个窗口里的原生采样节点，供推理对照。`train.jsonl` 每一行有 loss、flow、`rounds_error_fell`、gate、梯度范数、基础学习率和 `gate_learning_rate`。
 
 64 个进程各自写 `RUN_DIR/logs/rank_00.log` 到 `rank_63.log`。这些文件在共享盘上，从 worker-0 就能看。没有 wandb。
 

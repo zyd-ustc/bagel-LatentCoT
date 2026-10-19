@@ -10,6 +10,11 @@ records whether the first correction's mean square is below the native mean
 square, and, in stage 2, whether that dual error is below the frozen GEN-only
 path and whether shuffled and zero are higher. Those flags are logs. They do
 not stop the run and they do not show that a generated image improved.
+
+Stage 1 does not train ``adapter.mem_out``. The first dual step multiplies
+that still-random matrix by ``0.01`` once, so an already open gate does not
+write the full initialization into the body. A mid-stage resume does not
+scale it again.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ from .gen_only_train import (
     conditional_flow,
     encode_target,
     forward_correction,
+    gate_learning_rate,
     paired_latents,
     place_optimizer_state,
     posterior_seed_for,
@@ -40,6 +46,9 @@ from .loop import AnchoredDualStateLoop
 from .loss import anchored_loss
 from ..diagnostics import distributed as parallel
 from ..diagnostics.record import FrozenGuard, write_json
+
+
+MEM_OUT_HANDOFF_SCALE = 0.01
 
 
 GEN_ONLY_PREFIXES = (
@@ -185,26 +194,30 @@ def apply_stage_parameters(loop: AnchoredDualStateLoop, stage: CurriculumStage) 
 
     Stage 2 leaves the stage-1 residual and the gate frozen. Attention norms
     and ``adapter.norm_m`` stay frozen as well. The returned groups carry
-    ``base_lr`` so a later warmup can scale them separately.
+    ``base_lr`` so a later warmup can scale them separately. While the gate is
+    trainable it is its own group: ``max(stage.learning_rate * 50, 5e-4)`` and
+    weight decay 0. The initial value stays 0.
     """
     prefixes = stage_prefixes(stage)
     outputs = output_prefixes(stage)
-    base, output = [], []
+    base, output, gate = [], [], []
     for name, parameter in loop.named_parameters():
         selected = name.startswith(prefixes)
         parameter.requires_grad_(selected)
         if not selected:
             continue
-        if name.startswith(outputs):
+        if name.startswith("gate."):
+            gate.append(parameter)
+        elif name.startswith(outputs):
             output.append(parameter)
         else:
             base.append(parameter)
-    if not base or not output:
+    if not base or not output or (stage.name == "gen_only" and not gate):
         raise RuntimeError("curriculum stage exposed an empty parameter group")
     loop.config.variant = stage.name
     loop.config.correction_rounds = stage.correction_rounds
     loop.config.validate(len(loop.decoder.layers))
-    return [
+    groups = [
         {"params": base, "lr": stage.learning_rate, "base_lr": stage.learning_rate, "name": "base"},
         {
             "params": output,
@@ -213,6 +226,30 @@ def apply_stage_parameters(loop: AnchoredDualStateLoop, stage: CurriculumStage) 
             "name": "output",
         },
     ]
+    if gate:
+        gate_lr = gate_learning_rate(stage.learning_rate)
+        groups.append({
+            "params": gate,
+            "lr": gate_lr,
+            "base_lr": gate_lr,
+            "weight_decay": 0.0,
+            "name": "gate",
+        })
+    return groups
+
+
+def prepare_dual_handoff(loop: AnchoredDualStateLoop, start: int) -> None:
+    """Shrink untrained ``mem_out`` once, before the first dual optimizer step.
+
+    Stage 1 can open the gate while ``mem_out`` is still the std-``1e-2`` draw.
+    Dual writes ``gate * (mem_out(read) + up(context))``. Multiplying this one
+    matrix by ``0.01`` leaves the stage-1 residual and the gate unchanged.
+    ``start > 0`` is a mid-dual resume and must keep the trained matrix.
+    """
+    if start != 0:
+        return
+    with torch.no_grad():
+        loop.adapter.mem_out.weight.mul_(MEM_OUT_HANDOFF_SCALE)
 
 
 def require_stage2_reader(checkpoint: str, source_mode: str) -> Path:
@@ -339,6 +376,26 @@ def freeze_val_probe(source, train: AnchoredTrainConfig, t_min: float, t_max: fl
     noise = random.Random(train.seed + 1009)
     seeds = [noise.randrange(2**63 - 1) for _ in range(train.val_images)]
     return rows, [float(value) for value in times], seeds
+
+
+def residual_ratio(
+    delta: torch.Tensor | None,
+    anchor: torch.Tensor,
+    vae_indexes: torch.Tensor,
+    eps: float = 1e-6,
+) -> float:
+    """Image-token RMS of the written residual divided by the anchor RMS.
+
+    The denominator is at least ``eps``. Text rows are not in either RMS.
+    This is a batch diagnostic. It does not say the correction improved an image.
+    """
+    if delta is None or vae_indexes.numel() == 0:
+        return 0.0
+    written = delta.detach().float()[vae_indexes]
+    reference = anchor.detach().float()[vae_indexes]
+    delta_rms = float(written.pow(2).mean().sqrt())
+    anchor_rms = float(reference.pow(2).mean().sqrt())
+    return delta_rms / max(anchor_rms, eps)
 
 
 def _statistic_keys(rounds: int) -> tuple[str, ...]:
@@ -532,6 +589,8 @@ def train_anchored(
         parameters = [parameter for group in groups for parameter in group["params"]]
         optimizer = torch.optim.AdamW(groups, weight_decay=train.weight_decay)
         start = stage_step if index == stage_index else 0
+        if stage.name == "dual":
+            prepare_dual_handoff(loop, start)
         if blob is not None and index == stage_index and start > 0:
             optimizer.load_state_dict(blob["optimizer"])
             place_optimizer_state(optimizer)
@@ -555,6 +614,8 @@ def train_anchored(
             ]
             keys = _statistic_keys(rounds)
             totals = [0.0] * len(keys)
+            ratio_index = len(totals)
+            totals.append(0.0)
             for item in range(parallel.rank(), train.global_batch, parallel.world_size()):
                 row = batch[item]
                 flow_time, noise_seed = draws[item]
@@ -579,6 +640,9 @@ def train_anchored(
                 (loss / train.global_batch).backward()
                 for key_index, key in enumerate(keys):
                     totals[key_index] += float(parts[key])
+                totals[ratio_index] += residual_ratio(
+                    output_step.delta, output_step.anchor, flow["packed_vae_token_indexes"],
+                )
                 del output_step, loss, latent, target, flow, x0
             if stage.name == "dual":
                 loop.observer.freeze()
@@ -586,9 +650,13 @@ def train_anchored(
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 parameters, train.gradient_clip, error_if_nonfinite=True,
             )
+            gate_now = float(loop.gate.raw.detach())
             scale = _learning_scale(step, stage.warmup_steps)
+            gate_learning_rate_now = None
             for group in optimizer.param_groups:
                 group["lr"] = group["base_lr"] * scale
+                if group.get("name") == "gate":
+                    gate_learning_rate_now = group["lr"]
             optimizer.step()
             guard.check()
             loop.assert_native_frozen()
@@ -606,11 +674,14 @@ def train_anchored(
                 "improve": averaged["improve"],
                 "mse_0": averaged["mse_0"],
                 "mse_1": averaged["mse_1"],
+                "mse_diff": averaged["mse_1"] - averaged["mse_0"],
                 "error_fell_1": averaged["error_fell_1"],
-                "gate": float(loop.gate.raw.detach()),
+                "gate": gate_now,
+                "delta_ratio": reduced[ratio_index] / train.global_batch,
                 "gradient_norm": float(grad_norm),
                 "learning_rate": stage.learning_rate * scale,
                 "output_learning_rate": stage.output_learning_rate * scale,
+                **({} if gate_learning_rate_now is None else {"gate_learning_rate": gate_learning_rate_now}),
                 "step_seconds": time.perf_counter() - step_started,
                 "elapsed_seconds": time.perf_counter() - started_at,
                 "peak_memory_gib": parallel.max_statistics(

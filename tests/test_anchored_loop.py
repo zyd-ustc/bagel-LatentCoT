@@ -5,9 +5,13 @@ from dataclasses import replace
 import pytest
 import torch
 
-from qwen_latent_cot.anchored.adapter import GATE_WARMUP_SCALE, written_residual
+from qwen_latent_cot.anchored.adapter import (
+    GATE_WARMUP_SCALE,
+    AnchoredReentryAdapter,
+    written_residual,
+)
 from qwen_latent_cot.anchored.cli import main
-from qwen_latent_cot.anchored.feedback import FeedbackStateUpdater
+from qwen_latent_cot.anchored.feedback import FeedbackState, FeedbackStateUpdater
 from qwen_latent_cot.anchored.loss import (
     anchored_loss,
     focal_flow_loss,
@@ -70,6 +74,33 @@ def test_negative_gate_writes_zero_and_does_not_flip_the_warmup():
     assert float(zero_delta.grad.abs().sum()) > 0.0
     assert float(zero.grad.abs()) > 0.0
     assert GATE_WARMUP_SCALE == 1e-3
+
+
+def test_residual_write_stays_float32_under_bf16_autocast():
+    language_model = tiny_language_model()
+    hidden, branch = pack_case(language_model, seed=3)
+    hidden = hidden.to(dtype=torch.bfloat16)
+    anchor = torch.randn_like(hidden)
+    adapter = AnchoredReentryAdapter(hidden.shape[-1], 8)
+    memory = FeedbackState(
+        value=torch.randn(1, 4, hidden.shape[-1], dtype=torch.bfloat16),
+        branch="cond",
+        round_index=0,
+        flow_time=0.5,
+    )
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        free = adapter.state_free_delta(hidden, anchor, 0.5, branch)
+        dual = adapter(hidden, memory, anchor, 0.5, branch)
+        written = written_residual(
+            free, torch.tensor(0.1), anchor, 1.0, branch.packed_vae_token_indexes,
+        )
+    assert free.dtype == torch.float32
+    assert dual.dtype == torch.float32
+    assert written.dtype == anchor.dtype
+    text = branch.packed_text_indexes
+    assert torch.count_nonzero(free[text]) == 0
+    assert torch.count_nonzero(dual[text]) == 0
+    assert torch.count_nonzero(free[branch.packed_vae_token_indexes]) > 0
 
 
 def test_later_rounds_detach_adapter_hidden_and_keep_feedback_state():

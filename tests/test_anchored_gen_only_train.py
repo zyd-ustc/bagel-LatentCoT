@@ -16,6 +16,7 @@ from qwen_latent_cot.anchored.gen_only_train import (
     schedule_time_window,
     scheduled_flow_times,
     shift_unit_into_window,
+    gen_only_parameter_groups,
     select_gen_only_parameters,
 )
 from qwen_latent_cot.anchored.legacy import refuse_legacy_checkpoint
@@ -108,6 +109,31 @@ def test_gen_only_step_trains_the_gate_and_leaves_memory_out():
     refuse_legacy_checkpoint(blob)
     assert all(not key.startswith("observer") for key in blob["model"])
     assert parameters
+
+
+def test_gen_only_gate_keeps_its_own_learning_rate():
+    loop = make_loop(variant="gen_only", max_delta_rms_ratio=1.0)
+    train = GenOnlyTrainConfig.from_json(ROOT / "configs/anchored_gen_only_train.json")
+    groups = {
+        group["name"]: group
+        for group in gen_only_parameter_groups(loop, train.learning_rate, train.weight_decay)
+    }
+    assert any(item is loop.gate.raw for item in groups["gate"]["params"])
+    assert not any(item is loop.gate.raw for item in groups["base"]["params"])
+    assert any(item is loop.adapter.up.weight for item in groups["base"]["params"])
+    assert groups["base"]["base_lr"] == pytest.approx(1e-5)
+    assert groups["gate"]["base_lr"] == pytest.approx(5e-4)
+    assert groups["gate"]["weight_decay"] == 0.0
+    optimizer = torch.optim.AdamW(
+        [groups["base"], groups["gate"]], weight_decay=train.weight_decay,
+    )
+    for group in optimizer.param_groups:
+        group["lr"] = group["base_lr"] * (1.0 / 20.0)
+    warmed = {group["name"]: group for group in optimizer.param_groups}
+    assert warmed["gate"]["lr"] == pytest.approx(5e-4 / 20.0)
+    assert warmed["base"]["lr"] == pytest.approx(1e-5 / 20.0)
+    assert warmed["gate"]["weight_decay"] == 0.0
+    assert float(loop.gate.raw.detach()) == 0.0
 
 
 def test_train_gen_only_refuses_a_single_process_launch():

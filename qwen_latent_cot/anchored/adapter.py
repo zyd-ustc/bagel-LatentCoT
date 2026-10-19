@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -15,6 +16,23 @@ from .native_path import BranchContext, sample_groups
 # forward product uses max(gamma, 0), so a zero or negative gate writes an
 # exact zero.
 GATE_WARMUP_SCALE = 1e-3
+
+
+def _float32_math(device: torch.device):
+    """Keep the residual in float32 while the body runs under bf16 autocast.
+
+    NPU ``index_put`` does not cast. Autocast turns ``zeros_like`` into bf16
+    and leaves the fp32 adapter row as float32, so the write fails. The gate
+    product and the RMS cap still run in float32. The one cast into the
+    anchor dtype stays in ``written_residual``.
+    """
+    if device.type in ("cpu", "cuda", "npu"):
+        return torch.autocast(device_type=device.type, enabled=False)
+    return nullcontext()
+
+
+def _blank_float(like: torch.Tensor) -> torch.Tensor:
+    return torch.zeros(like.shape, device=like.device, dtype=torch.float32)
 
 
 def time_features(flow_time: float, width: int, device, dtype) -> torch.Tensor:
@@ -36,15 +54,16 @@ def bound_residual(
     """Per-token RMS cap relative to the native body entry. Text rows stay zero."""
     if max_ratio <= 0.0:
         raise ValueError("max_delta_rms_ratio must be positive")
-    bounded = torch.zeros_like(delta)
-    raw = delta[vae_indexes]
-    reference = anchor[vae_indexes]
-    # Floor the mean square before the square root. A zero residual then has a
-    # finite backward: sqrt(0) is not on the graph, and a closed gate stays exact.
-    raw_rms = raw.float().pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12).sqrt()
-    ref_rms = reference.float().pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12).sqrt()
-    factor = (max_ratio * ref_rms / raw_rms).clamp(max=1.0)
-    bounded[vae_indexes] = (raw.float() * factor).to(dtype=delta.dtype)
+    with _float32_math(delta.device):
+        bounded = _blank_float(delta)
+        raw = delta[vae_indexes].float()
+        reference = anchor[vae_indexes].float()
+        # Floor the mean square before the square root. A zero residual then has a
+        # finite backward: sqrt(0) is not on the graph, and a closed gate stays exact.
+        raw_rms = raw.pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12).sqrt()
+        ref_rms = reference.pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12).sqrt()
+        factor = (max_ratio * ref_rms / raw_rms).clamp(max=1.0)
+        bounded[vae_indexes] = raw * factor
     return bounded
 
 
@@ -176,40 +195,42 @@ class AnchoredReentryAdapter(nn.Module):
 
     def forward(self, hidden, feedback, anchor, flow_time: float, branch: BranchContext) -> torch.Tensor:
         groups = sample_groups(branch, anchor.shape[0])
-        hidden = hidden.float()
-        anchor_f = anchor.float()
-        memory_value = feedback.value.float()
-        if memory_value.shape[0] != len(groups) or memory_value.shape[-1] != hidden.shape[-1]:
-            raise ValueError("feedback slots do not match the packed samples")
-        delta = torch.zeros_like(anchor_f)
-        clock = time_features(flow_time, self.time_width, anchor.device, torch.float32)
-        time_bias = self.time_down(clock)
-        for sample, group in enumerate(groups):
-            vae = group["vae"]
-            image = self.norm_h(hidden[vae])
-            slots = self.norm_m(memory_value[sample])
-            read = slot_attention(
-                self.q_proj(image), self.k_proj(slots), self.v_proj(slots),
-                num_heads=self.num_heads, q_norm=self.q_norm, k_norm=self.k_norm,
-            )
-            context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
-            delta[vae] = self.mem_out(read) + self.up(context)
-        return delta
+        with _float32_math(anchor.device):
+            hidden = hidden.float()
+            anchor_f = anchor.float()
+            memory_value = feedback.value.float()
+            if memory_value.shape[0] != len(groups) or memory_value.shape[-1] != hidden.shape[-1]:
+                raise ValueError("feedback slots do not match the packed samples")
+            delta = _blank_float(anchor)
+            clock = time_features(flow_time, self.time_width, anchor.device, torch.float32)
+            time_bias = self.time_down(clock)
+            for sample, group in enumerate(groups):
+                vae = group["vae"]
+                image = self.norm_h(hidden[vae])
+                slots = self.norm_m(memory_value[sample])
+                read = slot_attention(
+                    self.q_proj(image), self.k_proj(slots), self.v_proj(slots),
+                    num_heads=self.num_heads, q_norm=self.q_norm, k_norm=self.k_norm,
+                )
+                context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
+                delta[vae] = (self.mem_out(read) + self.up(context)).float()
+            return delta
 
     def state_free_delta(self, hidden, anchor, flow_time: float, branch: BranchContext) -> torch.Tensor:
         """``ΔH(H_r, P_t, t)`` on image tokens. Memory slots are not an input."""
         groups = sample_groups(branch, anchor.shape[0])
-        hidden = hidden.float()
-        anchor_f = anchor.float()
-        delta = torch.zeros_like(anchor_f)
-        clock = time_features(flow_time, self.time_width, anchor.device, torch.float32)
-        time_bias = self.time_down(clock)
-        for _sample, group in enumerate(groups):
-            vae = group["vae"]
-            image = self.norm_h(hidden[vae])
-            context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
-            delta[vae] = self.up(context)
-        return delta
+        with _float32_math(anchor.device):
+            hidden = hidden.float()
+            anchor_f = anchor.float()
+            delta = _blank_float(anchor)
+            clock = time_features(flow_time, self.time_width, anchor.device, torch.float32)
+            time_bias = self.time_down(clock)
+            for _sample, group in enumerate(groups):
+                vae = group["vae"]
+                image = self.norm_h(hidden[vae])
+                context = self.h_down(image) + self.p_down(self.norm_p(anchor_f[vae])) + time_bias
+                delta[vae] = self.up(context).float()
+            return delta
 
 
 class EntryGate(nn.Module):

@@ -114,6 +114,47 @@ def select_gen_only_parameters(loop: AnchoredDualStateLoop) -> list[torch.nn.Par
     return selected
 
 
+def gate_learning_rate(learning_rate: float) -> float:
+    """Step size for the scalar gate. Adam's update on one scalar is the learning rate.
+
+    The gate starts at 0. ``max(learning_rate * 50, 5e-4)`` is the rate used while
+    it is trainable. It is not a target value for ``gate.raw``.
+    """
+    if learning_rate <= 0.0:
+        raise ValueError("gate learning rate needs a positive base rate")
+    return max(float(learning_rate) * 50.0, 5e-4)
+
+
+def gen_only_parameter_groups(
+    loop: AnchoredDualStateLoop, learning_rate: float, weight_decay: float,
+) -> list[dict]:
+    """Split the scalar gate out of the base AdamW group. Gate decay stays 0."""
+    selected = select_gen_only_parameters(loop)
+    live = {id(parameter) for parameter in selected}
+    base: list[torch.nn.Parameter] = []
+    gate: list[torch.nn.Parameter] = []
+    for name, parameter in loop.named_parameters():
+        if id(parameter) not in live:
+            continue
+        if name.startswith("gate."):
+            gate.append(parameter)
+        else:
+            base.append(parameter)
+    if not base or not gate:
+        raise RuntimeError("gen_only exposed an empty parameter group")
+    gate_lr = gate_learning_rate(learning_rate)
+    return [
+        {
+            "params": base, "lr": learning_rate, "base_lr": learning_rate,
+            "weight_decay": weight_decay, "name": "base",
+        },
+        {
+            "params": gate, "lr": gate_lr, "base_lr": gate_lr,
+            "weight_decay": 0.0, "name": "gate",
+        },
+    ]
+
+
 def scheduled_flow_times(config: LoopConfig, sampler_steps: int, timestep_shift: float) -> list[float]:
     """Native sampler nodes that enter the correction. Late nodes stay out."""
     times = native_times({"sampler_steps": sampler_steps, "timestep_shift": timestep_shift})
@@ -314,16 +355,17 @@ def train_gen_only(loop, bundle, pairs, train: GenOnlyTrainConfig, output: Path,
     train.validate()
     require_sixty_four(parallel.world_size(), train.global_batch)
     output = Path(output)
-    parameters = select_gen_only_parameters(loop)
+    groups = gen_only_parameter_groups(loop, train.learning_rate, train.weight_decay)
+    parameters = [parameter for group in groups for parameter in group["params"]]
     loop.train()
     sampler = pairs
     if resume:
-        optimizer = torch.optim.AdamW(parameters, lr=train.learning_rate, weight_decay=train.weight_decay)
+        optimizer = torch.optim.AdamW(groups, weight_decay=train.weight_decay)
         start = load_checkpoint(resume, loop, optimizer, sampler)
         select_gen_only_parameters(loop)
     else:
         parallel.broadcast_parameters(loop)
-        optimizer = torch.optim.AdamW(parameters, lr=train.learning_rate, weight_decay=train.weight_decay)
+        optimizer = torch.optim.AdamW(groups, weight_decay=train.weight_decay)
         start = 0
     bundle.model.eval()
     bundle.vae.eval()
@@ -390,9 +432,13 @@ def train_gen_only(loop, bundle, pairs, train: GenOnlyTrainConfig, output: Path,
         grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters, train.gradient_clip, error_if_nonfinite=True,
         )
-        learning_rate = train.learning_rate * min(1.0, step / max(1, train.warmup_steps))
+        scale = min(1.0, step / max(1, train.warmup_steps))
+        learning_rate = train.learning_rate * scale
+        gate_learning_rate_now = None
         for group in optimizer.param_groups:
-            group["lr"] = learning_rate
+            group["lr"] = group["base_lr"] * scale
+            if group.get("name") == "gate":
+                gate_learning_rate_now = group["lr"]
         optimizer.step()
         guard.check()
         loop.assert_native_frozen()
@@ -406,6 +452,7 @@ def train_gen_only(loop, bundle, pairs, train: GenOnlyTrainConfig, output: Path,
             "gate": float(loop.gate.raw.detach()),
             "gradient_norm": float(grad_norm),
             "learning_rate": learning_rate,
+            "gate_learning_rate": gate_learning_rate_now,
             "step_seconds": time.perf_counter() - step_started,
             "elapsed_seconds": time.perf_counter() - started_at,
             "peak_memory_gib": parallel.max_statistics([max_memory_allocated(device) / 1024**3], device)[0],
