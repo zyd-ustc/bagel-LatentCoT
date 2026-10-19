@@ -1,0 +1,14 @@
+{
+  "steps": 500,
+  "global_batch": 64,
+  "learning_rate": 1e-5,
+  "weight_decay": 0.0,
+  "gradient_clip": 1.0,
+  "warmup_steps": 20,
+  "save_steps": [100, 250, 500],
+  "seed": 17,
+  "resolution": 512,
+  "sampler_steps": 50,
+  "timestep_shift": 3.0,
+  "posterior_seed": 0
+}

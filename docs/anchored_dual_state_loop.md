@@ -40,6 +40,8 @@ Every forward returns `round_velocities`, `round_deltas`, and `round_observation
 
 `round_loss_weights` is optional. `None` keeps the flow loss on the final velocity. A tuple with one non-negative weight per correction replaces that term with `sum_r w_r MSE(v^{(r)}, target)`. The weights may differ. A zero weight stays out of the graph. The anchor prior stays on the final velocity, and the entry term stays on the last written residual. Early training can put more weight on the first correction, for example `(1.0, 0.25)`, and a later run can supervise the last round alone. `round_velocity_report` lists each round's error against one flow target, whether that error fell or rose relative to the previous round, and the drift from the native velocity. That report measures the round-to-round change. It does not show that feedback improves generation.
 
+GEN-only training uses `scripts/anchored_gen_only_64.sh` on 64 devices, four workers by 16. It samples native flow nodes inside the loop schedule and trains the state-free residual and the gate. The UND reader and the memory parameters stay out of the optimizer. The launcher refuses any device count other than 64. Image sampling stays on the native generator until a trained checkpoint is evaluated separately.
+
 Check the contract on a tiny MoT decoder:
 
 ```bash

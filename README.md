@@ -6,6 +6,8 @@
 python -m qwen_latent_cot.anchored.cli self-check
 ```
 
+GEN-only 的 64 卡训练入口是 `scripts/anchored_gen_only_64.sh`。四个节点各 16 张卡。它只更新无状态残差和 gate。
+
 配置见 `configs/anchored_dual_state_loop.json`，合同见 [Anchored Dual-State Loop](docs/anchored_dual_state_loop.md)。
 
 旧的 Observation → Memory writer → 生成 SFT 路线保留为诊断记录，训练入口默认锁住。复现历史训练时才设置 `BAGEL_ALLOW_LEGACY_MEMORY_SFT=1`。
