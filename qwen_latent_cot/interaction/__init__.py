@@ -1,1 +1,1 @@
-"""Observe-initialized continuous interaction: paired flow SFT and Flow-GRPO."""
+"""Full-layer BAGEL dual-state recurrence, supervised training and sampling."""

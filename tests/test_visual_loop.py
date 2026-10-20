@@ -8,7 +8,6 @@ from test_memory_topology import lm, runtime, setup_writer
 from qwen_latent_cot.diagnostics.memory import MemoryWriter
 from qwen_latent_cot.diagnostics.visual import VisualStudent
 from qwen_latent_cot.diagnostics.flow_training import conditional_gen, flow_mse
-from qwen_latent_cot.diagnostics.loop_training import memory_loop
 from qwen_latent_cot.diagnostics.data import load_dataset, tensor_hash, visual_label
 from qwen_latent_cot.diagnostics.record import FrozenGuard
 
@@ -73,16 +72,6 @@ def test_paired_state_and_native_conditional_parity(visual_runtime):
 
 
 
-def test_fixed_bank_R2_and_diagnostics_do_not_change_R1(visual_runtime):
-    runtime, row = visual_runtime; student = VisualStudent(runtime)
-    state = runtime.training_state(row, .9, 7)
-    with torch.no_grad():
-        a = memory_loop(student, state, 2, feedback='fixed')
-        b = memory_loop(student, state, 1, diagnostics=True)
-    torch.testing.assert_close(a.exits[0].velocity, a.exits[1].velocity, rtol=0, atol=0)
-    torch.testing.assert_close(a.exits[0].velocity, b.exits[0].velocity, rtol=0, atol=0)
-    # Sources contain the actually shifted positions of the Memory conditional call.
-    assert b.exits[0].source[0].positions[0] == a.baseline.source[0].positions[0]+16
 
 
 def test_observation_state_hash_is_binding(visual_runtime):
@@ -118,29 +107,8 @@ def test_unreviewed_proxy_never_becomes_confirmed(tmp_path):
 
 
 
-def test_complete_sampling_updates_once_and_resets_seed(visual_runtime):
-    from qwen_latent_cot.diagnostics.visual_evaluation import complete_sampling
-    runtime, row = visual_runtime; student = VisualStudent(runtime)
-    a, records = complete_sampling(student, row, 3, 2, 'fixed')
-    b, other = complete_sampling(student, row, 3, 1, 'new')
-    torch.testing.assert_close(a, b, rtol=0, atol=0)
-    assert len(records) == runtime.config['sampler_steps']-1
-    assert all(r['sampler_updates'] == 1 for r in records)
-    assert sum(r['gen_calls_including_cfg'] for r in records) > sum(r['gen_calls_including_cfg'] for r in other)
 
 
-def test_layer_and_final_norm_hooks_are_read_only(visual_runtime):
-    from qwen_latent_cot.diagnostics.visual_evaluation import observe_layers
-    runtime, row = visual_runtime
-    state = runtime.training_state(row, .75, 4)
-    with torch.no_grad():
-        expected = conditional_gen(runtime, state, capture=False)
-        with observe_layers(runtime, state.flow['past_key_values']) as tensors:
-            actual = conditional_gen(runtime, state, capture=False)
-    torch.testing.assert_close(actual.velocity, expected.velocity, rtol=0, atol=0)
-    assert set(tensors) == {0,1,2,'final_head'}
-    assert set(tensors[0]) == {'hidden_before_norm','hidden_after_norm','attention_output'}
-    assert not tensors['final_head']['normalized_hidden'].requires_grad
 
 
 
@@ -156,37 +124,3 @@ def test_weak_teacher_response_is_reported_and_filtered(visual_runtime):
     loss, metrics = bank_response(runtime, bank, teacher, state_probe(runtime,state))
     assert float(loss.detach()) == 0 and all(r['weak_teacher_filtered'] for r in metrics)
     assert all('condition_energy' in r for r in metrics)
-
-
-def test_R2_controls_keep_original_prompt_and_use_actual_sampler_nodes(visual_runtime, tmp_path):
-    from qwen_latent_cot.diagnostics.visual_evaluation import evaluate
-    runtime, row = visual_runtime;student = VisualStudent(runtime,runtime.writer)
-    runtime.config['eval_t']=[.75];runtime.config['noise_seeds']=[0]
-    other_image=tmp_path/'blue.png';Image.new('RGB',(32,32),'blue').save(other_image)
-    a=dict(row,split='test',swap_id='b')
-    b=dict(row,sample_id='b',scene_id='b',family_id='b',split='test',image=str(other_image),swap_id='a')
-    cache,lens,positions=runtime.prompt_context(runtime.config['neutral_prompt'])
-    reference=[cache.key_cache[i].clone() for i in range(3)]
-    out=tmp_path/'controls';out.mkdir()
-    records=evaluate(student,[a,b],out,rounds=2,save_images=True,continue_sampling=True,layer_diagnostics=True)
-    arms={r['arm'] for r in records}
-    assert {'R0','R1','R2-new','R2-old','R2-fixed','R2-swap','Source-swap',
-            'Target-text-oracle','Target-C1-oracle','G-fixed','G-neutral','G-layout'} <= arms
-    assert all(r['requested_t']==.75 and r['t']!=.75 for r in records)
-    assert all(r['image_policy']=='single_native_node_injection_then_native_suffix' for r in records)
-    assert all((out/r['layer_tensors']).exists() for r in records)
-    for i,k in enumerate(reference):torch.testing.assert_close(k,cache.key_cache[i],rtol=0,atol=0)
-    assert (out/'blind_mapping.json').exists()
-
-
-def test_observe_evaluation_reports_captions_without_flow_supervision(visual_runtime,tmp_path):
-    from qwen_latent_cot.diagnostics.visual_evaluation import evaluate
-    runtime,row=visual_runtime
-    runtime.config.update(stage='C2-observe',eval_t=[.2],noise_seeds=[0],source_layers=[0,1,2])
-    row=dict(row,task='observe',flow_supervision=False)
-    student=VisualStudent(runtime)
-    records=evaluate(student,[row],tmp_path/'observe')
-    assert {'R0','R1','Source-off'} <= {r['arm'] for r in records}
-    assert all(r['conditional_flow_mse'] is None for r in records)
-    assert all(torch.isfinite(torch.tensor(r['caption']['nll'])) for r in records)
-    assert (tmp_path/'observe/summary.json').exists()

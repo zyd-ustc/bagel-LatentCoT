@@ -6,7 +6,7 @@ from .record import validate_checkpoint
 from .data import file_hash
 
 FORMAT_VERSION = 4
-STAGES = ('C2-observe', 'C2-feedback', 'C3-loop')
+STAGES = ('C2-observe', 'C2-feedback')
 RESUME_KEYS = ('effective_batch', 'seed', 'loss_weights', 'learning_rate', 'weight_decay',
                'gradient_clip', 'cross_round_gradients', 'und_train', 'source_layers',
                'feedback_updates', 'online_feedback', 'noise_curriculum', 'noise_calibration',

@@ -2,7 +2,7 @@
 # Observe/Feedback text supervision on indexed corpus.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-MODE=${1:?usage: visual_training_npu.sh observe|feedback|check|eval|sample output [arguments]}
+MODE=${1:?usage: visual_training_npu.sh observe|feedback|check|eval|source-review output [arguments]}
 RUN=${2:?fresh output required}; shift 2
 PYTHON=${MODEL_PYTHON:-/root/venvs/bagel-NPU/bin/python}
 MODEL=${MODEL_PATH:-/data/zyd_workspace/bagel-LatentCoT/models/Bagel-7B-MoT}
@@ -11,7 +11,7 @@ C0=${C0_PASS:-/root/outputs/c0_text16_20261012_111241/calibration.json}
 case "$MODE" in
  observe) COMMAND=train; CONFIG=visual_memory_pilot; STAGE=C2-observe ;;
  feedback) COMMAND=train; CONFIG=visual_feedback; STAGE=C2-feedback ;;
- check|eval|sample|label-states|source-review) COMMAND=$MODE; CONFIG=${VISUAL_STAGE_CONFIG:-visual_memory_pilot} ;;
+ check|eval|source-review) COMMAND=$MODE; CONFIG=${VISUAL_STAGE_CONFIG:-visual_memory_pilot} ;;
  *) echo 'Unknown training mode' >&2; exit 1 ;;
 esac
 CONFIG=${DIAGNOSTIC_CONFIG:-$ROOT/configs/$CONFIG.json}

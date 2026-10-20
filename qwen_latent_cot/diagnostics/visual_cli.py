@@ -38,7 +38,7 @@ def load_input_rows(args, cfg):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['check', 'train', 'eval', 'sample', 'label-states', 'source-review'])
+    parser.add_argument('command', choices=['check', 'train', 'eval', 'source-review'])
     parser.add_argument('--model', required=True)
     parser.add_argument('--data', help='small diagnostic JSONL only')
     parser.add_argument('--corpus', help='annotation task indexes for training')
@@ -67,10 +67,6 @@ def main(argv=None):
     parser.add_argument('--noise-seeds', nargs='+', type=int)
     parser.add_argument('--review-t', nargs='+', type=float, default=[.25, .75, .9],
                         help='source-review states; leaves training evaluation policy unchanged')
-    parser.add_argument('--rounds', choices=[1, 2], type=int)
-    parser.add_argument('--images', action='store_true', help='save local x0/CFG prediction and blind review table')
-    parser.add_argument('--continue-sampling', action='store_true', help='selected actual native node + complete native suffix')
-    parser.add_argument('--layer-diagnostics', action='store_true')
     parser.add_argument('--max-samples', type=int)
     args = parser.parse_args(argv)
     cfg = json.loads(Path(args.config).read_text())
@@ -91,7 +87,7 @@ def main(argv=None):
     if args.noise_seeds is not None: cfg['noise_seeds'] = args.noise_seeds
     stage = args.stage or cfg['stage']
     if args.command == 'train' and stage not in ('C2-observe', 'C2-feedback'):
-        parser.error('Generation training uses qwen_latent_cot.interaction.cli sft|rl')
+        parser.error('Generation training uses qwen_latent_cot.interaction.cli sft')
     cfg['stage'] = stage
     if args.command == 'check' and args.distributed:
         parser.error('E0 runs on one NPU before formal 16-NPU training')
@@ -107,7 +103,7 @@ def main(argv=None):
     else:
         if not args.data: parser.error('diagnostic commands require --data')
         rows,_=load_input_rows(args,cfg)
-    if args.command in ('eval', 'sample', 'source-review') and not args.checkpoint:
+    if args.command in ('eval', 'source-review') and not args.checkpoint:
         parser.error('evaluation requires --checkpoint')
     if args.command == 'source-review' and any(not 0 <= t < 1 for t in args.review_t):
         parser.error('source-review requires actual t in [0,1)')
@@ -185,25 +181,9 @@ def main(argv=None):
             local_rows = [row for row in selected if row['family_id'] in assigned]
             directory = output/f'rank_{parallel.rank():02d}' if args.distributed else output
             directory.mkdir(parents=True, exist_ok=True)
-            if args.command == 'eval':
-                from .visual_evaluation import evaluate, evaluate_feedback
-                # Swap partners are available even when the donor family is on another rank.
-                if stage == 'C2-observe':
-                    evaluate(student, local_rows, directory, donor_rows=rows, rounds=1,
-                             save_images=args.images, continue_sampling=args.continue_sampling,
-                             layer_diagnostics=args.layer_diagnostics)
-                else:
-                    evaluate_feedback(student, local_rows, directory,
-                                      updates=args.rounds or (2 if stage == 'C3-loop' else 1), donor_rows=selected)
-            elif args.command == 'sample':
-                from .visual_evaluation import complete_sampling
-                for row in local_rows:
-                    for seed in cfg['noise_seeds']:
-                        for rounds, arm in ((1,'base'), (1,'new'), (2,'new')):
-                            complete_sampling(student, row, seed, rounds, arm, output=directory)
-            else:
-                from .visual_evaluation import collect_label_states
-                collect_label_states(runtime, local_rows, directory)
+            from .task_evaluation import evaluate_tasks
+            from .curriculum import NoisePolicy
+            evaluate_tasks(student, local_rows, directory, NoisePolicy(cfg), stage)
             parallel.barrier()
         run['status'] = 'completed'
     except Exception as error:

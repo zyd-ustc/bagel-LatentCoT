@@ -202,8 +202,7 @@ class MemoryWriter(nn.Module):
                 raise ValueError('GEN source positions overlap writer slots')
             current_source = None if source_off else origin
             def block(value, layer=layer, rope=rope, current_source=current_source):
-                with adapter_scope():
-                    return und_block(layer, value, rope, slot_lengths, current_source)
+                return und_block(layer, value, rope, slot_lengths, current_source)
             if self.activation_checkpointing and torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
                 hidden = checkpoint(block, h, use_reentrant=False)

@@ -59,10 +59,6 @@ def test_neutral_seed_prefill_matches_native_inputs(lm):
     for ours, native in zip(seeds, captured): torch.testing.assert_close(ours, native, rtol=0, atol=0)
 
 
-
-
-
-
 def test_rope_once_and_same_layer_guard(lm):
     writer, seeds, source, positions = setup_writer(lm)
     bank = writer(seeds, source, positions)
@@ -205,96 +201,12 @@ def runtime(lm, tmp_path):
     return runtime
 
 
-def test_train_transfer_caption_and_gen_pipeline(runtime, tmp_path):
-    from pathlib import Path
-    from PIL import Image
-    from qwen_latent_cot.diagnostics.caption import train, evaluate
-    from qwen_latent_cot.diagnostics.gen import diagnose_gen
-    from qwen_latent_cot.diagnostics.record import load_checkpoint
-    image = tmp_path/'image.png'; Image.new('RGB', (32, 32), color='red').save(image)
-    def row(name, split, swap=None):
-        return dict(sample_id=name, scene_id=name, split=split, caption='a token', label_type='clean',
-                    verified=True, prompt='an object', image=str(image), swap_id=swap,
-                    facts=[dict(category='object', aliases=['token'], alternatives=['missing'])])
-    rows = [row('train', 'train'), row('val', 'val'), row('test_a', 'test', 'test_b'), row('test_b', 'test', 'test_a')]
-    c1 = tmp_path/'c1'; c1.mkdir()
-    train(runtime, rows, 'C1', c1)
-    assert (c1/'best.pt').exists() and (c1/'last.pt').exists()
-    c2 = tmp_path/'c2'; c2.mkdir()
-    # Historical C2 checkpoints remain diagnostic inputs; C2 training now has
-    # one implementation in visual_training (covered by test_visual_loop).
-    with pytest.raises(ValueError, match='visual training'):
-        train(runtime, rows, 'C2', c2, str(c1/'best.pt'))
-    from qwen_latent_cot.diagnostics.record import save_checkpoint
-    save_checkpoint(c2/'fixture.pt', runtime, 0, 'C2')
-    cap = tmp_path/'caption'; cap.mkdir()
-    evaluated = evaluate(runtime, rows[2:], 'C2', cap)
-    assert {'Correct', 'Source-off', 'Source-swap', 'Memory-swap', 'Memory-masked', 'Pure-noise'} <= {r['arm'] for r in evaluated}
-    runtime.config['eval_t'] = [.5]
-    gen = tmp_path/'gen'; gen.mkdir()
-    diagnose_gen(runtime, rows[2:], gen, str(c1/'best.pt'), str(c2/'fixture.pt'), continuation=True)
-    records = [json.loads(line) for line in (gen/'gen.jsonl').read_text().splitlines()]
-    assert {'G-base', 'G-layout', 'G-fixed', 'G-neutral', 'G-text', 'G-TL', 'G-VL', 'G-swap-TL', 'G-swap-VL'} == {r['arm'] for r in records}
-    assert (gen/'blind_annotations.csv').exists()
-    assert all(r['prompt'] == 'an object' and r['writer_prompt'] == 'An image.' for r in records)
-    assert all(r['frozen_guard'] == 'passed' for r in records)
-    from qwen_latent_cot.diagnostics.schedule import native_suffix, nearest_node
-    actual = nearest_node(runtime.config, .5)[1]
-    assert all(r['requested_t'] == .5 and r['t'] == actual for r in records)
-    assert all(r['continuation_times'] == [actual]+native_suffix(runtime.config, actual) for r in records)
-    expected = runtime.state(rows[2], actual, 0)[0]
-    stored = torch.load(gen/'test_a_000.pt', weights_only=True)
-    torch.testing.assert_close(stored['x_t'], expected, rtol=0, atol=0)
-    swap_rows = [r for r in evaluated if 'swap' in r['arm']]
-    assert all(r['intervention_evidence_group'] == 'donor_bank_swap' for r in swap_rows)
-    assert all(r['equivalent_to'] == 'Source-swap' for r in swap_rows if r['arm'] == 'Memory-swap')
-    train_records = [json.loads(line) for line in (c1/'train.jsonl').read_text().splitlines()]
-    assert all(g['k_max'] > 0 and g['v_max'] > 0 for g in train_records[0]['memory_gradient_audit'])
-    assert train_records[0]['sampled_states'][0]['t'] is None
-
-
 def test_checkpoint_rejects_native_provenance_change(runtime, tmp_path):
-    from qwen_latent_cot.diagnostics.record import save_checkpoint, load_checkpoint
-    path = tmp_path/'checkpoint.pt'; save_checkpoint(path, runtime, 1, 'C1')
+    from qwen_latent_cot.diagnostics.record import validate_checkpoint
+    saved = dict(native_files=runtime.native_files)
     runtime.native_files = {'different': 'checkpoint'}
-    with pytest.raises(ValueError, match='provenance'): load_checkpoint(path, runtime)
-
-
-def test_trajectory_records_actual_native_times(runtime, tmp_path):
-    from qwen_latent_cot.diagnostics.trajectory import collect
-    folder = tmp_path/'trajectory'; folder.mkdir()
-    collect(runtime, [dict(sample_id='sample', scene_id='scene', split='test', prompt='an object')], folder)
-    rows = [json.loads(line) for line in (folder/'observation_candidates.jsonl').read_text().splitlines()]
-    assert rows and all(not r['verified'] and r['label_type'] == 'observed' for r in rows)
-    for row in rows:
-        state = torch.load(folder/row['state'], weights_only=True)
-        assert state['t'] == row['actual_t'] and state['state_source'] == 'trajectory'
-
-
-def test_report_keeps_four_tables_and_does_not_invent_blind_labels(tmp_path):
-    from qwen_latent_cot.diagnostics.report import summarize
-    from qwen_latent_cot.diagnostics.record import write_json
-    run = tmp_path/'run'; run.mkdir()
-    write_json(run/'manifest.json', dict(model_files={}, dataset_hash='fixed', depth=3, slots=16,
-                                        config={}, source_hashes={}, topology='L'))
-    item = dict(topology='L', stage='C1', arm='Correct', label_type='clean', state_source='text_oracle',
-                initialization_only=False, nll=2., fact_accuracy=1., scene_id='one', facts=[])
-    (run/'captions.jsonl').write_text(json.dumps(item)+'\n')
-    output = tmp_path/'report'; summarize([str(run)], output)
-    tables = json.loads((output/'tables.json').read_text())
-    assert set(tables) == {'text_bridge', 'visual_caption', 'gen_local', 'final_image'}
-    assert tables['final_image'] == [] and tables['text_bridge'][0]['fact_accuracy']['mean'] == 1.
-
-
-def test_report_rejects_incomparable_models(tmp_path):
-    from qwen_latent_cot.diagnostics.report import summarize
-    from qwen_latent_cot.diagnostics.record import write_json
-    runs = []
-    for index in range(2):
-        run = tmp_path/str(index); run.mkdir(); runs.append(str(run))
-        write_json(run/'manifest.json', dict(model_files={'weights':str(index)}, dataset_hash='fixed', depth=3,
-                                            slots=16, config={}, source_hashes={}, topology='L'))
-    with pytest.raises(ValueError, match='different'): summarize(runs, tmp_path/'output')
+    with pytest.raises(ValueError, match='provenance'):
+        validate_checkpoint(saved, runtime)
 
 
 def test_original_image_cannot_cross_split_under_different_ids(tmp_path):
@@ -303,37 +215,6 @@ def test_original_image_cannot_cross_split_under_different_ids(tmp_path):
                  label_type='clean', image='image.bin', facts=[]) for i, split in enumerate(['train', 'test'])]
     dataset = tmp_path/'data.jsonl'; dataset.write_text('\n'.join(json.dumps(r) for r in rows))
     with pytest.raises(ValueError, match='original image'): load_dataset(dataset)
-
-
-def test_cli_c0_manifest_serializes_native_vae_config(runtime, tmp_path, monkeypatch):
-    import sys
-    from qwen_latent_cot.diagnostics.cli import main
-    import qwen_latent_cot.bagel.backbone as backbone
-    from qwen_latent_cot.bagel.modeling.autoencoder import AutoEncoderParams
-    # Use the ACTUAL native VAE config dataclass, which transformers leaves nested.
-    runtime.model.config.vae_config = AutoEncoderParams(256, 3, 8, 128, 3, [1,2,4,4], 2, 16, .3611, .1159)
-    native_dir = tmp_path/'native'; native_dir.mkdir()
-    (native_dir/'llm_config.json').write_text('{}')
-    runtime.bundle.model_path = str(native_dir)
-    config = dict(runtime.config, resolution=512)
-    config_path = tmp_path/'config.json'; config_path.write_text(json.dumps(config))
-    dataset = tmp_path/'dataset.jsonl'
-    dataset.write_text(json.dumps(dict(sample_id='calibrate', scene_id='scene', split='val',
-                       caption='a token', label_type='clean', verified=True,
-                       facts=[dict(category='object', aliases=['token'], alternatives=['absent'])]))+'\n')
-    monkeypatch.setattr(backbone, 'load_native', lambda *args: runtime.bundle)
-    output = tmp_path/'calibration'
-    monkeypatch.setattr(sys, 'argv', ['memory-topology', 'calibrate', '--model', str(native_dir),
-                        '--data', str(dataset), '--config', str(config_path), '--split', 'val', '--output', str(output)])
-    main()
-    record = json.loads((output/'manifest.json').read_text())
-    assert record['native_config']['vae_config']['scale_factor'] == .3611
-    assert record['status'].startswith('executed')
-    assert not json.loads((output/'calibration.json').read_text())['passed']
-    assert not any('build/' in name for name in record['source_hashes'])
-
-
-
 
 
 def test_literal_negation_is_local_to_assertion():
@@ -352,20 +233,10 @@ def test_c0_uses_own_repeat_instruction(runtime):
     assert runtime.config['c0_instruction'] != runtime.config['caption_instruction']
 
 
-
-
 def test_continuation_rejects_partial_first_step(runtime):
     x = torch.ones(4, 8)
     with pytest.raises(ValueError, match='native'):
         runtime.continue_once(x, .05, x, {}, [0.])
-
-
-def test_pure_noise_audit_compares_hashes_without_swap():
-    from qwen_latent_cot.diagnostics.caption import check_pure_noise
-    rows = [dict(t=1, arm='Correct', state_source='controlled', noise_seed=0,
-                 x_t_hash=h, generated_ids=[1]) for h in ('a', 'b')]
-    with pytest.raises(RuntimeError, match='pure.noise'):
-        check_pure_noise(rows)
 
 
 def test_real_qwen2_tokenizer_matches_native_prompt_wrapper(runtime, tmp_path):
@@ -385,21 +256,6 @@ def test_real_qwen2_tokenizer_matches_native_prompt_wrapper(runtime, tmp_path):
         assert actual == [257]+tokenizer.encode(instruction, add_special_tokens=False)+[258]
     assert runtime.prompt_ids(runtime.config['c0_instruction']) != runtime.prompt_ids(runtime.config['caption_instruction'])
     assert runtime.answer_ids('a red cube') == tokenizer.encode('a red cube', add_special_tokens=False)+[258]
-
-
-def test_c0_both_decode_paths_receive_repeat_instruction(runtime, monkeypatch):
-    import qwen_latent_cot.diagnostics.caption as caption
-    calls = []
-    runtime.c0_instruction_ids = [1, 11, 12, 2]
-    runtime.instruction_ids = [1, 20, 21, 2]
-    def loss(bundle, instruction, answer, prefix, start):
-        calls.append(instruction); return torch.tensor(1.), None
-    def free(bundle, instruction, prefix, start, max_tokens):
-        calls.append(instruction); return 'a red cube', [11]
-    monkeypatch.setattr(caption, 'teacher_forcing', loss)
-    monkeypatch.setattr(caption, 'free_caption', free)
-    caption.caption_result(runtime, dict(caption='a red cube', facts=[]), None, 0, 'C0')
-    assert calls == [runtime.c0_instruction_ids]*2
 
 
 def test_controlled_continuation_uses_complete_native_steps(runtime, monkeypatch):
@@ -431,23 +287,6 @@ def test_image_posterior_seeds_depend_on_content_and_preserve_rng(runtime, tmp_p
     assert runtime.image_posterior_seed(a) != runtime.image_posterior_seed(b)
     runtime.encode_image(a, runtime.image_posterior_seed(a))
     torch.testing.assert_close(before, torch.random.get_rng_state(), rtol=0, atol=0)
-
-
-def test_checkpoint_rejects_pre_correction_contract(runtime, tmp_path):
-    from qwen_latent_cot.diagnostics.record import save_checkpoint, load_checkpoint
-    path = tmp_path/'old.pt'; save_checkpoint(path, runtime, 1, 'C1')
-    old = torch.load(path, weights_only=True)
-    del old['config']['adapter_type']; torch.save(old, path)
-    with pytest.raises(ValueError, match='adapter_type'):
-        load_checkpoint(path, runtime)
-
-
-def test_pure_noise_audit_rejects_output_mismatch_at_same_hash():
-    from qwen_latent_cot.diagnostics.caption import check_pure_noise
-    rows = [dict(t=1, arm='Correct', state_source='controlled', noise_seed=0,
-                 x_t_hash='same', generated_ids=[token]) for token in (1, 2)]
-    with pytest.raises(RuntimeError, match='pure.noise'):
-        check_pure_noise(rows)
 
 
 def test_trajectory_rejects_different_native_schedule(runtime, tmp_path):

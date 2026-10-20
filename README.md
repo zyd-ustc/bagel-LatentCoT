@@ -1,54 +1,45 @@
-# BAGEL-LatentCoT
+# BAGEL Full-Layer Dual-State Loop
 
-通过连续 memory 连接 BAGEL 的理解与生成，让模型在图像生成过程中读取状态、形成反馈并更新生成预测。
+在 `loop-layer-NPU` 上重构。每个启用循环的 flow 步执行一次原生 GEN，加两次全层反馈遍历。
+上一轮 GEN 的末层图像 hidden 回灌到下一轮入口；UND Memory KV 在全部 block 联合参与 attention。
 
-生成专家（GEN）先计算当前状态的内部特征。理解专家（UND）结合目标文字写入连续 memory，第二遍 GEN 消费反馈，重新预测同一状态的速度。外层采样器据此推进图像。
+- 前 `ceil(实际 Euler 更新数 / 2)` 次更新启用循环，后半程原生采样。
+- 全部 28 个 block 共享权重；16 个 Memory slot 全强度注入。
+- 保留 Prompt KV、GEN 的 +16 RoPE 偏移及原生 CFG；偏移不逐轮累计。
+- 训练和采样共用 `interaction.loop.full_loop`，中间反馈输出直接接受 flow 监督。
+- 新 checkpoint 为 `bagel_full_loop_v2`。旧交互 LoRA/RL checkpoint 不兼容；format-4 C2 checkpoint 用于初始化 Reader。
 
-训练路线为 **Observe 初始化 → 交互监督微调（SFT）→ Flow-GRPO 强化学习（RL）**。SFT 联合训练 UND writer 与 GEN consumer，RL 根据终图奖励更新 consumer。
+## 训练
 
-[方法设计](docs/design.md) · [实验与运行](docs/experiments.md) · [训练数据](docs/data.md) · [Benchmark](docs/benchmark.md)
-
-## 当前进展
-
-| 阶段 | 结果 |
-|---|---|
-| Observe | 原生 UND 全层注意力训练完成 20,000 步；高噪声课程与多机训练入口已实现 |
-| 交互 SFT | 双 rank-16 LoRA 已接入；真实 BAGEL 单卡 2 步、16 卡 20 步验证通过 |
-| Flow-GRPO | 14 张策略卡与 2 张评分卡完成 32 张候选生成、评分、一次参数更新和重载生成 |
-| 统一推理 | 支持原版 BAGEL、parent、正常反馈、屏蔽反馈和交换反馈 |
-
-2026-10-17 的 16 卡 SFT 记录为平均 1.569 秒/步、峰值显存 38.406 GiB。运行目录、训练参数与阶段结果见[实验文档](docs/experiments.md#阶段结果)。下一轮训练预算为 500 步 SFT 与 100 批 RL。
-
-## 开始使用
-
-准备 Python 3.10+、与设备匹配的 PyTorch 和 BAGEL 基础模型。在仓库根目录安装：
+安装项目依赖后，在仓库根目录执行：
 
 ```bash
-python -m pip install -e '.[dev]'
-python -m qwen_latent_cot.interaction.cli --help
+python -m qwen_latent_cot.interaction.cli sft \
+  --model /absolute/path/Bagel-7B-MoT \
+  --parent /absolute/path/observe/best.pt \
+  --train /absolute/path/train.jsonl --val /absolute/path/val.jsonl \
+  --output /absolute/path/full-loop-run --device npu:0
 ```
 
-交互训练读取 caption-image JSONL：
+每行输入为 `{"caption":"Three red apples on a plate.","image":"/absolute/path/image.jpg"}`。
+默认 10,000 步、全局 batch 256；步数可通过 `--steps` 修改。续训使用 `--resume` 替代 `--parent`。
 
-```json
-{"caption":"Three red apples on a white plate.","image":"/absolute/path/to/image.png"}
-```
+多卡入口为 `scripts/train_interaction_npu.sh OUTPUT --parent ... --train ... --val ...`。
+多实例时，在每个实例设置相同 `NNODES`、`MASTER_ADDR`、`MASTER_PORT`，并设置各自的 `NODE_RANK`；每机默认 16 卡。
 
-数据准备见[训练数据](docs/data.md)，Observe、SFT 与 RL 启动命令见[实验与运行](docs/experiments.md)。
-
-使用交互 checkpoint 生成图像：
+## 采样
 
 ```bash
-export BAGEL_MODEL=/absolute/path/to/Bagel-7B-MoT
-export INTERACTION_CHECKPOINT=/absolute/path/to/step_000500.pt
 python -m qwen_latent_cot.interaction.cli sample \
-  --model "$BAGEL_MODEL" --checkpoint "$INTERACTION_CHECKPOINT" \
-  --caption 'Three red apples on a white plate.' \
-  --device npu:0 --seed 0 --output sample.png
+  --model /absolute/path/Bagel-7B-MoT \
+  --checkpoint /absolute/path/full-loop-run/step_001000.pt \
+  --caption 'Three red apples on a plate.' --seed 17 \
+  --output /absolute/path/sample.png --device npu:0
 ```
 
-输出为 `sample.png` 与采样节点记录 `sample.png.json`。现有训练脚本面向 Ascend NPU，模型与环境路径通过环境变量设置。
+输出图片及同名 `.png.json` 更新记录。`--native` 禁用循环和适配器，并使用原始 BAGEL UND 权重生成基准。
 
-## 许可
+[架构与验收](docs/design.md) · [全部改动文件 URL](docs/changed_files_urls.md)
 
-基于 [BAGEL](https://github.com/ByteDance-Seed/Bagel) 的理解、生成与流匹配接口。代码采用 [Apache-2.0](LICENSE)，模型与数据遵循各自许可证。
+不额外训练时，采样命令将 `--checkpoint ...` 替换为 `--parent /absolute/path/observe/best.pt`。
+这会初始化同一个新循环：Write/GEN LoRA 的增量为零，Memory 全强度注入，回灌强度为 1。

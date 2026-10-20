@@ -1,5 +1,6 @@
 """Differentiable native conditional GEN, with the SAME injection kernel as inference."""
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
+from types import MethodType
 from dataclasses import dataclass
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -31,16 +32,40 @@ class FlowOutput:
     velocity: torch.Tensor
     source: tuple[KV, ...]
     round: int
+    hidden: torch.Tensor | None = None
+
+
+@contextmanager
+def conditional_reentry(decoder, cache, image_indexes, hidden_input):
+    """Replace image entrance only; observe the exit before final output norm."""
+    original = decoder.forward_inference
+    captured = {}
+    def exit_hook(module, args, kwargs, result):
+        if kwargs.get('mode') == 'gen' and kwargs.get('past_key_values') is cache:
+            captured['hidden'] = result[0][image_indexes]
+    def call(self, **kwargs):
+        if kwargs.get('mode') == 'gen' and kwargs.get('past_key_values') is cache and hidden_input is not None:
+            kwargs = dict(kwargs)
+            hidden = kwargs['packed_query_sequence'].clone()
+            hidden[image_indexes] = hidden_input.to(hidden.dtype)
+            kwargs['packed_query_sequence'] = hidden
+        return original(**kwargs)
+    handle = decoder.layers[-1].register_forward_hook(exit_hook, with_kwargs=True)
+    decoder.forward_inference = MethodType(call, decoder)
+    try:
+        yield captured
+    finally:
+        decoder.forward_inference = original
+        handle.remove()
 
 
 def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
                     round_index=0, detach_source=True, checkpoint_activations=False,
-                    adapter_scope=nullcontext, guidance=False):
-    """Unwrap ONLY native no_grad; all time/position/norm/heads stay native.
+                    adapter_scope=nullcontext, guidance=False, hidden_input=None):
+    """One full-depth native flow call. CFG references never receive feedback.
 
-    Checkpoint closure owns its contexts: backward recomputation re-enters the
-    same injection kernel, even after the original forward context has closed.
-    Captured K/V are explicit checkpoint outputs, never a mutable backward cache.
+    Reentry, Memory, adapter scopes and capture are recreated inside checkpoint
+    recomputation. Hidden and captured KV are explicit differentiable outputs.
     """
     native = getattr(runtime.model._forward_flow, '__wrapped__', None)
     if native is None:
@@ -50,36 +75,37 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
     if int(source_positions.max()) >= runtime.config['writer_position_start']:
         raise ValueError('GEN positions overlap writer slots')
     metadata = []
+    image_indexes = flow['packed_vae_token_indexes']
 
-    def forward(x):
+    def forward(x, entrance):
         context = (gen_memory_call(runtime.decoder, flow['past_key_values'], bank,
                                    state.lengths, state.positions, masked, adapter_scope=adapter_scope)
                    if bank is not None else nullcontext())
         observer = (capture_gen(runtime.decoder, flow['past_key_values'], t=state.t,
                                 round_index=round_index, positions=source_positions,
-                                detach=detach_source,
-                                source_policy=runtime.config.get('visual_source_policy', 'full_query'))
+                                detach=detach_source, source_policy='full_query')
                     if capture else nullcontext({}))
-        with context, observer as captured, autocast_for(runtime.device):
-            velocity = native(runtime.model, x_t=x,
-                              timestep=torch.full((len(x),), state.t, device=runtime.device),
-                              **flow, cfg_text_scale=runtime.config['cfg_text_scale'] if guidance else 1., cfg_img_scale=1.,
-                              cfg_renorm_min=runtime.config['cfg_renorm_min'],
-                              cfg_renorm_type=runtime.config['cfg_renorm_type'])
+        with conditional_reentry(runtime.decoder, flow['past_key_values'], image_indexes, entrance) as exit_state:
+            with context, observer as captured, autocast_for(runtime.device):
+                velocity = native(runtime.model, x_t=x,
+                                  timestep=torch.full((len(x),), state.t, device=runtime.device),
+                                  **flow, cfg_text_scale=runtime.config['cfg_text_scale'] if guidance else 1., cfg_img_scale=1.,
+                                  cfg_renorm_min=runtime.config['cfg_renorm_min'],
+                                  cfg_renorm_type=runtime.config['cfg_renorm_type'])
         source = tuple(captured[i] for i in range(len(runtime.decoder.layers))) if capture else ()
         if not metadata:
             metadata.extend(source)
-        return (velocity, *(value for kv in source for value in (kv.keys, kv.values)))
+        return (velocity, exit_state['hidden'], *(value for kv in source for value in (kv.keys, kv.values)))
 
-    outputs = (checkpoint(forward, state.x_t, use_reentrant=False, preserve_rng_state=True)
+    outputs = (checkpoint(forward, state.x_t, hidden_input, use_reentrant=False, preserve_rng_state=True)
                if checkpoint_activations and torch.is_grad_enabled() and bank is not None
-               else forward(state.x_t))
+               else forward(state.x_t, hidden_input))
     if not torch.isfinite(outputs[0]).all():
         raise FloatingPointError('non-finite conditional GEN velocity')
-    source = tuple(KV(kv.layer, outputs[1+2*i], outputs[2+2*i], kv.lengths,
+    source = tuple(KV(kv.layer, outputs[2+2*i], outputs[3+2*i], kv.lengths,
                       kv.rotated, kv.source_kind, kv.t, kv.round, kv.token_roles,
                       kv.positions, kv.expert) for i, kv in enumerate(metadata))
-    return FlowOutput(outputs[0], source, round_index)
+    return FlowOutput(outputs[0], source, round_index, outputs[1])
 
 
 def flow_mse(output, state):

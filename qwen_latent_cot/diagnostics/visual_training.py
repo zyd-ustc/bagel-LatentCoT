@@ -1,4 +1,4 @@
-"""Indexed Observe/Feedback text training, separate from generation SFT/RL."""
+"""Indexed Observe/Feedback text training, separate from generation full-loop SFT."""
 import time
 import torch
 from . import distributed as parallel
@@ -14,7 +14,7 @@ from ..bagel.accelerator import synchronize, reset_peak_memory_stats, max_memory
 
 def train(student, corpus, stage, output, parent=None, *, resume=None, skip_validation=False, wandb_options=None):
     if stage not in ('C2-observe', 'C2-feedback'):
-        raise ValueError('Generation training uses interaction SFT/RL')
+        raise ValueError('Generation training uses interaction full-loop SFT')
     runtime=student.runtime; cfg=runtime.config; validate_config(runtime,stage)
     excluded=set(cfg.get('excluded_sources',[]))
     active=[]

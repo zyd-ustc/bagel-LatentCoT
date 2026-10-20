@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 import torch
 
-KIND = 'interaction_lora_v1'
+KIND = 'bagel_full_loop_v2'
 
 
 def read(path):
@@ -40,7 +40,7 @@ def save(path, student, stage, step, *, optimizer=None, sampler=None, provenance
     path = Path(path)
     value = dict(kind=KIND, stage=stage, step=step, parent=student.parent,
                  config=student.config, adapters=cpu_state(student.adapters.state_dict()),
-                 reference=student.adapters.reference_state(),
+                 bridge=cpu_state(student.bridge.state_dict()),
                  optimizer=cpu_state(optimizer.state_dict()) if optimizer else None,
                  sampler=sampler.state_dict() if sampler else None,
                  rng_by_rank=rng_by_rank or [rng_state(student.runtime.device)],
@@ -52,13 +52,9 @@ def save(path, student, stage, step, *, optimizer=None, sampler=None, provenance
 
 def apply(saved, student):
     if saved.get('kind') != KIND:
-        raise ValueError('Expected an interaction checkpoint, not an UND training checkpoint')
+        raise ValueError('Expected bagel_full_loop_v2; legacy LoRA/RL checkpoints are not supported')
     student.adapters.load_state_dict(saved['adapters'], strict=True)
-    if saved['stage'] == 'rl':
-        student.adapters.freeze_writer()
-        if not saved['reference']:
-            raise ValueError('RL checkpoint is missing its fixed SFT reference')
-        student.adapters.load_reference(saved['reference'])
+    student.bridge.load_state_dict(saved['bridge'], strict=True)
 
 
 def resume(saved, student, optimizer, sampler, provenance):

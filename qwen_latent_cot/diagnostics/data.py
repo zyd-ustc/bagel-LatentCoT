@@ -38,7 +38,7 @@ def visual_label(row, *, c1_feedback=False):
     row.setdefault('prompt', 'An image.')
     row.setdefault('label_type', 'observed' if row.get('state') else 'clean')
     if kind == 'feedback':
-        from .explicit_feedback import Feedback
+        from .feedback import Feedback
         from dataclasses import asdict
         feedback = Feedback(**row['feedback'])
         historical = feedback.origin == 'source_annotation' and c1_feedback and row.get('image') and not row.get('state')

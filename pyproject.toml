@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bagel-latent-cot"
 version = "0.6.1"
-description = "Frozen BAGEL independent L/C Memory topology diagnostics"
+description = "BAGEL full-layer dual-state recurrence"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-memory-topology = "qwen_latent_cot.diagnostics.cli:main"
+bagel-observe = "qwen_latent_cot.diagnostics.visual_cli:main"
 bagel-interaction = "qwen_latent_cot.interaction.cli:main"
 
 [project.optional-dependencies]

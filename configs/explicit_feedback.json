@@ -1,7 +1,0 @@
-{
-  "protocol": "explicit_feedback",
-  "early": [10, 20],
-  "max_reflection_tokens": 384,
-  "vit_max_image_size": 980,
-  "vit_min_image_size": 224
-}

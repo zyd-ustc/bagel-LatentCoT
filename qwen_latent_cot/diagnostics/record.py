@@ -96,22 +96,6 @@ def manifest(runtime, args, data_path, *, rows=None):
     return result
 
 
-def save_checkpoint(path, runtime, step, stage, parent=None):
-    torch.save(dict(adapters=runtime.writer.state_dict(), topology=runtime.writer.topology,
-                    slots=runtime.writer.slots, depth=len(runtime.decoder.layers),
-                    seed_ids=runtime.seed_ids, config=runtime.config, step=step, stage=stage, parent=parent,
-                    native_files=runtime.native_files,
-                    response_cumulative_steps=getattr(runtime, 'response_cumulative_steps', 0),
-                    parent_hash=file_hash(parent) if parent else None), path)
-
-
-def load_checkpoint(path, runtime, expected_stage=None):
-    saved = torch.load(path, map_location=runtime.device, weights_only=True)
-    validate_checkpoint(saved, runtime, expected_stage)
-    runtime.writer.load_state_dict(saved['adapters'], strict=True)
-    return saved
-
-
 def validate_checkpoint(saved, runtime, expected_stage=None):
     """Validate native model and writer capacity without modifying any weights."""
     if saved.get('native_files') != runtime.native_files:

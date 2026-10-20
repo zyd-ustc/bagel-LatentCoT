@@ -1,4 +1,4 @@
-"""Observe parent -> interaction flow SFT -> fixed-writer Flow-GRPO."""
+"""BAGEL full-depth dual-state loop: supervised training and sampling."""
 import argparse
 import json
 import os
@@ -8,11 +8,11 @@ from pathlib import Path
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest='command', required=True)
-    for stage in ('sft', 'rl'):
+    for stage in ('sft',):
         command = commands.add_parser(stage)
         command.add_argument('--model', required=True)
         source = command.add_mutually_exclusive_group(required=True)
-        source.add_argument('--parent' if stage == 'sft' else '--checkpoint', required=False)
+        source.add_argument('--parent')
         source.add_argument('--resume')
         command.add_argument('--config', default=f'configs/interaction_{stage}.json')
         command.add_argument('--train', required=True)
@@ -23,22 +23,21 @@ def parser():
         command.add_argument('--steps', type=int)
         command.add_argument('--global-batch', type=int)
         command.add_argument('--val-images', type=int)
-        if stage == 'rl':
-            command.add_argument('--reward-questions', required=True)
-            command.add_argument('--judge-queue', required=True)
-            command.add_argument('--prompts-per-batch', type=int)
         command.add_argument('--wandb-mode', default=os.getenv('WANDB_MODE', 'disabled'), choices=('online', 'offline', 'disabled'))
         command.add_argument('--wandb-project', default=os.getenv('WANDB_PROJECT', 'bagel-interaction'))
         command.add_argument('--wandb-entity', default=os.getenv('WANDB_ENTITY'))
         command.add_argument('--wandb-name', default=os.getenv('WANDB_NAME'))
     sample = commands.add_parser('sample')
     sample.add_argument('--model', required=True)
-    sample.add_argument('--checkpoint', required=True)
+    source = sample.add_mutually_exclusive_group(required=True)
+    source.add_argument('--checkpoint', help='Trained full-loop v2 checkpoint')
+    source.add_argument('--parent', help='C2 format-4 checkpoint: run the new loop without additional training')
+    sample.add_argument('--config', default='configs/interaction_sft.json', help='Initialization config for --parent')
     sample.add_argument('--caption', required=True)
     sample.add_argument('--output', required=True)
     sample.add_argument('--device', default='npu:0')
     sample.add_argument('--seed', type=int, default=0)
-    sample.add_argument('--arm', default=None)
+    sample.add_argument('--native', action='store_true', help='Disable loop and adapters for a baseline')
     audit = commands.add_parser('audit')
     audit.add_argument('--input', required=True)
     audit.add_argument('--output', required=True)
@@ -69,8 +68,13 @@ def main(argv=None):
     if args.command == 'sample':
         from ..diagnostics.inference import InferenceEngine
         from ..bagel.accelerator import set_device
-        engine = InferenceEngine.load(args.model, args.checkpoint, set_device(args.device))
-        image, nodes = engine.generate(args.caption, args.seed, arm=args.arm)
+        device = set_device(args.device)
+        if args.parent:
+            config = json.loads(Path(args.config).read_text())
+            engine = InferenceEngine.from_parent(args.model, args.parent, config, device)
+        else:
+            engine = InferenceEngine.load(args.model, args.checkpoint, device)
+        image, nodes = engine.generate(args.caption, args.seed, native=args.native)
         image.save(args.output)
         Path(args.output+'.json').write_text(json.dumps(nodes, indent=2))
         return
@@ -89,35 +93,27 @@ def main(argv=None):
     from ..diagnostics.training_logging import start_wandb
 
     cfg = json.loads(Path(args.config).read_text())
-    for key in ('steps', 'global_batch', 'val_images', 'prompts_per_batch'):
+    for key in ('steps', 'global_batch', 'val_images'):
         if getattr(args, key, None) is not None:
             cfg[key] = getattr(args, key)
-    if cfg['early_steps'] != 20 or cfg['rank'] != 16 or cfg['alpha'] != 16:
-        raise ValueError('First interaction protocol requires early20 and rank/alpha16')
     device = parallel.initialize(args.device) if args.distributed else set_device(args.device)
     torch.manual_seed(cfg['seed'])
     random.seed(cfg['seed'])
-    path = resolve_checkpoint(args.resume or getattr(args, 'parent', None) or getattr(args, 'checkpoint', None))
+    path = resolve_checkpoint(args.resume or args.parent)
     saved = checkpoint.read(path)
     initialized = saved.get('kind') == checkpoint.KIND
     if args.command == 'sft' and not args.resume and initialized:
         raise ValueError('SFT --parent is a format-4 Observe/Feedback parent; continue SFT with --resume')
     if args.resume and (not initialized or saved['stage'] != args.command):
         raise ValueError('Resume requires the same interaction training stage')
-    if args.command == 'rl' and not args.resume and (not initialized or saved['stage'] != 'sft'):
-        raise ValueError('RL starts from a saved SFT interaction checkpoint')
     parent = saved['parent'] if initialized else saved
     runtime_cfg = dict(parent['config'])
-    if (runtime_cfg['sampler_steps'], runtime_cfg['timestep_shift']) != (50, 3):
-        raise ValueError('Interaction protocol requires the native 50-node shift=3 grid')
     runtime_cfg['source_layers'] = list(range(parent['depth']))
-    runtime = DiagnosticRuntime(load_native(args.model, device, 3), runtime_cfg, 'C')
+    runtime = DiagnosticRuntime(load_native(args.model, device, runtime_cfg['timestep_shift']), runtime_cfg, 'C')
     runtime.native_files = parent['native_files']
     student = InteractionStudent(runtime, parent, cfg)
     if initialized:
         checkpoint.apply(saved, student)
-    if args.command == 'rl' and not args.resume:
-        student.begin_rl()
     train, val = load_pairs(args.train), load_pairs(args.val)
     validate_splits(train, val)
     parent_hash = parallel.gather_samples([file_hash(path)] if parallel.rank() == 0 and not args.resume else [])
@@ -125,8 +121,6 @@ def main(argv=None):
                       val=str(Path(args.val).resolve()), val_sha256=file_hash(args.val),
                       parent_path=str(path) if not args.resume else saved['provenance']['parent_path'],
                       parent_sha256=parent_hash[0] if not args.resume else saved['provenance']['parent_sha256'])
-    if args.command == 'rl':
-        provenance['reward_questions_sha256'] = file_hash(args.reward_questions)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     if not args.resume and (output/'train.jsonl').exists():
@@ -136,11 +130,7 @@ def main(argv=None):
     trainer = Trainer(student, train, val, output, args.command, provenance,
                       saved=saved if args.resume else None, wandb=wandb)
     try:
-        if args.command == 'sft':
-            train_sft(trainer)
-        else:
-            from .rl import train_rl
-            train_rl(trainer, args.reward_questions, args.judge_queue)
+        train_sft(trainer)
     finally:
         if wandb:
             wandb.finish()

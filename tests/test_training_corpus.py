@@ -126,21 +126,23 @@ def tiny_config(runtime,stage):
     cfg.update({k:runtime.config[k] for k in ('resolution','caption_instruction')})
     cfg.update(stage=stage,source_layers=[0,1,2],steps=1,effective_batch=2,eval_every=1,sampler_steps=4,
                max_caption_tokens=2,output_token_budgets=[2],noise_seeds=[0],validation_max_rows=2,
-               task_mix={'generation':1},loss_weights=dict(sem=1 if stage=='C2-observe' else 0,teacher=0,flow=0 if stage=='C2-observe' else 1))
+               task_mix={'endpoint':1},loss_weights=dict(sem=1,teacher=0,flow=0))
     runtime.config=cfg;return cfg
 
 
 def test_native_condition_prefix_keeps_prompt_separate_and_input_gradients(visual_runtime,tmp_path):
     runtime,row=visual_runtime;tiny_config(runtime,'C2-feedback')
-    condition=image(tmp_path,'condition.png','blue');row=dict(row,condition_images=[condition])
-    state=runtime.training_state(row,.9,3)
+    condition=image(tmp_path,'condition.png','blue')
+    row=dict(row,condition_images=[condition],task='feedback',flow_supervision=False,
+             feedback=dict(observation='',gap='',correction='make blue',satisfied=False,origin='source_annotation'))
+    state=runtime.training_state(row,.2,3)
     assert state.lengths[0]>state.positions[0]
     assert state.prompt_kv[0].lengths[0]==len(state.prompt_kv[0].positions)
     assert 'cfg_img_past_key_values' in state.flow
     student=VisualStudent(runtime);values,report=training_objective(student,row,state,'C2-feedback')
-    values['flow'].backward()
-    assert student.visual.layers[0].up.weight.grad.abs().max()>0
-    assert all(p.grad is None for p in runtime.model.parameters())
+    values['sem'].backward()
+    assert any(p.grad is not None and p.grad.abs().sum()>0 for p in student.native_parameters().values())
+    assert all(p.grad is None for p in runtime.model.parameters() if not p.requires_grad)
 
 
 @pytest.mark.parametrize('stage',['C2-observe','C2-feedback'])
@@ -159,18 +161,9 @@ def test_indexed_training_resume_matches_uninterrupted(visual_runtime,tmp_path,s
     logs=[json.loads(s) for s in (complete/'training.jsonl').read_text().splitlines()]
     resumed_log=json.loads((resumed/'training.jsonl').read_text())
     assert logs[1]['sampled_states']==resumed_log['sampled_states']
-    assert all(p.grad is None for p in runtime.model.parameters());corpus.close()
+    assert all(p.grad is None for p in runtime.model.parameters() if not p.requires_grad);corpus.close()
 
 
-def test_repair_has_no_reconstruction_fallback(visual_runtime):
-    runtime,row=visual_runtime;tiny_config(runtime,'C2-feedback');runtime.config['loss_weights']=dict(sem=1,teacher=0,flow=1)
-    row=dict(row,task='feedback',flow_supervision=False,feedback=dict(observation='',gap='',correction='make blue',satisfied=False,origin='source_annotation'))
-    state=runtime.training_state(row,.2,3)
-    with pytest.raises(ValueError):state.flow_target()
-    student=VisualStudent(runtime);values,_=training_objective(student,row,state,'C2-feedback')
-    assert float(values['flow'])==0 and values['sem'].requires_grad
-    runtime.config['feedback_updates']=2
-    with pytest.raises(ValueError,match='online feedback'):training_objective(student,row,state,'C3-loop')
 
 
 def test_pair_draws_do_not_distort_task_quota(tmp_path):
@@ -329,21 +322,14 @@ def test_disabled_legacy_images_stay_out_of_training_views(tmp_path):
     corpus.close()
 
 
-def test_feedback_validation_uses_native_cfg_suffix_without_relabeling(visual_runtime,tmp_path):
+def test_feedback_validation_keeps_semantic_state_without_generation(visual_runtime,tmp_path):
     from qwen_latent_cot.diagnostics.task_evaluation import evaluate_tasks
     runtime,row=visual_runtime;cfg=tiny_config(runtime,'C2-feedback')
     cfg['loss_weights']=dict(sem=1,teacher=0,flow=0)
-    row=dict(row,task='feedback',flow_supervision=False,feedback=dict(observation='',gap='',correction='make blue',satisfied=False,origin='source_annotation'))
+    row=dict(row,source='tiny',task='feedback',flow_supervision=False,feedback=dict(observation='',gap='',correction='make blue',satisfied=False,origin='source_annotation'))
     output=tmp_path/'validation';output.mkdir();records=evaluate_tasks(VisualStudent(runtime),[row],output,NoisePolicy(cfg),'C2-feedback')
-    record=records[0];assert record['state']['t']<=.25 and record['image_state']['t']>.25
-    assert record['supervision']['masks']['sem']
-    assert {'base','memory','source_off'}==set(record['images'])
-    assert all((output/name).is_file() for name in record['images'].values())
-
-
-def test_c3_online_endpoint_sampling_uses_calibrated_native_nodes(tmp_path):
-    import random
-    cfg=json.loads(Path('configs/memory_loop_r2.json').read_text());policy=NoisePolicy(cfg)
-    row=dict(task='feedback');rng=random.Random(0)
-    for _ in range(20):
-        t=policy.time(row,rng);assert 0<t<=.25 and t in policy.native[:-1]
+    record=records[0]
+    assert record['state']['t']<=.25 and not record['state']['flow_supervision']
+    assert record['expected_feedback']==row['feedback']
+    assert record['feedback_nll']>=0 and record['source_off']['nll']>=0
+    assert 'images' not in record and 'image_state' not in record

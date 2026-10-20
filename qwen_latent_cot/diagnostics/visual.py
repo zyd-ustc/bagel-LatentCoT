@@ -106,7 +106,7 @@ class VisualStudent(nn.Module):
             raise ValueError('text teacher is not configured')
         if state is not None:
             from .feedback_source import prompt_source, write_feedback
-            from .explicit_feedback import correction_source
+            from .conditioning import correction_source
             flow, lengths, positions = runtime.flow_inputs(state.metadata['prompt'])
             correction = correction_source(runtime, flow, lengths, positions, caption)[0]
             return write_feedback(runtime, prompt_source(flow, lengths, positions),
@@ -126,8 +126,8 @@ class VisualStudent(nn.Module):
 
 def validate_config(runtime, stage):
     cfg = runtime.config
-    if stage not in ('C2-observe', 'C2-feedback', 'C3-loop'):
-        raise ValueError('select C2-observe/C2-feedback/C3-loop')
+    if stage not in ('C2-observe', 'C2-feedback'):
+        raise ValueError('select C2-observe/C2-feedback')
     if cfg['slots'] != 16 or runtime.writer.topology != 'C':
         raise ValueError('feedback uses continuous UND and 16 slots')
     if cfg.get('writer_architecture') != VisualStudent.architecture:

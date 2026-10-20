@@ -8,7 +8,7 @@ from .data import PairSampler
 from ..diagnostics import distributed as parallel
 from ..diagnostics.flow_training import flow_mse
 from ..diagnostics.record import FrozenGuard, write_json
-from ..diagnostics.schedule import native_times
+from .loop import training_times, supervised_loss
 from ..bagel.accelerator import synchronize, reset_peak_memory_stats, max_memory_allocated
 
 
@@ -22,7 +22,7 @@ class Trainer:
         from ..diagnostics.training_logging import configure_logging
         self.logger = configure_logging(self.output)
         self.sampler = PairSampler(rows, self.config['seed'])
-        parallel.broadcast_parameters(student.adapters)
+        parallel.broadcast_parameters(student)
         self.optimizer = torch.optim.AdamW(student.optimizer_groups(), weight_decay=self.config['weight_decay'])
         self.start = checkpoint.resume(saved, student, self.optimizer, self.sampler, provenance) if saved else 0
         self.guard = FrozenGuard(student.runtime.model, student.runtime.bundle.vae, exclude_trainable=True)
@@ -33,15 +33,15 @@ class Trainer:
                        parent_stage=student.parent['stage'], parent_step=student.parent['step'],
                        parent_noise_curriculum=student.parent['config'].get('noise_curriculum'),
                        sampling={k: student.runtime.config[k] for k in ('sampler_steps', 'timestep_shift', 'resolution', 'cfg_text_scale', 'cfg_renorm_type', 'cfg_renorm_min')},
-                       memory_times=native_times(student.runtime.config)[:self.config['early_steps']],
+                       memory_times=training_times(student.runtime.config),
                        train_pairs=len(rows), val_pairs=len(val), world=parallel.world_size(),
                        trainable={k: sum(p.numel() for p in v) for k, v in student.parameter_groups().items()}))
 
     def update(self, step):
-        parallel.sum_gradients(self.student.adapters)
+        parallel.sum_gradients(self.student)
         group_norms = {name: float(torch.stack([p.grad.float().square().sum() for p in values]).sum().sqrt())
                        for name, values in self.student.parameter_groups().items() if values}
-        norm = torch.nn.utils.clip_grad_norm_([p for p in self.student.adapters.parameters() if p.requires_grad],
+        norm = torch.nn.utils.clip_grad_norm_([p for p in self.student.parameters() if p.requires_grad],
                                              self.config['gradient_clip'], error_if_nonfinite=True)
         for group in self.optimizer.param_groups:
             group['lr'] = self.config[group['name']+'_lr']*min(1., step/max(1, self.config.get('warmup_steps', 0)))
@@ -70,28 +70,23 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, step):
-        from ..diagnostics.shallow_sampling import sample
+        from .sampling import sample
         runtime = self.student.runtime
         records = []
         directory = self.output/f'validation_{step:06d}'
         directory.mkdir(exist_ok=True)
         for index in range(parallel.rank(), min(len(self.val), self.config['val_images']), parallel.world_size()):
             row = self.val[index]
-            state = runtime.training_state(row, native_times(runtime.config)[10], self.config['seed']+index)
-            current, base, _ = self.student(state)
+            state = runtime.training_state(row, training_times(runtime.config)[-1], self.config['seed']+index)
+            result = self.student(state)
+            loss, losses = supervised_loss(result, state, self.config['round_loss_weights'])
             record = dict(sample_id=row['sample_id'], caption=row['caption'], image=row['image'],
-                          flow=float(flow_mse(current, state)), base_flow=float(flow_mse(base, state)))
-            for arm, enabled, passes, mode in (
-                ('parent', False, 2, 'correct'), ('correct', True, 2, 'correct'),
-                ('masked', True, 2, 'masked'), ('swap', True, 2, 'swap')):
-                self.student.adapters_enabled = enabled
-                try:
-                    image, _ = sample(self.student, row['caption'], self.config['seed']+index, passes,
-                                      self.config['early_steps'], memory_mode=mode,
-                                      donor_seed=self.config['seed']+index+1 if mode == 'swap' else None)
-                    image.save(directory/f'{index:03d}_{arm}.png')
-                finally:
-                    self.student.adapters_enabled = True
+                          loss=float(loss), round_flow=[float(x) for x in losses],
+                          base_flow=float(flow_mse(result.baseline, state)))
+            for arm, native in (('native', True), ('loop', False)):
+                image, nodes = sample(self.student, row['caption'], self.config['seed']+index, native=native)
+                image.save(directory/f'{index:03d}_{arm}.png')
+                write_json(directory/f'{index:03d}_{arm}.json', nodes)
             records.append(record)
         records = parallel.gather_samples(records)
         if parallel.rank() == 0:
@@ -104,27 +99,30 @@ def train_sft(trainer):
     batch = cfg['global_batch']
     if batch % parallel.world_size():
         raise ValueError('SFT global_batch must be divisible by world size')
-    nodes = native_times(student.runtime.config)[:cfg['early_steps']]
+    nodes = training_times(student.runtime.config)
     for step in range(trainer.start+1, cfg['steps']+1):
         started = time.perf_counter()
         trainer.optimizer.zero_grad(set_to_none=True)
         rows = trainer.sampler.take(batch)
         draws = [(trainer.sampler.rng.choice(nodes), trainer.sampler.rng.randrange(2**63-1)) for _ in rows]
-        values = [0., 0., 0.]
+        values = [0.]*(3+cfg['feedback_updates'])
         for index in range(parallel.rank(), batch, parallel.world_size()):
             t, seed = draws[index]
             state = student.runtime.training_state(rows[index], t, seed)
-            output, base, _ = student(state)
-            loss = flow_mse(output, state)
+            output = student(state)
+            base = output.baseline
+            loss, round_losses = supervised_loss(output, state, cfg['round_loss_weights'])
             (loss/batch).backward()
             values[0] += float(loss.detach())
             values[1] += float(flow_mse(base, state))
             values[2] += float((output.velocity.detach().float()-base.velocity.float()).square().mean().sqrt())
-            del output, base, state, loss
+            for round_index, round_loss in enumerate(round_losses):
+                values[3+round_index] += float(round_loss.detach())
+            del output, base, state, loss, round_losses, round_loss
         gradients = trainer.update(step)
         values = parallel.sum_statistics(values, trainer.device)
         synchronize(trainer.device)
-        trainer.log(step, dict(flow=values[0]/batch, base_flow=values[1]/batch, delta_v_rms=values[2]/batch,
+        trainer.log(step, dict(loss=values[0]/batch, round_flow=[v/batch for v in values[3:]], base_flow=values[1]/batch, delta_v_rms=values[2]/batch,
                               t_mean=sum(t for t, _ in draws)/batch, t_min=min(t for t, _ in draws),
                               t_max=max(t for t, _ in draws),
                               step_seconds=time.perf_counter()-started, **gradients))
