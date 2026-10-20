@@ -79,9 +79,12 @@ class Trainer:
             row = self.val[index]
             state = runtime.training_state(row, training_times(runtime.config)[-1], self.config['seed']+index)
             result = self.student(state)
-            loss, losses = supervised_loss(result, state, self.config['round_loss_weights'])
+            terms = supervised_loss(result, state, self.config['round_loss_weights'],
+                                    hard_patch_alpha=self.config['hard_patch_alpha'], keep_weight=self.config['keep_weight'])
             record = dict(sample_id=row['sample_id'], caption=row['caption'], image=row['image'],
-                          loss=float(loss), round_flow=[float(x) for x in losses],
+                          loss=float(terms.total), round_flow=[float(x) for x in terms.round_flow],
+                          round_weighted_flow=[float(x) for x in terms.round_weighted_flow],
+                          round_keep=[float(x) for x in terms.round_keep],
                           base_flow=float(flow_mse(result.baseline, state)))
             for arm, native in (('native', True), ('loop', False)):
                 image, nodes = sample(self.student, row['caption'], self.config['seed']+index, native=native)
@@ -105,24 +108,30 @@ def train_sft(trainer):
         trainer.optimizer.zero_grad(set_to_none=True)
         rows = trainer.sampler.take(batch)
         draws = [(trainer.sampler.rng.choice(nodes), trainer.sampler.rng.randrange(2**63-1)) for _ in rows]
-        values = [0.]*(3+cfg['feedback_updates'])
+        rounds = cfg['feedback_updates']
+        values = [0.]*(3+3*rounds)
         for index in range(parallel.rank(), batch, parallel.world_size()):
             t, seed = draws[index]
             state = student.runtime.training_state(rows[index], t, seed)
             output = student(state)
             base = output.baseline
-            loss, round_losses = supervised_loss(output, state, cfg['round_loss_weights'])
+            terms = supervised_loss(output, state, cfg['round_loss_weights'],
+                                    hard_patch_alpha=cfg['hard_patch_alpha'], keep_weight=cfg['keep_weight'])
+            loss = terms.total
             (loss/batch).backward()
             values[0] += float(loss.detach())
             values[1] += float(flow_mse(base, state))
             values[2] += float((output.velocity.detach().float()-base.velocity.float()).square().mean().sqrt())
-            for round_index, round_loss in enumerate(round_losses):
-                values[3+round_index] += float(round_loss.detach())
-            del output, base, state, loss, round_losses, round_loss
+            for group_index, losses in enumerate((terms.round_flow, terms.round_weighted_flow, terms.round_keep)):
+                for round_index, round_loss in enumerate(losses):
+                    values[3+group_index*rounds+round_index] += float(round_loss.detach())
+            del output, base, state, loss, terms, losses, round_loss
         gradients = trainer.update(step)
         values = parallel.sum_statistics(values, trainer.device)
         synchronize(trainer.device)
-        trainer.log(step, dict(loss=values[0]/batch, round_flow=[v/batch for v in values[3:]], base_flow=values[1]/batch, delta_v_rms=values[2]/batch,
+        trainer.log(step, dict(loss=values[0]/batch, round_flow=[v/batch for v in values[3:3+rounds]],
+                              round_weighted_flow=[v/batch for v in values[3+rounds:3+2*rounds]],
+                              round_keep=[v/batch for v in values[3+2*rounds:]], base_flow=values[1]/batch, delta_v_rms=values[2]/batch,
                               t_mean=sum(t for t, _ in draws)/batch, t_min=min(t for t, _ in draws),
                               t_max=max(t for t, _ in draws),
                               step_seconds=time.perf_counter()-started, **gradients))

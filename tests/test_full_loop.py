@@ -70,6 +70,7 @@ def test_gradients_cross_round_and_frozen_reader(full_student):
     for name, parameters in student.parameter_groups().items():
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in parameters), name
         assert sum(float(p.grad.abs().sum()) for p in parameters) > 0, name
+    assert all(update.b.grad.abs().sum()>0 for name,update in student.adapters.consumer.items() if name.endswith('v_proj'))
     guard.check()
     assert all(not scope.get() for scope in student.adapters.scopes.values())
 
@@ -95,7 +96,7 @@ def test_writer_adaptation_does_not_modify_c2_reader(full_student):
     for before, after in zip(seen[:3], seen[3:]):
         torch.testing.assert_close(before, after, rtol=0, atol=0)
     assert not torch.equal(first.layers[0].values, second.layers[0].values)
-    assert len(student.adapters.writer) == 6 and len(student.adapters.consumer) == 6
+    assert len(student.adapters.writer) == 6 and len(student.adapters.consumer) == 9
 
 
 def test_checkpoint_recomputation_matches_eager(full_student):
@@ -106,9 +107,10 @@ def test_checkpoint_recomputation_matches_eager(full_student):
         student.writer.activation_checkpointing = enabled
         student.zero_grad(set_to_none=True)
         result = student(state)
-        loss, losses = supervised_loss(result, state, student.config['round_loss_weights'])
-        torch.testing.assert_close(loss, .5*losses[0]+losses[1])
-        loss.backward()
+        terms = supervised_loss(result, state, student.config['round_loss_weights'])
+        expected = sum(w*(f+.02*k) for w,f,k in zip(student.config['round_loss_weights'],terms.round_weighted_flow,terms.round_keep))
+        torch.testing.assert_close(terms.total, expected)
+        terms.total.backward()
         outputs.append(result.velocity.detach())
         grads.append([p.grad.clone() for p in student.parameters()])
     torch.testing.assert_close(*outputs, rtol=0, atol=0)
@@ -168,8 +170,8 @@ def test_checkpoint_reload_resume_and_reject_old(full_student,tmp_path):
     from qwen_latent_cot.interaction.data import PairSampler
     student,state = full_student
     optimizer = torch.optim.AdamW(student.optimizer_groups())
-    loss,_ = supervised_loss(student(state),state,student.config['round_loss_weights'])
-    loss.backward();optimizer.step()
+    terms = supervised_loss(student(state),state,student.config['round_loss_weights'])
+    terms.total.backward();optimizer.step()
     expected = student(state).velocity.detach()
     sampler = PairSampler(list(range(7)),5);sampler.take(3)
     path=tmp_path/'step_000001.pt'
@@ -185,8 +187,9 @@ def test_checkpoint_reload_resume_and_reject_old(full_student,tmp_path):
     assert checkpoint.resume(saved,student,opt,resumed,{'train':'tiny'}) == 1
     assert resumed.take(7) == draws
     torch.testing.assert_close(torch.randn(3),noise,rtol=0,atol=0)
-    assert saved['bridge'] and saved['kind'] == 'bagel_full_loop_v2'
-    with pytest.raises(ValueError): checkpoint.apply(dict(kind='interaction_lora_v1'),student)
+    assert saved['bridge'] and saved['kind'] == 'bagel_full_loop_v3'
+    for kind in ('interaction_lora_v1','bagel_full_loop_v2'):
+        with pytest.raises(ValueError): checkpoint.apply(dict(kind=kind),student)
 
 
 def test_last_round_depends_on_previous_hidden(full_student):
@@ -234,3 +237,46 @@ def test_sampling_cli_supports_explicit_training_free_initialization():
     with pytest.raises(SystemExit):
         parser().parse_args(['sample','--model','/model','--parent','/observe.pt',
                              '--checkpoint','/loop.pt','--caption','x','--output','/x.png'])
+
+
+def test_global_bridge_preserves_spatial_energy_and_starts_at_point15():
+    from qwen_latent_cot.interaction.loop import ReentryBridge
+    bridge=ReentryBridge(2,torch.device('cpu'))
+    anchor=torch.ones(2,2)
+    previous=torch.tensor([[1.,2.],[10.,20.]],requires_grad=True)
+    residual=bridge(anchor,previous)-anchor
+    assert float(bridge.strength.detach())==pytest.approx(.15)
+    assert not hasattr(bridge,'norm')
+    torch.testing.assert_close(residual[1],10*residual[0])
+    torch.testing.assert_close(residual.square().mean().sqrt(),torch.tensor(.15))
+    bridge(anchor,previous).sum().backward()
+    assert previous.grad is not None and torch.isfinite(previous.grad).all()
+    assert torch.isfinite(bridge(anchor,torch.zeros_like(previous))).all()
+
+
+def test_hard_patch_and_keep_loss_are_detached_and_exact():
+    from types import SimpleNamespace
+    from qwen_latent_cot.interaction.loop import LoopOutput,patch_weights
+    from qwen_latent_cot.diagnostics.flow_training import FlowOutput
+    baseline=torch.tensor([[0.],[3.]],requires_grad=True)
+    target=torch.zeros(2,1,requires_grad=True)
+    velocity=torch.tensor([[1.],[2.]],requires_grad=True)
+    hard,keep=patch_weights(baseline,target,1.)
+    torch.testing.assert_close(hard,torch.tensor([.5,1.5]))
+    torch.testing.assert_close(keep,torch.tensor([1.,1/3]))
+    assert not hard.requires_grad and not keep.requires_grad
+    output=LoopOutput(FlowOutput(baseline,(),0),[FlowOutput(velocity,(),1)],[])
+    state=SimpleNamespace(flow_target=lambda:target)
+    terms=supervised_loss(output,state,[1.])
+    torch.testing.assert_close(terms.round_flow[0],torch.tensor(2.5))
+    torch.testing.assert_close(terms.round_weighted_flow[0],torch.tensor(3.25))
+    torch.testing.assert_close(terms.round_keep[0],torch.tensor(2/3))
+    torch.testing.assert_close(terms.total,torch.tensor(3.25+.02*2/3))
+    terms.total.backward()
+    assert baseline.grad is None and target.grad is None
+    assert torch.isfinite(velocity.grad).all() and velocity.grad.abs().sum()>0
+    plain=supervised_loss(output,state,[1.],hard_patch_alpha=0,keep_weight=0)
+    torch.testing.assert_close(plain.total,plain.round_flow[0])
+    hard,keep=patch_weights(torch.zeros(2,1),torch.zeros(2,1),1.)
+    torch.testing.assert_close(hard,torch.ones(2))
+    torch.testing.assert_close(keep,torch.ones(2))

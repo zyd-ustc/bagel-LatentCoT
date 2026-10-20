@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 import torch
 
-KIND = 'bagel_full_loop_v2'
+KIND = 'bagel_full_loop_v3'
 
 
 def read(path):
@@ -52,7 +52,7 @@ def save(path, student, stage, step, *, optimizer=None, sampler=None, provenance
 
 def apply(saved, student):
     if saved.get('kind') != KIND:
-        raise ValueError('Expected bagel_full_loop_v2; legacy LoRA/RL checkpoints are not supported')
+        raise ValueError('Expected bagel_full_loop_v3; legacy LoRA/RL checkpoints are not supported')
     student.adapters.load_state_dict(saved['adapters'], strict=True)
     student.bridge.load_state_dict(saved['bridge'], strict=True)
 

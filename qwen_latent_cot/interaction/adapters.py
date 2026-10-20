@@ -1,4 +1,4 @@
-"""Scoped Write-KV and GEN-Q/O LoRA. C2 reading always uses frozen weights."""
+"""Scoped Write-KV and GEN-Q/V/O LoRA. C2 reading always uses frozen weights."""
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
@@ -50,7 +50,7 @@ class Adapters(nn.Module):
         for index, layer in enumerate(decoder.layers):
             for group, suffix, names, rank in (
                 ('writer', '', ('k_proj', 'v_proj'), writer_rank),
-                ('consumer', '_moe_gen', ('q_proj', 'o_proj'), consumer_rank)):
+                ('consumer', '_moe_gen', ('q_proj', 'v_proj', 'o_proj'), consumer_rank)):
                 for name in names:
                     base = getattr(layer.self_attn, name+suffix)
                     if isinstance(base, ScopedLinear):

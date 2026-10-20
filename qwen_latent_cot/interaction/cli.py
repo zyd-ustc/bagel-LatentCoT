@@ -30,7 +30,7 @@ def parser():
     sample = commands.add_parser('sample')
     sample.add_argument('--model', required=True)
     source = sample.add_mutually_exclusive_group(required=True)
-    source.add_argument('--checkpoint', help='Trained full-loop v2 checkpoint')
+    source.add_argument('--checkpoint', help='Trained full-loop v3 checkpoint')
     source.add_argument('--parent', help='C2 format-4 checkpoint: run the new loop without additional training')
     sample.add_argument('--config', default='configs/interaction_sft.json', help='Initialization config for --parent')
     sample.add_argument('--caption', required=True)

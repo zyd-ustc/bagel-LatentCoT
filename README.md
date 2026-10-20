@@ -7,7 +7,14 @@
 - 全部 28 个 block 共享权重；16 个 Memory slot 全强度注入。
 - 保留 Prompt KV、GEN 的 +16 RoPE 偏移及原生 CFG；偏移不逐轮累计。
 - 训练和采样共用 `interaction.loop.full_loop`，中间反馈输出直接接受 flow 监督。
-- 新 checkpoint 为 `bagel_full_loop_v2`。旧交互 LoRA/RL checkpoint 不兼容；format-4 C2 checkpoint 用于初始化 Reader。
+- 新 checkpoint 为 `bagel_full_loop_v3`。旧交互 LoRA/RL checkpoint 不兼容；format-4 C2 checkpoint 用于初始化 Reader。
+
+## 回灌与训练目标
+
+回灌不做逐 token RMSNorm；投影后用全图标量 RMS 匹配入口，初始强度为 0.15。
+consumer 训练 Q/V/O LoRA。训练目标使用均值归一为 1 的 Hard-Patch 误差权重，
+以及 `keep_weight=0.02` 的低误差区域速度保真项。默认 `hard_patch_alpha=1.0`。
+原始 flow MSE、加权 flow MSE 和保真项分别记录，详见架构文档。
 
 ## 训练
 
@@ -42,4 +49,4 @@ python -m qwen_latent_cot.interaction.cli sample \
 [架构与验收](docs/design.md) · [全部改动文件 URL](docs/changed_files_urls.md)
 
 不额外训练时，采样命令将 `--checkpoint ...` 替换为 `--parent /absolute/path/observe/best.pt`。
-这会初始化同一个新循环：Write/GEN LoRA 的增量为零，Memory 全强度注入，回灌强度为 1。
+这会初始化同一个新循环：Write/GEN LoRA 的增量为零，Memory 全强度注入，回灌强度为 0.15，使用全图 RMS 匹配（不做逐 token RMSNorm）。

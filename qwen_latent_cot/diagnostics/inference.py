@@ -31,7 +31,7 @@ def load_runtime(model, parent, device):
 
 
 class InferenceEngine:
-    """The same new loop, initialized from C2 or restored from a v2 checkpoint."""
+    """The same new loop, initialized from C2 or restored from a v3 checkpoint."""
     def __init__(self, runtime, parent, config, *, saved=None):
         from ..interaction.checkpoint import apply
         from ..interaction.student import InteractionStudent
@@ -46,7 +46,7 @@ class InferenceEngine:
         from ..interaction.checkpoint import read, KIND
         saved = read(checkpoint)
         if saved.get('kind') != KIND:
-            raise ValueError('Sampling requires a bagel_full_loop_v2 checkpoint; use --parent for C2 initialization')
+            raise ValueError('Sampling requires a bagel_full_loop_v3 checkpoint; use --parent for C2 initialization')
         runtime = load_runtime(model, saved['parent'], device)
         return cls(runtime, saved['parent'], saved['config'], saved=saved)
 
