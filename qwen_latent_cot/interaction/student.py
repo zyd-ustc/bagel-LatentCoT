@@ -33,8 +33,12 @@ class InteractionStudent(nn.Module):
         runtime._neutral_context = None
         self.writer = runtime.writer
         self.writer.activation_checkpointing = config.get('activation_checkpointing', True)
-        self.adapters = Adapters(runtime.decoder, config['writer_rank'], config['consumer_rank'])
+        self.adapters = Adapters(runtime.decoder, config['writer_rank'], config['consumer_rank'], consumer_k=config.get('stage_a', False))
         self.bridge = ReentryBridge(runtime.decoder.config.hidden_size, runtime.device)
+        if config.get('stage_a'):
+            self.bridge.vel_scale = nn.Parameter(torch.full((config['feedback_updates'],), config['velocity_scale_init'], device=runtime.device))
+            for layer in runtime.decoder.layers:
+                layer._und_checkpointing = config.get('activation_checkpointing', True)
         if config['feedback_updates'] < 1 or len(config['round_loss_weights']) != config['feedback_updates']:
             raise ValueError('feedback_updates must match nonempty round_loss_weights')
         if any(w <= 0 for w in config['round_loss_weights']):
@@ -71,8 +75,8 @@ class InteractionStudent(nn.Module):
             return self.writer(runtime.seeds, source, positions, source_kind='visual', t=t,
                                detach_source=False, adapter_scope=self.adapters.context('writer'))
 
-    def forward(self, state, *, guidance=False):
-        return full_loop(self, state, guidance=guidance)
+    def forward(self, state, *, guidance=False, feedback_updates=None, memory_masked=False, reentry=True):
+        return full_loop(self, state, guidance=guidance, feedback_updates=feedback_updates, memory_masked=memory_masked, reentry=reentry)
 
     def parameter_groups(self):
         return {name: list(module.parameters()) for name, module in (

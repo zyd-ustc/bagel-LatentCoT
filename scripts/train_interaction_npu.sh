@@ -9,8 +9,9 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 NPROC=${NPROC_PER_NODE:-16}
 NNODES=${NNODES:-1}
-ARGS=(-m qwen_latent_cot.interaction.cli sft --model "$MODEL" --device npu:0
-      --config "$ROOT/configs/interaction_sft.json" --output "$RUN")
+STAGE=${TRAIN_STAGE:-sft}
+ARGS=(-m qwen_latent_cot.interaction.cli "$STAGE" --model "$MODEL" --device npu:0
+      --config "$ROOT/configs/interaction_${STAGE}.json" --output "$RUN")
 if [[ "$NPROC" == 1 && "$NNODES" == 1 ]]; then
   exec "$PYTHON" "${ARGS[@]}" "$@"
 fi

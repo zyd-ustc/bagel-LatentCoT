@@ -43,10 +43,10 @@ class InferenceEngine:
 
     @classmethod
     def load(cls, model, checkpoint, device='npu:0'):
-        from ..interaction.checkpoint import read, KIND
+        from ..interaction.checkpoint import read, KINDS
         saved = read(checkpoint)
-        if saved.get('kind') != KIND:
-            raise ValueError('Sampling requires a bagel_full_loop_v3 checkpoint; use --parent for C2 initialization')
+        if saved.get('kind') not in KINDS:
+            raise ValueError('Sampling requires a full-loop v3 or Stage A v4 checkpoint; use --parent for C2 initialization')
         runtime = load_runtime(model, saved['parent'], device)
         return cls(runtime, saved['parent'], saved['config'], saved=saved)
 
@@ -59,6 +59,6 @@ class InferenceEngine:
         runtime = load_runtime(model, saved, device)
         return cls(runtime, saved, config)
 
-    def generate(self, prompt, seed=0, *, native=False, on_step=None):
+    def generate(self, prompt, seed=0, *, native=False, on_step=None, feedback_updates=None):
         from ..interaction.sampling import sample
-        return sample(self.student, prompt, seed, native=native, on_step=on_step)
+        return sample(self.student, prompt, seed, native=native, on_step=on_step, feedback_updates=feedback_updates)

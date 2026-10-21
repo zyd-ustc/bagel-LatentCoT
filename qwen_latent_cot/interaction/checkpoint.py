@@ -5,6 +5,11 @@ from pathlib import Path
 import torch
 
 KIND = 'bagel_full_loop_v3'
+STAGE_A_KIND = 'bagel_full_loop_stage_a_v4'
+KINDS = (KIND, STAGE_A_KIND)
+
+def kind(student):
+    return STAGE_A_KIND if student.config.get('stage_a') else KIND
 
 
 def read(path):
@@ -38,7 +43,7 @@ def restore_rng(state, device):
 
 def save(path, student, stage, step, *, optimizer=None, sampler=None, provenance=None, rng_by_rank=None):
     path = Path(path)
-    value = dict(kind=KIND, stage=stage, step=step, parent=student.parent,
+    value = dict(kind=kind(student), stage=stage, step=step, parent=student.parent,
                  config=student.config, adapters=cpu_state(student.adapters.state_dict()),
                  bridge=cpu_state(student.bridge.state_dict()),
                  optimizer=cpu_state(optimizer.state_dict()) if optimizer else None,
@@ -51,8 +56,8 @@ def save(path, student, stage, step, *, optimizer=None, sampler=None, provenance
 
 
 def apply(saved, student):
-    if saved.get('kind') != KIND:
-        raise ValueError('Expected bagel_full_loop_v3; legacy LoRA/RL checkpoints are not supported')
+    if saved.get('kind') != kind(student):
+        raise ValueError('Checkpoint architecture does not match this full-loop configuration')
     student.adapters.load_state_dict(saved['adapters'], strict=True)
     student.bridge.load_state_dict(saved['bridge'], strict=True)
 

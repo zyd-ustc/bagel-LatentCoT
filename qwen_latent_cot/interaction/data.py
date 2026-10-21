@@ -20,7 +20,8 @@ def load_pairs(path):
             raise ValueError(f'{path}:{number}: require nonempty caption and absolute image')
         rows.append(dict(caption=caption, image=str(image), prompt=caption,
                          sample_id=identity(caption, image), task='generation',
-                         flow_supervision=True, label_kind='target_clean'))
+                         flow_supervision=True, label_kind='target_clean',
+                         **{k:value[k] for k in ('family_id','source','split') if k in value}))
     if not rows:
         raise ValueError(f'Empty caption-image input: {path}')
     if len({r['sample_id'] for r in rows}) != len(rows):
@@ -29,6 +30,8 @@ def load_pairs(path):
 
 
 def validate_splits(train, val):
+    if {r['family_id'] for r in train if r.get('family_id')} & {r['family_id'] for r in val if r.get('family_id')}:
+        raise ValueError('Train and validation families overlap')
     if {r['image'] for r in train} & {r['image'] for r in val}:
         raise ValueError('Train and validation image paths overlap')
 
@@ -156,3 +159,81 @@ def export_candidates(corpus_root, output, count, seed):
     output.write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in rows))
     Path(str(output)+'.audit.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in audit))
     return dict(exported=len(rows), seed=seed, output=str(output))
+
+
+class GenerationCorpus:
+    """Read only paired generation views in the existing v1/v2 corpus.
+
+    Reuse the binary indices and record LRU; do not rebuild or load 37M rows.
+    Original family splits and target-image meaning are preserved.
+    """
+    def __init__(self, root):
+        from collections import OrderedDict
+        from ..diagnostics.corpus import TaskView
+        self.root = Path(root)
+        self.manifest = json.loads((self.root/'manifest.json').read_text())
+        if self.manifest['format'] not in ('annotation_index_v1', 'annotation_index_v2'):
+            raise ValueError('Stage A requires the paired annotation index v1/v2')
+        self.handles = OrderedDict()
+        self.views = [TaskView(self, info) for info in self.manifest['views']
+                      if info['task'] == 'generation' and info['count']]
+        self.fingerprint = self.manifest['fingerprint']
+
+    def record(self, shard, offset):
+        from ..diagnostics.corpus import Corpus
+        return Corpus.record(self, shard, offset)
+
+    def groups(self, split, tasks=None):
+        return [v for v in self.views if v.info['split'] == split
+                and (tasks is None or 'generation' in tasks)]
+
+    def materialize(self, value, role):
+        from ..diagnostics.corpus import resolve_path
+        if role != 2: raise ValueError('Stage A accepts paired generation records only')
+        caption = value['target_caption'].strip()
+        image = resolve_path(value['target_image'], value['original']['path'], self.manifest['registry'].get('roots', {}))
+        if not caption or not image: raise ValueError('Generation record has no caption/target image')
+        return dict(caption=caption, prompt=caption, image=image, task='generation',
+                    flow_supervision=True, label_kind='target_clean',
+                    sample_id=value['record_id'], family_id=value['family_id'],
+                    source=value['source'], split=value['split'], annotation=value['annotation'])
+
+    def close(self):
+        from ..diagnostics.corpus import Corpus
+        Corpus.close(self)
+
+
+class CorpusPairs:
+    """Lightweight train inventory with the established source-coverage sampler."""
+    def __init__(self, corpus, config):
+        self.corpus, self.config = corpus, config
+
+    def __len__(self):
+        return sum(len(v) for v in self.corpus.groups('train'))
+
+    def sampler(self):
+        from ..diagnostics.curriculum import CoverageSampler
+        # Generation-only selection. Reuse its affine permutations and resume state.
+        cfg = dict(self.config, task_mix={'generation': 1.}, loss_weights=dict(sem=0.,teacher=0.,flow=1.))
+        base = CoverageSampler(self.corpus, cfg, 'C2-feedback')
+        class Sampler:
+            @property
+            def rng(self): return base.rng
+            def take(self, count): return [base.next(1)[0] for _ in range(count)]
+            def state_dict(self): return base.state_dict()
+            def load_state_dict(self, state): base.load_state_dict(state)
+        return Sampler()
+
+
+def corpus_validation(corpus, count):
+    """Deterministic, family-distinct validation, never draw from train/test."""
+    rows, families = [], set()
+    views = corpus.groups('val')
+    for position in range(count):
+        for view in views:
+            if position >= len(view): continue
+            row = view[position]
+            if row['family_id'] in families: continue
+            rows.append(row); families.add(row['family_id'])
+            if len(rows) >= count: return rows
+    return rows

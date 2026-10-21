@@ -41,7 +41,7 @@ class ScopedLinear(nn.Module):
 
 
 class Adapters(nn.Module):
-    def __init__(self, decoder, writer_rank, consumer_rank):
+    def __init__(self, decoder, writer_rank, consumer_rank, *, consumer_k=False):
         super().__init__()
         self.writer = nn.ModuleDict()
         self.consumer = nn.ModuleDict()
@@ -50,7 +50,7 @@ class Adapters(nn.Module):
         for index, layer in enumerate(decoder.layers):
             for group, suffix, names, rank in (
                 ('writer', '', ('k_proj', 'v_proj'), writer_rank),
-                ('consumer', '_moe_gen', ('q_proj', 'v_proj', 'o_proj'), consumer_rank)):
+                ('consumer', '_moe_gen', ('q_proj', 'k_proj', 'v_proj', 'o_proj') if consumer_k else ('q_proj', 'v_proj', 'o_proj'), consumer_rank)):
                 for name in names:
                     base = getattr(layer.self_attn, name+suffix)
                     if isinstance(base, ScopedLinear):

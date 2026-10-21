@@ -61,7 +61,8 @@ def conditional_reentry(decoder, cache, image_indexes, hidden_input):
 
 def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
                     round_index=0, detach_source=True, checkpoint_activations=False,
-                    adapter_scope=nullcontext, guidance=False, hidden_input=None):
+                    adapter_scope=nullcontext, guidance=False, hidden_input=None,
+                    velocity_baseline=None, velocity_scale=None):
     """One full-depth native flow call. CFG references never receive feedback.
 
     Reentry, Memory, adapter scopes and capture are recreated inside checkpoint
@@ -78,6 +79,18 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
     image_indexes = flow['packed_vae_token_indexes']
 
     def forward(x, entrance):
+        # First llm2vae invocation is conditional; reference heads stay native.
+        calls = 0
+        def residual_head(module, args, value):
+            nonlocal calls
+            calls += 1
+            if calls != 1 or velocity_baseline is None: return value
+            adjusted = value.clone()
+            raw = value[image_indexes].float()
+            base = velocity_baseline.detach().float()
+            adjusted[image_indexes] = (base+velocity_scale*(raw-base)).to(value.dtype)
+            return adjusted
+        handle = runtime.model.llm2vae.register_forward_hook(residual_head)
         context = (gen_memory_call(runtime.decoder, flow['past_key_values'], bank,
                                    state.lengths, state.positions, masked, adapter_scope=adapter_scope)
                    if bank is not None else nullcontext())
@@ -85,13 +98,16 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
                                 round_index=round_index, positions=source_positions,
                                 detach=detach_source, source_policy='full_query')
                     if capture else nullcontext({}))
-        with conditional_reentry(runtime.decoder, flow['past_key_values'], image_indexes, entrance) as exit_state:
-            with context, observer as captured, autocast_for(runtime.device):
-                velocity = native(runtime.model, x_t=x,
-                                  timestep=torch.full((len(x),), state.t, device=runtime.device),
-                                  **flow, cfg_text_scale=runtime.config['cfg_text_scale'] if guidance else 1., cfg_img_scale=1.,
-                                  cfg_renorm_min=runtime.config['cfg_renorm_min'],
-                                  cfg_renorm_type=runtime.config['cfg_renorm_type'])
+        try:
+            with conditional_reentry(runtime.decoder, flow['past_key_values'], image_indexes, entrance) as exit_state:
+                with context, observer as captured, autocast_for(runtime.device):
+                    velocity = native(runtime.model, x_t=x,
+                                      timestep=torch.full((len(x),), state.t, device=runtime.device),
+                                      **flow, cfg_text_scale=runtime.config['cfg_text_scale'] if guidance else 1., cfg_img_scale=1.,
+                                      cfg_renorm_min=runtime.config['cfg_renorm_min'],
+                                      cfg_renorm_type=runtime.config['cfg_renorm_type'])
+        finally:
+            handle.remove()
         source = tuple(captured[i] for i in range(len(runtime.decoder.layers))) if capture else ()
         if not metadata:
             metadata.extend(source)

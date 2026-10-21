@@ -7,14 +7,17 @@ from .loop import active_updates
 
 
 @torch.no_grad()
-def sample(student, prompt, seed=0, *, native=False, on_step=None):
+def sample(student, prompt, seed=0, *, native=False, on_step=None, reader_prompt=None, feedback_updates=None, loop_enabled=True, memory_masked=False, reentry=True):
+    if native and feedback_updates is not None:
+        raise ValueError('Native sampling does not accept a feedback override')
     with student.native_context() if native else nullcontext():
-        return _sample(student, prompt, seed, native=native, on_step=on_step)
+        return _sample(student, prompt, seed, native=native, on_step=on_step, reader_prompt=reader_prompt, feedback_updates=feedback_updates, loop_enabled=loop_enabled, memory_masked=memory_masked, reentry=reentry)
 
 
-def _sample(student, prompt, seed, *, native, on_step):
+def _sample(student, prompt, seed, *, native, on_step, reader_prompt, feedback_updates, loop_enabled, memory_masked, reentry):
     runtime = student.runtime
     flow, lengths, positions = runtime.flow_inputs(prompt)
+    reader_kv = runtime.text(reader_prompt)[0] if reader_prompt is not None else None
     model = runtime.model
     size = runtime.config['resolution']//model.latent_downsample
     width = model.latent_channel*model.latent_patch_size**2
@@ -22,11 +25,14 @@ def _sample(student, prompt, seed, *, native, on_step):
     times = native_times(runtime.config)
     records = []
     for index, (current, following) in enumerate(zip(times, times[1:])):
-        active = not native and index < active_updates(runtime.config)
+        active = not native and loop_enabled and index < active_updates(runtime.config)
         if active:
             state = TrainingState(x, None, None, current, flow, tuple(lengths), positions,
-                                  dict(prompt=prompt, flow_supervision=False))
-            result = student(state, guidance=True)
+                                  dict(prompt=prompt, flow_supervision=False), prompt_kv=reader_kv)
+            options = {'feedback_updates': feedback_updates} if feedback_updates is not None else {}
+            if memory_masked: options['memory_masked'] = True
+            if not reentry: options['reentry'] = False
+            result = student(state, guidance=True, **options)
             velocity = result.velocity
             passes = 1+len(result.exits)
         else:

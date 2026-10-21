@@ -51,24 +51,31 @@ def image_entrance(runtime, state):
                 + model.latent_pos_embed(state.flow['packed_vae_position_ids']))
 
 
-def full_loop(student, state, *, guidance=False):
+def full_loop(student, state, *, guidance=False, feedback_updates=None, memory_masked=False, reentry=True):
     runtime = student.runtime
+    if (feedback_updates is not None or memory_masked or not reentry) and torch.is_grad_enabled():
+        raise ValueError('feedback_updates override is inference-only')
+    updates = student.config['feedback_updates'] if feedback_updates is None else feedback_updates
+    if not isinstance(updates, int) or isinstance(updates, bool) or updates < 1:
+        raise ValueError('feedback_updates must be a positive integer; use native sampling for base')
     with torch.no_grad():
         baseline = conditional_gen(runtime, state, detach_source=True)
         anchor = image_entrance(runtime, state)
     prompt = state.prompt_kv if state.prompt_kv is not None else prompt_source(state.flow, state.lengths, state.positions)
     previous = baseline
     banks, exits = [], []
-    for index in range(student.config['feedback_updates']):
+    for index in range(updates):
         bank = student.write(previous.source, state.t, prompt=prompt)
         with autocast_for(runtime.device):
-            entrance = student.bridge(anchor, previous.hidden)
-        output = conditional_gen(runtime, state, bank, round_index=index+1,
+            entrance = student.bridge(anchor, previous.hidden) if reentry else None
+        output = conditional_gen(runtime, state, bank, masked=memory_masked, round_index=index+1,
                                  hidden_input=entrance, detach_source=False,
-                                 capture=index < student.config['feedback_updates']-1,
+                                 capture=index < updates-1,
                                  adapter_scope=student.adapters.context('consumer'),
-                                 guidance=guidance and index == student.config['feedback_updates']-1,
-                                 checkpoint_activations=student.config['activation_checkpointing'])
+                                 guidance=guidance and index == updates-1,
+                                 checkpoint_activations=student.config['activation_checkpointing'],
+                                 velocity_baseline=baseline.velocity if hasattr(student.bridge, 'vel_scale') else None,
+                                 velocity_scale=student.bridge.vel_scale[min(index, len(student.bridge.vel_scale)-1)] if hasattr(student.bridge, 'vel_scale') else None)
         banks.append(bank)
         exits.append(output)
         previous = output
