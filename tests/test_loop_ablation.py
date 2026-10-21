@@ -45,3 +45,43 @@ def test_probe_matches_conditional_velocity_before_cfg(stage_student,monkeypatch
     expected=(output.velocity.float()-output.baseline.velocity.float()).square().mean().sqrt()
     assert len(rows)==1
     assert abs(rows[0]['conditional_delta_rms']-float(expected))<1e-5
+
+
+def test_masked_memory_skips_consumer_and_preserves_native_positions(stage_student):
+    from dataclasses import replace
+    from qwen_latent_cot.diagnostics.flow_training import conditional_gen
+    student,state=stage_student
+    update=student.runtime.decoder.layers[0].self_attn.q_proj_moe_gen.update
+    with torch.no_grad(): update.b.fill_(.02)
+    calls=[]
+    handle=update.register_forward_hook(lambda *args:calls.append(1))
+    try:
+        with torch.no_grad():
+            student(state,guidance=True,feedback_updates=1,memory_masked=True,reentry=False)
+            assert not calls
+            calls.clear()
+            actual=student(state,guidance=True,feedback_updates=1,memory_masked=True,reentry=False,consumer_enabled=False)
+            assert not calls
+            expected=conditional_gen(student.runtime,state,guidance=True,capture=False,
+                                     native_scope=student.native_context)
+        torch.testing.assert_close(actual.velocity,expected.velocity,rtol=1e-5,atol=1e-6)
+    finally:handle.remove()
+
+
+def test_gamma_multiplier_scales_and_restores_on_failure(stage_student,monkeypatch):
+    import pytest
+    import qwen_latent_cot.interaction.loop as loop
+    from qwen_latent_cot.interaction.sampling import sample
+    student,_=stage_student;student.runtime.config['sampler_steps']=3
+    before=student.bridge.vel_scale.detach().clone();scales=[];original=loop.conditional_gen
+    def record(*args,**kwargs):
+        if kwargs.get('velocity_scale') is not None:scales.append(float(kwargs['velocity_scale']))
+        return original(*args,**kwargs)
+    monkeypatch.setattr(loop,'conditional_gen',record)
+    sample(student,'a red token',17,feedback_updates=1,gamma_multiplier=.2)
+    assert scales==pytest.approx([float(before[0])*.2])
+    torch.testing.assert_close(student.bridge.vel_scale,before,atol=0,rtol=0)
+    def fail(node):raise RuntimeError('intentional test failure')
+    with pytest.raises(RuntimeError,match='intentional'):
+        sample(student,'a red token',17,feedback_updates=1,gamma_multiplier=.3,on_step=fail)
+    torch.testing.assert_close(student.bridge.vel_scale,before,atol=0,rtol=0)

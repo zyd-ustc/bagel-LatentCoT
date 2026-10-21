@@ -1,9 +1,9 @@
-"""Stage A: a prompt information gap, paired Flow targets and Memory semantics."""
-from dataclasses import dataclass
+"""Stage A v2: native Teacher residuals, predictive canvases and Memory semantics."""
+from dataclasses import dataclass, replace
 import random
 import re
 import torch
-from .loop import supervised_loss, image_entrance
+from .loop import image_entrance, canvas_entrance
 from ..diagnostics.flow_training import conditional_gen
 from ..diagnostics.native import teacher_forcing
 from ..diagnostics.numerics import autocast_for
@@ -75,7 +75,13 @@ def training_state(student, row, t, noise_seed, split_seed):
     split = split_prompt(full, split_seed, drop_fraction=cfg['clause_drop_fraction'],
                          full_probability=cfg['full_prompt_probability'], min_words=cfg['min_prompt_words'])
     # All GEN caches, including baseline and CFG, derive ONLY from partial.
-    state = runtime.training_state(dict(row, prompt=split.partial), t, noise_seed)
+    with student.native_context():
+        state = runtime.training_state(dict(row, prompt=split.partial), t, noise_seed)
+        teacher_flow, lengths, positions = runtime.flow_inputs(full)
+    teacher_state = replace(state, flow=teacher_flow, lengths=tuple(lengths), positions=positions)
+    teacher = conditional_gen(runtime, teacher_state, capture=False, native_scope=student.native_context).velocity
+    eta = cfg['teacher_mix']
+    state.correction_target = (eta*teacher.float()+(1-eta)*state.flow_target()).detach()
     state.prompt_kv = runtime.text(full)[0]  # Reader-only; never replaces state.flow.
     state.metadata.update(full_prompt=full, removed_clauses=split.removed,
                           prompt_split_reason=split.reason, split_seed=split_seed,
@@ -99,24 +105,57 @@ def memory_controls(student, state, output, donor_bank):
     """Fix recipient x/t/prompt/hidden/LoRA; vary ONLY last-pass Memory."""
     with autocast_for(student.runtime.device):
         previous = output.baseline if len(output.exits) == 1 else output.exits[-2]
-        entrance = student.bridge(image_entrance(student.runtime, state), previous.hidden)
+        entrance = student.bridge(image_entrance(student.runtime, state),
+                                  canvas_entrance(student.runtime, state, previous.velocity))
     kwargs = dict(hidden_input=entrance, capture=False, detach_source=True,
                   adapter_scope=student.adapters.context('consumer'),
-                  velocity_baseline=output.baseline.velocity, velocity_scale=student.bridge.vel_scale[-1])
+                  velocity_baseline=previous.velocity, velocity_scale=student.bridge.vel_scale[-1],
+                  memory_gates=student.bridge.memory_gates, native_scope=student.native_context)
     off = conditional_gen(student.runtime, state, output.banks[-1], masked=True, **kwargs)
     shuffled = conditional_gen(student.runtime, state, donor_bank, **kwargs)
-    target = state.flow_target().detach()
+    target = state.correction_target.detach()
     return ((off.velocity.float()-target).square().mean(),
             (shuffled.velocity.float()-target).square().mean())
 
 
 def losses(student, state, output, split, *, shuffled_error=None):
     cfg = student.config
-    flow = supervised_loss(output, state, cfg['round_loss_weights'],
-                           hard_patch_alpha=cfg['hard_patch_alpha'], keep_weight=cfg['keep_weight'])
+    flow = correction_loss(output, state, cfg)
     sem = sum(w*semantic_loss(student, bank, split) for w,bank in zip(cfg['round_loss_weights'],output.banks))
     correct = flow.round_flow[-1]
     contrast = (torch.relu(correct-shuffled_error.detach()+cfg['memory_margin'])
                 if shuffled_error is not None else correct.new_zeros(()))
     total = flow.total+cfg['semantic_weight']*sem+cfg['memory_contrast_weight']*contrast
     return total, flow, sem, contrast
+
+
+@dataclass
+class CorrectionLoss:
+    total: torch.Tensor
+    round_flow: list
+    round_cos: list
+    round_raw: list
+
+
+def residual_correction_loss(pred_vel, base_vel, target_vel, cos_weight=0.1):
+    import torch.nn.functional as F
+    residual = (pred_vel.float()-base_vel.detach().float()).reshape(1, -1)
+    target = (target_vel.detach().float()-base_vel.detach().float()).reshape(1, -1)
+    mse = F.mse_loss(residual, target)
+    # Each TrainingState contains one image. Ignore direction for a zero target.
+    cos = (1-F.cosine_similarity(residual, target, dim=-1, eps=1e-4)).mean()
+    cos = torch.where(target.square().sum() > 0, cos, cos.new_zeros(()))
+    return mse+cos_weight*cos, mse, cos
+
+
+def correction_loss(output, state, config):
+    total, mses, cosines, raw_losses = 0., [], [], []
+    previous = output.baseline.velocity
+    for weight, value in zip(config['round_loss_weights'], output.exits):
+        applied, mse, cosine = residual_correction_loss(value.velocity, previous, state.correction_target, config['cos_weight'])
+        # A zero velocity gate otherwise blocks both zero-initialized input gates.
+        raw, _, _ = residual_correction_loss(value.raw_velocity, previous, state.correction_target, config['cos_weight'])
+        total = total+weight*(applied+config['raw_correction_weight']*raw)
+        mses.append(mse); cosines.append(cosine); raw_losses.append(raw)
+        previous = value.velocity.detach()
+    return CorrectionLoss(total, mses, cosines, raw_losses)

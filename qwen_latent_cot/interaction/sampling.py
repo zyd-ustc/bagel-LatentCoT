@@ -7,16 +7,25 @@ from .loop import active_updates
 
 
 @torch.no_grad()
-def sample(student, prompt, seed=0, *, native=False, on_step=None, reader_prompt=None, feedback_updates=None, loop_enabled=True, memory_masked=False, reentry=True):
+def sample(student, prompt, seed=0, *, native=False, on_step=None, reader_prompt=None, feedback_updates=None, loop_enabled=True, memory_masked=False, reentry=True, consumer_enabled=True, gamma_multiplier=1.0):
     if native and feedback_updates is not None:
         raise ValueError('Native sampling does not accept a feedback override')
-    with student.native_context() if native else nullcontext():
-        return _sample(student, prompt, seed, native=native, on_step=on_step, reader_prompt=reader_prompt, feedback_updates=feedback_updates, loop_enabled=loop_enabled, memory_masked=memory_masked, reentry=reentry)
+    original_scales = None
+    if gamma_multiplier != 1.0:
+        original_scales = student.bridge.vel_scale.detach().clone()
+        student.bridge.vel_scale.mul_(gamma_multiplier)
+    try:
+        with student.native_context() if native else nullcontext():
+            return _sample(student, prompt, seed, native=native, on_step=on_step, reader_prompt=reader_prompt, feedback_updates=feedback_updates, loop_enabled=loop_enabled, memory_masked=memory_masked, reentry=reentry, consumer_enabled=consumer_enabled)
+    finally:
+        if original_scales is not None:
+            student.bridge.vel_scale.copy_(original_scales)
 
 
-def _sample(student, prompt, seed, *, native, on_step, reader_prompt, feedback_updates, loop_enabled, memory_masked, reentry):
+def _sample(student, prompt, seed, *, native, on_step, reader_prompt, feedback_updates, loop_enabled, memory_masked, reentry, consumer_enabled):
     runtime = student.runtime
-    flow, lengths, positions = runtime.flow_inputs(prompt)
+    with student.native_context() if student.config.get('stage_a') and not native and loop_enabled else nullcontext():
+        flow, lengths, positions = runtime.flow_inputs(prompt)
     reader_kv = runtime.text(reader_prompt)[0] if reader_prompt is not None else None
     model = runtime.model
     size = runtime.config['resolution']//model.latent_downsample
@@ -32,11 +41,13 @@ def _sample(student, prompt, seed, *, native, on_step, reader_prompt, feedback_u
             options = {'feedback_updates': feedback_updates} if feedback_updates is not None else {}
             if memory_masked: options['memory_masked'] = True
             if not reentry: options['reentry'] = False
+            if not consumer_enabled: options['consumer_enabled'] = False
             result = student(state, guidance=True, **options)
             velocity = result.velocity
             passes = 1+len(result.exits)
         else:
-            velocity = runtime.velocity(x, current, flow)[1]
+            with student.native_context() if student.config.get('stage_a') and not native and loop_enabled else nullcontext():
+                velocity = runtime.velocity(x, current, flow)[1]
             passes = 1
         x = x-(current-following)*velocity
         records.append(dict(step=index+1, t=current, next_t=following, loop_active=active,

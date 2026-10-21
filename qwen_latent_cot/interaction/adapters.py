@@ -1,4 +1,4 @@
-"""Scoped Write-KV and GEN-Q/V/O LoRA. C2 reading always uses frozen weights."""
+"""Scoped Write-KV LoRA; Stage A consumer modifies only independent Memory queries."""
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
@@ -40,8 +40,11 @@ class ScopedLinear(nn.Module):
         return result + self.update(x).to(result.dtype) if self.scope.get() else result
 
 
+STAGE_A_CONSUMER_TARGETS = ("q_proj_moe_gen",)
+
+
 class Adapters(nn.Module):
-    def __init__(self, decoder, writer_rank, consumer_rank, *, consumer_k=False):
+    def __init__(self, decoder, writer_rank, consumer_rank, *, stage_a=False):
         super().__init__()
         self.writer = nn.ModuleDict()
         self.consumer = nn.ModuleDict()
@@ -50,7 +53,7 @@ class Adapters(nn.Module):
         for index, layer in enumerate(decoder.layers):
             for group, suffix, names, rank in (
                 ('writer', '', ('k_proj', 'v_proj'), writer_rank),
-                ('consumer', '_moe_gen', ('q_proj', 'k_proj', 'v_proj', 'o_proj') if consumer_k else ('q_proj', 'v_proj', 'o_proj'), consumer_rank)):
+                ('consumer', '_moe_gen', tuple(name.removesuffix('_moe_gen') for name in STAGE_A_CONSUMER_TARGETS) if stage_a else ('q_proj', 'v_proj', 'o_proj'), consumer_rank)):
                 for name in names:
                     base = getattr(layer.self_attn, name+suffix)
                     if isinstance(base, ScopedLinear):

@@ -1,5 +1,8 @@
 # Stage A 生图测试
 
+> 历史 Stage A v4 记录：以下配置、检查点、运行状态和测试结果属于重构前版本。当前实现请使用 [Stage A v2](stage_a_v2_canvas_reentry.md)，旧检查点不能加载。
+
+
 测试使用训练 checkpoint 的原始参数，不放大 gate，不改变 Loop 的时间窗口或全层注入方式。
 采样和训练共用同一条生成路径。脚本固定 checkpoint、Prompt 和初始噪声种子，16 个独立 worker 各占一张卡。
 

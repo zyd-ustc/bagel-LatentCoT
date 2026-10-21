@@ -1,9 +1,8 @@
 {
   "writer_rank": 256,
-  "consumer_rank": 128,
-  "feedback_updates": 2,
+  "consumer_rank": 32,
+  "feedback_updates": 1,
   "round_loss_weights": [
-    0.5,
     1.0
   ],
   "writer_lr": 0.0001,
@@ -42,14 +41,14 @@
   ],
   "val_images": 4,
   "seed": 17,
-  "hard_patch_alpha": 1.0,
-  "keep_weight": 0.02,
   "stage_a": true,
-  "velocity_scale_init": 1.0,
   "clause_drop_fraction": 0.4,
   "full_prompt_probability": 0.2,
   "min_prompt_words": 30,
   "semantic_weight": 0.1,
-  "memory_contrast_weight": 0.1,
-  "memory_margin": 0.01
+  "memory_contrast_weight": 0.0,
+  "memory_margin": 0.01,
+  "teacher_mix": 0.8,
+  "cos_weight": 0.1,
+  "raw_correction_weight": 1.0
 }

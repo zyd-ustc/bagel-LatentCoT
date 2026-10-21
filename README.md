@@ -1,22 +1,24 @@
-# BAGEL Full-Layer Dual-State Loop
+# BAGEL Stage A v2 · Predictive Canvas Loop
 
-在 `loop-layer-NPU` 上重构。每个启用循环的 flow 步执行一次原生 GEN，加两次全层反馈遍历。
-上一轮 GEN 的末层图像 hidden 回灌到下一轮入口；UND Memory KV 在全部 block 联合参与 attention。
+Stage A 使用预测画布 `x_t - t*v` 重入，以及独立 Softmax 的 Memory 注意力。
+原生 GEN 的 Prompt / Self Image 注意力保持冻结，不再增加 16 个 RoPE 位置。
 
-- 前 `ceil(实际 Euler 更新数 / 2)` 次更新启用循环，后半程原生采样。
-- 全部 28 个 block 共享权重；16 个 Memory slot 全强度注入。
-- 保留 Prompt KV、GEN 的 +16 RoPE 偏移及原生 CFG；偏移不逐轮累计。
-- 训练和采样共用 `interaction.loop.full_loop`，中间反馈输出直接接受 flow 监督。
-- SFT checkpoint 为 `bagel_full_loop_v3`，Stage A 为 `bagel_full_loop_stage_a_v4`。旧交互 LoRA/RL checkpoint 不兼容；format-4 C2 checkpoint 用于初始化 Reader。
+- 训练一次纠错；推理可执行 1–3 轮，每轮更新画布和 UND Memory。
+- consumer 只训练 Memory 分支的 Query LoRA，rank 32。
+- 入口门、逐层 Memory 门和速度门全部零初始化。
+- full Prompt 原生 Teacher 与 student 共享 x/t；采用残差 MSE、余弦方向损失和 Memory 文本监督。
+- 未缩放速度的辅助损失负责启动零门训练，不改变初始采样结果。
+- 新检查点格式为 `bagel_canvas_stage_a_v2`，不兼容旧 Stage A v4，需从 C2 parent 重新训练。
 
-## 回灌与训练目标
+[当前架构、训练命令、迁移与验收](docs/stage_a_v2_canvas_reentry.md)。
+CPU 小型 MoT 已验证零初始化逐像素一致；完整模型的 NPU 画风、语义和性能验收待执行。
 
-回灌不做逐 token RMSNorm；投影后用全图标量 RMS 匹配入口，初始强度为 0.15。
-SFT consumer 训练 Q/V/O LoRA，Stage A 训练 Q/K/V/O LoRA。训练目标使用均值归一为 1 的 Hard-Patch 误差权重，
-以及 `keep_weight=0.02` 的低误差区域速度保真项。默认 `hard_patch_alpha=1.0`。
-原始 flow MSE、加权 flow MSE 和保真项分别记录，详见架构文档。
+## 原 SFT 路径
 
-## 训练
+下方 SFT 命令保持原合同：末层 hidden 重入、两轮反馈、联合 Memory 注意力、+16 RoPE 和 Hard-Patch/Keep Loss。
+SFT checkpoint 仍为 `bagel_full_loop_v3`，不使用 Stage A v2 结构。
+
+## SFT 训练
 
 安装项目依赖后，在仓库根目录执行：
 
@@ -36,15 +38,15 @@ python -m qwen_latent_cot.interaction.cli sft \
 
 ## Stage A 训练
 
-新增 `stage_a` 入口：GEN 读取删减 Prompt，UND 读取完整 Prompt，联合训练 Memory 文本监督和生成速度修正。
-使用原 v1 全量图文索引，默认 20,000 步；原 `sft` 路径保持不变。
-[Prompt 切割、训练目标和运行命令](docs/stage_a.md)。
+使用 `stage_a` 入口：GEN 读取删减 Prompt，UND 读取完整 Prompt，原生 full Prompt Teacher 提供残差目标。
+[Stage A v2 训练和迁移](docs/stage_a_v2_canvas_reentry.md)。
+[旧 Stage A 的 Prompt 统计及实验记录](docs/stage_a.md)。
 [Stage A 生图测试与离线对比页](docs/stage_a_sampling.md)。
 [GenEval2 高复杂度 Prompt：Base / 1 / 2 / 3 / 4 次反馈对比](docs/feedback_sweep.md)。
 [GenEval benchmark 接入、现成资源与全量运行命令](docs/benchmark_stage_a.md)。
 [四个 benchmark 的八组消融：运行与结果](docs/loop_ablation/README.md)。
 
-## 采样
+## SFT 采样
 
 ```bash
 python -m qwen_latent_cot.interaction.cli sample \
@@ -59,4 +61,4 @@ python -m qwen_latent_cot.interaction.cli sample \
 [架构与验收](docs/design.md) · [全部改动文件 URL](docs/changed_files_urls.md)
 
 不额外训练时，采样命令将 `--checkpoint ...` 替换为 `--parent /absolute/path/observe/best.pt`。
-这会初始化同一个新循环：Write/GEN LoRA 的增量为零，Memory 全强度注入，回灌强度为 0.15，使用全图 RMS 匹配（不做逐 token RMSNorm）。
+默认使用 SFT 配置，因此会初始化旧 SFT 循环：Write/GEN LoRA 的增量为零，Memory 全强度注入，回灌强度为 0.15，使用全图 RMS 匹配（不做逐 token RMSNorm）。

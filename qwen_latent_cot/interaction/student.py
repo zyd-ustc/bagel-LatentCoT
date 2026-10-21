@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from .adapters import Adapters
 from ..diagnostics.feedback_source import compose_source
-from .loop import ReentryBridge, full_loop
+from .loop import ReentryBridge, CanvasReentryBridge, full_loop
 from ..diagnostics.numerics import autocast_for
 
 
@@ -33,10 +33,15 @@ class InteractionStudent(nn.Module):
         runtime._neutral_context = None
         self.writer = runtime.writer
         self.writer.activation_checkpointing = config.get('activation_checkpointing', True)
-        self.adapters = Adapters(runtime.decoder, config['writer_rank'], config['consumer_rank'], consumer_k=config.get('stage_a', False))
-        self.bridge = ReentryBridge(runtime.decoder.config.hidden_size, runtime.device)
+        self.adapters = Adapters(runtime.decoder, config['writer_rank'], config['consumer_rank'], stage_a=config.get('stage_a', False))
+        self.bridge = (CanvasReentryBridge(runtime.decoder.config.hidden_size, config['feedback_updates'],
+                                           len(runtime.decoder.layers), runtime.device) if config.get('stage_a')
+                       else ReentryBridge(runtime.decoder.config.hidden_size, runtime.device))
         if config.get('stage_a'):
-            self.bridge.vel_scale = nn.Parameter(torch.full((config['feedback_updates'],), config['velocity_scale_init'], device=runtime.device))
+            if config['feedback_updates'] != 1:
+                raise ValueError('Stage A v2 trains one correction; override updates at inference')
+            if not 0 <= config['teacher_mix'] <= 1 or config['cos_weight'] < 0 or config['raw_correction_weight'] <= 0:
+                raise ValueError('Invalid Stage A v2 correction loss coefficients')
             for layer in runtime.decoder.layers:
                 layer._und_checkpointing = config.get('activation_checkpointing', True)
         if config['feedback_updates'] < 1 or len(config['round_loss_weights']) != config['feedback_updates']:
@@ -54,16 +59,31 @@ class InteractionStudent(nn.Module):
 
     @contextmanager
     def native_context(self):
-        """Original BAGEL prompt encoding, restored after native comparison."""
+        """Bind original UND parameters without changing tensors saved for backward."""
+        bindings = []
         try:
             for name, value in self.original_und.items():
-                parameter = self.native_tensor(name)
-                parameter.data = value.to(device=parameter.device).clone()
+                if name.startswith('layers.'):
+                    module_name, parameter_name = name.rsplit('.', 1)
+                    module = self.runtime.decoder.get_submodule(module_name)
+                    # ScopedLinear stores the original Parameter in base.
+                    if hasattr(module, 'base'):
+                        module = module.base
+                else:
+                    group, suffix = name.split('.', 1)
+                    module = {'final_norm': self.runtime.decoder.norm,
+                              'embeddings': self.runtime.decoder.embed_tokens,
+                              'lm_head': self.runtime.model.language_model.lm_head}[group]
+                    module_name, _, parameter_name = suffix.rpartition('.')
+                    if module_name:
+                        module = module.get_submodule(module_name)
+                current = module._parameters[parameter_name]
+                bindings.append((module, parameter_name, current))
+                module._parameters[parameter_name] = nn.Parameter(value.to(current.device), requires_grad=False)
             yield
         finally:
-            for name, value in self.parent['und'].items():
-                parameter = self.native_tensor(name)
-                parameter.data = value.to(device=parameter.device).clone()
+            for module, name, current in reversed(bindings):
+                module._parameters[name] = current
             self.runtime._neutral_context = None
 
     def write(self, source, t, *, prompt):
@@ -75,8 +95,8 @@ class InteractionStudent(nn.Module):
             return self.writer(runtime.seeds, source, positions, source_kind='visual', t=t,
                                detach_source=False, adapter_scope=self.adapters.context('writer'))
 
-    def forward(self, state, *, guidance=False, feedback_updates=None, memory_masked=False, reentry=True):
-        return full_loop(self, state, guidance=guidance, feedback_updates=feedback_updates, memory_masked=memory_masked, reentry=reentry)
+    def forward(self, state, *, guidance=False, feedback_updates=None, memory_masked=False, reentry=True, consumer_enabled=True):
+        return full_loop(self, state, guidance=guidance, feedback_updates=feedback_updates, memory_masked=memory_masked, reentry=reentry, consumer_enabled=consumer_enabled)
 
     def parameter_groups(self):
         return {name: list(module.parameters()) for name, module in (

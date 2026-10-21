@@ -83,19 +83,27 @@ def test_stage_a_real_loss_gradients_controls_and_resume(stage_student,visual_ru
     train_stage_a(trainer)
     log=json.loads((tmp_path/'train/train.jsonl').read_text())
     assert log['semantic_ce']>0 and log['masked_fraction']==1
-    assert all(log['gradient_'+group]>0 for group in ('writer','consumer','bridge'))
-    assert all(update.b.grad is not None for name,update in student.adapters.consumer.items() if name.endswith('k_proj'))
+    assert log['gradient_writer']>0 and log['gradient_bridge']>0
+    # With alpha=0 the query adapter starts learning after the memory gate opens.
+    assert log['gradient_consumer']==0
+    assert any(v != 0 for v in log['memory_gates'])
+    assert log['cos_loss']==1.0 and log['raw_correction_loss']>0
+    assert all(name.endswith('q_proj') for name in student.adapters.consumer)
     saved=checkpoint.read(tmp_path/'train/step_000001.pt')
     assert saved['kind']==checkpoint.STAGE_A_KIND and saved['stage']=='stage_a'
-    assert 'vel_scale' in saved['bridge'] and len(saved['adapters'])==36
+    assert 'vel_scale' in saved['bridge'] and len(saved['adapters'])==18
     before=student.bridge.vel_scale.detach().clone()
     with torch.no_grad(): student.bridge.vel_scale.zero_()
     checkpoint.apply(saved,student)
     torch.testing.assert_close(student.bridge.vel_scale,before)
-    student.config['steps']=2
+    student.config['steps']=4
     resumed=Trainer(student,[row,donor],[],tmp_path/'train','stage_a',{'train':'tiny'},saved=saved)
     train_stage_a(resumed)
-    assert checkpoint.read(tmp_path/'train/step_000002.pt')['step']==2
+    assert checkpoint.read(tmp_path/'train/step_000004.pt')['step']==4
+    records=[json.loads(line) for line in (tmp_path/'train/train.jsonl').read_text().splitlines()]
+    assert any(record['gradient_consumer']>0 for record in records[1:])
+    # BF16 may round tiny applied corrections to zero during the first steps.
+    assert any(any(g != 0 for g in record['velocity_scale']) for record in records[1:])
 
 
 def test_v1_generation_corpus_keeps_splits_and_sampler_resume(tmp_path):
@@ -136,6 +144,11 @@ def test_stage_a_checkpointed_loss_matches_eager(stage_student,visual_runtime):
     _,row=visual_runtime
     row=dict(row,caption='A red token. A blue token.')
     state,split=training_state(student,row,.9,3,17)
+    with torch.no_grad():
+        student.bridge.strength.fill_(.2)
+        student.bridge.memory_gates.fill_(.3)
+        student.bridge.vel_scale.fill_(.7)
+        student.runtime.decoder.layers[0].self_attn.q_proj.weight.add_(.1)
     gradients=[];outputs=[]
     for enabled in (False,True):
         student.config['activation_checkpointing']=enabled
@@ -166,3 +179,109 @@ def test_stage_a_validation_uses_gap_and_memory_controls(stage_student,visual_ru
     assert record['donor_sample_id']=='b'
     assert record['semantic_ce']>0 and record['off_flow']>0 and record['shuffled_flow']>0
     assert (path/'000_native.png').is_file() and (path/'000_loop.png').is_file()
+
+
+def test_zero_initialization_matches_native_pixels_with_changed_parent(stage_student):
+    from qwen_latent_cot.interaction.sampling import sample
+    student, _ = stage_student
+    runtime = student.runtime
+    runtime.config['sampler_steps'] = 5
+    # Emulate a trained UND parent that differs from original BAGEL.
+    with torch.no_grad():
+        runtime.decoder.layers[0].self_attn.q_proj.weight.add_(.3)
+        for update in student.adapters.consumer.values():
+            update.b.fill_(.2)
+    native_image, _ = sample(student, 'a red token', 17, native=True)
+    for updates in (1, 2, 3):
+        image, _ = sample(student, 'a red token', 17, feedback_updates=updates)
+        assert image.tobytes() == native_image.tobytes()
+    assert student.bridge.strength.item() == 0
+    assert not student.bridge.vel_scale.count_nonzero()
+    assert not student.bridge.memory_gates.count_nonzero()
+
+
+def test_memory_query_adapter_never_changes_native_attention(stage_student):
+    student, state = stage_student
+    # Gamma=1 exposes raw velocity, so zero gamma cannot conceal a broken native branch.
+    with torch.no_grad():
+        student.bridge.vel_scale.fill_(1)
+        for update in student.adapters.consumer.values():
+            update.b.fill_(.5)
+        base = conditional_gen(student.runtime, state, capture=False, native_scope=student.native_context)
+        result = student(state)
+        torch.testing.assert_close(result.velocity, base.velocity, atol=0, rtol=0)
+        student.bridge.memory_gates.fill_(.4)
+        active = student(state)
+        assert not torch.equal(active.velocity, base.velocity)
+        masked = student(state, memory_masked=True)
+        torch.testing.assert_close(masked.velocity, base.velocity, atol=0, rtol=0)
+    assert all(name.endswith('q_proj') for name in student.adapters.consumer)
+    for layer in student.runtime.decoder.layers:
+        assert not hasattr(layer.self_attn.k_proj_moe_gen, 'update')
+        assert not hasattr(layer.self_attn.v_proj_moe_gen, 'update')
+        assert not hasattr(layer.self_attn.o_proj_moe_gen, 'update')
+
+
+def test_predictive_canvas_and_velocity_baseline_follow_previous_round(stage_student, monkeypatch):
+    import qwen_latent_cot.interaction.loop as loop
+    student, state = stage_student
+    with torch.no_grad():
+        student.bridge.strength.fill_(.2)
+        student.bridge.memory_gates.fill_(.3)
+        student.bridge.vel_scale.fill_(.8)
+    canvases, bases = [], []
+    original_canvas, original_gen = loop.canvas_entrance, loop.conditional_gen
+    def canvas(runtime, current, velocity):
+        canvases.append(velocity)
+        return original_canvas(runtime, current, velocity)
+    def gen(*args, **kwargs):
+        if kwargs.get('velocity_baseline') is not None:
+            bases.append(kwargs['velocity_baseline'])
+        return original_gen(*args, **kwargs)
+    monkeypatch.setattr(loop, 'canvas_entrance', canvas)
+    monkeypatch.setattr(loop, 'conditional_gen', gen)
+    with torch.no_grad():
+        output = student(state, feedback_updates=3)
+    for index, previous in enumerate([output.baseline, *output.exits[:-1]]):
+        assert canvases[index] is previous.velocity and bases[index] is previous.velocity
+        assert previous.source[0].positions == output.baseline.source[0].positions
+    # Canvas carries no final hidden state, time embedding, or cross-round gradient.
+    velocity = output.baseline.velocity.detach().clone().requires_grad_()
+    actual = original_canvas(student.runtime, state, velocity)
+    from qwen_latent_cot.diagnostics.numerics import autocast_for
+    with autocast_for(student.runtime.device):
+        expected = student.runtime.model.vae2llm((state.x_t.float()-state.t*velocity.float()).detach().to(state.x_t.dtype))
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert not actual.requires_grad
+
+
+def test_teacher_uses_same_state_and_frozen_full_prompt(stage_student, visual_runtime):
+    student, _ = stage_student
+    _, row = visual_runtime
+    state, split = training_state(student, dict(row, caption='A red token. A blue token.'), .9, 3, 17)
+    from dataclasses import replace
+    with student.native_context():
+        flow, lengths, positions = student.runtime.flow_inputs(split.full)
+    teacher = conditional_gen(student.runtime, replace(state, flow=flow, lengths=tuple(lengths), positions=positions),
+                              capture=False, native_scope=student.native_context).velocity
+    eta = student.config['teacher_mix']
+    torch.testing.assert_close(state.correction_target, eta*teacher.float()+(1-eta)*state.flow_target(), atol=0, rtol=0)
+    assert not state.correction_target.requires_grad
+    with pytest.raises(ValueError):
+        from qwen_latent_cot.interaction import checkpoint
+        checkpoint.apply({'kind': 'bagel_full_loop_stage_a_v4'}, student)
+
+
+def test_residual_loss_amplitude_direction_and_zero_target():
+    from qwen_latent_cot.interaction.stage_a import residual_correction_loss
+    base = torch.zeros(2, 2, requires_grad=True)
+    target = torch.ones(2, 2, requires_grad=True)
+    good = torch.ones(2, 2, requires_grad=True)
+    loss, mse, cosine = residual_correction_loss(good, base, target)
+    torch.testing.assert_close(loss, torch.tensor(0.))
+    wrong, _, wrong_cos = residual_correction_loss(-good, base, target)
+    assert wrong > loss and wrong_cos == 2
+    loss.backward()
+    assert base.grad is None and target.grad is None and torch.isfinite(good.grad).all()
+    zero, _, direction = residual_correction_loss(torch.zeros(2, 2), base, base.detach())
+    assert zero == 0 and direction == 0

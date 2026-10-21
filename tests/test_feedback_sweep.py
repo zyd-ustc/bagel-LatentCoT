@@ -12,9 +12,9 @@ def test_feedback_override_default_parity_and_explicit_inference_only(stage_stud
     student,state=stage_student
     with torch.no_grad():
         default=student(state,guidance=True)
-        explicit=student(state,guidance=True,feedback_updates=2)
+        explicit=student(state,guidance=True,feedback_updates=1)
     torch.testing.assert_close(default.velocity,explicit.velocity,rtol=0,atol=0)
-    assert student.config['feedback_updates']==2 and len(student.bridge.vel_scale)==2
+    assert student.config['feedback_updates']==1 and len(student.bridge.vel_scale)==1
     with pytest.raises(ValueError,match='inference-only'):student(state,feedback_updates=3)
     with torch.no_grad(),pytest.raises(ValueError,match='positive integer'):student(state,feedback_updates=0)
 
@@ -22,7 +22,7 @@ def test_feedback_override_default_parity_and_explicit_inference_only(stage_stud
 def test_real_blocks_cfg_once_and_last_gate_reused(stage_student,monkeypatch):
     import qwen_latent_cot.interaction.loop as loop
     student,state=stage_student
-    with torch.no_grad():student.bridge.vel_scale.copy_(torch.tensor([.8,1.2]))
+    with torch.no_grad():student.bridge.vel_scale.copy_(torch.tensor([.8]))
     original=loop.conditional_gen;scales=[]
     def record(*args,**kwargs):
         if kwargs.get('velocity_scale') is not None:scales.append(float(kwargs['velocity_scale']))
@@ -39,13 +39,13 @@ def test_real_blocks_cfg_once_and_last_gate_reused(stage_student,monkeypatch):
         assert len(result.exits)==len(result.banks)==n
         assert sum(c is state.flow['past_key_values'] for c in calls)==n+1
         assert sum(c is state.flow['cfg_text_past_key_values'] for c in calls)==1
-        assert scales==pytest.approx(([.8]+[1.2]*(n-1)))
+        assert scales==pytest.approx(([.8]*n))
         assert torch.isfinite(result.velocity).all()
         for value in result.exits[:-1]:
             assert len(value.source)==3
-            assert value.source[0].positions==tuple(p+16 for p in result.baseline.source[0].positions)
+            assert value.source[0].positions==result.baseline.source[0].positions
         assert result.exits[-1].source==()
-    assert student.config['feedback_updates']==2
+    assert student.config['feedback_updates']==1
 
 
 def test_shared_sampler_reports_actual_passes(stage_student):

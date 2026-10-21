@@ -1,5 +1,8 @@
 # Base / 1 / 2 / 3 / 4 次反馈：GenEval2 人工比较
 
+> 历史 Stage A v4 记录：以下配置、检查点、运行状态和测试结果属于重构前版本。当前实现请使用 [Stage A v2](stage_a_v2_canvas_reentry.md)，旧检查点不能加载。
+
+
 ## 固定的条件
 
 使用 Stage A `step_004000.pt`，全部组输入同一条 GenEval2 原始完整 Prompt，初始噪声 seed 17。

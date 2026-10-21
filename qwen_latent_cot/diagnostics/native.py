@@ -134,17 +134,19 @@ def free_caption(bundle, instruction_ids, prefix=None, start=0, max_tokens=96):
 
 @contextmanager
 def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_positions, masked=False, *,
-                    wrap_decoder=True, adapter_scope=nullcontext):
-    """Keep native prompt; append 16 slots for ONE conditional decoder call.
+                    wrap_decoder=True, adapter_scope=nullcontext, memory_gates=None):
+    """Consume Memory for one conditional call; CFG references remain native.
 
-    CFG branches remain native. G-layout reserves identical indices/positions
-    while excluding Memory from softmax. No bank persists after this context.
+    Stage A v2 supplies memory_gates for independent content attention with
+    native positions. Legacy SFT/diagnostics retain joint-prefix attention.
+    No bank persists after this context.
     """
     if len(bank.layers) != len(decoder.layers):
         raise ValueError('GEN must receive full-depth Memory')
     if len(prompt_lengths) != len(bank.layers[0].lengths):
         raise ValueError('GEN packed sample counts differ')
-    memory = consume_bank(decoder, bank, prompt_positions)
+    decoupled = memory_gates is not None
+    memory = bank.layers if decoupled else consume_bank(decoder, bank, prompt_positions)
     original_decoder = decoder.forward_inference
     originals = []
     call_count = 0
@@ -161,9 +163,10 @@ def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_pos
             qlens = kwargs['query_lens'].tolist()
             if tuple(kwargs['key_values_lens'].tolist()) != tuple(prompt_lengths):
                 raise ValueError('conditional prompt layout changed')
-            chunks = kwargs['packed_query_position_ids'].split(qlens)
-            kwargs['packed_query_position_ids'] = torch.cat([p+bank.slots for p in chunks])
-            with adapter_scope():
+            if not decoupled:
+                chunks = kwargs['packed_query_position_ids'].split(qlens)
+                kwargs['packed_query_position_ids'] = torch.cat([p+bank.slots for p in chunks])
+            with nullcontext() if decoupled else adapter_scope():
                 return original_decoder(**kwargs)
         return original_decoder(**kwargs)
 
@@ -175,6 +178,29 @@ def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_pos
                 return original(**kwargs)
             if kwargs.get('update_past_key_values', True):
                 raise ValueError('GEN Memory consumption cannot persist its KV')
+            if decoupled:
+                if masked:
+                    return original(**kwargs)
+                ii = kwargs['packed_vae_token_indexes']
+                hidden = kwargs['packed_query_sequence'][ii].to(torch.bfloat16)
+                # Content-only memory attention: no shared RoPE offset or native KV changes.
+                with adapter_scope():
+                    query = self.q_proj_moe_gen(hidden).view(-1, self.num_heads, self.head_dim)
+                    query = self.q_norm_moe_gen(query.float()).to(torch.bfloat16)
+                offsets = torch.cumsum(kwargs['query_lens'], 0)
+                starts = torch.cat((offsets.new_zeros(1), offsets[:-1]))
+                lengths = tuple(int(((ii >= a) & (ii < b)).sum()) for a, b in zip(starts, offsets))
+                kv = memory[index]
+                extra = packed_attention(query, kv.keys.to(query.dtype), kv.values.to(query.dtype),
+                                         lengths, kv.lengths, native_unmasked=True).reshape(len(ii), -1)
+                def inject(module, args):
+                    return (args[0]+memory_gates[index].tanh().to(args[0].dtype)*extra.to(args[0].dtype),)
+                handle = self.o_proj_moe_gen.register_forward_pre_hook(inject)
+                try:
+                    # Native Q/K/V, native kernel, native output projection, unchanged text tokens.
+                    return original(**kwargs)
+                finally:
+                    handle.remove()
             if masked:
                 # All Memory keys are excluded. Preserve the 16-position shift
                 # in decoder_call, but use the exact native unmasked kernel on

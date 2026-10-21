@@ -1,5 +1,8 @@
 # Stage A 的现成 benchmark
 
+> 历史 Stage A v4 记录：以下配置、检查点、运行状态和测试结果属于重构前版本。当前实现请使用 [Stage A v2](stage_a_v2_canvas_reentry.md)，旧检查点不能加载。
+
+
 首选 **GenEval**：原始 553 条标注、六个类别，配套 Mask2Former + OpenCLIP 评分器。
 可直接检查数量、颜色、位置与颜色绑定。官方仓库：<https://github.com/djghosh13/geneval>。
 

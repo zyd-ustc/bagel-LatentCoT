@@ -46,7 +46,7 @@ class InferenceEngine:
         from ..interaction.checkpoint import read, KINDS
         saved = read(checkpoint)
         if saved.get('kind') not in KINDS:
-            raise ValueError('Sampling requires a full-loop v3 or Stage A v4 checkpoint; use --parent for C2 initialization')
+            raise ValueError('Sampling requires a full-loop v3 or Stage A canvas v2 checkpoint; use --parent for C2 initialization')
         runtime = load_runtime(model, saved['parent'], device)
         return cls(runtime, saved['parent'], saved['config'], saved=saved)
 

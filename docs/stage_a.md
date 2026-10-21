@@ -1,5 +1,8 @@
 # Stage A：用 Prompt 信息差训练 Memory → GEN 的响应
 
+> 历史 Stage A v4 记录：以下配置、检查点、运行状态和测试结果属于重构前版本。当前实现请使用 [Stage A v2](stage_a_v2_canvas_reentry.md)，旧检查点不能加载。
+
+
 Stage A 在 `loop-layer-NPU` 上实现。数据使用原来的 `annotation_index_v1` 图文对，
 不使用新改写文本，也不生成伪图像。这里只训练 Stage A；Stage B 尚未实现。
 

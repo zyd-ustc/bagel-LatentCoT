@@ -37,7 +37,7 @@ def arm_inputs(row, arm, donor):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model',required=True)
-    parser.add_argument('--checkpoint',required=True,help='Pinned Stage A v4 checkpoint file; not a training directory')
+    parser.add_argument('--checkpoint',required=True,help='Pinned Stage A canvas v2 checkpoint file; not a training directory')
     parser.add_argument('--prompts',required=True)
     parser.add_argument('--output',required=True)
     parser.add_argument('--rank',type=int,required=True)
@@ -64,7 +64,7 @@ def main():
         write_json(worker,dict(meta,status='loading'))
         device=set_device(args.device)
         saved=read(args.checkpoint)
-        if saved.get('kind')!=STAGE_A_KIND or saved.get('stage')!='stage_a':raise ValueError('Require a trained Stage A v4 checkpoint')
+        if saved.get('kind')!=STAGE_A_KIND or saved.get('stage')!='stage_a':raise ValueError('Require a trained Stage A canvas v2 checkpoint')
         runtime=load_runtime(args.model,saved['parent'],device)
         engine=InferenceEngine(runtime,saved['parent'],saved['config'],saved=saved)
         meta.update(checkpoint_step=saved['step'],checkpoint_kind=saved['kind'],model=args.model,
