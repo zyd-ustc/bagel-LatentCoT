@@ -50,5 +50,6 @@
   "memory_margin": 0.01,
   "teacher_mix": 0.8,
   "cos_weight": 0.1,
-  "raw_correction_weight": 1.0
+  "raw_correction_weight": 0.0,
+  "gate_scale": 10.0
 }

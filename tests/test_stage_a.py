@@ -87,7 +87,8 @@ def test_stage_a_real_loss_gradients_controls_and_resume(stage_student,visual_ru
     # With alpha=0 the query adapter starts learning after the memory gate opens.
     assert log['gradient_consumer']==0
     assert any(v != 0 for v in log['memory_gates'])
-    assert log['cos_loss']==1.0 and log['raw_correction_loss']>0
+    assert log['cos_loss']==0.0 and 'raw_correction_loss' not in log
+    assert log['velocity_scale']==[1.0]
     assert all(name.endswith('q_proj') for name in student.adapters.consumer)
     saved=checkpoint.read(tmp_path/'train/step_000001.pt')
     assert saved['kind']==checkpoint.STAGE_A_KIND and saved['stage']=='stage_a'
@@ -103,7 +104,7 @@ def test_stage_a_real_loss_gradients_controls_and_resume(stage_student,visual_ru
     records=[json.loads(line) for line in (tmp_path/'train/train.jsonl').read_text().splitlines()]
     assert any(record['gradient_consumer']>0 for record in records[1:])
     # BF16 may round tiny applied corrections to zero during the first steps.
-    assert any(any(g != 0 for g in record['velocity_scale']) for record in records[1:])
+    assert any(record['delta_v_rms']>0 for record in records[1:])
 
 
 def test_v1_generation_corpus_keeps_splits_and_sampler_resume(tmp_path):
@@ -196,7 +197,7 @@ def test_zero_initialization_matches_native_pixels_with_changed_parent(stage_stu
         image, _ = sample(student, 'a red token', 17, feedback_updates=updates)
         assert image.tobytes() == native_image.tobytes()
     assert student.bridge.strength.item() == 0
-    assert not student.bridge.vel_scale.count_nonzero()
+    assert torch.equal(student.bridge.vel_scale, torch.ones_like(student.bridge.vel_scale))
     assert not student.bridge.memory_gates.count_nonzero()
 
 
@@ -285,3 +286,21 @@ def test_residual_loss_amplitude_direction_and_zero_target():
     assert base.grad is None and target.grad is None and torch.isfinite(good.grad).all()
     zero, _, direction = residual_correction_loss(torch.zeros(2, 2), base, base.detach())
     assert zero == 0 and direction == 0
+
+
+def test_fast_gate_scale_and_cosine_zero_residual_start(stage_student):
+    student, _ = stage_student
+    bridge = student.bridge
+    anchor = torch.zeros(2, bridge.projection.in_features)
+    canvas = torch.ones_like(anchor)
+    with torch.no_grad():
+        bridge.strength.fill_(.02)
+    torch.testing.assert_close(bridge(anchor, canvas), torch.full_like(anchor, torch.tanh(torch.tensor(.2))))
+    from qwen_latent_cot.interaction.stage_a import residual_correction_loss
+    prediction = torch.zeros(2, 2, requires_grad=True)
+    target = torch.ones_like(prediction)
+    loss, mse, direction = residual_correction_loss(prediction, torch.zeros_like(prediction), target)
+    assert direction.item() == 0
+    torch.testing.assert_close(loss, mse)
+    loss.backward()
+    torch.testing.assert_close(prediction.grad, torch.full_like(prediction, -.5))

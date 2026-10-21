@@ -134,7 +134,7 @@ def free_caption(bundle, instruction_ids, prefix=None, start=0, max_tokens=96):
 
 @contextmanager
 def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_positions, masked=False, *,
-                    wrap_decoder=True, adapter_scope=nullcontext, memory_gates=None):
+                    wrap_decoder=True, adapter_scope=nullcontext, memory_gates=None, memory_gate_scale=1.0):
     """Consume Memory for one conditional call; CFG references remain native.
 
     Stage A v2 supplies memory_gates for independent content attention with
@@ -194,7 +194,7 @@ def gen_memory_call(decoder, conditional_cache, bank, prompt_lengths, prompt_pos
                 extra = packed_attention(query, kv.keys.to(query.dtype), kv.values.to(query.dtype),
                                          lengths, kv.lengths, native_unmasked=True).reshape(len(ii), -1)
                 def inject(module, args):
-                    return (args[0]+memory_gates[index].tanh().to(args[0].dtype)*extra.to(args[0].dtype),)
+                    return (args[0]+(memory_gate_scale*memory_gates[index]).tanh().to(args[0].dtype)*extra.to(args[0].dtype),)
                 handle = self.o_proj_moe_gen.register_forward_pre_hook(inject)
                 try:
                     # Native Q/K/V, native kernel, native output projection, unchanged text tokens.

@@ -1,4 +1,4 @@
-# Stage A v2：预测画布重入与独立 Memory 注意力
+# Stage A v2.1：预测画布重入与独立 Memory 注意力
 
 本页描述当前实现。旧 Stage A 的训练结果保留在历史文档中，不能作为 v2 的质量或性能证据。
 
@@ -8,7 +8,8 @@
 Stage A 训练一次纠错，推理可以覆盖为 1–3 次；每轮重新写入 Memory、更新预测画布。
 前半程 Euler 更新启用 Loop，后半程使用原版 BAGEL。原 SFT 的实现及 `bagel_full_loop_v3` 格式保持不变。
 
-Stage A 使用新格式 `bagel_canvas_stage_a_v2`。旧 `bagel_full_loop_stage_a_v4` 的 adapter、bridge、优化器均不兼容。
+Stage A 使用新格式 `bagel_canvas_stage_a_v2_1`。旧 `bagel_full_loop_stage_a_v4` 的 adapter、bridge、优化器均不兼容。
+初版 v2 的 `bagel_canvas_stage_a_v2` 也不直接加载：本次门控含义和损失已改变。
 用 format-4 C2 Observe/Feedback parent 重新初始化，不迁移旧 Stage A 的 consumer 权重。
 
 ## 预测画布代替末层 hidden
@@ -20,7 +21,7 @@ Stage A 使用新格式 `bagel_canvas_stage_a_v2`。旧 `bagel_full_loop_stage_a
 canvas = stop_gradient(x_t - t * previous_velocity)
 canvas_embed = vae2llm(canvas)
 anchor = vae2llm(x_t) + time_embed(t) + latent_pos_embed
-entrance = anchor + tanh(beta) * P(canvas_embed - anchor)
+entrance = anchor + tanh(10 * beta) * P(canvas_embed - anchor)
 ```
 
 `P` 初始化为单位阵，`beta=0`。canvas 编码不重复添加时间或位置嵌入。
@@ -38,7 +39,7 @@ GEN 主分支直接调用原有 attention，实现和核函数均不替换。Pro
 
 ```text
 memory_output = SDPA(image_query_with_consumer, memory_key, memory_value)
-combined_image_attention = native_image_attention + tanh(alpha[layer]) * memory_output
+combined_image_attention = native_image_attention + tanh(10 * alpha[layer]) * memory_output
 output = frozen_o_proj_moe_gen(combined_image_attention)
 ```
 
@@ -58,30 +59,34 @@ velocity = stop_gradient(previous_velocity)
          + gamma * (raw_velocity - stop_gradient(previous_velocity))
 ```
 
-默认 `teacher_mix=0.8`，可设为 1.0 做纯蒸馏。`gamma=0`，在条件速度头合成后才执行原生 CFG。
+默认 `teacher_mix=0.8`，可设为 1.0 做纯蒸馏。`gamma=1`，在条件速度头合成后才执行原生 CFG。
 推理额外轮次复用单步训练的 gamma，合成锚点随轮次更新，不一直围绕 `v0`。
 
 纠错损失比较 `velocity - stop_gradient(previous_velocity)` 与 `target - stop_gradient(previous_velocity)`：
 
 ```text
 correction = residual_MSE + 0.1 * residual_cosine_loss
-raw_correction = 同一损失，但用 raw_velocity 代替 velocity
-total = correction + raw_correction_weight * raw_correction + 0.1 * semantic_CE
+total = correction + 0.1 * semantic_CE
 ```
 
-**对原方案的必要调整**：beta、alpha、gamma 同时为零时，raw_velocity 等于基线，
-实际残差损失无法启动纠错分支。加入默认权重为 1 的 `raw_correction`，使 beta 和 alpha 先获得梯度；
-随后 Query LoRA 和 gamma 开始学习。辅助损失不改变前向采样的零初始化结果。
-首步 consumer 梯度为零符合该结构。BF16 也可能将训练早期很小的实际速度变化舍入为零。
+alpha、beta 保持零初始化，gamma 初始化为 1。初始 raw_velocity 已等于基线，故仍保持原生输出，
+主损失可以直接训练内层门控。`raw_correction_weight=0`，已移除辅助损失及其额外速度输出。
+首步 consumer 梯度仍为零；alpha、beta 先更新，之后 Query LoRA 开始学习。
+入口和 Memory 门均使用 `tanh(gate_scale * parameter)`，配置 `gate_scale=10`。
+日志记录缩放后真正生效的门值，而不是未缩放参数的 tanh。
 
-每个 TrainingState 对应一张图。余弦方向按全图所有 token 和通道计算，数值稳定项为 `1e-4`；
+每个 TrainingState 对应一张图。余弦方向按全图 token 和通道计算，数值稳定项为 `1e-2`。
+另以 `clamp(stop_gradient(norm(predicted_residual)) / 1e-2, max=1)` 平滑启用余弦项：
+零残差时由 MSE 启动，范数达到 0.01 后使用完整方向权重。
+停止该启用权重的梯度，避免模型通过缩小残差来降低方向损失。
+日志 `cos_loss` 为乘过启用权重后的方向损失，初始值为 0；不能与初版 v2 的未加权 cos_loss 直接比较。
 目标残差严格为零时不计方向损失。Hard-Patch 权重和 Keep Loss 已从 Stage A 移除。
 Memory contrast 默认关闭，验证仍保存 Memory-off / shuffled 对照。
 
 日志中的 `correct_flow`、`round_flow`、`off_flow`、`shuffled_flow` 改为对混合 Teacher 目标的 MSE；
 `base_flow` 仍是对数据集 `epsilon-x0` 的 MSE，不能直接与前四项相减。
-新增 `cos_loss`、`raw_correction_loss`、`memory_gates`、`reentry_gate`。
-`target_residual_rms` 使用混合 Teacher 目标；验证文件还记录 `round_cos` 和 `round_raw_correction`。
+记录 `cos_loss`、`memory_gates`、`reentry_gate`，移除 `raw_correction_loss`。
+`target_residual_rms` 使用混合 Teacher 目标；验证文件还记录 `round_cos`，移除 `round_raw_correction`。
 
 ## 训练与采样
 
@@ -115,7 +120,7 @@ python -m qwen_latent_cot.interaction.cli sample \
 
 ## 验收与证据范围
 
-本地完整回归为 107 项通过。CPU 小型真实 BAGEL MoT 测试覆盖：
+本地回归 107 项及新增专项 1 项通过。CPU 小型真实 BAGEL MoT 测试覆盖：
 
 - C2 权重不同于原版时，零初始化 1–3 轮采样与原生图片逐像素一致。
 - 非零 consumer Query 不污染原生注意力；Memory 门为零或屏蔽 Memory 时恢复原生路径。
@@ -123,8 +128,9 @@ python -m qwen_latent_cot.interaction.cli sample \
 - Teacher 共享 x/t，full 与 partial 缓存隔离。
 - 零门启动、方向损失、激活重计算梯度一致、验证对照、保存和续训。
 
-完整权重的 NPU 零初始化逐像素对照、1k–2k 步训练后的 32 条 Prompt 画风与语义检查、
-以及 1–3 轮外推收益，仍需在部署主机执行。本次没有启动或停止远端任务。
+初版 v2 已完成完整权重的 NPU 零初始化对照：512px、5 个采样节点，速度和图片均逐位一致。
+v2.1 保持 alpha、beta 为零，gamma=1 的初始化合同由 CPU 1–3 轮采样测试覆盖。
+训练后 32 条 Prompt 的画风、语义补全及 1–3 轮外推收益仍需后续实验。
 独立 Softmax 和冻结原生投影消除了对应的结构干扰，但不能据此承诺训练后绝对不改变画风。
 Teacher 增加一次无梯度前向；当前实现还会临时装载原版 UND 参数。
 显存减半、速度翻倍需要实测，不能从纠错轮数减半直接推出。

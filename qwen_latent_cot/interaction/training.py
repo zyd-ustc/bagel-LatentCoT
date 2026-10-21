@@ -87,8 +87,7 @@ class Trainer:
             if split is not None:
                 from .stage_a import correction_loss
                 terms = correction_loss(result, state, self.config)
-                metrics = dict(round_cos=[float(x) for x in terms.round_cos],
-                               round_raw_correction=[float(x) for x in terms.round_raw])
+                metrics = dict(round_cos=[float(x) for x in terms.round_cos])
             else:
                 terms = supervised_loss(result, state, self.config['round_loss_weights'],
                                         hard_patch_alpha=self.config['hard_patch_alpha'], keep_weight=self.config['keep_weight'])
@@ -190,7 +189,7 @@ def train_stage_a(trainer):
             if any(d is None for d in donor_rows):
                 raise ValueError('Shuffled Memory requires at least two distinct sampled families')
         names = ('loss','base_flow','correct_flow','semantic_ce','memory_contrast','off_flow','shuffled_flow',
-                 'delta_v_rms','target_residual_rms','removed_word_fraction','masked_fraction','cos_loss','raw_correction_loss')
+                 'delta_v_rms','target_residual_rms','removed_word_fraction','masked_fraction','cos_loss')
         values = [0.]*len(names)
         round_values = [0.]*cfg['feedback_updates']
         for index in range(parallel.rank(), batch, parallel.world_size()):
@@ -216,7 +215,7 @@ def train_stage_a(trainer):
                                 (output.velocity.float()-base).square().mean().sqrt(),
                                 (state.correction_target-base).square().mean().sqrt(),
                                 len(split.removed.split())/max(1,len(split.full.split())), bool(split.removed),
-                                flow.round_cos[-1], flow.round_raw[-1])
+                                flow.round_cos[-1])
                 for j,value in enumerate(measurements): values[j] += float(value)
                 for j,value in enumerate(flow.round_flow): round_values[j] += float(value)
             if parallel.rank() == 0 and index == 0 and step == trainer.start+1:
@@ -234,8 +233,8 @@ def train_stage_a(trainer):
         record.update(off_minus_correct=record['off_flow']-record['correct_flow'] if cfg['memory_contrast_weight'] else None,
                       shuffled_minus_correct=record['shuffled_flow']-record['correct_flow'] if cfg['memory_contrast_weight'] else None,
                       velocity_scale=student.bridge.vel_scale.detach().float().cpu().tolist(),
-                      memory_gates=student.bridge.memory_gates.detach().tanh().float().cpu().tolist(),
-                      reentry_gate=float(student.bridge.strength.detach().tanh()),
+                      memory_gates=(student.bridge.gate_scale*student.bridge.memory_gates.detach()).tanh().float().cpu().tolist(),
+                      reentry_gate=float((student.bridge.gate_scale*student.bridge.strength.detach()).tanh()),
                       t_mean=sum(d[0] for d in draws)/batch, step_seconds=time.perf_counter()-started, **gradients)
         trainer.log(step,record)
         if step in cfg['save_steps'] or step == cfg['steps']:

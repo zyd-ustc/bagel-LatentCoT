@@ -35,12 +35,12 @@ class InteractionStudent(nn.Module):
         self.writer.activation_checkpointing = config.get('activation_checkpointing', True)
         self.adapters = Adapters(runtime.decoder, config['writer_rank'], config['consumer_rank'], stage_a=config.get('stage_a', False))
         self.bridge = (CanvasReentryBridge(runtime.decoder.config.hidden_size, config['feedback_updates'],
-                                           len(runtime.decoder.layers), runtime.device) if config.get('stage_a')
+                                           len(runtime.decoder.layers), runtime.device, config['gate_scale']) if config.get('stage_a')
                        else ReentryBridge(runtime.decoder.config.hidden_size, runtime.device))
         if config.get('stage_a'):
             if config['feedback_updates'] != 1:
                 raise ValueError('Stage A v2 trains one correction; override updates at inference')
-            if not 0 <= config['teacher_mix'] <= 1 or config['cos_weight'] < 0 or config['raw_correction_weight'] <= 0:
+            if not 0 <= config['teacher_mix'] <= 1 or config['cos_weight'] < 0 or config['raw_correction_weight'] != 0 or config['gate_scale'] <= 0:
                 raise ValueError('Invalid Stage A v2 correction loss coefficients')
             for layer in runtime.decoder.layers:
                 layer._und_checkpointing = config.get('activation_checkpointing', True)

@@ -110,7 +110,8 @@ def memory_controls(student, state, output, donor_bank):
     kwargs = dict(hidden_input=entrance, capture=False, detach_source=True,
                   adapter_scope=student.adapters.context('consumer'),
                   velocity_baseline=previous.velocity, velocity_scale=student.bridge.vel_scale[-1],
-                  memory_gates=student.bridge.memory_gates, native_scope=student.native_context)
+                  memory_gates=student.bridge.memory_gates, memory_gate_scale=student.bridge.gate_scale,
+                  native_scope=student.native_context)
     off = conditional_gen(student.runtime, state, output.banks[-1], masked=True, **kwargs)
     shuffled = conditional_gen(student.runtime, state, donor_bank, **kwargs)
     target = state.correction_target.detach()
@@ -134,7 +135,6 @@ class CorrectionLoss:
     total: torch.Tensor
     round_flow: list
     round_cos: list
-    round_raw: list
 
 
 def residual_correction_loss(pred_vel, base_vel, target_vel, cos_weight=0.1):
@@ -143,19 +143,20 @@ def residual_correction_loss(pred_vel, base_vel, target_vel, cos_weight=0.1):
     target = (target_vel.detach().float()-base_vel.detach().float()).reshape(1, -1)
     mse = F.mse_loss(residual, target)
     # Each TrainingState contains one image. Ignore direction for a zero target.
-    cos = (1-F.cosine_similarity(residual, target, dim=-1, eps=1e-4)).mean()
+    # Zero residual starts with MSE; enable direction as its norm reaches 1e-2.
+    # Detach the ramp so shrinking the residual cannot reduce loss through the weight.
+    direction_weight = (residual.detach().norm(dim=-1)/1e-2).clamp(max=1.)
+    cos = (direction_weight*(1-F.cosine_similarity(residual, target, dim=-1, eps=1e-2))).mean()
     cos = torch.where(target.square().sum() > 0, cos, cos.new_zeros(()))
     return mse+cos_weight*cos, mse, cos
 
 
 def correction_loss(output, state, config):
-    total, mses, cosines, raw_losses = 0., [], [], []
+    total, mses, cosines = 0., [], []
     previous = output.baseline.velocity
     for weight, value in zip(config['round_loss_weights'], output.exits):
         applied, mse, cosine = residual_correction_loss(value.velocity, previous, state.correction_target, config['cos_weight'])
-        # A zero velocity gate otherwise blocks both zero-initialized input gates.
-        raw, _, _ = residual_correction_loss(value.raw_velocity, previous, state.correction_target, config['cos_weight'])
-        total = total+weight*(applied+config['raw_correction_weight']*raw)
-        mses.append(mse); cosines.append(cosine); raw_losses.append(raw)
+        total = total+weight*applied
+        mses.append(mse); cosines.append(cosine)
         previous = value.velocity.detach()
-    return CorrectionLoss(total, mses, cosines, raw_losses)
+    return CorrectionLoss(total, mses, cosines)

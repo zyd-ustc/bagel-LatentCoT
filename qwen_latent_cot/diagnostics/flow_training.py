@@ -34,7 +34,6 @@ class FlowOutput:
     source: tuple[KV, ...]
     round: int
     hidden: torch.Tensor | None = None
-    raw_velocity: torch.Tensor | None = None
 
 
 @contextmanager
@@ -64,7 +63,7 @@ def conditional_reentry(decoder, cache, image_indexes, hidden_input):
 def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
                     round_index=0, detach_source=True, checkpoint_activations=False,
                     adapter_scope=nullcontext, guidance=False, hidden_input=None,
-                    velocity_baseline=None, velocity_scale=None, memory_gates=None, native_scope=nullcontext):
+                    velocity_baseline=None, velocity_scale=None, memory_gates=None, memory_gate_scale=1.0, native_scope=nullcontext):
     """One full-depth native flow call. CFG references never receive feedback.
 
     Reentry, Memory, adapter scopes and capture are recreated inside checkpoint
@@ -87,12 +86,9 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
     def native_forward(x, entrance):
         # First llm2vae invocation is conditional; reference heads stay native.
         calls = 0
-        raw_head = []
         def residual_head(module, args, value):
             nonlocal calls
             calls += 1
-            if calls == 1:
-                raw_head.append(value[image_indexes])
             if calls != 1 or velocity_baseline is None: return value
             adjusted = value.clone()
             raw = value[image_indexes].float()
@@ -101,7 +97,8 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
             return adjusted
         handle = runtime.model.llm2vae.register_forward_hook(residual_head)
         context = (gen_memory_call(runtime.decoder, flow['past_key_values'], bank,
-                                   state.lengths, state.positions, masked, adapter_scope=adapter_scope, memory_gates=memory_gates)
+                                   state.lengths, state.positions, masked, adapter_scope=adapter_scope, memory_gates=memory_gates,
+                                   memory_gate_scale=memory_gate_scale)
                    if bank is not None else nullcontext())
         observer = (capture_gen(runtime.decoder, flow['past_key_values'], t=state.t,
                                 round_index=round_index, positions=source_positions,
@@ -120,17 +117,17 @@ def conditional_gen(runtime, state, bank=None, *, masked=False, capture=True,
         source = tuple(captured[i] for i in range(len(runtime.decoder.layers))) if capture else ()
         if not metadata:
             metadata.extend(source)
-        return (velocity, exit_state['hidden'], raw_head[0], *(value for kv in source for value in (kv.keys, kv.values)))
+        return (velocity, exit_state['hidden'], *(value for kv in source for value in (kv.keys, kv.values)))
 
     outputs = (checkpoint(forward, state.x_t, hidden_input, use_reentrant=False, preserve_rng_state=True)
                if checkpoint_activations and torch.is_grad_enabled() and bank is not None
                else forward(state.x_t, hidden_input))
     if not torch.isfinite(outputs[0]).all():
         raise FloatingPointError('non-finite conditional GEN velocity')
-    source = tuple(KV(kv.layer, outputs[3+2*i], outputs[4+2*i], kv.lengths,
+    source = tuple(KV(kv.layer, outputs[2+2*i], outputs[3+2*i], kv.lengths,
                       kv.rotated, kv.source_kind, kv.t, kv.round, kv.token_roles,
                       kv.positions, kv.expert) for i, kv in enumerate(metadata))
-    return FlowOutput(outputs[0], source, round_index, outputs[1], outputs[2])
+    return FlowOutput(outputs[0], source, round_index, outputs[1])
 
 
 def flow_mse(output, state):

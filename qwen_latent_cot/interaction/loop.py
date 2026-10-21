@@ -34,17 +34,18 @@ class ReentryBridge(nn.Module):
 
 
 class CanvasReentryBridge(nn.Module):
-    def __init__(self, width, updates, depth, device):
+    def __init__(self, width, updates, depth, device, gate_scale=10.0):
         super().__init__()
         self.projection = nn.Linear(width, width, bias=False, device=device, dtype=torch.float32)
         nn.init.eye_(self.projection.weight)
         self.strength = nn.Parameter(torch.zeros((), device=device))
-        self.vel_scale = nn.Parameter(torch.zeros(updates, device=device))
+        self.vel_scale = nn.Parameter(torch.ones(updates, device=device))
+        self.gate_scale = gate_scale
         self.memory_gates = nn.Parameter(torch.zeros(depth, device=device))
 
     def forward(self, anchor, canvas_embed):
         delta = self.projection(canvas_embed.float()-anchor.float())
-        return (anchor.float()+self.strength.tanh()*delta.float()).to(anchor.dtype)
+        return (anchor.float()+(self.gate_scale*self.strength).tanh()*delta.float()).to(anchor.dtype)
 
 
 def canvas_entrance(runtime, state, velocity):
@@ -100,6 +101,7 @@ def full_loop(student, state, *, guidance=False, feedback_updates=None, memory_m
                                  checkpoint_activations=student.config['activation_checkpointing'],
                                  native_scope=student.native_context if student.config.get('stage_a') else nullcontext,
                                  memory_gates=getattr(student.bridge, 'memory_gates', None),
+                                 memory_gate_scale=getattr(student.bridge, 'gate_scale', 1.0),
                                  velocity_baseline=previous.velocity if hasattr(student.bridge, 'vel_scale') else None,
                                  velocity_scale=student.bridge.vel_scale[min(index, len(student.bridge.vel_scale)-1)] if hasattr(student.bridge, 'vel_scale') else None)
         banks.append(bank)

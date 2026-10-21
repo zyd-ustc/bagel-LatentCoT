@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 KIND = 'bagel_full_loop_v3'
-STAGE_A_KIND = 'bagel_canvas_stage_a_v2'
+STAGE_A_KIND = 'bagel_canvas_stage_a_v2_1'
 KINDS = (KIND, STAGE_A_KIND)
 
 def kind(student):
