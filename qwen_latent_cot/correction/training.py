@@ -68,7 +68,8 @@ def train(corrector,corpus,output,provenance,saved=None):
     optimizer=torch.optim.AdamW([p for p in corrector.parameters() if p.requires_grad],lr=cfg['lr'],weight_decay=cfg['weight_decay'])
     start=0
     if saved:
-        if saved['provenance']!=provenance:raise ValueError('Resume model/corpus/source provenance differs')
+        if {k:v for k,v in saved['provenance'].items() if k!='source_revision'}!={k:v for k,v in provenance.items() if k!='source_revision'}:
+            raise ValueError('Resume native model/corpus provenance differs')
         mutable={'steps','save_steps','val_images','activation_checkpointing'}
         if {k:v for k,v in saved['config'].items() if k not in mutable}!={k:v for k,v in cfg.items() if k not in mutable}:
             raise ValueError('Resume optimization/method config differs')

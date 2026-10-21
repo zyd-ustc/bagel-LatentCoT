@@ -38,7 +38,8 @@ def targets():
   if not path.name.isdigit():continue
   try:args=path.joinpath('cmdline').read_bytes().decode().split('\\0')
   except (OSError,UnicodeError):continue
-  if any(name in args for name in ('qwen_latent_cot.interaction.cli','qwen_latent_cot.diagnostics.visual_cli')) and not any(name in args for name in ('sample','audit','export','evaluate')):
+  training=('qwen_latent_cot.interaction.cli' in args and any(stage in args for stage in ('sft','stage_a'))) or ('qwen_latent_cot.diagnostics.visual_cli' in args and 'train' in args)
+  if training and any(arg.startswith('/data/zyd_workspace/bagel-LatentCoT/outputs/') for arg in args):
    result.append((int(path.name),'torch.distributed.run' in args))
  return result
 before=targets()
