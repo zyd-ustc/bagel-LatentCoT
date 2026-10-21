@@ -28,11 +28,13 @@ def apply(saved,corrector):
     if set(actual)!=set(expected):raise ValueError('Corrector parameter inventory differs')
     with torch.no_grad():
         for name,p in expected.items():p.copy_(actual[name].to(p.device))
+    if hasattr(corrector,'calibration'):corrector.calibration.load_state_dict(saved['calibration'])
 
 
 def save(path,corrector,step,optimizer,sampler,provenance,rng_by_rank):
     saved=dict(kind=KIND,step=step,config=corrector.config,
         trainable={name:p.detach().cpu() for name,p in corrector.trainable().items()},optimizer=optimizer.state_dict(),
         sampler=sampler.state_dict(),provenance=provenance,rng_by_rank=rng_by_rank)
+    if hasattr(corrector,'calibration'):saved['calibration']=corrector.calibration.state_dict()
     path=Path(path);temporary=path.with_suffix('.partial')
     torch.save(saved,temporary);os.replace(temporary,path)

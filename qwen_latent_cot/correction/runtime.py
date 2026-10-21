@@ -5,7 +5,7 @@ from PIL import Image
 import numpy as np
 from .attention import Context, project, rotate
 from ..bagel.accelerator import seeded_context
-from .numerics import autocast_for
+from .numerics import autocast_for, guided
 
 
 def device_inputs(inputs, device):
@@ -82,6 +82,13 @@ class Runtime:
             cfg_name = {'packed_indexes':'packed_query_indexes'}.get(name,name)
             reference[name] = flow['cfg_text_'+cfg_name]
         return self.predict(x_t,t,reference,capture=False)[0]
+
+    @torch.no_grad()
+    def proposal(self, x_t, t, flow, *, capture=True):
+        """The same native guided velocity and clean proposal used at deployment."""
+        conditional,context=self.predict(x_t,t,flow,capture=capture)
+        reference=self.reference(x_t,t,flow) if self.config['cfg_text_scale']>1 else conditional
+        return guided(conditional,reference,self.config).detach(),context
 
     @torch.no_grad()
     def encode(self, path, posterior_seed):

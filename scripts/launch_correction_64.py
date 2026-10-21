@@ -42,6 +42,12 @@ def targets():
   if training and any(arg.startswith('/data/zyd_workspace/bagel-LatentCoT/outputs/') for arg in args):
    result.append((int(path.name),'torch.distributed.run' in args))
  return result
+active=[]
+for path in Path('/proc').iterdir():
+ try:args=path.joinpath('cmdline').read_bytes().decode().split('\\0')
+ except (OSError,UnicodeError):continue
+ if 'qwen_latent_cot.correction.cli' in args and 'train' in args:active.append(int(path.name))
+if active:raise RuntimeError('Existing correction training is active: '+str(active))
 before=targets()
 for pid,launcher in before:
  if launcher:

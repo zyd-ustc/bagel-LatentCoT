@@ -1,0 +1,7 @@
+- [x] Read current code, callers, tests, prior diagnosis, and remote state.
+- [x] Align training and sampling with post-CFG correction.
+- [ ] Build and inspect filtered photo corpus, preserving splits.
+- [x] Add train-only global calibration and three-arm evaluation.
+- [ ] Pass CPU and full-model NPU acceptance; inspect images.
+- [ ] Deploy a fixed revision and launch fresh 64-card 5000-step run.
+- [ ] Verify step10 save, finite distributed training, and durable follow-up.

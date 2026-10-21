@@ -20,7 +20,7 @@ def main(argv=None):
             p.add_argument('--corpus',required=True);p.add_argument('--resume');p.add_argument('--distributed',action='store_true')
             p.add_argument('--steps',type=int);p.add_argument('--global-batch',type=int);p.add_argument('--val-images',type=int)
         else:
-            p.add_argument('--checkpoint',required=True);p.add_argument('--prompt',required=True);p.add_argument('--seed',type=int,default=17);p.add_argument('--native',action='store_true')
+            p.add_argument('--checkpoint',required=True);p.add_argument('--prompt',required=True);p.add_argument('--seed',type=int,default=17);p.add_argument('--native',action='store_true');p.add_argument('--global-only',action='store_true')
     args=parser.parse_args(argv)
     saved=checkpoint.read(args.checkpoint if args.command=='sample' else args.resume) if args.command=='sample' or args.resume else None
     cfg=dict(saved['config']) if args.command=='sample' else json.loads(Path(args.config).read_text())
@@ -37,7 +37,7 @@ def main(argv=None):
         from .sampling import sample
         if saved['provenance']['model_path']!=str(Path(args.model).resolve()):raise ValueError('Sampling model path differs from training')
         checkpoint.apply(saved,corrector)
-        image,trace=sample(corrector,args.prompt,args.seed,native=args.native)
+        image,trace=sample(corrector,args.prompt,args.seed,native=args.native,global_only=args.global_only)
         Path(args.output).parent.mkdir(parents=True,exist_ok=True);image.save(args.output)
         Path(args.output+'.json').write_text(json.dumps(trace,indent=2));return
     from .data import Corpus

@@ -53,6 +53,11 @@ class SpatialCorrector(nn.Module):
         self.head = nn.Linear(width, channels, bias=True, device=runtime.device, dtype=torch.float32)
         nn.init.zeros_(self.head.weight); nn.init.zeros_(self.head.bias)
 
+        if config.get('correction_space')=='post_cfg':
+            from .calibration import GlobalCalibration
+            from .sampling import times, active_steps
+            self.calibration=GlobalCalibration(times(config)[:active_steps(config)],channels,runtime.device)
+
     def forward(self, proposal, t, flow, context):
         model, decoder = self.runtime.model, self.runtime.decoder
         if len(context) != len(self.layers): raise ValueError('Context must cover all UND layers')

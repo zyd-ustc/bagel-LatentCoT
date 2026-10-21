@@ -49,13 +49,13 @@ class Corpus:
         return json.loads(handle.readline())
     def groups(self,split): return [v for v in self.views if v.info['split']==split]
     def validation(self,count):
-        result=[];families=set();views=self.groups('val')
+        result=[];families=set();images=set();views=self.groups('val')
         for position in range(count):
             for view in views:
                 if position>=len(view):continue
                 row=view[position]
-                if row['family_id'] in families:continue
-                result.append(row);families.add(row['family_id'])
+                if row['family_id'] in families or row['image'] in images:continue
+                result.append(row);families.add(row['family_id']);images.add(row['image'])
                 if len(result)==count:return result
         if len(result)<count:raise ValueError('Insufficient distinct validation families')
         return result
@@ -78,7 +78,7 @@ class Sampler:
     def take(self,count):
         rows=[]
         for _ in range(count):
-            i=self.rng.choices(range(len(self.views)),weights=[len(v)**.5 for v in self.views],k=1)[0]
+            i=self.rng.choices(range(len(self.views)),weights=[len(v)**(1. if self.corpus.manifest.get('sampling')=='pair_count' else .5) for v in self.views],k=1)[0]
             view=self.views[i];a,b=self.transforms[i]
             rows.append(view[(a*self.cursors[i]+b)%len(view)]);self.cursors[i]+=1
             if self.cursors[i]==len(view):

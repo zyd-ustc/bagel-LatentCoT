@@ -15,7 +15,7 @@ from qwen_latent_cot.correction.training import FrozenGuard
 from qwen_latent_cot.correction import checkpoint
 
 
-def tiny(checkpointing=False):
+def tiny(checkpointing=False,post_cfg=False):
     torch.manual_seed(7)
     cfg=Qwen2Config(vocab_size=64,hidden_size=32,intermediate_size=64,num_hidden_layers=3,
         num_attention_heads=4,num_key_value_heads=2,layer_module='Qwen2MoTDecoderLayer')
@@ -30,6 +30,7 @@ def tiny(checkpointing=False):
         def decode(self,x):return torch.nn.functional.interpolate(torch.cat((x,x[:,:1]),1),scale_factor=8)
     bundle=SimpleNamespace(model=model,vae=VAE(),tokenizer=Tokenizer(),token_ids=dict(bos_token_id=1,eos_token_id=2,start_of_image=1,end_of_image=3))
     config=json.loads(Path('configs/correction.json').read_text());config.update(resolution=32,sampler_steps=4,lora_rank=4,activation_checkpointing=checkpointing)
+    if post_cfg:config['correction_space']='post_cfg'
     runtime=Runtime(bundle,config)
     return SpatialCorrector(runtime,config)
 

@@ -32,28 +32,61 @@ def paired_state(runtime,row,t,noise_seed):
     epsilon=torch.randn(x0.shape,generator=torch.Generator().manual_seed(noise_seed)).to(x0.device)
     x_t=(1-t)*x0.float()+t*epsilon
     flow=runtime.flow(row['caption'])
-    base,context=runtime.predict(x_t,t,flow)
+    base,context=(runtime.proposal(x_t,t,flow) if runtime.config.get('correction_space')=='post_cfg'
+                  else runtime.predict(x_t,t,flow))
     return x0,epsilon,x_t,flow,base,context
 
 
 @torch.no_grad()
 def validate(corrector,rows,output,step):
     cfg=corrector.config;runtime=corrector.runtime;directory=Path(output)/f'validation_{step:06d}';directory.mkdir(exist_ok=True)
-    records=[];nodes=times(cfg)[:active_steps(cfg)]
+    records=[];nodes=times(cfg)[:active_steps(cfg)];deployed=cfg.get('correction_space')=='post_cfg'
+    selected=sorted(set((0,len(nodes)//3,2*len(nodes)//3,len(nodes)-1))) if deployed else [len(nodes)-1]
     for index in range(parallel.rank(),len(rows),parallel.world_size()):
-        row=rows[index];t=nodes[-1]
-        x0,epsilon,x_t,flow,base,context=paired_state(runtime,row,t,cfg['seed']+index)
-        delta=corrector(proposal_from(x_t,t,base),t,flow,context)
-        records.append(dict(sample_id=row['sample_id'],family_id=row['family_id'],caption=row['caption'],
-            residual_mse=float(correction_loss(delta,base,x0,epsilon)),
-            base_mse=float((base.float()-(epsilon-x0.float())).square().mean()),
-            delta_rms=float(delta.square().mean().sqrt())))
-        del x0,epsilon,x_t,flow,base,context,delta
-        for native,label in ((True,'native'),(False,'corrected')):
-            image,trace=sample(corrector,row['caption'],cfg['seed']+index,native=native)
+        row=rows[index]
+        for node in selected:
+            t=nodes[node]
+            x0,epsilon,x_t,flow,base,context=paired_state(runtime,row,t,cfg['seed']+index)
+            delta=corrector(proposal_from(x_t,t,base),t,flow,context)
+            record=dict(sample_id=row['sample_id'],family_id=row['family_id'],caption=row['caption'],t=t,
+                residual_mse=float(correction_loss(delta,base,x0,epsilon)),
+                base_mse=float((base.float()-(epsilon-x0.float())).square().mean()),delta_rms=float(delta.square().mean().sqrt()))
+            if deployed:
+                global_delta=corrector.calibration(t).expand_as(base)
+                record['global_mse']=float(correction_loss(global_delta,base,x0,epsilon))
+            records.append(record)
+            del x0,epsilon,x_t,flow,base,context,delta
+        arms=[('native',dict(native=True)),('corrected',{})]
+        if deployed:arms.insert(1,('global',dict(global_only=True)))
+        for label,kwargs in arms:
+            image,trace=sample(corrector,row['caption'],cfg['seed']+index,**kwargs)
             image.save(directory/f'{index:03d}_{label}.png');write(directory/f'{index:03d}_{label}.json',trace)
     records=parallel.gather_samples(records)
     if parallel.rank()==0:write(directory/'records.json',records)
+    parallel.barrier()
+
+
+@torch.no_grad()
+def semantic_validation(corrector,output,step):
+    """Fixed annotated prompts; three image arms, not an automatic success score."""
+    cfg=corrector.config
+    prompt_path=Path(cfg['semantic_prompts'])
+    if not prompt_path.is_absolute():prompt_path=Path(__file__).resolve().parents[2]/prompt_path
+    prompts=[json.loads(line) for line in prompt_path.read_text().splitlines() if line.strip()]
+    directory=Path(output)/f'semantic_{step:06d}';directory.mkdir(exist_ok=True)
+    baseline=Path(output)/'semantic_native';baseline.mkdir(exist_ok=True)
+    records=[]
+    for index in range(parallel.rank(),len(prompts),parallel.world_size()):
+        row=prompts[index];record=dict(row,index=index,seed=cfg['seed'],arms={})
+        for label,kwargs in [('native',dict(native=True)),('global',dict(global_only=True)),('corrected',{})]:
+            target=(baseline if label=='native' else directory)/f'{index:03d}_{label}.png'
+            if not target.exists():
+                image,trace=sample(corrector,row['prompt'],cfg['seed'],**kwargs)
+                image.save(target);write(target.with_suffix('.json'),trace)
+            record['arms'][label]=str(target.relative_to(output))
+        write(directory/f'case_{index:03d}.json',record);records.append(record)
+    records=parallel.gather_samples(records)
+    if parallel.rank()==0:write(directory/'records.json',sorted(records,key=lambda r:r['index']))
     parallel.barrier()
 
 
@@ -81,22 +114,26 @@ def train(corrector,corpus,output,provenance,saved=None):
     if parallel.rank()==0:
         write(out/'run.json',dict(config=cfg,provenance=provenance,world=world,start_step=start,
             train_pairs=sum(len(v) for v in corpus.groups('train')),trainable_parameters=sum(p.numel() for p in corrector.parameters() if p.requires_grad),
-            objective='MSE(delta, epsilon-x0-v0)',initialization='native_pretrained_UND',
+            objective='MSE(delta, epsilon-x0-v0)',velocity_space=cfg.get('correction_space','conditional'),
+            global_baseline='train-only per-time constant-field least-squares mean' if hasattr(corrector,'calibration') else None,initialization='native_pretrained_UND',
             validation=[dict(sample_id=r['sample_id'],family_id=r['family_id']) for r in val]))
     nodes=times(cfg)[:active_steps(cfg)];reset_peak_memory_stats(device);began=time.perf_counter()
     for step in range(start+1,cfg['steps']+1):
         started=time.perf_counter();optimizer.zero_grad(set_to_none=True)
         rows=sampler.take(batch);draws=[(sampler.rng.choice(nodes),sampler.rng.randrange(2**63-1)) for _ in rows]
         values=[0.]*4
+        pending=torch.zeros((len(nodes),corrector.calibration.sums.shape[1]+1),device=device) if hasattr(corrector,'calibration') else None
         for index in range(parallel.rank(),batch,world):
             t,noise_seed=draws[index]
             x0,epsilon,x_t,flow,base,context=paired_state(corrector.runtime,rows[index],t,noise_seed)
             delta=corrector(proposal_from(x_t,t,base),t,flow,context)
             loss=correction_loss(delta,base,x0,epsilon);(loss/batch).backward()
+            if pending is not None:corrector.calibration.observe(pending,t,epsilon.float()-x0.float()-base.float())
             with torch.no_grad():
                 values[0]+=float(loss);values[1]+=float((epsilon-x0.float()-base.float()).square().mean())
                 values[2]+=float(delta.square().mean().sqrt());values[3]+=t
             del x0,epsilon,x_t,flow,base,context,delta,loss
+        if pending is not None:corrector.calibration.update(pending)
         parallel.sum_gradients(corrector)
         groups=corrector.group_parameters()
         gradients={f'gradient_{name}':float(torch.stack([p.grad.float().square().sum() for p in parameters]).sum().sqrt()) for name,parameters in groups.items()}
@@ -117,4 +154,5 @@ def train(corrector,corpus,output,provenance,saved=None):
             if parallel.rank()==0:checkpoint.save(out/f'step_{step:06d}.pt',corrector,step,optimizer,sampler,provenance,rngs)
             parallel.barrier()
             if val and (step==cfg['steps'] or step%100==0):validate(corrector,val,out,step)
+            if step in cfg.get('semantic_eval_steps',[]):semantic_validation(corrector,out,step)
     corpus.close()
