@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bagel-latent-cot"
-version = "0.6.1"
-description = "BAGEL full-layer dual-state recurrence"
+version = "0.7.0"
+description = "BAGEL direct spatial correction with the understanding expert"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,8 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-bagel-observe = "qwen_latent_cot.diagnostics.visual_cli:main"
-bagel-interaction = "qwen_latent_cot.interaction.cli:main"
+bagel-correction = "qwen_latent_cot.correction.cli:main"
 
 [project.optional-dependencies]
 tracking = ["wandb==0.22.3", "protobuf>=3.19,<5"]
