@@ -2,6 +2,8 @@
 
 冻结原生 BAGEL GEN，让理解专家 UND 直接纠正当前图像预测。训练只使用天然图文对和速度修正 MSE。
 
+**实验状态：** [5000步照片实验](docs/overnight_20261022/RESULTS.md)已完成，残差MSE下降，但生图仍有画风和语义崩坏，尚未通过生成质量验收。
+
 ```text
 完整 Prompt + noisy latent → 冻结 GEN + 原生 CFG/renorm → v_native、xhat、GEN 特征
                                          ↓
