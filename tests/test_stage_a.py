@@ -304,3 +304,30 @@ def test_fast_gate_scale_and_cosine_zero_residual_start(stage_student):
     torch.testing.assert_close(loss, mse)
     loss.backward()
     torch.testing.assert_close(prediction.grad, torch.full_like(prediction, -.5))
+
+
+def test_no_gap_reuses_teacher_without_changing_loop_outputs(stage_student, visual_runtime):
+    from dataclasses import replace
+    from qwen_latent_cot.diagnostics.flow_training import ExecutionCounter
+    student, _ = stage_student
+    runtime, row = visual_runtime
+    student.config['full_prompt_probability'] = 1.
+    with torch.no_grad():
+        student.bridge.memory_gates.fill_(.02)
+        student.bridge.strength.fill_(.01)
+    counter = ExecutionCounter(runtime)
+    try:
+        state, split = training_state(student, dict(row, caption='A red token. A blue token.'), .9, 3, 17)
+        assert split.full == split.partial and state.prepared_baseline is not None
+        with torch.no_grad():
+            reused = student(state)
+        assert counter.counts[0] == 2  # one full teacher/native baseline + one correction
+    finally:
+        counter.close()
+    with torch.no_grad():
+        direct = student(replace(state, prepared_baseline=None))
+    torch.testing.assert_close(reused.velocity, direct.velocity, rtol=0, atol=0)
+    torch.testing.assert_close(reused.baseline.velocity, direct.baseline.velocity, rtol=0, atol=0)
+    for a, b in zip(reused.banks[0].layers, direct.banks[0].layers):
+        torch.testing.assert_close(a.keys, b.keys, rtol=0, atol=0)
+        torch.testing.assert_close(a.values, b.values, rtol=0, atol=0)

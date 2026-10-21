@@ -21,6 +21,7 @@ class TrainingState:
     metadata: dict
     prompt_kv: tuple | None = None
     correction_target: torch.Tensor | None = None
+    prepared_baseline: "FlowOutput | None" = None
 
     def flow_target(self):
         if self.x0 is None or self.epsilon is None or not self.metadata.get('flow_supervision', False):

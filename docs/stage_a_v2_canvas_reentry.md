@@ -118,6 +118,20 @@ python -m qwen_latent_cot.interaction.cli sample \
 推理 API：`engine.generate(prompt, seed=17, feedback_updates=3)`；默认仍为训练时的一次纠错。
 `sample_feedback_sweep.py` 继续支持 Base / 1 / 2 / 3 / 4 轮，2–4 轮复用同一个速度门控。
 
+## 提速时保持训练合同
+
+全局 batch 通过逐样本梯度累积实现；调大全局 batch 不会扩大前向 microbatch，反而增加每步样本数。
+若目的是缩短相同步数的时间，应保持全局 batch 不变。
+
+Stage A 跳过会被覆盖的 partial Prompt 文本读出。full 与 partial 相同时，Teacher 同时充当
+原生 baseline，复用其冻结速度和逐层 KV；不再重复原生 GEN 或 full Prompt 预填充。
+Prompt 有信息差时仍分别执行 full Teacher 和 partial baseline。
+这些复用只发生在同一 x/t、同一 Prompt 的冻结计算之间，不改变训练目标。
+
+可在显存足够时设 `activation_checkpointing=false`，用更多显存减少反向传播中的重计算。
+续训允许改变该执行选项，仍恢复优化器、sampler 和各 rank RNG；全局 batch、数据、损失等合同仍严格检查。
+切换前需测量真实样本的速度、峰值显存，以及 BF16 下的前向和梯度差异。
+
 ## 验收与证据范围
 
 本地回归 107 项及新增专项 1 项通过。CPU 小型真实 BAGEL MoT 测试覆盖：

@@ -187,6 +187,12 @@ def test_checkpoint_reload_resume_and_reject_old(full_student,tmp_path):
     assert checkpoint.resume(saved,student,opt,resumed,{'train':'tiny'}) == 1
     assert resumed.take(7) == draws
     torch.testing.assert_close(torch.randn(3),noise,rtol=0,atol=0)
+    student.config['activation_checkpointing'] = not student.config['activation_checkpointing']
+    assert checkpoint.resume(saved,student,opt,resumed,{'train':'tiny'}) == 1
+    student.config['global_batch'] *= 2
+    with pytest.raises(ValueError,match='data/config'):
+        checkpoint.resume(saved,student,opt,resumed,{'train':'tiny'})
+    student.config['global_batch'] //= 2
     assert saved['bridge'] and saved['kind'] == 'bagel_full_loop_v3'
     for kind in ('interaction_lora_v1','bagel_full_loop_v2'):
         with pytest.raises(ValueError): checkpoint.apply(dict(kind=kind),student)

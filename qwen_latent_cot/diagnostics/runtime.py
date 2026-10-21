@@ -155,7 +155,7 @@ class DiagnosticRuntime:
         return x, flow, lengths, positions, metadata
 
     @torch.no_grad()
-    def training_state(self, row, t, noise_seed):
+    def training_state(self, row, t, noise_seed, *, capture_prompt=True):
         """Task controls the prompt and label scope; only explicit targets permit flow."""
         from .flow_training import TrainingState
         if not 0 <= float(t) <= 1: raise ValueError('actual flow time must be in [0,1]')
@@ -182,7 +182,7 @@ class DiagnosticRuntime:
                         posterior_seed=posterior_seed, posterior_seed_policy=self.config['posterior_seed_policy'],
                         x_t_hash=tensor_hash(x), image_hash=file_hash(row['image']))
         flow, lengths, positions = self.flow_inputs(prompt, conditions)
-        prompt_kv = self.text(prompt)[0]
+        prompt_kv = self.text(prompt)[0] if capture_prompt else None
         expected = row.get('state_hash', row.get('observation_state_hash'))
         if expected and expected != tensor_hash(x): raise ValueError('label belongs to another x_t')
         if row.get('label_kind') in ('observation_proxy', 'target_observation_gap'):

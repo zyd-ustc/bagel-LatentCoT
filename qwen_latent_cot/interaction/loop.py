@@ -82,8 +82,10 @@ def full_loop(student, state, *, guidance=False, feedback_updates=None, memory_m
     if not isinstance(updates, int) or isinstance(updates, bool) or updates < 1:
         raise ValueError('feedback_updates must be a positive integer; use native sampling for base')
     with torch.no_grad():
-        baseline = conditional_gen(runtime, state, detach_source=True,
-                                   native_scope=student.native_context if student.config.get('stage_a') else nullcontext)
+        baseline = state.prepared_baseline
+        if baseline is None:
+            baseline = conditional_gen(runtime, state, detach_source=True,
+                                       native_scope=student.native_context if student.config.get('stage_a') else nullcontext)
         anchor = image_entrance(runtime, state)
     prompt = state.prompt_kv if state.prompt_kv is not None else prompt_source(state.flow, state.lengths, state.positions)
     previous = baseline

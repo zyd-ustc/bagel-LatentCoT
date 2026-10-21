@@ -64,9 +64,10 @@ def apply(saved, student):
 
 def resume(saved, student, optimizer, sampler, provenance):
     from ..diagnostics.distributed import rank, world_size
-    budget_keys = ('steps', 'save_steps', 'val_images')
-    active = {k: v for k, v in student.config.items() if k not in budget_keys}
-    previous = {k: v for k, v in saved['config'].items() if k not in budget_keys}
+    # Activation recomputation changes execution/memory, not the training objective.
+    mutable_keys = ('steps', 'save_steps', 'val_images', 'activation_checkpointing')
+    active = {k: v for k, v in student.config.items() if k not in mutable_keys}
+    previous = {k: v for k, v in saved['config'].items() if k not in mutable_keys}
     # Model directories can move; parent native_files carry the model identity.
     stored_data = {k: v for k, v in saved['provenance'].items() if k != 'model'}
     current_data = {k: v for k, v in provenance.items() if k != 'model'}

@@ -75,11 +75,19 @@ def training_state(student, row, t, noise_seed, split_seed):
     split = split_prompt(full, split_seed, drop_fraction=cfg['clause_drop_fraction'],
                          full_probability=cfg['full_prompt_probability'], min_words=cfg['min_prompt_words'])
     # All GEN caches, including baseline and CFG, derive ONLY from partial.
+    same_prompt = split.partial == split.full
     with student.native_context():
-        state = runtime.training_state(dict(row, prompt=split.partial), t, noise_seed)
-        teacher_flow, lengths, positions = runtime.flow_inputs(full)
-    teacher_state = replace(state, flow=teacher_flow, lengths=tuple(lengths), positions=positions)
-    teacher = conditional_gen(runtime, teacher_state, capture=False, native_scope=student.native_context).velocity
+        # This partial-prompt readout is replaced by C2 full-prompt Memory input below.
+        state = runtime.training_state(dict(row, prompt=split.partial), t, noise_seed, capture_prompt=False)
+        if same_prompt:
+            teacher_state = state
+        else:
+            teacher_flow, lengths, positions = runtime.flow_inputs(full)
+            teacher_state = replace(state, flow=teacher_flow, lengths=tuple(lengths), positions=positions)
+    teacher_output = conditional_gen(runtime, teacher_state, capture=same_prompt, native_scope=student.native_context)
+    teacher = teacher_output.velocity
+    if same_prompt:
+        state.prepared_baseline = teacher_output
     eta = cfg['teacher_mix']
     state.correction_target = (eta*teacher.float()+(1-eta)*state.flow_target()).detach()
     state.prompt_kv = runtime.text(full)[0]  # Reader-only; never replaces state.flow.
