@@ -1,0 +1,25 @@
+/home/ma-user/anaconda3/envs/PyTorch-2.7.1/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /home/ma-user/anaconda3/envs/PyTorch-2.7.1/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+test_per_image_projection_and_target (test_pipeline.Algebra.test_per_image_projection_and_target) ... ok
+test_excludes_original_prompt_family_and_preserves_default (test_pipeline.DataFilter.test_excludes_original_prompt_family_and_preserves_default) ... ok
+test_native_release_loader_roundtrip (test_pipeline.Pipeline.test_native_release_loader_roundtrip) ... The OrderedVocab you are attempting to save contains holes for indices [1], your vocabulary could be corrupted!
+The OrderedVocab you are attempting to save contains holes for indices [1], your vocabulary could be corrupted!
+`torch_dtype` is deprecated! Use `dtype` instead!
+ok
+test_native_zero_correction_and_reader_backward (test_pipeline.Pipeline.test_native_zero_correction_and_reader_backward) ... ok
+test_train_export_resume_all_stages (test_pipeline.Pipeline.test_train_export_resume_all_stages) ... {"step": 1, "loss": 4.190464019775391, "t": 0.0, "gradient_norm": 0.10846293717622757, "gradient_reader": 0.10846293717622757, "seconds": 0.07616649381816387}
+{"step": 2, "loss": 4.190393447875977, "t": 0.050000011920928955, "gradient_norm": 0.11146484315395355, "gradient_reader": 0.11146484315395355, "seconds": 0.07623410411179066}
+{"step": 1, "applied_base_mse": 1.001499056816101, "applied_delta_rms": 0.0, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.001177430152893, "conditional_corrected_mse": 1.001177430152893, "loss": 1.0011649131774902, "raw_delta_rms": 0.0, "t": 0.0, "zero_correction_mse": 1.0011647939682007, "gradient_norm": 0.05807826295495033, "gradient_reader": 0.0, "gradient_head": 0.05807844176888466, "seconds": 0.10284965671598911}
+{"step": 2, "applied_base_mse": 1.1176331043243408, "applied_delta_rms": 0.0007541419472545385, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.1192333698272705, "conditional_corrected_mse": 1.1176409721374512, "loss": 1.1176409721374512, "raw_delta_rms": 0.0007541419472545385, "t": 0.050000011920928955, "zero_correction_mse": 1.1192333698272705, "gradient_norm": 0.06034693866968155, "gradient_reader": 0.006996615789830685, "gradient_head": 0.059940047562122345, "seconds": 0.11045519076287746}
+{"step": 3, "applied_base_mse": 0.9986851811408997, "applied_delta_rms": 0.0014951289631426334, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.0012186765670776, "conditional_corrected_mse": 0.9982317686080933, "loss": 0.9981720447540283, "raw_delta_rms": 0.0014951545745134354, "t": 0.0, "zero_correction_mse": 1.0011588335037231, "gradient_norm": 0.05852304771542549, "gradient_reader": 0.01273122988641262, "gradient_head": 0.05712185427546501, "seconds": 0.10677294433116913}
+{"step": 1, "applied_base_mse": 1.001499056816101, "applied_delta_rms": 0.0, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.001177430152893, "conditional_corrected_mse": 1.001177430152893, "loss": 1.0011649131774902, "raw_delta_rms": 0.0, "t": 0.0, "zero_correction_mse": 1.0011647939682007, "gradient_norm": 0.05807826295495033, "gradient_reader": 0.0, "gradient_head": 0.05807844176888466, "seconds": 0.10652595572173595}
+{"step": 2, "applied_base_mse": 1.1176331043243408, "applied_delta_rms": 0.0007541419472545385, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.1192333698272705, "conditional_corrected_mse": 1.1176409721374512, "loss": 1.1176409721374512, "raw_delta_rms": 0.0007541419472545385, "t": 0.050000011920928955, "zero_correction_mse": 1.1192333698272705, "gradient_norm": 0.06034693866968155, "gradient_reader": 0.006996615789830685, "gradient_head": 0.059940047562122345, "seconds": 0.1064583919942379}
+{"step": 3, "applied_base_mse": 0.9986851811408997, "applied_delta_rms": 0.0014951289631426334, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.0012186765670776, "conditional_corrected_mse": 0.9982317686080933, "loss": 0.9981720447540283, "raw_delta_rms": 0.0014951545745134354, "t": 0.0, "zero_correction_mse": 1.0011588335037231, "gradient_norm": 0.05852304771542549, "gradient_reader": 0.01273122988641262, "gradient_head": 0.05712185427546501, "seconds": 0.10557756386697292}
+{"step": 1, "loss": 1.1184942722320557, "t": 0.050000011920928955, "gradient_norm": 0.244700625538826, "seconds": 0.06914886087179184}
+{"step": 2, "loss": 1.3902778625488281, "t": 0.125, "gradient_norm": 0.33465394377708435, "seconds": 0.06652266904711723}
+ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 6.380s
+
+OK

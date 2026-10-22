@@ -23,7 +23,7 @@ def dimensions(width, height, short=512, long=1024, multiple=16):
     return w,h
 
 
-def build(pairs, output, tokenizer, config, seed=17):
+def build(pairs, output, tokenizer, config, seed=17, *, excluded_prompts=(), excluded_benchmarks=()):
     pairs=Path(pairs).resolve(); output=Path(output).resolve()
     output.mkdir(parents=True,exist_ok=False)
     db=sqlite3.connect(output/'pairs.sqlite')
@@ -31,17 +31,23 @@ def build(pairs, output, tokenizer, config, seed=17):
       prompt TEXT,source_file TEXT,source_line INTEGER,benchmark TEXT,width INTEGER,height INTEGER,
       tokens INTEGER,family TEXT,split TEXT);
       CREATE INDEX source_lookup ON pairs(source_file,source_line);''')
+    excluded={' '.join(x.split()).casefold() for x in excluded_prompts}
+    excluded_benchmarks={x.casefold() for x in excluded_benchmarks}
     removed=Counter(); total=0
     with pairs.open() as stream:
         for total,line in enumerate(stream,1):
             try:
                 row=json.loads(line)
+                if str(row['benchmark']).casefold() in excluded_benchmarks:
+                    removed['evaluation_benchmark']+=1;continue
                 prompt=row['prompt'].strip()
                 if not prompt: raise ValueError('empty prompt')
                 image=Path(row['image']).resolve(strict=True)
                 with Image.open(image) as im:
                     im=ImageOps.exif_transpose(im);im.load()
                     w,h=dimensions(*im.size,config['min_short_side'],config['max_long_side'])
+                if config.get('expected_geometry') and (w,h)!=tuple(config['expected_geometry']):
+                    removed['different_geometry']+=1;continue
                 tokens=len(tokenizer.encode(prompt))+4
                 if tokens+(h//16)*(w//16)>config['max_sequence_length']:
                     removed['overlength']+=1;continue
@@ -62,6 +68,9 @@ def build(pairs, output, tokenizer, config, seed=17):
                 if row['uid']!=wanted[number]:raise ValueError(f'Source UID mismatch: {source}:{number}')
                 family=' '.join(row['raw_prompt'].split()).casefold()
                 if not family:raise ValueError('Empty original prompt')
+                if family in excluded:
+                    db.execute('DELETE FROM pairs WHERE source_file=? AND source_line=?',(source,number))
+                    removed['evaluation_prompt_family']+=1;del wanted[number];continue
                 bucket=zlib.crc32((str(seed)+'\n'+family).encode())%10000
                 split='test' if bucket<100 else 'val' if bucket<200 else 'train'
                 db.execute('UPDATE pairs SET family=?,split=? WHERE source_file=? AND source_line=?',(family,split,source,number))
@@ -77,6 +86,8 @@ def build(pairs, output, tokenizer, config, seed=17):
                   grouping='normalized original prompt; global across benchmark labels; duplicate paths removed',
                   screening='full image decode, resolution, token length; not a semantic quality score',
                   min_short_side=config['min_short_side'],max_long_side=config['max_long_side'],max_sequence_length=config['max_sequence_length'])
+    if excluded or excluded_benchmarks:
+        manifest['evaluation_exclusion']=dict(prompt_families=len(excluded),benchmark_labels=sorted(excluded_benchmarks))
     (output/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n');db.close()
     return manifest
 

@@ -18,21 +18,21 @@ def load(path, name):
     return module
 
 
-def prepare(run, api):
+def prepare(run, api, *, protocol='bagel_step2000_original_sixbench_rubric_local27b_v1', artifact_prefix='BAGEL_STEP2000_27B'):
     helper = load(PACKAGE/'code/prepare_sixbench_scoring.py', '_original_preparation')
     helper.endpoint(api)
     original = json.loads((SOURCE/'qwen38_27b_rescore_config.json').read_text())
     root = run/'scoring_qwen27b_v1'
     config = {k: v for k, v in original.items() if k not in ('jobs','source_max_config_sha256')}
     plan = json.loads((run/'PLAN.json').read_text())
-    config.update(schema='bagel_step2000_sixbench_v1', api_base=api, python=CLIENT,
+    config.update(schema=plan.get('schema','bagel_step2000_sixbench_v1'), api_base=api, python=CLIENT,
         repo_root=str(SOURCE.parents[1]), control_root=str(root/'control'), jobs=[], arms=[ARM],
         workers_per_cell=8, max_global_inflight=8, expected_image_records=sum(COUNTS.values()),
-        protocol='bagel_step2000_original_sixbench_rubric_local27b_v1',
-        artifact_prefix='BAGEL_STEP2000_27B', official_comparable=False, judge_kind='local_vllm',
+        protocol=protocol,
+        artifact_prefix=artifact_prefix, official_comparable=False, judge_kind='local_vllm',
         external_api_calls=False, proxy_namespace=NAMESPACE,
         proxy_protocol='qwen38_27b_local_exact_rubric_wire_v1', generation=plan,
-        reason_not_official='Original rubric and aggregation, with independent local27B judge and BAGEL sampling.',
+        reason_not_official='Original rubric and aggregation, with independent local27B judge and '+plan.get('display_name','BAGEL sampling')+'.',
         payload_cache='New run exact-wire cache, no historical votes or training reward gateway')
     inputs = set()
     for bench in COUNTS:
@@ -40,7 +40,7 @@ def prepare(run, api):
         template = next(x for x in original['jobs'] if x['benchmark'] == bench and x['arm'] == 'friend17500')
         job = json.loads(json.dumps(template).replace('/mnt/sfs/', '/data/'))
         view = root/'views'/ARM/bench
-        job.update(id=ARM+':'+bench, arm=ARM, display_name='BAGEL guidance-safe Step2000',
+        job.update(id=ARM+':'+bench, arm=ARM, display_name=plan.get('display_name','BAGEL guidance-safe Step2000'),
             score_root=str(root/'scores'/ARM/bench), ready_marker=str(view/'VIEW_COMPLETE.json'),
             manifest=str(run/'score_manifests'/(bench+('.json' if bench.endswith('_pp') else '.jsonl'))))
         for key in ('ready_markers','pipeline_root','image_root'): job.pop(key, None)

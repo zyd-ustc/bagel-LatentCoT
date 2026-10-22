@@ -24,6 +24,7 @@ dependencies = [
 [project.scripts]
 bagel-correction = "qwen_latent_cot.correction.cli:main"
 bagel-t2i = "qwen_latent_cot.t2i.cli:main"
+u15-pipeline = "qwen_latent_cot.u15.cli:main"
 
 [project.optional-dependencies]
 tracking = ["wandb==0.22.3", "protobuf>=3.19,<5"]

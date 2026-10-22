@@ -1,0 +1,25 @@
+/home/ma-user/anaconda3/envs/PyTorch-2.7.1/lib/python3.11/site-packages/torch_npu/utils/_path_manager.py:66: UserWarning: Permission mismatch: The owner of /home/ma-user/anaconda3/envs/PyTorch-2.7.1/lib/python3.11/site-packages/torch_npu/lib/libop_plugin_atb.so does not match.
+  warnings.warn(f"Permission mismatch: The owner of {path} does not match.")
+test_per_image_projection_and_target (test_pipeline.Algebra.test_per_image_projection_and_target) ... ok
+test_excludes_original_prompt_family_and_preserves_default (test_pipeline.DataFilter.test_excludes_original_prompt_family_and_preserves_default) ... ok
+test_native_release_loader_roundtrip (test_pipeline.Pipeline.test_native_release_loader_roundtrip) ... `torch_dtype` is deprecated! Use `dtype` instead!
+ok
+test_native_zero_correction_and_reader_backward (test_pipeline.Pipeline.test_native_zero_correction_and_reader_backward) ... /data/zyd_workspace/bagel-LatentCoT/code/sensenova-u15-c35c83b/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py:478: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at build/CMakeFiles/torch_npu.dir/compiler_depend.ts:335.)
+  h_idx = torch.zeros_like(t_idx)
+ok
+test_train_export_resume_all_stages (test_pipeline.Pipeline.test_train_export_resume_all_stages) ... {"step": 1, "loss": 4.192928314208984, "t": 0.0, "gradient_norm": 0.1037515178322792, "gradient_reader": 0.1037515178322792, "seconds": 0.5261644534766674}
+{"step": 2, "loss": 4.1927595138549805, "t": 0.050000011920928955, "gradient_norm": 0.104392871260643, "gradient_reader": 0.104392871260643, "seconds": 0.10517077520489693}
+{"step": 1, "applied_base_mse": 1.0011591911315918, "applied_delta_rms": 0.0, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.0008456707000732, "conditional_corrected_mse": 1.0008456707000732, "loss": 1.0008456707000732, "raw_delta_rms": 0.0, "t": 0.0, "zero_correction_mse": 1.0008456707000732, "gradient_norm": 0.058320630341768265, "gradient_reader": 0.0, "gradient_head": 0.058320630341768265, "seconds": 0.20814514718949795}
+{"step": 2, "applied_base_mse": 1.1168471574783325, "applied_delta_rms": 0.0009724120609462261, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.1187727451324463, "conditional_corrected_mse": 1.1167173385620117, "loss": 1.1167173385620117, "raw_delta_rms": 0.0009724120609462261, "t": 0.050000011920928955, "zero_correction_mse": 1.1187727451324463, "gradient_norm": 0.06371422111988068, "gradient_reader": 0.005838006269186735, "gradient_head": 0.06344619393348694, "seconds": 0.1367847342044115}
+{"step": 3, "applied_base_mse": 0.9980552196502686, "applied_delta_rms": 0.0018557992298156023, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.0014655590057373, "conditional_corrected_mse": 0.9977585673332214, "loss": 0.9977585077285767, "raw_delta_rms": 0.0018557992298156023, "t": 0.0, "zero_correction_mse": 1.0014655590057373, "gradient_norm": 0.06093147024512291, "gradient_reader": 0.010958785191178322, "gradient_head": 0.05993787944316864, "seconds": 0.13733519800007343}
+{"step": 1, "applied_base_mse": 1.0011591911315918, "applied_delta_rms": 0.0, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.0008456707000732, "conditional_corrected_mse": 1.0008456707000732, "loss": 1.0008456707000732, "raw_delta_rms": 0.0, "t": 0.0, "zero_correction_mse": 1.0008456707000732, "gradient_norm": 0.058320630341768265, "gradient_reader": 0.0, "gradient_head": 0.058320630341768265, "seconds": 0.13758013769984245}
+{"step": 2, "applied_base_mse": 1.1168471574783325, "applied_delta_rms": 0.0009724120609462261, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.1187727451324463, "conditional_corrected_mse": 1.1167173385620117, "loss": 1.1167173385620117, "raw_delta_rms": 0.0009724120609462261, "t": 0.050000011920928955, "zero_correction_mse": 1.1187727451324463, "gradient_norm": 0.06371422111988068, "gradient_reader": 0.005838006269186735, "gradient_head": 0.06344619393348694, "seconds": 0.13681146502494812}
+{"step": 3, "applied_base_mse": 0.9980552196502686, "applied_delta_rms": 0.0018557992298156023, "applied_negative_fraction": 0.0, "conditional_base_mse": 1.0014655590057373, "conditional_corrected_mse": 0.9977585673332214, "loss": 0.9977585077285767, "raw_delta_rms": 0.0018557992298156023, "t": 0.0, "zero_correction_mse": 1.0014655590057373, "gradient_norm": 0.06093147024512291, "gradient_reader": 0.010958785191178322, "gradient_head": 0.05993787944316864, "seconds": 0.137692678719759}
+{"step": 1, "loss": 1.118497610092163, "t": 0.050000011920928955, "gradient_norm": 0.24478331208229065, "seconds": 0.06915091723203659}
+{"step": 2, "loss": 1.3902778625488281, "t": 0.125, "gradient_norm": 0.33459141850471497, "seconds": 0.06650296971201897}
+ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 9.028s
+
+OK

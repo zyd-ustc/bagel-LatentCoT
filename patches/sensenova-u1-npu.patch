@@ -1,0 +1,56 @@
+--- a/src/sensenova_u1/models/neo_unify/modeling_qwen3.py
++++ b/src/sensenova_u1/models/neo_unify/modeling_qwen3.py
+@@ -44,6 +44,7 @@
+ #   * ``"flash"`` - force flash-attn; raise if ``flash_attn`` is not installed.
+ #   * ``"sdpa"``  - force torch SDPA (useful for reproducibility tests and
+ #                    debugging, even when flash-attn is available).
++U15_UND_LORA = True
+ _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
+ _ATTN_BACKEND: str = "auto"
+ 
+@@ -166,7 +167,7 @@
+     arange = torch.arange(L, device=index.device)
+     mask = (idx_j == idx_i) | (arange.unsqueeze(0) <= arange.unsqueeze(1))
+ 
+-    return torch.where(mask[None, None, :, :] > 0, torch.tensor(0.0), torch.tensor(float('-inf')))
++    return torch.zeros((1, 1, L, L), device=index.device, dtype=torch.float32).masked_fill(~mask[None, None], float('-inf'))
+ 
+ 
+ def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
+@@ -441,19 +442,24 @@
+         input_shape = hidden_states.shape[:-1]
+         hidden_shape = (*input_shape, -1, self.head_dim)
+ 
+-        query_states = self.q_proj(hidden_states).view(hidden_shape)
++        def projection(name, x):
++            result = getattr(self, name)(x)
++            adapters = kwargs.get('und_lora')
++            return result if adapters is None else result + adapters[name](x)
++
++        query_states = projection('q_proj', hidden_states).view(hidden_shape)
+         query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
+         query_states_t = self.q_norm(query_states_t).transpose(1, 2)
+         query_states_hw = self.q_norm_hw(query_states_hw).transpose(1, 2)
+         query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
+ 
+-        key_states = self.k_proj(hidden_states).view(hidden_shape)
++        key_states = projection('k_proj', hidden_states).view(hidden_shape)
+         key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
+         key_states_t = self.k_norm(key_states_t).transpose(1, 2)
+         key_states_hw = self.k_norm_hw(key_states_hw).transpose(1, 2)
+         key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
+ 
+-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++        value_states = projection('v_proj', hidden_states).view(hidden_shape).transpose(1, 2)
+ 
+         cos_t, sin_t = self.rotary_emb(hidden_states, indexes[0].unsqueeze(0))
+         query_states_t, key_states_t = apply_rotary_pos_emb(query_states_t, key_states_t, cos_t, sin_t)
+@@ -501,7 +507,7 @@
+         )
+ 
+         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+-        attn_output = self.o_proj(attn_output)
++        attn_output = projection('o_proj', attn_output)
+         return attn_output, attn_weights
+ 
+     # def forward_gen(
