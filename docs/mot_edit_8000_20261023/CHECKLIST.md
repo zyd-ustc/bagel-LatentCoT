@@ -1,0 +1,13 @@
+# Execution checklist
+- [x] New dedicated run branch and fixed plan
+- [x] Exact JSONL reachable,606433 source rows
+- [x] Implement no-head native MoT loop and training stages
+- [ ] Index exact data, image/provenance audit
+- [x] CPU mechanism checks
+- [x] Full512 NPU caption/edit/checkpoint reload/sampling pilot; exact optimizer resume covered by CPU
+- [ ] Free only this task's idle judge, audit all four nodes
+- [ ] Launch64 ranks and confirm finite progressing steps
+- [ ] Enable20-minute quiet-on-healthy heartbeat
+- [ ] Step1000 observation stage complete
+- [ ] Step1100/2000/4000 images downloaded and inspected
+- [ ] Step8000 checkpoint and final32×three-arm gallery complete
