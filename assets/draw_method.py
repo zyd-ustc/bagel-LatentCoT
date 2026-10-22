@@ -1,24 +1,25 @@
-"""Draw the current method (frozen GEN + spatial UND velocity correction).
+"""Draw the method: native BAGEL MoT, training objective, inference loop.
 
-Style follows the legacy Loop-figure diagrams: rounded panels, pill headers,
-green = correction path, blue = frozen native, beige = trainable.
+Panel A keeps the native two-expert MoT drawing; B and C tell the final
+training and inference story. Implementation details (ranks, precision,
+initialisation, parameter counts) stay out of the figure.
 """
 from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Circle
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
 OUT = Path(__file__).resolve().parent
 plt.rcParams.update({
     'font.family': ['Arial', 'Helvetica', 'DejaVu Sans'],
-    'font.size': 13,
+    'font.size': 12,
     'svg.fonttype': 'none',
     'pdf.fonttype': 42,
     'mathtext.fontset': 'dejavusans',
 })
 
-W, H = 22, 13.2
+W, H = 22, 11.8
 fig, ax = plt.subplots(figsize=(W, H))
 fig.subplots_adjust(left=.008, right=.992, top=.992, bottom=.008)
 ax.set(xlim=(0, W), ylim=(0, H)); ax.axis('off')
@@ -34,7 +35,7 @@ C = {
 def txt(x, y, s, fs=12, c='ink', ha='center', va='center', bold=False, **kw):
     kw.setdefault('zorder', 6)
     ax.text(x, y, s, fontsize=fs, color=C.get(c, c), ha=ha, va=va,
-            weight='bold' if bold else 'normal', linespacing=1.45, **kw)
+            weight='bold' if bold else 'normal', linespacing=1.5, **kw)
 
 
 def rbox(x, y, w, h, edge='line', face='white', lw=1.6, dash=False, z=2, rs=.07):
@@ -51,195 +52,170 @@ def arrow(p, q, c='ink', dash=False, rad=0, ms=13, lw=1.6):
                                  connectionstyle=f'arc3,rad={rad}', zorder=5))
 
 
-def path(pts, c='ink', dash=False, lw=1.5, head=True):
+def path(pts, c='ink', dash=False, lw=1.5):
     for p, q in zip(pts[:-2], pts[1:-1]):
         ax.plot([p[0], q[0]], [p[1], q[1]], lw=lw, color=C.get(c, c),
-                ls=(0, (4, 3)) if dash else '-', zorder=4,
-                solid_capstyle='round')
-    if head:
-        arrow(pts[-2], pts[-1], c, dash, lw=lw)
-            # noqa: E999
+                ls=(0, (4, 3)) if dash else '-', zorder=4, solid_capstyle='round')
+    arrow(pts[-2], pts[-1], c, dash, lw=lw)
 
 
-def pill(cx, cy, label, w, face='#F1F1F1'):
+def pill(cx, cy, label, w, face='#F1F1F1', fs=13):
     rbox(cx - w / 2, cy - .22, w, .44, edge='line', face=face, lw=1.3, rs=.2)
-    txt(cx, cy, label, 13.5, bold=True)
+    txt(cx, cy, label, fs, bold=True)
 
 
 def snow(x, y, fs=12):
     txt(x, y, '❄', fs, c='g', fontfamily='DejaVu Sans')
 
 
-# ---------------------------------------------------------------- canvas head
-txt(.5, 12.85, 'BAGEL · Frozen GEN + Spatial UND Velocity Correction', 21, ha='left', bold=True)
-txt(21.5, 12.85, 'Method', 12, c='gray', ha='right')
+# ------------------------------------------------------------------ head
+txt(.5, 11.5, 'BAGEL · Frozen GEN + Spatial UND Velocity Correction', 21, ha='left', bold=True)
+txt(21.5, 11.5, 'Method', 12, c='gray', ha='right')
 
-# legend
-lx = 13.6
-snow(lx, 12.42, 13)
-txt(lx + .28, 12.42, 'Frozen', 11, c='g', ha='left')
-rbox(lx + 1.6, 12.28, .34, .28, edge='t', face='tf', lw=1.2)
-txt(lx + 2.06, 12.42, 'Trainable', 11, c='t', ha='left')
-rbox(lx + 3.5, 12.28, .34, .28, edge='u', face='uf', lw=1.2)
-txt(lx + 3.96, 12.42, 'Correction path', 11, c='u', ha='left')
-arrow((lx + 5.7, 12.42), (lx + 6.25, 12.42), 'g', dash=True)
-txt(lx + 6.45, 12.42, 'Frozen KV context', 11, c='g', ha='left')
+snow(16.35, 11.08, 13)
+txt(16.6, 11.08, 'Frozen', 11, c='g', ha='left')
+rbox(17.9, 10.94, .34, .28, edge='t', face='tf', lw=1.2)
+txt(18.35, 11.08, 'Trainable', 11, c='t', ha='left')
+arrow((19.5, 11.08), (20.1, 11.08), 'g', dash=True)
+txt(20.25, 11.08, 'Frozen context', 11, c='g', ha='left')
 
-# ---------------------------------------------------------------- panel A
-rbox(.4, 8.7, 21.2, 3.35, edge='line', face='#FCFCFC', lw=1.4)
-pill(2.1, 12.05, 'A  Sampling step', 2.9)
+# ------------------------------------------------------------------ panel A
+rbox(.4, 6.75, 21.2, 4.05, edge='line', face='#FCFCFC', lw=1.4)
+pill(2.6, 10.8, 'A   BAGEL MoT · T2I', 4.2)
 
-# input
-rbox(.7, 9.85, 1.75, 1.2, edge='ink', face='white')
-txt(1.575, 10.45, r'$x_t$' + '\n' + r'$t$, prompt', 12)
-arrow((2.45, 10.45), (2.8, 10.45))
+# UND expert
+snow(1.75, 10.2, 12)
+txt(2.0, 10.2, 'UND expert', 13, c='u', bold=True, ha='left')
+rbox(1.6, 9.38, 6.4, .55, edge='u', face=C['uf'])
+txt(4.8, 9.655, 'Prompt → embeddings', 11.5)
+rbox(1.6, 8.73, 6.4, .47, edge='u', face=C['uf'])
+txt(4.8, 8.965, 'QKV', 11.5)
+rbox(1.6, 7.22, 6.4, .47, edge='u', face=C['uf'])
+txt(4.8, 7.455, 'FFN', 11.5)
 
-# frozen GEN panel
-rbox(2.8, 9.35, 4.5, 2.4, edge='g', face=C['gb'], lw=1.7)
-snow(3.02, 11.5, 12)
-txt(4.98, 11.5, 'Frozen GEN · MMDiT', 13.5, c='g', bold=True)
-rbox(2.98, 10.93, 2.02, .45, edge='g', face='white')
-txt(3.99, 11.155, r'$\epsilon_\theta(x_t,\ \mathrm{prompt})$', 10.5)
-rbox(5.1, 10.93, 2.02, .45, edge='g', face='white')
-txt(6.11, 11.155, r'$\epsilon_\theta(x_t,\ \varnothing)$', 10.5)
-rbox(3.4, 10.12, 3.3, .53, edge='g', face=C['gf'])
-txt(5.05, 10.385, 'CFG  s = 4 · global renorm', 10.5)
-arrow((3.99, 10.93), (3.99, 10.69), 'g')
-arrow((6.11, 10.93), (6.11, 10.69), 'g')
+# GEN expert
+snow(10.75, 10.2, 12)
+txt(11.0, 10.2, 'GEN expert', 13, c='g', bold=True, ha='left')
+rbox(10.6, 9.38, 6.4, .55, edge='g', face=C['gf'])
+txt(13.8, 9.655, r'vae2llm$(x_t)$ + $T(t)$', 11.5)
+rbox(10.6, 8.73, 6.4, .47, edge='g', face=C['gf'])
+txt(13.8, 8.965, 'QKV', 11.5)
+rbox(10.6, 7.22, 6.4, .47, edge='g', face=C['gf'])
+txt(13.8, 7.455, 'FFN', 11.5)
 
-# proposal
-arrow((6.7, 10.405), (7.85, 10.405))
-rbox(7.85, 9.85, 2.55, 1.15, edge='g', face='white')
-txt(9.125, 10.52, r'$\hat{x}=x_t-t\,v_{\mathrm{native}}$', 11.5)
-txt(9.125, 10.12, 'clean proposal', 9.5, c='gray')
-arrow((10.4, 10.405), (10.75, 10.405))
+# shared multimodal attention
+rbox(1.6, 7.85, 15.4, .78, edge='ink', face='white', lw=1.4)
+txt(7.25, 8.38, 'Multi-modal attention', 12.5)
+txt(1.85, 8.09, 'prompt KV cached', 9.5, c='u', ha='left')
+arrow((5.3, 8.09), (9.35, 8.09), 'u', dash=True)
+txt(9.55, 8.09, 'GEN reads', 9.5, c='g', ha='left')
 
-# corrector
-rbox(10.75, 9.35, 3.3, 2.4, edge='u', face=C['ub'], lw=1.7)
-txt(12.4, 11.5, 'Spatial UND corrector', 13, c='u', bold=True)
-txt(12.4, 11.05, '28 × UND layer (base frozen) + LoRA r64', 9.8)
-txt(12.4, 10.72, 'one query per image patch', 10.5)
-txt(12.4, 10.39, 'attends to prompt KV and GEN KV', 10.5)
-txt(12.4, 9.93, '53.4M trainable', 10, c='t', bold=True)
+for x in (4.8, 13.8):
+    arrow((x, 9.38), (x, 9.2), 'ink')
+    arrow((x, 8.73), (x, 8.63), 'ink')
+    arrow((x, 7.85), (x, 7.69), 'ink')
 
-# guidance projection
-arrow((14.05, 10.405), (14.35, 10.405))
-rbox(14.35, 9.8, 2.85, 1.25, edge='t', face=C['tf'])
-txt(15.775, 10.85, r'$H_g$ projection', 12, c='t', bold=True)
-txt(15.775, 10.45, r'$H_g(z)=z-\min(\langle z,g\rangle/\|g\|^2,0)\,g$', 9.5)
-txt(15.775, 10.04, r'$g=v_{\mathrm{guided}}-v_{\mathrm{conditional}}$', 9.5, c='gray')
+txt(17.3, 8.3, '× 28', 11, c='gray', ha='left')
+txt(4.8, 6.98, 'prompt KV per layer', 9.5, c='u')
+txt(13.8, 6.98, 'image features per layer · $v_t$', 9.5, c='g')
 
-# sum node and Euler
-arrow((17.2, 10.405), (17.38, 10.405), 't')
-ax.add_patch(Circle((17.55, 10.405), .18, facecolor='white', edgecolor=C['ink'], lw=1.5, zorder=6))
-txt(17.55, 10.4, '+', 13, zorder=7)
-arrow((17.73, 10.405), (18.05, 10.405))
-rbox(18.05, 9.85, 3.3, 1.15, edge='ink', face='white')
-txt(19.7, 10.62, 'Euler step', 12, bold=True)
-txt(19.7, 10.22, r'$x\leftarrow x-\Delta t\,v_{\mathrm{native}}-\Delta t\,r_{\mathrm{used}}$', 9.8)
+# frozen states reused downstream
+rbox(18.0, 7.12, 3.3, 3.05, edge='g', face=C['gb'], lw=1.4)
+snow(18.2, 9.87, 11)
+txt(18.45, 9.87, 'frozen, reused below', 9.8, c='g', ha='left')
+txt(18.2, 9.4, r'$v_{\mathrm{conditional}},\ v_{\mathrm{guided}}$', 9.2, ha='left')
+txt(18.2, 9.0, 'prompt KV (per layer)', 9.4, ha='left')
+txt(18.2, 8.6, 'image KV (per layer)', 9.4, ha='left')
+txt(18.2, 8.2, r'velocity $v_t$', 9.4, ha='left')
+txt(18.2, 7.7, 'CFG and the corrector', 9.0, c='gray', ha='left')
+txt(18.2, 7.45, 'read these states', 9.0, c='gray', ha='left')
 
-# v_native bus into the sum node
-path([(7.6, 10.405), (7.6, 9.15), (17.55, 9.15), (17.55, 10.22)], 'g')
-txt(12.2, 9.27, r'$v_{\mathrm{native}}$', 10.5, c='g')
+# ------------------------------------------------------------------ panel B
+rbox(.4, .4, 10.4, 5.95, edge='line', face='#FCFCFC', lw=1.4)
+pill(1.75, 6.35, 'B   Training', 2.5)
 
-# loop back
-path([(19.7, 9.85), (19.7, 8.88), (1.55, 8.88), (1.55, 9.85)])
-txt(10.6, 8.98, 'repeat for 50 nodes (shift 3) · correction at the first 25 updates', 10.5, c='gray')
+bx = [0.75, 3.30, 5.85, 8.40]
+bw, by, bh = 2.2, 2.95, 2.4
+for x, title, c, f in [
+    (bx[0], '1  Sample', 'ink', 'white'),
+    (bx[1], '2  Frozen GEN + CFG', 'g', C['gf']),
+    (bx[2], '3  Target', 't', C['tf']),
+    (bx[3], '4  Fit', 'u', C['uf']),
+]:
+    rbox(x, by, bw, bh, edge=c if c != 'ink' else 'line', face=f, lw=1.5)
+    txt(x + bw / 2, by + bh - .3, title, 11, c=c if c != 'ink' else 'ink', bold=True)
 
-# ---------------------------------------------------------------- panel B
-rbox(.4, .5, 11.9, 7.8, edge='line', face='#FCFCFC', lw=1.4)
-pill(2.0, 8.12, 'B  Corrector layer', 3.0)
+txt(bx[0] + bw / 2, 4.55, 'image $x_0$\ncaption\n$\\epsilon,\\ t$', 9.8)
+txt(bx[0] + bw / 2, 3.35, '$x_t=(1-t)x_0+t\\epsilon$', 9.0)
+txt(bx[1] + bw / 2, 4.5, 'conditional pass\nreference pass', 8.9)
+txt(bx[1] + bw / 2, 3.85, '$v_{\\mathrm{conditional}}$\n$v_{\\mathrm{guided}}$', 9.2)
+txt(bx[1] + bw / 2, 3.3, '$\\hat{x}=x_t-t\\,v_{\\mathrm{guided}}$', 8.6)
+txt(bx[2] + bw / 2, 4.45, '$g=v_{\\mathrm{guided}}-v_{\\mathrm{conditional}}$', 8.6)
+txt(bx[2] + bw / 2, 3.9, '$H_g(z)=z-\\min(\\langle z,g\\rangle/\\|g\\|^2,0)\\,g$', 8.4)
+txt(bx[2] + bw / 2, 3.25, '$\\mathrm{target}=H_g(\\epsilon-x_0-v_{\\mathrm{conditional}})$', 8.2)
+txt(bx[3] + bw / 2, 4.5, '$r=\\mathrm{Corrector}(\\hat{x})$', 9.8)
+txt(bx[3] + bw / 2, 3.9, '$\\mathrm{loss}=\\mathrm{MSE}(r,\\ \\mathrm{target})$', 9.0)
+txt(bx[3] + bw / 2, 3.3, 'gradients reach the corrector', 8.6, c='gray')
 
-rbox(1.1, 7.0, 3.0, .68, edge='u', face=C['uf'])
-txt(2.6, 7.34, r'$\hat{x}$ patch tokens · $t$', 11.5)
-arrow((2.6, 7.0), (2.6, 6.72), 'u')
-rbox(1.1, 6.2, 3.0, .48, edge='u', face='white')
-txt(2.6, 6.44, 'LayerNorm', 11)
-arrow((2.6, 6.2), (2.6, 5.96), 'u')
-rbox(1.1, 5.3, 3.0, .7, edge='t', face=C['tf'])
-txt(2.6, 5.74, 'Q K V · LoRA r64', 11.5, c='t', bold=True)
-txt(2.6, 5.5, 'base frozen · B = 0', 8.8, c='gray')
-arrow((2.6, 5.3), (2.6, 5.03), 't')
-rbox(1.1, 4.52, 3.0, .48, edge='u', face='white')
-txt(2.6, 4.76, 'RoPE · native 2D position', 10.5)
-arrow((4.1, 4.76), (4.75, 4.76), 'u')
+for i in range(3):
+    arrow((bx[i] + bw, 4.15), (bx[i + 1], 4.15))
 
-# attention with frozen context
-rbox(4.75, 3.5, 3.5, 1.55, edge='u', face=C['uf'], lw=1.6)
-txt(6.5, 4.74, 'SDPA', 12, c='u', bold=True)
-txt(6.5, 4.34, r'$[\,P_l\,;\,G_l\,;\ \mathrm{patch}\ ]$', 11)
-txt(6.5, 3.9, r'$q$ from patch · $kv$ concat', 9.5, c='gray')
-rbox(9.0, 5.2, 2.85, .55, edge='g', face=C['gf'])
-txt(10.42, 5.475, r'$P_l$  prompt KV', 10.5, c='g')
-rbox(9.0, 4.5, 2.85, .55, edge='g', face=C['gf'])
-txt(10.42, 4.775, r'$G_l$  GEN image KV', 10.5, c='g')
-arrow((9.0, 5.3), (8.3, 4.85), 'g', dash=True)
-arrow((9.0, 4.62), (8.3, 4.55), 'g', dash=True)
-snow(9.35, 5.9, 11)
-txt(9.55, 5.9, 'frozen context', 9.8, c='g', ha='left')
-txt(9.15, 3.95, 'captured in the same GEN pass', 9.5, c='gray', ha='left')
-txt(9.15, 3.68, 'detached before the corrector', 9.5, c='gray', ha='left')
+# the sample also feeds the target
+path([(bx[0] + 1.1, by + bh), (bx[0] + 1.1, 5.75), (bx[2] + 1.1, 5.75), (bx[2] + 1.1, by + bh)], 'gray', dash=True)
+txt(4.4, 5.9, '$x_0,\\ \\epsilon$', 9.5, c='gray')
 
-arrow((6.5, 3.5), (6.5, 3.32), 'u')
-rbox(4.75, 2.62, 3.5, .6, edge='u', face='white')
-txt(6.5, 2.92, 'o_proj (LoRA) + residual', 10.5)
-arrow((6.5, 2.62), (6.5, 2.42), 'u')
-rbox(4.75, 1.86, 3.5, .5, edge='u', face='white')
-txt(6.5, 2.11, 'MLP · native', 10.5)
-arrow((6.5, 1.86), (6.5, 1.68), 'u')
-rbox(4.75, 1.0, 3.5, .62, edge='t', face=C['tf'])
-txt(6.5, 1.31, 'norm → FP32 head', 11, c='t', bold=True)
-txt(6.5, .8, 'zero-init: r = 0 at initialization', 9, c='gray')
-arrow((8.25, 1.31), (8.75, 1.31), 't')
-rbox(8.75, 1.0, 1.75, .62, edge='t', face='white')
-txt(9.625, 1.31, r'$r_{\mathrm{raw}}$', 12, c='t')
+txt(5.6, 2.45, 'The target keeps the guidance-preserving residual.', 9.6, c='gray')
+txt(5.6, 2.1, 'Sampling applies the same projection to the prediction.', 9.6, c='gray')
 
-ax.plot([1.0, .86, .86, 1.0], [1.86, 1.86, 6.68, 6.68], lw=1.0, color=C['u'], zorder=3)
-txt(.68, 4.42, '× 28', 10, c='u', rotation=90)
+snow(1.0, 1.5, 11)
+txt(1.25, 1.5, 'frozen: GEN and UND backbone', 9.4, c='g', ha='left')
+rbox(6.35, 1.37, .3, .24, edge='t', face=C['tf'], lw=1.1)
+txt(6.78, 1.5, 'trainable: spatial corrector', 9.4, c='t', ha='left')
 
-# ---------------------------------------------------------------- panel C
-rbox(12.55, .5, 9.05, 7.8, edge='line', face='#FCFCFC', lw=1.4)
-pill(14.85, 8.12, 'C  Guidance-safe objective', 4.2)
+# ------------------------------------------------------------------ panel C
+rbox(11.2, .4, 10.4, 5.95, edge='line', face='#FCFCFC', lw=1.4)
+pill(12.55, 6.35, 'C   Inference', 2.5)
 
-# geometry inset
-rbox(12.85, 4.62, 8.45, 3.05, edge='line', face='#FAFBFC', lw=1.3)
-txt(13.05, 7.42, 'projection geometry', 10, c='gray', ha='left')
-O = (15.05, 5.55)
-arrow(O, (18.35, 5.55), 'ink', ms=14)
-txt(18.5, 5.55, r'$g$', 12.5, ha='left')
-arrow(O, (14.15, 6.95), 't', ms=14)
-txt(13.85, 7.08, r'$r_{\mathrm{raw}}$', 11.5, c='t', ha='right')
-arrow(O, (15.05, 6.95), 'u', ms=14)
-txt(15.18, 6.9, r'$r_{\mathrm{used}}=H_g(r_{\mathrm{raw}})$', 11, c='u', ha='left')
-ax.plot([14.15, 15.05], [6.95, 6.95], lw=1.2, color=C['red'], ls=(0, (4, 3)), zorder=4)
-ax.plot([14.15, 14.15], [5.55, 6.95], lw=1.0, color=C['line'], ls=(0, (2, 3)), zorder=3)
-arrow((15.05, 5.55), (14.15, 5.55), 'red', ms=11, lw=1.3)
-txt(14.55, 5.3, r'removed ($\langle r,g\rangle<0$)', 9.5, c='red')
+cx = [11.55, 14.15, 16.75, 19.35]
+cw, cy, ch = 2.2, 3.55, 1.5
+for x, title, c, f in [
+    (cx[0], 'Frozen GEN + CFG', 'g', C['gf']),
+    (cx[1], 'Proposal', 'g', 'white'),
+    (cx[2], 'Corrector', 'u', C['uf']),
+    (cx[3], 'Euler step', 'ink', 'white'),
+]:
+    rbox(x, cy, cw, ch, edge=c if c != 'ink' else 'line', face=f, lw=1.5)
+    txt(x + cw / 2, cy + ch - .32, title, 10.5, c=c if c != 'ink' else 'ink', bold=True)
 
-# formulas
-rbox(12.85, 2.12, 8.45, 2.3, edge='line', face='white', lw=1.3)
-lines = [
-    (r'$g=v_{\mathrm{guided}}-v_{\mathrm{conditional}}$', 'ink'),
-    (r'$H_g(z)=z-\min(\langle z,g\rangle/\|g\|^2,\ 0)\,g$', 'ink'),
-    (r'$\mathrm{target}=H_g(\varepsilon-x_0-v_{\mathrm{conditional}})$', 'ink'),
-    (r'$\mathrm{loss}=\mathrm{MSE}(r_{\mathrm{raw}},\ \mathrm{target})$', 'ink'),
-    (r'$r_{\mathrm{used}}=H_g(r_{\mathrm{raw}})\ \ \mathrm{at\ sampling}$', 'u'),
-]
-yy = 4.12
-for s, c in lines:
-    txt(13.1, yy, s, 11, c=c if c != 'ink' else 'ink', ha='left')
-    yy -= .4
+txt(cx[0] + cw / 2, 4.05, '$v_{\\mathrm{native}}$\nKV', 9.6)
+txt(cx[1] + cw / 2, 4.1, '$\\hat{x}=x_t-t\\,v_{\\mathrm{native}}$', 8.8)
+txt(cx[2] + cw / 2, 4.2, '$r\\ \\rightarrow\\ H_g(r)$', 9.4)
+txt(cx[2] + cw / 2, 3.85, '$r_{\\mathrm{used}}$', 9.0, c='u')
+txt(cx[3] + cw / 2, 4.05, '$x\\leftarrow x-\\Delta t\\,(v_{\\mathrm{native}}+r_{\\mathrm{used}})$', 8.2)
 
-# trainable / frozen summary
-rbox(12.85, .72, 8.45, 1.2, edge='line', face='white', lw=1.3)
-rbox(13.05, 1.42, .3, .24, edge='t', face=C['tf'], lw=1.1)
-txt(13.48, 1.54, 'Trainable  53.4M · LoRA (28 layers) · input projection · FP32 head',
-    10.5, ha='left')
-snow(13.12, 1.0, 11)
-rbox(13.36, .88, .3, .24, edge='g', face=C['gf'], lw=1.1)
-txt(13.78, 1.0, 'Frozen  GEN (MMDiT) · UND base · prompt KV · GEN KV', 10.5, ha='left')
+for i in range(3):
+    arrow((cx[i] + cw, 4.3), (cx[i + 1], 4.3))
 
-# ---------------------------------------------------------------- export
+# frozen context into the corrector
+rbox(16.45, 5.45, 2.8, .55, edge='g', face=C['gf'], lw=1.3)
+snow(16.65, 5.725, 10)
+txt(17.85, 5.725, 'prompt + image KV', 9.6, c='g')
+arrow((17.85, 5.45), (17.85, 5.05), 'g', dash=True)
+
+# decode exit
+rbox(19.4, 5.45, 1.9, .55, edge='ink', face='white', lw=1.3)
+txt(20.35, 5.725, 'VAE → image', 9.8)
+arrow((20.45, 5.05), (20.45, 5.45), 'ink')
+
+# sampling loop
+path([(20.45, 3.55), (20.45, 2.65), (12.65, 2.65), (12.65, 3.55)])
+txt(16.55, 2.78, r'repeat $t: 1 \rightarrow 0$ · 50 nodes · $\Delta t=t_i-t_{i+1}$', 9.4, c='gray')
+
+txt(16.4, 1.95, '$v=v_{\\mathrm{native}}+r_{\\mathrm{used}}$', 10.5)
+txt(16.4, 1.45, '$r_{\\mathrm{used}}=H_g(r)$', 10.5, c='u')
+txt(16.4, .95, 'same projection as training', 9.2, c='gray')
+
+# ------------------------------------------------------------------ export
 for ext in ('png', 'pdf', 'svg'):
     fig.savefig(OUT / f'method_und.{ext}', dpi=300, facecolor='white')
 fig.savefig(OUT / 'method_und_preview.png', dpi=100, facecolor='white')
