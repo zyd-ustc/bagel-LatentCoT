@@ -30,7 +30,7 @@ def wrap(bundle, config, device):
 
 
 def example(bundle,row,config,device,drop=False):
-    prompt='' if drop else row['prompt']
+    prompt=None if drop else row['prompt']
     inputs=sequence(bundle.model,bundle.tokenizer,bundle.token_ids,prompt,row['height'],row['width'],device,config['max_sequence_length'])
     with torch.no_grad(),torch.autocast(device.type,dtype=torch.bfloat16):
         latent=bundle.vae.encode(pixels(row,device).to(next(bundle.vae.parameters()).dtype))[0].float()

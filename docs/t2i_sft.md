@@ -17,7 +17,7 @@
 | 图像尺寸 | 短边至少512、长边最多1024，16像素对齐 |
 | 文本条件丢弃 | 0.1 |
 
-本版本只取生成任务。论文的CE:MSE=0.25:1、理解/视频/交错数据采样比不应用到纯T2I；文字没有CE目标。工程上采用global batch256、每rank逐图累积、单图内部双向注意力，而非论文每rank 40K–45K token packing。序列上限40960，只用于拒绝超长样本，不是每rank实际token量。不能将本配置宣称为完整Table3混合训练、72.7B tokens或其benchmark复现。
+本版本只取生成任务。论文的CE:MSE=0.25:1、理解/视频/交错数据采样比不应用到纯T2I；文字没有CE目标。丢弃条件时移除整个文本段（包括文本边界），与原生CFG的空文本缓存一致。工程上采用global batch256、每rank逐图累积、单图内部双向注意力，而非论文每rank 40K–45K token packing。序列上限40960，只用于拒绝超长样本，不是每rank实际token量。不能将本配置宣称为完整Table3混合训练、72.7B tokens或其benchmark复现。
 
 令z0为冻结VAE编码，epsilon为独立标准高斯噪声。对每图采样u~N(0,1)，s=sigmoid(u)，t=4s/(1+3s)，zt=(1-t)z0+t epsilon。原生GEN预测速度，唯一损失为每图mean((v_theta-(epsilon-z0))²)，再对全局batch图像平均。整个时间区间参与训练，每图每次只做一个时间点，不运行50步生图。文本在前且因果，图像split内部双向、可看文本；目标图不作为额外SigLIP或干净VAE条件。
 
@@ -93,8 +93,9 @@ bash scripts/train_t2i_npu.sh \
 
 ## 当前验证状态
 
-- 26项CPU测试通过，包括原生训练forward对照、GEN梯度/UND冻结、激活重计算、分组索引、精确续训、EMA导出及原生采样。
-- 两进程CPU/Gloo的真实FSDP FULL_SHARD试跑通过，包含逐rank精确续训、EMA和重组导出。
+- 27项CPU测试通过，包括原生训练forward对照、GEN梯度/UND冻结、激活重计算、分组索引、精确续训、EMA导出及原生采样。
+- 本地及ModelArts目标Python环境的两进程CPU/Gloo FSDP FULL_SHARD试跑通过，包含逐rank精确续训、EMA和重组导出。
+- 代码已独立部署在 `modelarts-64:/data/zyd_workspace/bagel-LatentCoT/code/bagel-native-t2i-sft-20261022`，不替换当前纠错作业代码。ModelArts CPU测试日志为 `artifacts/t2i_sft_20261022/modelarts_cpu_tests.log`，分片日志为 `modelarts_fsdp_two_rank.log`。
 - 尚未准备606433条全量数据的最终corpus；尚未在真实原生7B GEN上执行NPU/HCCL显存及前反向验收；尚未启动正式SFT。现有64卡纠错训练未改动。
 
 日志在本地`artifacts/t2i_sft_20261022/cpu_tests.log`与`fsdp_two_rank.log`。可复跑分片合同测试：

@@ -8,7 +8,7 @@
 
 冻结原生 BAGEL GEN，让理解专家 UND 直接纠正当前图像预测。训练只使用天然图文对和速度修正 MSE。
 
-新训练方案与运行记录见[guidance-safe重启](docs/guidance_safe_20261022/PLAN.md)，GEN输出速度方案暂不实现。
+纠错实验方案与运行记录见[guidance-safe重启](docs/guidance_safe_20261022/PLAN.md)，将UND纠错器改为GEN输出速度的方案暂不实现。
 
 **历史实验状态：** [5000步照片实验](docs/overnight_20261022/RESULTS.md)已完成，残差MSE下降，但生图仍有画风和语义崩坏，尚未通过生成质量验收。
 

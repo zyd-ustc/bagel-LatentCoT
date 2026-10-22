@@ -24,7 +24,7 @@ def configure(model):
 
 def sequence(model, tokenizer, token_ids, prompt, height, width, device, max_length):
     """Same tokens and image positions as native prepare_prompts/prepare_vae_latent."""
-    text = [token_ids['bos_token_id']] + tokenizer.encode(prompt) + [token_ids['eos_token_id']]
+    text = [] if prompt is None else [token_ids['bos_token_id']] + tokenizer.encode(prompt) + [token_ids['eos_token_id']]
     n = (height // model.latent_downsample) * (width // model.latent_downsample)
     prefix = len(text); length = prefix + n + 2
     if length > max_length:

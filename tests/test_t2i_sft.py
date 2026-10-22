@@ -104,6 +104,16 @@ class T2ITests(unittest.TestCase):
                 if gen_parameter(n):torch.testing.assert_close(p,a['ema']['model.'+n].to(p.dtype),rtol=0,atol=0)
             bad=dict(c3,lr=1e-3)
             with self.assertRaises(ValueError):train(bundle(),corpus,first,bad,torch.device('cpu'),first/'step_000003')
+    def test_text_dropout_matches_empty_native_cfg_context(self):
+        b=bundle();m=NativeT2I(b.model,False).float()
+        inputs=sequence(b.model,b.tokenizer,b.token_ids,None,32,32,'cpu',128)
+        self.assertEqual(inputs['ids'].tolist(),[b.token_ids['start_of_image'],b.token_ids['end_of_image']])
+        self.assertEqual(inputs['positions'].count_nonzero(),0)
+        self.assertEqual(inputs['mask'].count_nonzero(),0)
+        with torch.autocast('cpu',dtype=torch.bfloat16):
+            loss,_,_=m(torch.randn(2,4,4),inputs,torch.tensor(-3.))
+        self.assertTrue(torch.isfinite(loss));loss.backward()
+
     def test_sampler_resume(self):
         s=Sampler(list(range(11)),17);first=s.take(11);self.assertEqual(len(set(first)),11)
         saved=s.state_dict();expected=s.take(15);other=Sampler(list(range(11)),17);other.load_state_dict(saved)
