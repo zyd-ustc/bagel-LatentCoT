@@ -45,3 +45,7 @@
 - 完整数值系列：上级目录的`metrics.json`、`validation_metrics.csv`。
 - 最终checkpoint：modelarts-64上的`/data/zyd_workspace/bagel-LatentCoT/outputs/und_postcfg_photos_64npu_20261022_5000/step_005000.pt`，642,215,833字节。
 - 运行代码：`da7a915cffccd6a39d458fbfbbf785b6f3010802`；配置：`configs/correction_photo.json`。旧1000步checkpoint与原始数据未覆盖。
+
+## 后续冻结实验
+
+[Guidance投影实验](GUIDANCE_PROBE.md)已直接测到系统性反向分量；删除该分量能显著恢复对象与质感，但没有解决可靠语义纠错。这为下一步修正训练目标提供了证据。
