@@ -1,0 +1,6 @@
+- [x] Read current implementation, tests, caller contracts, and working tree.
+- [x] Implement shared guidance-preserving target and deployed projection.
+- [x] Verify unit tests, objective/metric meanings, exact resume and old semantics.
+- [x] Pass full-model pilot and inspect real images.
+- [x] Deploy fixed revision and start fresh 64-NPU / 5000-step run.
+- [x] Verify 64 ranks, finite stats, applied projection and checkpoint10; install follow-up.

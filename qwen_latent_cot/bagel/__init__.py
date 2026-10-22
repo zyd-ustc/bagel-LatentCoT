@@ -1,1 +1,1 @@
-"""Frozen native BAGEL runtime for independent Memory diagnostics."""
+"""Frozen native BAGEL model and accelerator backends."""

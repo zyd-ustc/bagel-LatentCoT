@@ -1,0 +1,36 @@
+{
+  "lora_rank": 64,
+  "activation_checkpointing": false,
+  "resolution": 512,
+  "sampler_steps": 50,
+  "timestep_shift": 3.0,
+  "cfg_text_scale": 4.0,
+  "cfg_renorm_type": "global",
+  "cfg_renorm_min": 0.0,
+  "global_batch": 256,
+  "steps": 5000,
+  "lr": 0.0001,
+  "weight_decay": 0.0,
+  "gradient_clip": 1.0,
+  "warmup_steps": 100,
+  "save_steps": [
+    10,
+    100,
+    500,
+    1000,
+    2000,
+    3000,
+    4000,
+    5000
+  ],
+  "val_images": 8,
+  "seed": 17,
+  "correction_space": "post_cfg",
+  "semantic_eval_steps": [
+    100,
+    1000,
+    3000,
+    5000
+  ],
+  "semantic_prompts": "configs/semantic32.jsonl"
+}

@@ -17,9 +17,7 @@ k64_gallery/
 *.bin
 .env
 
-# Independent Memory diagnostic artifacts
-outputs/
+# Generated training artifacts
+wandb/
 build/
 dist/
-*.egg-info/
-.pytest_cache/
