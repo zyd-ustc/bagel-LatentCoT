@@ -59,7 +59,6 @@ def main():
     device=set_device(f'{kind}:{os.environ["LOCAL_RANK"]}' if world>1 and kind!='cpu' else a.device)
     if world>1:
         dist.init_process_group({'npu':'hccl','cuda':'nccl','cpu':'gloo'}[kind],timeout=timedelta(minutes=30))
-        if kind=='cpu':raise ValueError('Full-shard distributed training requires an accelerator; CPU is single-rank test oracle')
     try:
         # Load on host. FSDP moves and shards one native block at a time.
         bundle=load_native(a.model,'cpu',config['timestep_shift'])

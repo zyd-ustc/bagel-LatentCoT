@@ -50,7 +50,7 @@ CORPUS=/data/zyd_workspace/bagel-LatentCoT/datasets/native_t2i_pairs_20261022
 ```bash
 export NNODES=4 NPROC_PER_NODE=16
 export NODE_RANK=0                 # 其他三个节点分别为1、2、3
-export MASTER_ADDR=<节点零集群地址>
+export MASTER_ADDR="${VC_WORKER_HOSTS%%,*}"
 export MASTER_PORT=29673
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 bash scripts/train_t2i_npu.sh \

@@ -76,7 +76,7 @@ def train(bundle,corpus_path,output,config,device,resume=None):
 def _train(bundle,corpus,output,config,device,resume):
     for k in ('min_short_side','max_long_side','max_sequence_length'):
         if config[k]!=corpus.manifest[k]:raise ValueError('Prepared data recipe differs: '+k)
-    if config['global_batch']%ck.world():raise ValueError('Global batch must divide world size')
+    if config['global_batch']%ck.world():raise ValueError('Global batch must be divisible by world size')
     per_rank=config['global_batch']//ck.world()
     torch.manual_seed(config['seed']+ck.rank());random.seed(config['seed']+ck.rank())
     model,shapes=wrap(bundle,config,device)
