@@ -1,0 +1,21 @@
+{
+  "steps": 15000,
+  "lr": 0.000025,
+  "betas": [0.9, 0.95],
+  "eps": 1e-15,
+  "weight_decay": 0.0,
+  "warmup_steps": 500,
+  "gradient_clip": 1.0,
+  "ema_decay": 0.995,
+  "timestep_shift": 4.0,
+  "text_dropout": 0.1,
+  "min_short_side": 512,
+  "max_long_side": 1024,
+  "max_sequence_length": 40960,
+  "global_batch": 256,
+  "activation_checkpointing": true,
+  "save_every": 1000,
+  "validate_every": 500,
+  "val_images": 64,
+  "seed": 17
+}

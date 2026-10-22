@@ -1,4 +1,10 @@
-# BAGEL · UND Spatial Correction
+# BAGEL · 原生 T2I SFT 与 UND Spatial Correction
+
+## 原生文生图后训练
+
+纯T2I入口为 `python -m qwen_latent_cot.t2i.cli`。直接训练原生GEN专家，使用Table3的SFT优化配方：15K steps、lr2.5e-5、warmup500、EMA0.995、shift4。冻结文本UND和视觉编码器，不接纠错器。数据准备、FSDP训练、精确续训、EMA导出及原生生图见[使用指南](docs/t2i_sft.md)。当前通过小型原生模型与两进程CPU分片验证；真实7B NPU训练与全量数据准备尚未执行。
+
+## UND 空间纠错实验
 
 冻结原生 BAGEL GEN，让理解专家 UND 直接纠正当前图像预测。训练只使用天然图文对和速度修正 MSE。
 

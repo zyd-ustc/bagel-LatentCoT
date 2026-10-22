@@ -11,6 +11,7 @@
 
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -281,7 +282,7 @@ class PackedAttention(Qwen2Attention):
             for query_states, key_states, value_states, attention_mask_per_sample in zip(
                 unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
             ):
-                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]) if query_states.device.type == 'cuda' else nullcontext():
                     attn_output = scaled_dot_product_attention(
                         query_states.to(torch.bfloat16).unsqueeze(0), 
                         key_states.to(torch.bfloat16).unsqueeze(0), 
@@ -465,7 +466,7 @@ class PackedAttentionMoT(Qwen2Attention):
             for query_states, key_states, value_states, attention_mask_per_sample in zip(
                 unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
             ):
-                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]) if query_states.device.type == 'cuda' else nullcontext():
                     attn_output = scaled_dot_product_attention(
                         query_states.to(torch.bfloat16).unsqueeze(0), 
                         key_states.to(torch.bfloat16).unsqueeze(0), 
