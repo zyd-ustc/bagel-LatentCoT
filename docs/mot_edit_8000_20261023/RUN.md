@@ -23,3 +23,9 @@ Corpus finalized:606433 indexed pairs; train594454,val6058,test5921; zero duplic
 Full606433 image-path coverage passed:0 missing files.128 deterministic sampled images fully decoded with0 errors. Audit JSON: remote `outputs/mot_edit_data_audit_20261023.json`. All rows retained in the index.
 
 Dedicated base-benchmark judge namespace confirmed idle (`inflight=0`), six scoring cells ended and no running/waiting cells. Saved current service argv/cwd/allowed runtime environment, then released only proxy1086311 and backend1084918 process groups. Recovery information: `outputs/mot_edit_judge_release_20261023.json`. No unrelated process was stopped.
+
+## Main launch and scheduled checks
+
+2026-10-23 02:52 Asia/Shanghai: four-node launcher succeeded, all node resource audits empty, each16 ranks requested. Run revision `b5f4241` (implementation `05d81d8`). Detached supervisor PIDs:node0=1164727,node1=718756,node2=717283,node3=718402. Pinned run and code paths in PLAN.md; launch logs at run path plus `_launch`. Initial launch snapshot is in local artifacts/status_initial.json; worker initialization still in progress at that snapshot.
+
+Heartbeat `mot-64-8000` created every20minutes, quiet on healthy unchanged state. It follows observation1000 and semantic1100/2000/4000/8000, downloads actual images and records, and reports meaningful changes/failure/completion. It preserves8000 total steps and the selected data/objective. Local gallery entry generator: `scripts/mot_edit_gallery.py`.

@@ -5,9 +5,9 @@
 - [x] Index exact data,606433 paths present,128 full image decodes passed
 - [x] CPU mechanism checks
 - [x] Full512 NPU caption/edit/checkpoint reload/sampling pilot; exact optimizer resume covered by CPU
-- [ ] Free only this task's idle judge, audit all four nodes
+- [x] Free only this task's idle judge, audit all four nodes
 - [ ] Launch64 ranks and confirm finite progressing steps
-- [ ] Enable20-minute quiet-on-healthy heartbeat
+- [x] Enable20-minute quiet-on-healthy heartbeat `mot-64-8000`
 - [ ] Step1000 observation stage complete
 - [ ] Step1100/2000/4000 images downloaded and inspected
 - [ ] Step8000 checkpoint and final32×three-arm gallery complete
