@@ -43,3 +43,14 @@ At the launch acceptance snapshot, step18 was running. All four nodes logged16 l
 Checkpoint10 loaded successfully on CPU: correct new objective,64 per-rank RNG states,25 calibration nodes,2560 accumulated training observations. The prior run/checkpoints remain intact.
 
 Heartbeat `guidance-safe-64-5000` is active every30minutes and stays quiet during healthy unchanged state. It will inspect milestone images, record findings and report completion/failure. Initial compute estimate is about4hours including scheduled validation, roughly17:15 Asia/Shanghai; this is an estimate, not a completion claim.
+
+
+## 13:43 follow-up — Step650, Step100 images inspected
+
+All64 ranks remain loaded, no four-node error tails, all logged values finite. Checkpoints10/100/500 exist. Step650 loss0.425869 vs matched zero0.462656; applied negative fraction remained0 across all logged updates. Raw negative fraction0.59375 shows deployment projection still removes learned negative components. Recent20 updates average2.647s.
+
+Downloaded semantic100 (32 prompts × three arms, including cached native images), validation100 records, training records and four node logs. Local gallery: `artifacts/guidance_safe_20261022/run/semantic_000100/index.html`; four contact sheets and per-case `visual_notes.json` accompany it. All32 cases inspected visually. This is an early qualitative snapshot, not a benchmark score.
+
+Observed: blowdryer08 and keyboard/microwave09 remain recognizable; face19 remains intact; train24 and desert28 retain their scene types instead of the prior run's destructive changes. However corrected08/09/10/14 still introduce vivid colored lighting/texture, horse15 remains on the wrong side and becomes toy-like, pose29 changes toward upright with extra background people, and difficult counts/precise text remain unreliable. Some apparent fixes (two sheep00, single treadmill23) also occur in global. The new objective has not yet demonstrated UND-specific semantic gains or eliminated style drift. Comparisons to oldstep5000 are descriptive across different training stages, not a matched-step causal ablation.
+
+Validation100 across32 paired states: native physical guided MSE0.792692, global0.809923, corrected0.717277; objective MSE0.414917 is a different target. Latest100 downloaded training rows average loss0.418616 vs matched zero0.451965. None of these values measures semantic success. Continue the fixed run; no change to data, objective, budget or GEN architecture.
