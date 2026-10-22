@@ -4,6 +4,8 @@
 
 ## 原理
 
+![Method overview](assets/method_und.png)
+
 ```text
 完整 Prompt + noisy latent
         ↓
@@ -46,6 +48,7 @@ loss   = MSE(r_raw, target)
 | `scripts/` | 64 卡持久启动、NPU pilot、照片语料构建 |
 | `configs/` | 训练配置；`correction_guidance_safe.json` 为当前主线 |
 | `tests/` | 21 项 CPU 契约测试（真实小型 MoT） |
+| `assets/` | 方法图（PNG/PDF/SVG）与绘制脚本 |
 | `docs/` | 方法原理文档 |
 
 ## 使用

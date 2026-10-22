@@ -1,5 +1,7 @@
 # 方法原理：冻结 GEN 上的空间 UND 速度纠错
 
+![Method overview](../assets/method_und.png)
+
 ## 1. 生成通路与 CFG
 
 BAGEL 生成侧是 flow-matching 的 MMDiT。给定干净 latent `x0` 与噪声 `ε`，采样状态为
