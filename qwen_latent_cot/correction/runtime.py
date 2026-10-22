@@ -84,11 +84,12 @@ class Runtime:
         return self.predict(x_t,t,reference,capture=False)[0]
 
     @torch.no_grad()
-    def proposal(self, x_t, t, flow, *, capture=True):
+    def proposal(self, x_t, t, flow, *, capture=True, with_conditional=False):
         """The same native guided velocity and clean proposal used at deployment."""
         conditional,context=self.predict(x_t,t,flow,capture=capture)
         reference=self.reference(x_t,t,flow) if self.config['cfg_text_scale']>1 else conditional
-        return guided(conditional,reference,self.config).detach(),context
+        base=guided(conditional,reference,self.config).detach()
+        return (base,context,conditional) if with_conditional else (base,context)
 
     @torch.no_grad()
     def encode(self, path, posterior_seed):

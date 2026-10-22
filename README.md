@@ -2,7 +2,9 @@
 
 冻结原生 BAGEL GEN，让理解专家 UND 直接纠正当前图像预测。训练只使用天然图文对和速度修正 MSE。
 
-**实验状态：** [5000步照片实验](docs/overnight_20261022/RESULTS.md)已完成，残差MSE下降，但生图仍有画风和语义崩坏，尚未通过生成质量验收。
+新训练方案与运行记录见[guidance-safe重启](docs/guidance_safe_20261022/PLAN.md)，GEN输出速度方案暂不实现。
+
+**历史实验状态：** [5000步照片实验](docs/overnight_20261022/RESULTS.md)已完成，残差MSE下降，但生图仍有画风和语义崩坏，尚未通过生成质量验收。
 
 ```text
 完整 Prompt + noisy latent → 冻结 GEN + 原生 CFG/renorm → v_native、xhat、GEN 特征
@@ -16,10 +18,12 @@
 - 一个图像 patch 对应一个纠错 query，保留原生 2D 位置嵌入和当前时间。
 - Prompt 和同层 GEN KV 是冻结上下文；没有额外的 16-slot Memory，也不修改 GEN 注意力或 hidden states。
 - 输入投影从恒等矩阵初始化，FP32 空间输出 head 从零初始化。零纠错时保留原生 CFG 与 Euler 运算结果。
-- 唯一目标：`MSE(r, epsilon - x0 - v_native)`。不使用 semantic CE、Teacher、partial Prompt、cosine、排序或 keep loss。
+- 新实验的目标为 `H_g(epsilon - x0 - v_conditional)`，损失为原始 UND 输出与该目标的 MSE。`g=v_guided-v_conditional`，`H_g(z)=z-min(<z,g>/||g||²,0)g`；g为0时不修改。推理也用H_g删除反向分量，不修改GEN架构。
+- 训练不投影原始预测再算loss，避免负向预测落入零梯度区。该目标有意排除了反向guidance残差，不再等价于完整guided-flow回归。不使用 semantic CE、Teacher、partial Prompt、cosine、排序或 keep loss。
+- `loss`与`zero_correction_mse`使用同一新目标；`base_mse`与`applied_base_mse`分别记录原生/实际纠错速度对原始flow目标的误差。不能将loss/base_mse解释成匹配的误差改善比例。
 - 每个选中采样节点执行一次 UND correction，之后推进外层 Euler；不执行第二遍 GEN correction。
 - 沿用 50 个采样节点、shift 3；在前 25 次更新启用纠错。新配置中 `v_native` 指原生 CFG/renorm 后的速度，训练和推理使用同一个 proposal。纠错通过 FP32 Euler 增量加一次；无条件分支和原生 CFG 不变。
-- 同批训练残差同时估计每个时间节点的全局常量场，作为独立基线。它不参与 UND 的损失或优化器；验证并列输出 native/global/corrected。
+- 同批训练目标同时估计每个时间节点的全局常量场，作为独立基线。它不参与 UND 的损失或优化器；新模式的global输出也经过相同H_g，所以实际施加的基线还依赖当前guidance方向。验证并列输出 native/global/corrected。
 
 ## 训练
 
@@ -29,7 +33,7 @@
 python -m qwen_latent_cot.correction.cli train \
   --model /absolute/path/Bagel-7B-MoT \
   --corpus /absolute/path/correction_photos_v2_20261022 \
-  --config configs/correction_photo.json \
+  --config configs/correction_guidance_safe.json \
   --output /absolute/path/new-correction-run --device npu:0
 ```
 
@@ -51,10 +55,10 @@ python scripts/prepare_photo_corpus.py \
   --code /absolute/path/deployed-code \
   --output /absolute/path/new-correction-run \
   --corpus /absolute/path/correction_photos_v2_20261022 \
-  --config /absolute/path/deployed-code/configs/correction_photo.json
+  --config /absolute/path/deployed-code/configs/correction_guidance_safe.json
 ```
 
-新配置为 5,000 步、全局 batch 256、AdamW lr 1e-4、warmup 100、梯度裁剪 1。配置见 `configs/correction_photo.json`。默认关闭 activation checkpointing（单卡实测峰值约 47.9 GiB）；显存受限时可在配置中启用。每个节点有独立日志和 PID，主进程写入 `train.jsonl`。启动器审查旧项目训练并停止，不终止无关作业。
+新配置为 5,000 步、全局 batch 256、AdamW lr 1e-4、warmup 100、梯度裁剪 1。新实验使用 `configs/correction_guidance_safe.json`；旧实验配置为 `configs/correction_photo.json`。默认关闭 activation checkpointing（单卡实测峰值约 47.9 GiB）；显存受限时可在配置中启用。每个节点有独立日志和 PID，主进程写入 `train.jsonl`。启动器审查旧项目训练并停止，不终止无关作业。
 
 ## 采样和续训
 

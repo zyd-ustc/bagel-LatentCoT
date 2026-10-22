@@ -4,9 +4,11 @@ from pathlib import Path
 import time
 import zlib
 import torch
+from torch.nn import functional as F
 from . import distributed as parallel
 from . import checkpoint
 from .data import Sampler
+from .objective import guidance_safe,residual_target,applied_correction,guidance_coefficient
 from .model import proposal_from,correction_loss
 from .sampling import times,active_steps,sample
 from ..bagel.accelerator import synchronize,reset_peak_memory_stats,max_memory_allocated
@@ -25,16 +27,21 @@ class FrozenGuard:
             raise RuntimeError('Frozen native/UND parameter was modified')
 
 
-def paired_state(runtime,row,t,noise_seed):
+def paired_state(runtime,row,t,noise_seed,*,with_conditional=False):
     # Stable posterior per sample across epochs/ranks without content-hashing every image.
     posterior_seed=(zlib.crc32(row['sample_id'].encode())+runtime.config['seed'])%(2**32)
     x0=runtime.encode(row['image'],posterior_seed)
     epsilon=torch.randn(x0.shape,generator=torch.Generator().manual_seed(noise_seed)).to(x0.device)
     x_t=(1-t)*x0.float()+t*epsilon
     flow=runtime.flow(row['caption'])
-    base,context=(runtime.proposal(x_t,t,flow) if runtime.config.get('correction_space')=='post_cfg'
-                  else runtime.predict(x_t,t,flow))
-    return x0,epsilon,x_t,flow,base,context
+    if runtime.config.get('correction_space')=='post_cfg':
+        if with_conditional:base,context,conditional=runtime.proposal(x_t,t,flow,with_conditional=True)
+        else:base,context=runtime.proposal(x_t,t,flow)
+    else:
+        base,context=runtime.predict(x_t,t,flow);conditional=base
+    result=(x0,epsilon,x_t,flow,base,context)
+    return (*result,conditional) if with_conditional else result
+
 
 
 @torch.no_grad()
@@ -46,16 +53,26 @@ def validate(corrector,rows,output,step):
         row=rows[index]
         for node in selected:
             t=nodes[node]
-            x0,epsilon,x_t,flow,base,context=paired_state(runtime,row,t,cfg['seed']+index)
-            delta=corrector(proposal_from(x_t,t,base),t,flow,context)
+            x0,epsilon,x_t,flow,base,context,conditional=paired_state(runtime,row,t,cfg['seed']+index,with_conditional=True)
+            raw_delta=corrector(proposal_from(x_t,t,base),t,flow,context)
+            delta=applied_correction(raw_delta,base,cfg,conditional)
+            target=residual_target(base,x0,epsilon,cfg,conditional)
             record=dict(sample_id=row['sample_id'],family_id=row['family_id'],caption=row['caption'],t=t,
                 residual_mse=float(correction_loss(delta,base,x0,epsilon)),
                 base_mse=float((base.float()-(epsilon-x0.float())).square().mean()),delta_rms=float(delta.square().mean().sqrt()))
+            record.update(objective_mse=float(F.mse_loss(raw_delta.float(),target)),zero_correction_mse=float(target.square().mean()),
+                conditional_base_mse=float((conditional.float()-(epsilon-x0.float())).square().mean()),
+                conditional_corrected_mse=float((conditional.float()+delta.float()-(epsilon-x0.float())).square().mean()),
+                raw_delta_rms=float(raw_delta.float().square().mean().sqrt()))
+            if guidance_safe(cfg):
+                g=base.float()-conditional.float()
+                record.update(guidance_projection_raw=float(guidance_coefficient(raw_delta,g)),
+                    guidance_projection_applied=float(guidance_coefficient(delta,g)))
             if deployed:
-                global_delta=corrector.calibration(t).expand_as(base)
+                global_delta=applied_correction(corrector.calibration(t).expand_as(base),base,cfg,conditional)
                 record['global_mse']=float(correction_loss(global_delta,base,x0,epsilon))
             records.append(record)
-            del x0,epsilon,x_t,flow,base,context,delta
+            del x0,epsilon,x_t,flow,base,context,delta,raw_delta,target,conditional
         arms=[('native',dict(native=True)),('corrected',{})]
         if deployed:arms.insert(1,('global',dict(global_only=True)))
         for label,kwargs in arms:
@@ -114,7 +131,10 @@ def train(corrector,corpus,output,provenance,saved=None):
     if parallel.rank()==0:
         write(out/'run.json',dict(config=cfg,provenance=provenance,world=world,start_step=start,
             train_pairs=sum(len(v) for v in corpus.groups('train')),trainable_parameters=sum(p.numel() for p in corrector.parameters() if p.requires_grad),
-            objective='MSE(delta, epsilon-x0-v0)',velocity_space=cfg.get('correction_space','conditional'),
+            objective='MSE(raw_delta, H_g(epsilon-x0-v_conditional))' if guidance_safe(cfg) else 'MSE(delta, epsilon-x0-v0)',
+            metric_meanings=dict(loss='raw prediction MSE to the configured training target',zero_correction_mse='zero prediction MSE to the same target',
+                base_mse='unmodified base velocity MSE to epsilon-x0',applied_base_mse='base plus actually applied correction MSE to epsilon-x0'),
+            velocity_space=cfg.get('correction_space','conditional'),
             global_baseline='train-only per-time constant-field least-squares mean' if hasattr(corrector,'calibration') else None,initialization='native_pretrained_UND',
             validation=[dict(sample_id=r['sample_id'],family_id=r['family_id']) for r in val]))
     nodes=times(cfg)[:active_steps(cfg)];reset_peak_memory_stats(device);began=time.perf_counter()
@@ -122,17 +142,30 @@ def train(corrector,corpus,output,provenance,saved=None):
         started=time.perf_counter();optimizer.zero_grad(set_to_none=True)
         rows=sampler.take(batch);draws=[(sampler.rng.choice(nodes),sampler.rng.randrange(2**63-1)) for _ in rows]
         values=[0.]*4
+        extra_names=('zero_correction_mse','conditional_base_mse','conditional_corrected_mse','applied_base_mse',
+                     'target_anti_removed_rms','raw_negative_fraction','applied_negative_fraction','raw_delta_rms')
+        extras=[0.]*len(extra_names)
         pending=torch.zeros((len(nodes),corrector.calibration.sums.shape[1]+1),device=device) if hasattr(corrector,'calibration') else None
         for index in range(parallel.rank(),batch,world):
             t,noise_seed=draws[index]
-            x0,epsilon,x_t,flow,base,context=paired_state(corrector.runtime,rows[index],t,noise_seed)
+            x0,epsilon,x_t,flow,base,context,conditional=paired_state(corrector.runtime,rows[index],t,noise_seed,with_conditional=True)
             delta=corrector(proposal_from(x_t,t,base),t,flow,context)
-            loss=correction_loss(delta,base,x0,epsilon);(loss/batch).backward()
-            if pending is not None:corrector.calibration.observe(pending,t,epsilon.float()-x0.float()-base.float())
+            target=residual_target(base,x0,epsilon,cfg,conditional)
+            loss=F.mse_loss(delta.float(),target);(loss/batch).backward()
+            if pending is not None:corrector.calibration.observe(pending,t,target)
             with torch.no_grad():
                 values[0]+=float(loss);values[1]+=float((epsilon-x0.float()-base.float()).square().mean())
-                values[2]+=float(delta.square().mean().sqrt());values[3]+=t
-            del x0,epsilon,x_t,flow,base,context,delta,loss
+                applied=applied_correction(delta,base,cfg,conditional)
+                values[2]+=float(applied.square().mean().sqrt());values[3]+=t
+                truth=epsilon.float()-x0.float();g=base.float()-conditional.float()
+                conditional_residual=truth-conditional.float()
+                row_extras=(float(target.square().mean()),float(conditional_residual.square().mean()),
+                    float((conditional.float()+applied-truth).square().mean()),float((base.float()+applied-truth).square().mean()),
+                    float((conditional_residual-target).square().mean().sqrt()) if guidance_safe(cfg) else 0.,
+                    float(guidance_coefficient(delta,g)<-1e-6),float(guidance_coefficient(applied,g)<-1e-6),
+                    float(delta.float().square().mean().sqrt()))
+                extras=[a+b for a,b in zip(extras,row_extras)]
+            del x0,epsilon,x_t,flow,base,context,delta,loss,target,conditional,applied,truth,g,conditional_residual
         if pending is not None:corrector.calibration.update(pending)
         parallel.sum_gradients(corrector)
         groups=corrector.group_parameters()
@@ -141,11 +174,12 @@ def train(corrector,corpus,output,provenance,saved=None):
         lr=cfg['lr']*min(1.,step/max(1,cfg['warmup_steps']))
         for group in optimizer.param_groups:group['lr']=lr
         optimizer.step();guard.check()
-        values=parallel.sum_statistics(values,device)
+        combined=parallel.sum_statistics(values+extras,device);values=combined[:4];extras=combined[4:]
         peak=parallel.max_statistics([max_memory_allocated(device)/1024**3],device)[0];synchronize(device)
         record=dict(step=step,loss=values[0]/batch,base_mse=values[1]/batch,delta_rms=values[2]/batch,t_mean=values[3]/batch,
                     gradient_norm=float(norm),**gradients,lr=lr,step_seconds=time.perf_counter()-started,
                     elapsed_seconds=time.perf_counter()-began,peak_memory_gib=peak,world=world)
+        record.update({name:value/batch for name,value in zip(extra_names,extras)})
         if parallel.rank()==0:
             with (out/'train.jsonl').open('a') as f:f.write(json.dumps(record,allow_nan=False)+'\n')
             print(json.dumps(record,allow_nan=False),flush=True)

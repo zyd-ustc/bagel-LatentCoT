@@ -6,6 +6,7 @@ import random
 import torch
 from . import checkpoint,distributed as parallel
 from .model import SpatialCorrector
+from .objective import guidance_safe
 from .runtime import Runtime
 from ..bagel.accelerator import set_device
 from ..bagel.backbone import load_native
@@ -28,6 +29,7 @@ def main(argv=None):
         for name in ('steps','global_batch','val_images'):
             if getattr(args,name) is not None:cfg[name]=getattr(args,name)
         if cfg['global_batch']%int(__import__('os').environ.get('WORLD_SIZE','1')):raise ValueError('Batch must divide world size')
+    guidance_safe(cfg)
     device=parallel.initialize(args.device) if getattr(args,'distributed',False) else set_device(args.device)
     torch.manual_seed(cfg['seed']);random.seed(cfg['seed'])
     runtime=Runtime(load_native(args.model,device,cfg['timestep_shift']),cfg)

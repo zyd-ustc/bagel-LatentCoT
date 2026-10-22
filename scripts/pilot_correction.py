@@ -12,6 +12,7 @@ from qwen_latent_cot.correction.data import Corpus
 from qwen_latent_cot.correction.training import paired_state,train,write
 from qwen_latent_cot.correction.sampling import sample,times,active_steps
 from qwen_latent_cot.correction import checkpoint
+from qwen_latent_cot.correction.objective import residual_target,guidance_safe
 
 
 def main():
@@ -46,16 +47,19 @@ def main():
         for index,t in enumerate(corrector.calibration.nodes):
             if corrector.calibration.counts[index]>0:continue
             with torch.no_grad():
-                x0,epsilon,x_t,flow,base,context=paired_state(runtime,training_row,t,17)
-                corrector.calibration.observe(pending,t,epsilon.float()-x0.float()-base.float())
+                x0,epsilon,x_t,flow,base,context,conditional=paired_state(runtime,training_row,t,17,with_conditional=True)
+                corrector.calibration.observe(pending,t,residual_target(base,x0,epsilon,cfg,conditional))
         corrector.calibration.update(pending);pilot_corpus.close()
         del x0,epsilon,x_t,flow,base,context
     for label,kwargs in [('native',dict(native=True)),('global',dict(global_only=True)),('corrected',{})] if cfg.get('correction_space')=='post_cfg' else [('native',dict(native=True)),('corrected',{})]:
         image,trace=sample(corrector,row['caption'],17,**kwargs)
         image.save(Path(a.output)/(label+'.png'));write(Path(a.output)/(label+'.json'),trace)
+        if guidance_safe(cfg):
+            assert all(node.get('guidance_projection_applied',0.)>=-1e-5 for node in trace)
     records=[json.loads(x) for x in (Path(a.output)/'train.jsonl').read_text().splitlines()]
     assert records[0]['gradient_head']>0 and records[0]['gradient_und']==0
     assert records[1]['gradient_und']>0 and records[1]['delta_rms']>0
+    if guidance_safe(cfg):assert all(r['applied_negative_fraction']==0 for r in records)
     synchronize(device)
     result=dict(status='passed',checks=['zero_init','head_then_und_gradients','frozen_native','checkpoint_restore','optimizer_sampler_rng_resume','paired_sampling'],
                 steps=4,peak_memory_gib=max_memory_allocated(device)/1024**3,caption=row['caption'])
