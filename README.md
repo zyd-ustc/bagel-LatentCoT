@@ -6,6 +6,8 @@
 
 ![Method overview](assets/method_und.png)
 
+*图：A 为原生 BAGEL MoT 结构，B 为训练目标，C 为推理循环。*
+
 ```text
 完整 Prompt + noisy latent
         ↓
