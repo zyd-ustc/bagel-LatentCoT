@@ -2,7 +2,7 @@
 - [x] New dedicated run branch and fixed plan
 - [x] Exact JSONL reachable,606433 source rows
 - [x] Implement no-head native MoT loop and training stages
-- [ ] Index exact data, image/provenance audit
+- [x] Index exact data,606433 paths present,128 full image decodes passed
 - [x] CPU mechanism checks
 - [x] Full512 NPU caption/edit/checkpoint reload/sampling pilot; exact optimizer resume covered by CPU
 - [ ] Free only this task's idle judge, audit all four nodes

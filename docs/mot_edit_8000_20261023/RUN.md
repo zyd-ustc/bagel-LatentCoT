@@ -17,3 +17,9 @@ Real native model, NPU15,1 caption update +2 two-round editing updates. Caption 
 Downloaded and actually inspected native/two-round pilot images. Both show a red cube left and a blue ball right on a wooden table, with intact photographic style. Prompt asks two cubes; both images have one. Two edit updates have not fixed that count. Artifacts: `artifacts/mot_edit_8000_20261023/pilot/`. Initial pilot failure and retry logs retained separately.
 
 Corpus finalized:606433 indexed pairs; train594454,val6058,test5921; zero duplicate/empty exclusions. Identity `a226556c-7479-43e9-8173-45b4721dd4bc`. Data path coverage/128-image decode audit runs read-only before main launch.
+
+## Data and resource preflight
+
+Full606433 image-path coverage passed:0 missing files.128 deterministic sampled images fully decoded with0 errors. Audit JSON: remote `outputs/mot_edit_data_audit_20261023.json`. All rows retained in the index.
+
+Dedicated base-benchmark judge namespace confirmed idle (`inflight=0`), six scoring cells ended and no running/waiting cells. Saved current service argv/cwd/allowed runtime environment, then released only proxy1086311 and backend1084918 process groups. Recovery information: `outputs/mot_edit_judge_release_20261023.json`. No unrelated process was stopped.

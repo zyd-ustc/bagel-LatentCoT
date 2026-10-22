@@ -10,8 +10,20 @@ RUN=Path('/data/zyd_workspace/bagel-LatentCoT/outputs/bagel_base_sixbench_202610
 DEST=Path('/data/zyd_workspace/bagel-LatentCoT/outputs/mot_edit_judge_release_20261023.json')
 
 
+def snapshot(pid):
+    path=Path('/proc')/str(pid)
+    argv=[x.decode() for x in path.joinpath('cmdline').read_bytes().split(b'\0') if x]
+    allowed={'PATH','LD_LIBRARY_PATH','PYTHONPATH','TMPDIR','TRITON_CACHE_DIR','ASCEND_RT_VISIBLE_DEVICES',
+             'ASCEND_HOME_PATH','ASCEND_OPP_PATH','ASCEND_AICPU_PATH','ASCEND_TOOLKIT_HOME',
+             'VLLM_USE_V1','VLLM_WORKER_MULTIPROC_METHOD','VLLM_ASCEND_ENABLE_NZ','HCCL_CONNECT_TIMEOUT','OMP_NUM_THREADS'}
+    env={}
+    for part in path.joinpath('environ').read_bytes().split(b'\0'):
+        key,sep,value=part.partition(b'=')
+        if sep and key.decode() in allowed:env[key.decode()]=value.decode()
+    return dict(pid=pid,pgid=os.getpgid(pid),argv=argv,cwd=str(path.joinpath('cwd').resolve()),env=env)
+
+
 def main():
-    from run_bagel_base_sixbench import snapshot
     with urlopen('http://127.0.0.1:18364/health',timeout=10) as response:health=json.load(response)
     progress=json.loads((RUN/'scoring_qwen27b_v1/control/progress.json').read_text())
     if health['namespace']!='bagel_native_base_sixbench_20261022_v1' or health['inflight']!=0:
