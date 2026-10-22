@@ -32,9 +32,12 @@ C = {
 }
 
 
+SCALE = 1.35
+
+
 def txt(x, y, s, fs=12, c='ink', ha='center', va='center', bold=False, **kw):
     kw.setdefault('zorder', 6)
-    ax.text(x, y, s, fontsize=fs, color=C.get(c, c), ha=ha, va=va,
+    ax.text(x, y, s, fontsize=fs * SCALE, color=C.get(c, c), ha=ha, va=va,
             weight='bold' if bold else 'normal', linespacing=1.55, **kw)
 
 
@@ -45,14 +48,14 @@ def rbox(x, y, w, h, edge='line', face='white', lw=1.7, z=2, rs=.07):
                                 lw=lw, zorder=z))
 
 
-def arrow(p, q, c='ink', dash=False, rad=0, ms=15, lw=1.8):
+def arrow(p, q, c='ink', dash=False, rad=0, ms=19, lw=2.0):
     ax.add_patch(FancyArrowPatch(p, q, arrowstyle='-|>', mutation_scale=ms,
                                  color=C.get(c, c), lw=lw,
                                  ls=(0, (4, 3)) if dash else '-',
                                  connectionstyle=f'arc3,rad={rad}', zorder=5))
 
 
-def path(pts, c='ink', dash=False, lw=1.7):
+def path(pts, c='ink', dash=False, lw=1.9):
     for p, q in zip(pts[:-2], pts[1:-1]):
         ax.plot([p[0], q[0]], [p[1], q[1]], lw=lw, color=C.get(c, c),
                 ls=(0, (4, 3)) if dash else '-', zorder=4, solid_capstyle='round')
@@ -69,7 +72,7 @@ def snow(x, y, fs=13):
 
 
 # ------------------------------------------------------------------ head
-txt(.5, 11.5, 'BAGEL · Frozen GEN + Spatial UND Velocity Correction', 21, ha='left', bold=True)
+txt(.5, 11.5, 'BAGEL · Frozen GEN + Spatial UND Velocity Correction', 18, ha='left', bold=True)
 txt(21.5, 11.5, 'Method', 12, c='gray', ha='right')
 
 snow(16.3, 11.06, 14)
@@ -81,7 +84,7 @@ txt(20.35, 11.06, 'KV context', 12, c='gray', ha='left')
 
 # ------------------------------------------------------------------ panel A
 rbox(.4, 6.75, 21.2, 4.05, edge='line', face='#FCFCFC', lw=1.4)
-pill(2.75, 10.8, 'A   BAGEL MoT · T2I', 4.5, fs=14)
+pill(2.9, 10.8, 'A   BAGEL MoT · T2I', 5.0, fs=13)
 
 snow(2.55, 10.2, 13)
 txt(2.85, 10.2, 'UND expert', 14, c='u', bold=True, ha='left')
@@ -111,12 +114,12 @@ for x in (6.2, 15.8):
     arrow((x, 7.78), (x, 7.6), 'ink')
 
 txt(19.85, 8.2, '× 28', 13, c='gray', ha='left')
-txt(6.2, 6.98, 'prompt KV', 11, c='u')
-txt(15.8, 6.98, 'image features · $v_t$', 11, c='g')
+txt(6.2, 6.92, 'prompt KV', 10, c='u')
+txt(15.8, 6.92, 'image features · $v_t$', 10, c='g')
 
 # ------------------------------------------------------------------ panel B
 rbox(.4, .4, 10.4, 5.95, edge='line', face='#FCFCFC', lw=1.4)
-pill(1.85, 6.35, 'B   Training', 2.7, fs=14)
+pill(1.95, 6.35, 'B   Training', 2.9, fs=13)
 
 bx = [0.75, 3.23, 5.71, 8.19]
 bw, by, bh = 2.25, 3.1, 2.4
@@ -152,7 +155,7 @@ txt(4.78, 1.55, 'trainable: corrector', 10.5, c='t', ha='left')
 
 # ------------------------------------------------------------------ panel C
 rbox(11.2, .4, 10.4, 5.95, edge='line', face='#FCFCFC', lw=1.4)
-pill(12.65, 6.35, 'C   Inference', 2.7, fs=14)
+pill(12.75, 6.35, 'C   Inference', 2.9, fs=13)
 
 cx = [11.7, 13.72, 15.74, 17.76, 19.78]
 cw, cy, ch = 1.82, 3.9, 1.35
