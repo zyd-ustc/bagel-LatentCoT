@@ -6,7 +6,7 @@
 - [x] CPU mechanism checks
 - [x] Full512 NPU caption/edit/checkpoint reload/sampling pilot; exact optimizer resume covered by CPU
 - [x] Free only this task's idle judge, audit all four nodes
-- [ ] Launch64 ranks and confirm finite progressing steps
+- [x] Launch64 ranks; finite Step98 snapshot; Step10/100 saved,Step10 loaded and verified
 - [x] Enable20-minute quiet-on-healthy heartbeat `mot-64-8000`
 - [ ] Step1000 observation stage complete
 - [ ] Step1100/2000/4000 images downloaded and inspected

@@ -29,3 +29,11 @@ Dedicated base-benchmark judge namespace confirmed idle (`inflight=0`), six scor
 2026-10-23 02:52 Asia/Shanghai: four-node launcher succeeded, all node resource audits empty, each16 ranks requested. Run revision `b5f4241` (implementation `05d81d8`). Detached supervisor PIDs:node0=1164727,node1=718756,node2=717283,node3=718402. Pinned run and code paths in PLAN.md; launch logs at run path plus `_launch`. Initial launch snapshot is in local artifacts/status_initial.json; worker initialization still in progress at that snapshot.
 
 Heartbeat `mot-64-8000` created every20minutes, quiet on healthy unchanged state. It follows observation1000 and semantic1100/2000/4000/8000, downloads actual images and records, and reports meaningful changes/failure/completion. It preserves8000 total steps and the selected data/objective. Local gallery entry generator: `scripts/mot_edit_gallery.py`.
+
+## Launch accepted:64 ranks updating, checkpoint verified
+
+Latest launch acceptance snapshot reached Step98 (observation):loss4.902211, observation gradient0.607367, finite; all four nodes report16 loaded/live workers, no error tails. Step10 and Step100 atomic checkpoints exist. Read Step10 on CPU:correct new format,8000 total steps,1000 observation steps,64 per-rank RNG states,672 adapter tensors, correct corpus identity and deployed revision `b5f4241b44caa03f6aa3a255a2419d8116826cde`. Native lm_head/llm2vae stay frozen; feedback/editor gradients are0 during this stage by design.
+
+Main observation updates recently around1.0–1.2s; peak29.37GiB/NPU. Main edit throughput will be measured after Step1000; single-card pilot timing is not substituted for that measurement. Local evidence:status_launch_confirmed.json,checkpoint10.json,data_audit.json and pilot images/logs under artifacts/mot_edit_8000_20261023.
+
+Data geometry is explicit:source images include1024×1024,832×1248,1248×832 and1376×768 in the128-image audit. This run follows the selected fixed512×512 recipe using existing latent codec's full-frame resize, with no content crop. Rectangular images are stretched to square. This geometry is part of this run's data processing, not evidence that richer source captions alone improve generation.
