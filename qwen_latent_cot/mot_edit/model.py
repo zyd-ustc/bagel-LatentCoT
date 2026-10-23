@@ -85,15 +85,20 @@ class MoTEdit(nn.Module):
         rt=self.runtime;m=rt.model
         # Private editor sequence contains feedback prefix and image segment, never the goal cache.
         pos=torch.arange(self.config['slots'],device=rt.device)
-        relocated=tuple(KV(kv.keys,kv.values,pos) for kv in feedback)
-        image_positions=torch.full((len(state),),self.config['slots'],device=rt.device,dtype=torch.long)
+        relocated=tuple(KV(kv.keys,kv.values,pos[:len(kv.keys)]) for kv in feedback)
+        # Preserve native image boundary tokens and their UND expert routing.
+        # The editor has no original prompt cache; its semantic prefix is feedback only.
+        flow=self.neutral_flow;image_indexes=flow['packed_vae_token_indexes'];text_indexes=flow['packed_text_indexes']
+        positions=torch.full((len(state)+len(text_indexes),),self.config['slots'],device=rt.device,dtype=torch.long)
         with autocast_for(rt.device):
-            hidden=m.vae2llm(state.to(m.vae2llm.weight.dtype))
-            hidden=hidden+m.time_embedder(torch.full((len(hidden),),t,device=rt.device))
-            hidden=hidden+m.latent_pos_embed(self.neutral_flow['packed_vae_position_ids'])
-            hidden=hidden.to(next(rt.decoder.parameters()).dtype)
-            hidden,_=self.editor(hidden,image_positions,(relocated,),checkpointing=self.config['activation_checkpointing'])
-            return m.llm2vae(rt.decoder.norm_moe_gen(hidden)).float()
+            image=m.vae2llm(state.to(m.vae2llm.weight.dtype))
+            image=image+m.time_embedder(torch.full((len(image),),t,device=rt.device))
+            image=image+m.latent_pos_embed(flow['packed_vae_position_ids'])
+            text=rt.decoder.embed_tokens(flow['packed_text_ids'])
+            hidden=text.new_zeros((len(positions),text.shape[-1]))
+            hidden[text_indexes]=text;hidden[image_indexes]=image.to(text.dtype)
+            hidden,_=self.editor(hidden,positions,(relocated,),checkpointing=self.config['activation_checkpointing'],text_indexes=text_indexes)
+            return m.llm2vae(rt.decoder.norm_moe_gen(hidden[image_indexes])).float()
     def round(self,state,t,flow):
         # Read a clean estimate, but predict velocity from the actual noisy state.
         vg,_,vc=self.runtime.proposal(state.detach(),t,flow,capture=False,with_conditional=True)

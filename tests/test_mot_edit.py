@@ -7,6 +7,7 @@ import torch
 from types import SimpleNamespace
 from test_correction import tiny
 from qwen_latent_cot.mot_edit.model import MoTEdit,project_safe,apply_edit
+from qwen_latent_cot.mot_edit.roles import KV
 from qwen_latent_cot.mot_edit.sampling import sample
 from qwen_latent_cot.mot_edit import checkpoint
 from qwen_latent_cot.mot_edit.data import prepare,Corpus,Sampler
@@ -69,6 +70,14 @@ class Tests(unittest.TestCase):
         m=setup();x=torch.randn(4,8);flow=m.runtime.flow('p');m.set_stage('edit')
         a=m.round(x,.55,flow)[1];m.config['activation_checkpointing']=False;b=m.round(x,.55,flow)[1]
         torch.testing.assert_close(a,b,rtol=0,atol=0)
+    def test_editor_without_feedback_matches_native_unconditional(self):
+        m=setup();m.set_stage('edit');x=torch.randn(4,8);flow=m.runtime.flow('p')
+        bank=m.observation_bank(x)
+        empty=tuple(KV(k.keys[:0],k.values[:0],k.positions[:0]) for k in bank)
+        actual=m.edit_velocity(x,.55,empty)
+        expected=m.runtime.reference(x,.55,flow).float()
+        torch.testing.assert_close(actual,expected,atol=2e-4,rtol=2e-3)
+
     def test_edit_renoises_with_same_noise_anchor(self):
         x=torch.tensor([[2.,3.]])
         vc=torch.tensor([[.1,.2]]);vg=torch.tensor([[.3,.2]])
