@@ -98,13 +98,19 @@ def atom_fix_stats(rows, index):
             if atom['correct']:
                 continue
             skill = parse_question(atom['question'])['kind']
-            slot = table.setdefault(skill, dict(atoms=0, loop_fixed=0, resample_fixed=0))
+            slot = table.setdefault(skill, dict(atoms=0, loop_fixed=0, resample_fixed=0,
+                                                full_fixed=0, full_atoms=0))
             slot['atoms'] += 1
             slot['loop_fixed'] += int(loop_atoms.get(atom['question'], {}).get('correct', False))
             slot['resample_fixed'] += int(resample_atoms.get(atom['question'], {}).get('correct', False))
+            if 'full_resample' in retry:
+                full_atoms = {a['question']: a for a in retry['full_resample']['atoms']}
+                slot['full_atoms'] += 1
+                slot['full_fixed'] += int(full_atoms.get(atom['question'], {}).get('correct', False))
     for slot in table.values():
         slot['loop_rate'] = slot['loop_fixed'] / slot['atoms'] if slot['atoms'] else None
         slot['resample_rate'] = slot['resample_fixed'] / slot['atoms'] if slot['atoms'] else None
+        slot['full_rate'] = slot['full_fixed'] / slot['full_atoms'] if slot['full_atoms'] else None
     return table
 
 
