@@ -40,8 +40,10 @@ print(json.dumps(workers))'''
     for directory in sorted(root.glob('semantic_[0-9]*')):
         record=directory/'records.json';sets[directory.name]=dict(records=record.exists(),cases=len(list(directory.glob('case_*.json'))),pngs=len(list(directory.glob('*.png'))))
     final=root/'semantic_008000/records.json'
+    run_config=json.loads((root/'run.json').read_text())['config'] if (root/'run.json').exists() else {}
+    needs_caption_final=8000 in run_config.get('observation_eval_steps',[])
     complete=bool(rows and rows[-1]['step']==8000 and (root/'step_008000.pt').exists() and final.exists()
-                  and (root/'observation_008000/records.json').exists()
+                  and (not needs_caption_final or (root/'observation_008000/records.json').exists())
                   and len(json.loads(final.read_text()))==32
                   and all((root/path).exists() for row in json.loads(final.read_text()) for path in row['arms'].values())
                   and all(n['exit']=={'returncode':0} for n in nodes))

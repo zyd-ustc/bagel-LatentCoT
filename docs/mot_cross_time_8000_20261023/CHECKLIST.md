@@ -4,7 +4,7 @@
 - [x] CPU real tiny MoT:five cross-time tests andseven v2 regressions
 - [x] Audit previous run stopped on all four nodes
 - [x] Full512 NPU pilot, finite gradients, checkpoint reload, actual images
-- [ ] Pinned source,64 ranks, first finite checkpoint
+- [x] Pinned source,64 ranks, first finite checkpoint
 - [x] New quiet-on-healthy monitor
 - [ ] Caption1000/2000/4000/8000 images/readings inspected
 - [ ] Semantic1100/2000/4000/8000:32 triptychs,records,trace,HTML inspected
