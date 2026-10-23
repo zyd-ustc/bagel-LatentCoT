@@ -16,19 +16,24 @@ def _word(count):
 def _atoms_from_objects(objects, exclude=()):
     atoms = []
     for entry in objects:
-        noun = entry['class']
+        noun = entry.get('class')
+        if not noun:
+            continue
         count = int(entry.get('count', 1))
         atoms.append([f'How many instances of {noun} are in the image?', _word(count)])
         if entry.get('color'):
             atoms.append([f'Is the {noun} {entry["color"]}?', 'Yes'])
         if entry.get('region') in ('left', 'right'):
             atoms.append([f'Is the {noun} on the {entry["region"]} side of the image?', 'Yes'])
-        if entry.get('position'):
-            relation, other = entry['position']
-            reference = objects[int(other)]['class']
-            atoms.append([f'Is the {noun} to the {relation} the {reference}?', 'Yes'])
+        position = entry.get('position')
+        if position:
+            relation, other = position
+            reference = objects[int(other)].get('class') if int(other) < len(objects) else None
+            if reference:
+                atoms.append([f'Is the {noun} to the {relation} the {reference}?', 'Yes'])
     for entry in exclude:
-        atoms.append([f'Are there any instances of {entry["class"]} in the image?', 'No'])
+        if entry.get('class'):
+            atoms.append([f'Are there any instances of {entry["class"]} in the image?', 'No'])
     return atoms
 
 
