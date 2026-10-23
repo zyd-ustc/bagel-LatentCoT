@@ -37,7 +37,8 @@ class FakeSampler:
 
     def __init__(self, config):
         self.config = config
-        self.grid = times_py(int(config['sampler_steps']), float(config['timestep_shift']))
+        steps = int(config.get('sampler_steps', config.get('num_steps', 50)))
+        self.grid = times_py(steps, float(config['timestep_shift']))
 
     def _image(self, tag, step):
         from PIL import Image, ImageDraw
@@ -88,10 +89,24 @@ class FakeReader:
         return answers
 
 
-def build(records, config, output, device, model, dry_run=False, accuracy=0.65):
+def build(records, config, output, device, model, dry_run=False, accuracy=0.65,
+          backend='bagel', source=None):
     if dry_run:
         sampler = FakeSampler(config)
         reader = FakeReader(accuracy)
+    elif backend == 'sensenova':
+        from ..u15.runtime import Runtime as U15Runtime
+        from .sensenova import SenseNovaSampler, SenseNovaReader
+        if not source:
+            raise SystemExit('--source is required for the sensenova backend')
+        runtime = U15Runtime.load(model, source, config, device)
+        sampler = SenseNovaSampler(runtime)
+        reader = SenseNovaReader(runtime, template=config.get('vqa_template', '{question}'),
+                                 max_answer_tokens=config.get('max_answer_tokens', 8))
+        print(json.dumps(dict(event='loaded', backend='sensenova', device=str(runtime.device),
+                              steps=sampler.num_steps,
+                              t_rollback=sampler.t_at(int(config['rollback_index'])),
+                              t_read=[sampler.t_at(int(i)) for i in config['read_indexes']])), flush=True)
     else:
         from ..bagel.backbone import load_native
         from ..correction.runtime import Runtime
@@ -123,6 +138,8 @@ def main(argv=None):
     parser.add_argument('--config', default='configs/upper_bound.json')
     parser.add_argument('--output', required=True)
     parser.add_argument('--device', default='npu:0')
+    parser.add_argument('--backend', choices=['bagel', 'sensenova'], default='bagel')
+    parser.add_argument('--source', help='pinned SenseNova-U1 source root')
     parser.add_argument('--limit', type=int, default=32)
     parser.add_argument('--ids', nargs='*')
     parser.add_argument('--shard', type=int, default=0)
@@ -153,7 +170,8 @@ def main(argv=None):
     if not records:
         raise SystemExit('no prompts selected')
     return build(records, config, args.output, args.device, args.model,
-                 dry_run=args.dry_run, accuracy=args.fake_accuracy)
+                 dry_run=args.dry_run, accuracy=args.fake_accuracy,
+                 backend=args.backend, source=args.source)
 
 
 if __name__ == '__main__':

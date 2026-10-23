@@ -1,0 +1,14 @@
+{
+  "width": 512,
+  "height": 512,
+  "num_steps": 50,
+  "timestep_shift": 3.0,
+  "cfg_scale": 4.0,
+  "cfg_norm": "none",
+  "t_eps": 0.02,
+  "seed": 17,
+  "read_indexes": [35, 40, 45],
+  "rollback_index": 25,
+  "vqa_template": "{question}",
+  "max_answer_tokens": 192
+}

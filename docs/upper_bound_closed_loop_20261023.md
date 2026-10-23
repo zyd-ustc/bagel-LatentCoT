@@ -103,6 +103,16 @@ python -m qwen_latent_cot.upper_bound.cli \
 - UND 问答：每条 1 次 base + 3 次 preview + 2×3 次重试判定 = 10 次，共 320 次；每次含一次 ViT 预填充。
 - `--full-resample` 每检出再追加 50 步，不作等算力比较。
 
+## SenseNova U1.5 后端
+
+同一套协议也支持 U1.5（`--backend sensenova`），差别只在采样与判分适配：
+
+- 模型：`/data/zyd_workspace/models/SenseNova-U1.5-8B-MoT`；上游源码 `code/sensenova-u15-c35c83b`（NPU patch）。
+- 状态在像素空间：`x_t = t·x0 + (1−t)·σ·ε`，`t` 从 0（噪声）到 1（干净）；预览解码是 clamp 而不是 VAE decode。
+- 默认 `rollback_index=25`（t≈0.25）、`read_indexes=35/40/45`（t≈0.44/0.57/0.75）。
+- 判分用原生 VLM chat（`model.chat`），回答带 `…`，配置 `max_answer_tokens=192` 并截取 `…` 之后；不修改 `system_message`，避免影响无条件 CFG 前缀。
+- 命令：`python -m qwen_latent_cot.upper_bound.cli --backend sensenova --source <u15-source> --model <model> ...`
+
 ## 已知限制
 
 - 预览与最终图都由同一个 native UND 判分，检出与纠错指标是自洽口径；等 27B 评分后端可用后应改用独立 judge。评分入口集中在 `UNDReader.score`，替换该函数即可。
