@@ -4,7 +4,7 @@ import os
 import torch
 from ..correction.checkpoint import rng_state,restore_rng
 
-KIND='bagel_mot_internal_edit_v1'
+KIND='bagel_mot_state_edit_v2'
 
 
 def read(path):

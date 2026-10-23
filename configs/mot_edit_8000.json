@@ -8,5 +8,6 @@
   "lr": 0.00001, "weight_decay": 0.0, "warmup_steps": 100, "gradient_clip": 1.0,
   "save_steps": [10,100,500,1000,1100,2000,4000,6000,8000],
   "semantic_eval_steps": [1100,2000,4000,8000],
+  "observation_eval_steps": [1000,2000,4000,8000],
   "semantic_prompts": "configs/semantic32.jsonl", "seed": 17
 }

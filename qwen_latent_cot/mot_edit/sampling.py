@@ -1,8 +1,7 @@
-"""Fixed outer anchor, actual projected proposal re-observation, native CFG untouched."""
+"""Commit clean edits to the actual latent; re-read and re-denoise each new state."""
 import json
 from pathlib import Path
 import torch
-from .model import apply_edit
 from ..correction.sampling import times
 from ..correction import distributed as parallel
 
@@ -14,17 +13,20 @@ def sample(model,prompt,seed,rounds=2):
     x=torch.randn((n,channels),generator=torch.Generator().manual_seed(seed)).to(rt.device)
     trace=[];grid=times(model.config)
     for index,(t,next_t) in enumerate(zip(grid,grid[1:])):
-        vg,_,vc=rt.proposal(x,t,flow,capture=False,with_conditional=True);delta=torch.zeros_like(vg,dtype=torch.float32)
         if rounds and index in model.config['feedback_indices']:
-            proposal=(x.float()-t*vg.float()).detach()
             for r in range(rounds):
-                w=model.round(proposal,t,flow);proposal,delta=apply_edit(x,t,vc,vg,w)
-                g=vg.float()-vc.float()
+                before=x
+                x,w,vc,vg,delta=model.round(x,t,flow)
+                g=vg.float()-vc.float();raw=w.float()-vc.float()
                 trace.append(dict(index=index,t=t,round=r+1,delta_rms=float(delta.square().mean().sqrt()),
+                    raw_delta_rms=float(raw.square().mean().sqrt()),
+                    delta_to_base_rms=float(delta.square().mean().sqrt()/vg.float().square().mean().sqrt().clamp_min(1e-12)),
+                    committed_shift_rms=float((x-before).square().mean().sqrt()),
                     applied_guidance_coefficient=float((delta*g).sum()/g.square().sum().clamp_min(1e-12))))
-        if not torch.isfinite(delta).all():raise FloatingPointError('Nonfinite edit')
+                if not torch.isfinite(x).all():raise FloatingPointError('Nonfinite committed edit')
+        # Native denoising starts from the committed state. Do not apply delta twice.
+        vg,_,_=rt.proposal(x,t,flow,capture=False,with_conditional=True)
         x=x-(t-next_t)*vg
-        if rounds and index in model.config['feedback_indices']:x=x-(t-next_t)*delta
     return rt.image(x),trace
 
 

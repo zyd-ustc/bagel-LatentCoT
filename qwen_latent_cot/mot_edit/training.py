@@ -5,7 +5,7 @@ import time
 import zlib
 import torch
 from torch.nn import functional as F
-from .model import project_safe,apply_edit
+from .model import project_safe
 from . import checkpoint
 from .data import Sampler
 from .sampling import semantic_validation,observation_validation
@@ -43,7 +43,9 @@ def train(model,corpus,output,provenance,saved=None):
         write(root/'run.json',dict(config=cfg,provenance=provenance,world=world,start_step=start,
             total_budget=cfg['steps'],observation_steps=cfg['observation_steps'],edit_steps=cfg['steps']-cfg['observation_steps'],
             adapter_parameters={role:sum(p.numel() for p in getattr(model,role).adapters().values()) for role in ('observation','feedback','editor')},
-            new_output_heads=0,heads='frozen native lm_head and llm2vae',train_pairs=len(sampler.ids),dataset=corpus.manifest))
+            new_output_heads=0,heads='frozen native lm_head and llm2vae',
+            trajectory='commit x <- x - t*safe(w-vc), re-read each actual state; native Euler after edits',
+            observation_in_edit='trainable',cross_round_gradient=True,train_pairs=len(sampler.ids),dataset=corpus.manifest))
     grid=times(cfg);nodes=[grid[i] for i in cfg['feedback_indices']]
     reset_peak_memory_stats(rt.device);began=time.perf_counter()
     for step in range(start+1,cfg['steps']+1):
@@ -64,21 +66,25 @@ def train(model,corpus,output,provenance,saved=None):
                 del loss,x0;continue
             epsilon=torch.randn(x0.shape,generator=torch.Generator().manual_seed(seed)).to(rt.device)
             x=(1-t)*x0.float()+t*epsilon;flow=rt.flow(row['prompt'])
-            vg,_,vc=rt.proposal(x,t,flow,capture=False,with_conditional=True)
-            truth=epsilon.float()-x0.float();g=vg.float()-vc.float();target_delta=project_safe(truth-vc.float(),g)
-            target=vc.float()+target_delta;proposal=(x.float()-t*vg.float()).detach()
-            stats[1]+=float(target_delta.square().mean())
+            state=x;round_losses=[]
             for r in range(cfg['rounds']):
-                w=model.round(proposal,t,flow)
-                loss=F.mse_loss(w.float(),target);(loss/(batch*cfg['rounds'])).backward()
-                proposal,delta=apply_edit(x,t,vc,vg,w.detach())
-                coefficient=float((delta*g).sum()/g.square().sum().clamp_min(1e-12))
-                stats[0]+=float(loss.detach())/cfg['rounds'];stats[2+r]+=float(loss.detach())
+                edited,w,vc,vg,delta=model.round(state,t,flow)
+                # The state has actually moved. Recompute its denoising target to x0.
+                truth=(state.detach().float()-x0.float())/t
+                g=vg.float()-vc.float();target_delta=project_safe(truth-vc.float(),g)
+                target=vc.float()+target_delta
+                loss=F.mse_loss(w.float(),target);round_losses.append(loss)
+                coefficient=float((delta.detach()*g).sum()/g.square().sum().clamp_min(1e-12))
+                stats[0]+=float(loss.detach())/cfg['rounds']
+                stats[1]+=float(target_delta.square().mean())/cfg['rounds']
+                stats[2+r]+=float(loss.detach())
                 stats[4]+=float(coefficient < -1e-6)/cfg['rounds']
-                stats[5]+=float((vg.float()+delta-truth).square().mean())/cfg['rounds']
-                stats[6]+=float(delta.square().mean().sqrt())/cfg['rounds']
-                del w,loss,delta
-            del x0,epsilon,x,flow,vc,vg,truth,g,target,target_delta,proposal
+                stats[5]+=float((vg.float()+delta.detach()-truth).square().mean())/cfg['rounds']
+                stats[6]+=float(delta.detach().square().mean().sqrt())/cfg['rounds']
+                state=edited
+            # Retain the cross-round state graph; target/native reference remain detached.
+            (torch.stack(round_losses).mean()/batch).backward()
+            del round_losses,loss,edited,w,vc,vg,delta,truth,g,target,target_delta,state,x0,epsilon,x,flow
         # Last-layer prefix Q/O are unused by layer-input KV export; zero grads are explicit.
         parallel.sum_gradients(model,allow_unused=True)
         gradients={}
@@ -102,6 +108,6 @@ def train(model,corpus,output,provenance,saved=None):
             rngs=parallel.gather_samples([checkpoint.rng_state(rt.device)])
             if parallel.rank()==0:checkpoint.save(root/f'step_{step:06d}.pt',model,step,optimizer,sampler,provenance,rngs)
             parallel.barrier()
-            if step==cfg['observation_steps'] and cfg.get('observe_validation',True):observation_validation(model,root,step)
+            if step in cfg['observation_eval_steps']:observation_validation(model,root,step)
             if step in cfg['semantic_eval_steps']:semantic_validation(model,root,step)
     corpus.close()

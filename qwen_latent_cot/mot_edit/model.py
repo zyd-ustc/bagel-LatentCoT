@@ -17,7 +17,9 @@ def project_safe(delta,g):
 
 def apply_edit(x,t,vc,vg,w):
     delta=project_safe(w.float()-vc.float(),vg.float()-vc.float())
-    return (x.float()-t*(vg.float()+delta)).detach(),delta
+    # Commit exactly the clean-preview displacement, preserving its noise anchor.
+    # Keep the state graph: later-round losses can train the earlier edit.
+    return x.float()-t*delta,delta
 
 
 class MoTEdit(nn.Module):
@@ -33,7 +35,7 @@ class MoTEdit(nn.Module):
     def set_stage(self,stage):
         if stage not in ('observation','edit'):raise ValueError(stage)
         self.stage=stage
-        self.observation.set_active(stage=='observation');self.feedback.set_active(stage=='edit');self.editor.set_active(stage=='edit')
+        self.observation.set_active(True);self.feedback.set_active(stage=='edit');self.editor.set_active(stage=='edit')
     def all_adapters(self):
         return {f'{role}.{n}':p for role in ('observation','feedback','editor')
                 for n,p in getattr(self,role).adapters().items()}
@@ -77,23 +79,28 @@ class MoTEdit(nn.Module):
         fp=torch.arange(length+self.config['slots'],length+2*self.config['slots'],device=self.runtime.device)
         with autocast_for(self.runtime.device):
             return self.feedback(self.slots(),fp,(tuple(goal),relocated),checkpointing=self.config['activation_checkpointing'],export=True)[1]
-    def edit_velocity(self,proposal,t,feedback):
+    def edit_velocity(self,state,t,feedback):
         rt=self.runtime;m=rt.model
         # Private editor sequence contains feedback prefix and image segment, never the goal cache.
         pos=torch.arange(self.config['slots'],device=rt.device)
         relocated=tuple(KV(kv.keys,kv.values,pos) for kv in feedback)
-        image_positions=torch.full((len(proposal),),self.config['slots'],device=rt.device,dtype=torch.long)
+        image_positions=torch.full((len(state),),self.config['slots'],device=rt.device,dtype=torch.long)
         with autocast_for(rt.device):
-            hidden=m.vae2llm(proposal.detach().to(m.vae2llm.weight.dtype))
+            hidden=m.vae2llm(state.to(m.vae2llm.weight.dtype))
             hidden=hidden+m.time_embedder(torch.full((len(hidden),),t,device=rt.device))
             hidden=hidden+m.latent_pos_embed(self.neutral_flow['packed_vae_position_ids'])
             hidden=hidden.to(next(rt.decoder.parameters()).dtype)
             hidden,_=self.editor(hidden,image_positions,(relocated,),checkpointing=self.config['activation_checkpointing'])
             return m.llm2vae(rt.decoder.norm_moe_gen(hidden)).float()
-    def round(self,proposal,t,flow):
-        with torch.no_grad():observed=self.observation_bank(proposal)
+    def round(self,state,t,flow):
+        # Read a clean estimate, but predict velocity from the actual noisy state.
+        vg,_,vc=self.runtime.proposal(state.detach(),t,flow,capture=False,with_conditional=True)
+        proposal=(state.detach().float()-t*vg.float()).detach()
+        observed=self.observation_bank(proposal)
         feedback=self.feedback_bank(observed,flow)
-        return self.edit_velocity(proposal,t,feedback)
+        w=self.edit_velocity(state,t,feedback)
+        edited,delta=apply_edit(state,t,vc,vg,w)
+        return edited,w,vc,vg,delta
     def caption_loss(self,latent,text):
         bank=self.observation_bank(latent)
         ids=self.runtime.bundle.tokenizer.encode(text,add_special_tokens=False)

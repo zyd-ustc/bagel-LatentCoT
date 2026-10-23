@@ -16,7 +16,7 @@ from qwen_latent_cot.mot_edit.sampling import sample
 p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--corpus',required=True);p.add_argument('--output',required=True)
 p.add_argument('--device',default='npu:15');a=p.parse_args()
 cfg=json.loads(Path('configs/mot_edit_8000.json').read_text())
-cfg.update(steps=3,observation_steps=1,global_batch=1,save_steps=[1,2,3],semantic_eval_steps=[],observe_validation=False,warmup_steps=1)
+cfg.update(steps=3,observation_steps=1,global_batch=1,save_steps=[1,2,3],semantic_eval_steps=[],observation_eval_steps=[],warmup_steps=1)
 torch.manual_seed(cfg['seed']);random.seed(cfg['seed']);device=set_device(a.device)
 rt=Runtime(load_native(a.model,device,cfg['timestep_shift']),cfg);model=MoTEdit(rt,cfg).eval()
 provenance={'pilot':'full512_caption_then_edit'}

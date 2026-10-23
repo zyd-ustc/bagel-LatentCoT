@@ -17,7 +17,7 @@ def setup():
     old=tiny();rt=old.runtime
     cfg=json.loads(Path('configs/mot_edit_8000.json').read_text())
     cfg.update(resolution=32,lora_rank=4,slots=4,sampler_steps=4,feedback_indices=[1],global_batch=1,
-        steps=3,observation_steps=1,save_steps=[1,2,3],semantic_eval_steps=[],observe_validation=False,warmup_steps=1)
+        steps=3,observation_steps=1,save_steps=[1,2,3],semantic_eval_steps=[],observation_eval_steps=[],warmup_steps=1)
     rt.config.update(cfg)
     return MoTEdit(rt,cfg)
 
@@ -32,22 +32,30 @@ class Tests(unittest.TestCase):
         m.zero_grad(set_to_none=True);m.set_stage('edit');flow=rt.flow('two red cubes')
         bank=m.observation_bank(x);f=m.feedback_bank(bank,flow);w=m.edit_velocity(x,.55,f)
         w.square().mean().backward()
-        for role in ('feedback','editor'):
+        for role in ('observation','feedback','editor'):
             self.assertGreater(sum(float(p.grad.abs().sum()) for p in getattr(m,role).adapters().values() if p.grad is not None),0)
         self.assertEqual(w.shape,x.shape)
         self.assertTrue(all(torch.equal(p,before[n]) for n,p in rt.model.named_parameters()))
         self.assertTrue(all(n.endswith(('.a','.b')) for n in m.trainable()))
-    def test_fixed_anchor_projection_and_actual_source(self):
+    def test_actual_state_editor_source_and_cross_round_gradient(self):
         m=setup();m.set_stage('edit');rt=m.runtime;x=torch.randn(4,8);flow=rt.flow('p')
         vg,_,vc=rt.proposal(x,.55,flow,capture=False,with_conditional=True)
         p=x-.55*vg;bank=m.observation_bank(p)
         changed=m.observation_bank(p+2)
         self.assertFalse(torch.equal(bank[-1].values,changed[-1].values))
-        w=m.round(p,.55,flow);p1,d1=apply_edit(x,.55,vc,vg,w)
-        torch.testing.assert_close(p1,x.float()-.55*(vg.float()+d1))
-        p2,d2=apply_edit(x,.55,vc,vg,m.round(p1,.55,flow))
-        torch.testing.assert_close(p2,x.float()-.55*(vg.float()+d2))
-        self.assertGreaterEqual(float((d2*(vg-vc).float()).sum()),-1e-4)
+        seen=[]
+        handle=rt.model.vae2llm.register_forward_pre_hook(lambda module,args:seen.append(args[0].detach().clone()))
+        state1,w1,vc1,vg1,d1=m.round(x,.55,flow)
+        handle.remove()
+        torch.testing.assert_close(seen[-1],x.to(seen[-1].dtype))
+        torch.testing.assert_close(state1,x.float()-.55*d1)
+        state2,w2,vc2,vg2,d2=m.round(state1,.55,flow)
+        torch.testing.assert_close(state2,state1-.55*d2)
+        self.assertGreaterEqual(float((d2.detach()*(vg2-vc2).float()).sum()),-1e-4)
+        cross=torch.autograd.grad(w2.square().mean(),w1,retain_graph=True)[0]
+        self.assertGreater(float(cross.abs().sum()),0)
+        w2.square().mean().backward()
+        self.assertGreater(sum(float(p.grad.abs().sum()) for p in m.observation.adapters().values() if p.grad is not None),0)
     def test_native_k0_and_checkpointing(self):
         m=setup();rt=m.runtime
         # K0 output is independent of all edit adapters, even after arbitrary changes.
@@ -59,8 +67,17 @@ class Tests(unittest.TestCase):
             for p in m.all_adapters().values():p.normal_()
         actual,_=sample(m,'p',17,0);self.assertEqual(original.tobytes(),actual.tobytes())
         m=setup();x=torch.randn(4,8);flow=m.runtime.flow('p');m.set_stage('edit')
-        a=m.round(x,.55,flow);m.config['activation_checkpointing']=False;b=m.round(x,.55,flow)
+        a=m.round(x,.55,flow)[1];m.config['activation_checkpointing']=False;b=m.round(x,.55,flow)[1]
         torch.testing.assert_close(a,b,rtol=0,atol=0)
+    def test_edit_commits_clean_displacement_to_actual_state(self):
+        x=torch.tensor([[2.,3.]])
+        vc=torch.tensor([[.1,.2]]);vg=torch.tensor([[.3,.2]])
+        w=torch.tensor([[.5,.6]])
+        state,delta=apply_edit(x,.5,vc,vg,w)
+        torch.testing.assert_close(state,x-.5*delta)
+        # The clean preview displacement equals the committed latent displacement.
+        torch.testing.assert_close(state-x,(x-.5*(vg+delta))-(x-.5*vg))
+
     def test_projection_zero_and_negative(self):
         g=torch.tensor([[1.,0.]])
         torch.testing.assert_close(project_safe(torch.tensor([[-2.,3.]]),g),torch.tensor([[0.,3.]]))
