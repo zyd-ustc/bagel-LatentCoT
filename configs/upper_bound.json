@@ -1,0 +1,13 @@
+{
+  "resolution": 512,
+  "sampler_steps": 50,
+  "timestep_shift": 3.0,
+  "cfg_text_scale": 4.0,
+  "cfg_renorm_type": "global",
+  "cfg_renorm_min": 0.0,
+  "seed": 17,
+  "read_indexes": [25, 30, 35],
+  "rollback_index": 20,
+  "vqa_template": "{question}\nAnswer:",
+  "max_answer_tokens": 8
+}
