@@ -42,6 +42,8 @@ caption训练读取真实x0，推理读取模型生成的中间proposal；captio
 
 `model.py:80–96` editor接收干净估计proposal，添加实际外层t，再经冻结原生llm2vae预测w。原生GEN速度预测接收的是实际带噪x_t及t。这里未给editor显式x_t/vc/vg，却要求它预测同一x_t的完整速度target。它需要同时重适配输入分布、从feedback恢复语义、拟合完整速度；QKVO LoRA承担这三项。
 
+后续实机修复还发现editor遗漏了原生start/end-of-image token及其UND路由。补齐完整query pack后，零adapter、无feedback的editor通过了原生无条件速度对照；同样32步试运行从整幅彩色网格恢复到可识别的立方体/球主体，但背景纹理伪影仍在。修复同时采用实际x_t输入和保留估计噪声的重加噪更新。
+
 两轮都拟合同一target，第一轮w.detach且proposal.detach，第二轮loss不回传第一轮决策。它是两次局部速度回归，不是通过最终改善来训练首轮反馈策略。因此第二轮更接近native也可能只是压掉首轮分布错配产生的扰动。
 
 ## 建议顺序
@@ -50,4 +52,4 @@ caption训练读取真实x0，推理读取模型生成的中间proposal；captio
 
 然后统一内循环与实际应用的更新：若读取完整编辑后的proposal，就需明确如何把该编辑落实到轨迹；若只做一个Euler步，就让反馈针对实际落实的状态。单独放大δ会同时放大现有纹理误差，无法修复读取错误或速度任务错配。
 
-本轮继续按原8000步预算完成，最终图册补充观察；本诊断没有修改正在运行的训练。
+本诊断最初为只读。用户随后授权修复并重启：旧run在Step7024停止，checkpoint6000与日志保留。新run从头8000步，执行状态和完整修改见 [v2执行记录](../mot_state_edit_8000_20261023/RUN.md)。
