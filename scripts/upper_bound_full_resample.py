@@ -7,11 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from qwen_latent_cot.bagel.backbone import load_native
-from qwen_latent_cot.correction.runtime import Runtime
 from qwen_latent_cot.upper_bound.atoms import score_atoms, image_pass
-from qwen_latent_cot.upper_bound.native import NativeSampler
-from qwen_latent_cot.upper_bound.reader import UNDReader
 
 
 def main():
@@ -24,6 +20,8 @@ def main():
     parser.add_argument('--shard', type=int, default=0)
     parser.add_argument('--shards', type=int, default=1)
     parser.add_argument('--seed-offset', type=int, default=300000)
+    parser.add_argument('--backend', choices=['bagel', 'sensenova'], default='bagel')
+    parser.add_argument('--source')
     args = parser.parse_args()
 
     config = json.loads(Path(args.config).read_text())
@@ -33,11 +31,25 @@ def main():
     output = Path(args.output)
     (output / 'images').mkdir(parents=True, exist_ok=True)
 
-    bundle = load_native(args.model, args.device)
-    runtime = Runtime(bundle, config)
-    sampler = NativeSampler(runtime)
-    reader = UNDReader(bundle, template=config.get('vqa_template', '{question}\nAnswer:'),
-                       max_answer_tokens=config.get('max_answer_tokens', 8))
+    if args.backend == 'sensenova':
+        from qwen_latent_cot.u15.runtime import Runtime as U15Runtime
+        from qwen_latent_cot.upper_bound.sensenova import SenseNovaSampler, SenseNovaReader
+        if not args.source:
+            raise SystemExit('--source is required for the sensenova backend')
+        runtime = U15Runtime.load(args.model, args.source, config, args.device)
+        sampler = SenseNovaSampler(runtime)
+        reader = SenseNovaReader(runtime, template=config.get('vqa_template', '{question}'),
+                                 max_answer_tokens=config.get('max_answer_tokens', 192))
+    else:
+        from qwen_latent_cot.bagel.backbone import load_native
+        from qwen_latent_cot.correction.runtime import Runtime
+        from qwen_latent_cot.upper_bound.native import NativeSampler
+        from qwen_latent_cot.upper_bound.reader import UNDReader
+        bundle = load_native(args.model, args.device)
+        runtime = Runtime(bundle, config)
+        sampler = NativeSampler(runtime)
+        reader = UNDReader(bundle, template=config.get('vqa_template', '{question}\nAnswer:'),
+                           max_answer_tokens=config.get('max_answer_tokens', 8))
     print(json.dumps(dict(event='loaded', device=str(runtime.device), prompts=len(records))), flush=True)
 
     with (output / 'full_resample.jsonl').open('w') as stream:

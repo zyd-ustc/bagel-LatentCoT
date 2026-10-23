@@ -58,8 +58,55 @@ base 整图通过 **126/280 = 45.0%**；原子正确率：count 71.0%（631 个�
 - 单 seed、280 条；置信区间只在配对子集上给 McNemar。
 - `partial` 不是“从头换 seed 重采”，而是“同一中间状态换噪声”，用于区分“重加噪”和“重来”两种干预；真正的重采基线是 `full`。
 
+## SenseNova U1.5 · 同协议全量（280 条，12 shard）
+
+- 模型：`/data/zyd_workspace/models/SenseNova-U1.5-8B-MoT`；像素空间采样，`t` 0（噪声）→ 1（干净）。
+- `rollback_index=25`（t≈0.25），`read_indexes=35/40/45`（t≈0.438/0.571/0.750）；loop 重试 25 步，full 50 步。
+- 判分：原生 VLM chat，`max_answer_tokens=192`，截取 `…` 之后；同一套验证式原子问题。
+
+base 整图通过 **177/280 = 63.2%**。
+
+**检出**：
+
+| t_read | TP/FP/FN | precision | recall |
+|---|---|---:|---:|
+| 0.438 | 101/154/2 | 0.396 | 0.981 |
+| 0.571 | 93/97/10 | 0.489 | 0.903 |
+| 0.750 | 82/31/21 | 0.726 | 0.796 |
+
+**修复率（整图）**：
+
+| t_read | n | loop | partial | full |
+|---|---:|---:|---:|---:|
+| 0.438 | 101 | 15.8% | 12.9% | **35.6%** |
+| 0.571 | 93 | 11.8% | 14.0% | **35.5%** |
+| 0.750 | 82 | 9.8% | 12.2% | **34.1%** |
+
+**原子级（t=0.438）**：count 失败原子 loop 16.7% / partial 21.6% / full **52.0%**；attribute loop 38.5% / partial 19.2% / full **50.0%**。
+
+## 两模型并列
+
+| | BAGEL（t=0.742） | U1.5（t=0.438） |
+|---|---:|---:|
+| base 整图通过 | 45.0% | 63.2% |
+| loop（整图） | 1.4% | 15.8% |
+| partial（整图） | 3.4% | 12.9% |
+| full（整图） | **29.0%** | **35.6%** |
+| count 原子 loop / full | 2.3% / **52.9%** | 16.7% / **52.0%** |
+| attribute 原子 loop / full | 3.1% / **65.6%** | 38.5% / **50.0%** |
+
+**共同结论**：
+
+1. 两个模型的完整重采都把 count 失败原子修好约 **50%**，与“随机重采修一半”的假设一致。
+2. 显式 loop 在两个模型上都输给完整重采：BAGEL 差 20 倍（整图），U1.5 差 2–3.5 倍；count 原子差 3–23 倍。
+3. U1.5 对晚期文字约束更敏感（loop 10–16% vs BAGEL 0–1.5%），但最多只拿到重采收益的三分之一。
+4. 在同一中间状态重新加噪（partial）不足以恢复：BAGEL 只能拿到 full 的 12%，U1.5 约 37%。错误在轨迹中段已被部分锁定，越晚干预收益越小。
+5. 按既定判据，显式闭环没有赢过重采，隐式版本没有可追的上界；若要继续，干预点应前移到 prompt/结构阶段，而不是采样中段回退。
+
 ## 证据位置
 
 - 主运行：`outputs/upper_bound_geneval_pp_20261023/merged/`（records、metrics、index.html）。
-- 完整重采补充：`outputs/upper_bound_pp_full_resample_20261023/merged2/metrics_full.json` 与 `summary_full.txt`。
+- 完整重采补充（BAGEL）：`outputs/upper_bound_pp_full_resample_20261023/merged2/metrics_full.json` 与 `summary_full.txt`。
+- SenseNova 主运行：`outputs/upper_bound_sensenova_geneval_pp_20261023/merged/`。
+- SenseNova 完整重采：`outputs/upper_bound_sensenova_full_resample_20261023/merged/metrics_full.json`。
 - 代码：`qwen_latent_cot/upper_bound/`、`scripts/upper_bound_{closed_loop,merge,full_resample,apply_full}.py`。
