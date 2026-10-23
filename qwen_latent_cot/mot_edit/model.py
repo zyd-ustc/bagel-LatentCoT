@@ -89,7 +89,7 @@ class MoTEdit(nn.Module):
         # Preserve native image boundary tokens and their UND expert routing.
         # The editor has no original prompt cache; its semantic prefix is feedback only.
         flow=self.neutral_flow;image_indexes=flow['packed_vae_token_indexes'];text_indexes=flow['packed_text_indexes']
-        positions=torch.full((len(state)+len(text_indexes),),self.config['slots'],device=rt.device,dtype=torch.long)
+        positions=torch.full((len(state)+len(text_indexes),),len(feedback[0].keys),device=rt.device,dtype=torch.long)
         with autocast_for(rt.device):
             image=m.vae2llm(state.to(m.vae2llm.weight.dtype))
             image=image+m.time_embedder(torch.full((len(image),),t,device=rt.device))
