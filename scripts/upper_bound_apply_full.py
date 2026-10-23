@@ -21,24 +21,24 @@ def main():
                 full[row['prompt_id']] = row
 
     records = json.loads(Path(args.records).read_text())
-    indexes = None
+    indexes = set()
     attached = 0
     for record in records:
         row = full.get(record['prompt_id'])
         if row is None:
             continue
-        indexes = [int(r['index']) for r in record['retries']]
+        indexes.update(int(r['index']) for r in record['retries'])
         for retry in record['retries']:
             retry['full_resample'] = dict(seed=row['seed'], image=row['image'],
                                           atoms=row['atoms'], passed=row['passed'],
                                           steps=50)
             attached += 1
-    if indexes is None:
+    if not indexes:
         raise SystemExit('no retries found in records')
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    report = evaluate(records, sorted(set(indexes)))
+    report = evaluate(records, sorted(indexes))
     (output / 'metrics_full.json').write_text(json.dumps(report, indent=2) + '\n')
     print(f'attached {attached} full-resample verdicts')
     for line in summary_lines(report):

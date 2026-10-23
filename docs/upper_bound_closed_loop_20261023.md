@@ -5,7 +5,7 @@
 1. **检出**：在 `t_read` 解码的预览图，原生 ViT-UND 能否发现最终图会犯的原子错误（数量、位置、颜色、属性）。
 2. **纠错**：若检出，GEN 能否从 `t_early` 带着文字纠正重走并真正改对。
 
-并给出**同算力对照**：同样在 `t_early` 回退，但只换 seed 重采、不改 prompt。GenEval++ 计数约 50% 成功率，随机重采本身能修好一半失败；显式闭环必须赢过它，否则隐式版本没有可追的上界。
+并给出两条重采对照：`partial` 在 `t_early` 同一状态上换 seed 重新加噪（等步数，用来隔离“重加噪”本身的作用），`full` 从 t=0 完整换 seed 重采（真正的“再抽一次”基线）。GenEval++ 计数约 50% 成功率，完整重采本身能修好约一半失败；显式闭环必须赢过它，否则隐式版本没有可追的上界。实测也证明 partial 不能代替 full（见结果文档）。
 
 ## 协议
 
@@ -16,11 +16,12 @@ base      50 步原生采样（CFG 4、shift 3、512px），保存 t_early 与�
 preview   在 t_read 解码 VAE 预览，用 ViT-UND 回答该 prompt 的 vqa_list
 detect    任一原子答案不符 → 判定为失败
 loop      回退到 t_early，把失败原子拼成约束句追加到 prompt，重走 t_early → 0
-resample  回退到同一 t_early，用新 seed 对该状态重新加噪，原 prompt 重走 t_early → 0
+partial   回退到同一 t_early，用新 seed 对该状态重新加噪，原 prompt 重走 t_early → 0
+full      从头换 seed 完整重采 50 步（`--full-resample`，非等步数，作为真实基线）
 ```
 
-- `loop` 与 `resample` 的 Euler 步数完全相同（`50 − rollback_index`），共享同一次 base 轨迹与同一次检出，因此是算力匹配的配对比较。
-- `--full-resample` 额外跑一条全新 50 步、换 seed 的完整重采，作为非等算力参考。
+- `loop` 与 `partial` 的 Euler 步数完全相同（`50 − rollback_index`），共享同一次 base 轨迹与同一次检出，是等步数的配对比较。
+- `full` 是真实的重采基线：同 prompt、换 seed、从 t=0 跑满 50 步。它与 loop 不等步数，但 loop 的总开销（预览 50 步 + 重试 29 步）已经高于它，因此比较方向对 loop 有利。
 - 修正文本由 `atoms.constraint` 确定性生成，例如：
   - 计数：`exactly seven croissants`（清单里的计数原子是**验证式**问题：`Are there exactly seven ...?`，避免开放式计数的系统偏差；实测开放式 “How many instances of bus” 会把单辆公交答成 2，而验证式能正确回答 No）
   - 属性：`the backpack is green`
@@ -93,7 +94,7 @@ python -m qwen_latent_cot.upper_bound.cli \
 ## 判读规则
 
 - **检出**看 `recall`（漏掉多少必然失败的样本）与 `precision`（误触发多少额外重跑）。
-- **纠错**只看 `retry` 子集：`loop_rate` 对 `resample_rate`。若两者持平，显式文字反馈没有超过“再抽一次”的收益；若低于，说明拼接约束反而破坏原生先验。
+- **纠错**只看 `retry` 子集：`loop_rate` 对 `full_rate`（真实重采基线）。`resample_rate` 是 partial，只用来判断“同一中间状态重新加噪”能否救回样本；它明显低于 full，说明错误在 t_early 已经锁定。
 - **上界**取三个 `t_read` 中最好的检出—纠错组合，并注明对应 `t`；不能用最差 `t_read` 否证整个方向。
 
 ## 算力账
