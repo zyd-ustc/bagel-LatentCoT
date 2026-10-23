@@ -14,11 +14,11 @@ from qwen_latent_cot.mot_edit import checkpoint
 from qwen_latent_cot.mot_edit.sampling import sample
 
 p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--corpus',required=True);p.add_argument('--output',required=True)
-p.add_argument('--device',default='npu:15');p.add_argument('--edit-steps',type=int,default=2);a=p.parse_args()
-cfg=json.loads(Path('configs/mot_edit_8000.json').read_text())
+p.add_argument('--config',default='configs/mot_edit_8000.json');p.add_argument('--device',default='npu:15');p.add_argument('--edit-steps',type=int,default=2);a=p.parse_args()
+cfg=json.loads(Path(a.config).read_text())
 cfg.update(steps=1+a.edit_steps,observation_steps=1,global_batch=1,save_steps=[1,1+a.edit_steps],semantic_eval_steps=[],observation_eval_steps=[],warmup_steps=1)
 torch.manual_seed(cfg['seed']);random.seed(cfg['seed']);device=set_device(a.device)
-rt=Runtime(load_native(a.model,device,cfg['timestep_shift']),cfg);model=MoTEdit(rt,cfg).eval()
+rt=Runtime(load_native(a.model,device,cfg['timestep_shift']),cfg);model=(__import__('qwen_latent_cot.mot_edit.cross_time',fromlist=['CrossTimeEdit']).CrossTimeEdit(rt,cfg) if cfg.get('pipeline')=='cross_time' else MoTEdit(rt,cfg)).eval()
 provenance={'pilot':'full512_caption_then_edit'}
 train(model,Corpus(a.corpus),a.output,provenance)
 saved=checkpoint.read(Path(a.output)/f"step_{cfg['steps']:06d}.pt");checkpoint.apply(saved,model)

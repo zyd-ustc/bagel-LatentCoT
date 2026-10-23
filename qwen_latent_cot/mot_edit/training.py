@@ -44,9 +44,11 @@ def train(model,corpus,output,provenance,saved=None):
             total_budget=cfg['steps'],observation_steps=cfg['observation_steps'],edit_steps=cfg['steps']-cfg['observation_steps'],
             adapter_parameters={role:sum(p.numel() for p in getattr(model,role).adapters().values()) for role in ('observation','feedback','editor')},
             new_output_heads=0,heads='frozen native lm_head and llm2vae',
-            trajectory='re-noise edited clean estimate: x <- x - t*(1-t)*safe(w-vc); native Euler after edits',
-            observation_in_edit='trainable',cross_round_gradient=True,train_pairs=len(sampler.ids),dataset=corpus.manifest))
-    grid=times(cfg);nodes=[grid[i] for i in cfg['feedback_indices']]
+            trajectory=('saved early state, late plan, persistent feedback replay' if cfg.get('pipeline')=='cross_time' else 'x <- x - t*(1-t)*safe(w-vc)'),
+            observation_in_edit='trainable',cross_round_gradient=cfg.get('pipeline')!='cross_time',
+            replay_gradient=('one uniformly sampled actual write state per round; rollouts and previous plans detached' if cfg.get('pipeline')=='cross_time' else 'two-round state graph'),train_pairs=len(sampler.ids),dataset=corpus.manifest))
+    grid=times(cfg);cross_time=cfg.get('pipeline')=='cross_time'
+    nodes=list(range(cfg['rollback_index'],cfg['read_index'])) if cross_time else [grid[i] for i in cfg['feedback_indices']]
     reset_peak_memory_stats(rt.device);began=time.perf_counter()
     for step in range(start+1,cfg['steps']+1):
         wanted='observation' if step<=cfg['observation_steps'] else 'edit'
@@ -56,7 +58,7 @@ def train(model,corpus,output,provenance,saved=None):
         started=time.perf_counter();optimizer.zero_grad(set_to_none=True)
         ids=sampler.take(batch);draws=[(sampler.rng.choice(nodes),sampler.rng.randrange(2**63-1)) for _ in ids]
         # Equal per-pair weighting; both edit-round losses contribute half, step only once.
-        stats=[0.]*7
+        stats=[0.]*7;caption_total=0.
         for i in range(parallel.rank(),batch,world):
             row=corpus.row(ids[i]);t,seed=draws[i]
             posterior=(zlib.crc32(row['uid'].encode())+cfg['seed'])%(2**32)
@@ -64,6 +66,12 @@ def train(model,corpus,output,provenance,saved=None):
             if wanted=='observation':
                 loss=model.caption_loss(x0,row['prompt']);(loss/batch).backward();stats[0]+=float(loss.detach())
                 del loss,x0;continue
+            if cross_time:
+                ce=model.caption_loss(x0,row['prompt']);caption_total+=float(ce.detach())
+                (cfg['caption_weight']*ce/batch).backward();del ce
+                from .cross_time_training import edit_pair
+                part=edit_pair(model,x0,rt.flow(row['prompt']),seed,t,batch)
+                stats=[a+b for a,b in zip(stats,part)];del x0;continue
             epsilon=torch.randn(x0.shape,generator=torch.Generator().manual_seed(seed)).to(rt.device)
             x=(1-t)*x0.float()+t*epsilon;flow=rt.flow(row['prompt'])
             state=x;round_losses=[]
@@ -95,10 +103,11 @@ def train(model,corpus,output,provenance,saved=None):
         within=step if wanted=='observation' else step-cfg['observation_steps']
         lr=cfg['lr']*min(1.,within/max(1,cfg['warmup_steps']))
         for group in optimizer.param_groups:group['lr']=lr
-        optimizer.step();guard.check();values=parallel.sum_statistics(stats,rt.device)
+        optimizer.step();guard.check();values=parallel.sum_statistics(stats+[caption_total],rt.device)
         peak=parallel.max_statistics([max_memory_allocated(rt.device)/1024**3],rt.device)[0];synchronize(rt.device)
         record=dict(step=step,stage=wanted,stage_step=within,loss=values[0]/batch,lr=lr,gradient_norm=float(norm),**gradients,
             step_seconds=time.perf_counter()-started,elapsed_seconds=time.perf_counter()-began,peak_memory_gib=peak,world=world)
+        if cross_time and wanted=='edit':record.update(caption_loss=values[7]/batch,total_loss=values[0]/batch+cfg['caption_weight']*values[7]/batch)
         if wanted=='edit':record.update(zero_correction_mse=values[1]/batch,round1_loss=values[2]/batch,round2_loss=values[3]/batch,
             applied_negative_fraction=values[4]/batch,applied_physical_mse=values[5]/batch,delta_rms=values[6]/batch)
         if parallel.rank()==0:

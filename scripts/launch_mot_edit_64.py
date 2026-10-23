@@ -18,7 +18,7 @@ def remote(host,source,master):
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--code',required=True);p.add_argument('--run',required=True);p.add_argument('--corpus',required=True)
-    p.add_argument('--resume');p.add_argument('--master-port',default='29653');a=p.parse_args()
+    p.add_argument('--config',default='configs/mot_edit_8000.json');p.add_argument('--resume');p.add_argument('--master-port',default='29653');a=p.parse_args()
     hosts=os.environ['VC_WORKER_HOSTS'].split(',')
     if len(hosts)!=4:raise ValueError('Requires four nodes')
     run=Path(a.run);launch=Path(a.run+'_launch')
@@ -50,7 +50,7 @@ if occupied or active or not all(Path(p).exists() for p in PATHS):raise RuntimeE
         args=['bash',a.code+'/scripts/train_mot_edit_npu.sh',a.run,'--corpus',a.corpus]
         if a.resume:args+=['--resume',a.resume]
         env=dict(NPROC_PER_NODE='16',NNODES='4',NODE_RANK=str(rank),MASTER_ADDR=hosts[0],MASTER_PORT=a.master_port,
-                 ASCEND_RT_VISIBLE_DEVICES=','.join(map(str,range(16))))
+                 MOT_CONFIG=str(Path(a.code)/a.config),ASCEND_RT_VISIBLE_DEVICES=','.join(map(str,range(16))))
         source=f'''
 import json,os,subprocess
 from pathlib import Path

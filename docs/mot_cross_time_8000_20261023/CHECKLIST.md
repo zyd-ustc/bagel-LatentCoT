@@ -1,0 +1,11 @@
+# Restart checklist
+- [x] Implement shared UND writer/reader and explicit instruction
+- [x] Preserve original prompt; persistent feedback and saved-state rollback
+- [x] CPU real tiny MoT:five cross-time tests andseven v2 regressions
+- [ ] Audit previous run stopped on all four nodes
+- [ ] Full512 NPU pilot, finite gradients, checkpoint reload, actual images
+- [ ] Pinned source,64 ranks, first finite checkpoint
+- [ ] New quiet-on-healthy monitor
+- [ ] Caption1000/2000/4000/8000 images/readings inspected
+- [ ] Semantic1100/2000/4000/8000:32 triptychs,records,trace,HTML inspected
+- [ ] Step8000/final checkpoint/final images/four exit0

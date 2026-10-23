@@ -32,10 +32,12 @@ def main():
     if a.command=='sample':cfg=saved['config']
     device=parallel.initialize(a.device) if getattr(a,'distributed',False) else set_device(a.device)
     torch.manual_seed(cfg['seed']);random.seed(cfg['seed'])
-    rt=Runtime(load_native(a.model,device,cfg['timestep_shift']),cfg);model=MoTEdit(rt,cfg).eval()
+    rt=Runtime(load_native(a.model,device,cfg['timestep_shift']),cfg);model=(__import__('qwen_latent_cot.mot_edit.cross_time',fromlist=['CrossTimeEdit']).CrossTimeEdit(rt,cfg) if cfg.get('pipeline')=='cross_time' else MoTEdit(rt,cfg)).eval()
     print(json.dumps(dict(event='loaded',rank=parallel.rank(),roles={r:sum(p.numel() for p in getattr(model,r).adapters().values()) for r in ('observation','feedback','editor')})),flush=True)
     if a.command=='sample':
         from .sampling import sample
+        if cfg.get('pipeline')=='cross_time':
+            from .cross_time import sample
         checkpoint.apply(saved,model);model.set_stage('edit')
         image,trace=sample(model,a.prompt,a.seed,a.rounds);Path(a.output).parent.mkdir(parents=True,exist_ok=True)
         image.save(a.output);Path(a.output+'.json').write_text(json.dumps(trace,indent=2)+'\n');return

@@ -8,6 +8,9 @@ from ..correction import distributed as parallel
 
 @torch.no_grad()
 def sample(model,prompt,seed,rounds=2):
+    if model.config.get('pipeline')=='cross_time':
+        from .cross_time import sample as cross_sample
+        return cross_sample(model,prompt,seed,rounds)
     rt=model.runtime;flow=rt.flow(prompt);n=len(flow['packed_vae_token_indexes'])
     channels=rt.model.latent_channel*rt.model.latent_patch_size**2
     x=torch.randn((n,channels),generator=torch.Generator().manual_seed(seed)).to(rt.device)
@@ -63,7 +66,7 @@ def observation_validation(model,output,step):
         prompt=prompts[i//2];seed=cfg['seed']+i%2;flow=rt.flow(prompt)
         n=len(flow['packed_vae_token_indexes']);channels=rt.model.latent_channel*rt.model.latent_patch_size**2
         x=torch.randn((n,channels),generator=torch.Generator().manual_seed(seed)).to(rt.device)
-        stop=cfg['feedback_indices'][i%len(cfg['feedback_indices'])]
+        stop=cfg['read_index'] if cfg.get('pipeline')=='cross_time' else cfg['feedback_indices'][i%len(cfg['feedback_indices'])]
         for index,(t,next_t) in enumerate(zip(grid,grid[1:])):
             vg,_,_=rt.proposal(x,t,flow,capture=False,with_conditional=True)
             if index==stop:
