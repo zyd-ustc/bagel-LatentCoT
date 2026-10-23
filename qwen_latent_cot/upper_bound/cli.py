@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .atoms import score_atoms, image_pass, correction_text
 from .gallery import write_gallery
+from .manifests import normalize
 from .metrics import evaluate, summary_lines
 from . import protocol
 
@@ -14,12 +15,10 @@ def load_manifest(path, limit=None, ids=None):
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     records = []
     for index, row in enumerate(rows):
-        prompt = row.get('prompt') or row.get('text')
-        vqa = row.get('vqa_list') or row.get('vqa')
-        if not prompt or not vqa:
-            raise ValueError(f'manifest row {index} needs prompt and vqa_list')
-        pid = str(row.get('prompt_id') or row.get('record_id') or f'row{index:05d}')
-        records.append(dict(prompt_id=pid, prompt=prompt, vqa_list=vqa))
+        record = normalize(row, index)
+        if record is None:
+            raise ValueError(f'manifest row {index}: expected vqa_list or GenEval include metadata')
+        records.append(record)
     if ids:
         wanted = set(ids)
         records = [r for r in records if r['prompt_id'] in wanted]

@@ -57,6 +57,15 @@ python -m qwen_latent_cot.upper_bound.cli \
   --device npu:0 --limit 32
 ```
 
+官方榜单清单可直接使用（`manifests.py` 会把 include/exclude 元数据转成原子问题）：
+
+```bash
+--manifest /data/250010019/unimoe_r3/outputs/0_qwen38max_fullbench_20261002/manifests/geneval.jsonl     # 553
+--manifest /data/250010019/unimoe_r3/outputs/0_qwen38max_fullbench_20261002/manifests/geneval_pp.jsonl  # 280
+```
+
+`data/geneval2_800.jsonl` 自带 `vqa_list`，两种格式都由同一个 loader 处理。GenEval++ 的 `region` 字段转成左右侧问题，官方空间指标仍以检测器为准，这里是 VQA 代理。
+
 常用开关：
 
 - `--read-index 25 30 35`、`--rollback-index 20`
@@ -105,6 +114,7 @@ python -m qwen_latent_cot.upper_bound.cli \
 
 ```text
 qwen_latent_cot/upper_bound/atoms.py      原子问题解析、答案匹配、约束句
+qwen_latent_cot/upper_bound/manifests.py  官方 GenEval / GenEval++ 清单适配
 qwen_latent_cot/upper_bound/native.py     原生采样、早停、回退、重加噪
 qwen_latent_cot/upper_bound/reader.py     ViT-UND 问答
 qwen_latent_cot/upper_bound/protocol.py   三臂协议与记录

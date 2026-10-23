@@ -59,15 +59,19 @@ def match_answer(got, expected):
     return e in g
 
 
+def _noun(text):
+    return re.sub(r'^instances? of ', '', text.strip())
+
+
 def parse_question(question):
     """Classify a GenEval question into count / object / position / attribute."""
     q = question.strip()
     m = COUNT_Q.match(q)
     if m:
-        return dict(kind='count', noun=m.group(1).strip())
+        return dict(kind='count', noun=_noun(m.group(1)))
     m = OBJECT_Q.match(q)
     if m:
-        return dict(kind='object', noun=m.group(1).strip())
+        return dict(kind='object', noun=_noun(m.group(1)))
     m = POSITION_Q.match(q)
     if m:
         return dict(kind='position', subject=m.group(1).strip(),

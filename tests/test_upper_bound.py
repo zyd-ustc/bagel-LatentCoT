@@ -3,6 +3,7 @@ import unittest
 from qwen_latent_cot.upper_bound.atoms import (match_answer, parse_question,
                                                correction_text, score_atoms, image_pass)
 from qwen_latent_cot.upper_bound.metrics import mcnemar_exact, evaluate
+from qwen_latent_cot.upper_bound.manifests import normalize
 
 
 class AtomTests(unittest.TestCase):
@@ -18,6 +19,12 @@ class AtomTests(unittest.TestCase):
         self.assertTrue(match_answer('no', 'No'))
         self.assertFalse(match_answer('No.', 'Yes'))
         self.assertTrue(match_answer('green backpack', 'green backpack'))
+
+    def test_instances_template(self):
+        spec = parse_question('How many instances of bench are in the image?')
+        self.assertEqual(spec['noun'], 'bench')
+        text = correction_text([dict(question='How many instances of bench are in the image?', expected='one')])
+        self.assertEqual(text, 'Ensure: exactly one bench.')
 
     def test_parse_and_constraint(self):
         spec = parse_question('How many backpacks are in the image?')
@@ -38,6 +45,32 @@ class AtomTests(unittest.TestCase):
         self.assertTrue(image_pass(rows))
         rows = score_atoms(['two', 'yes'], [['q1', 'one'], ['q2', 'Yes']])
         self.assertFalse(image_pass(rows))
+
+
+class ManifestTests(unittest.TestCase):
+    def test_geneval_shape(self):
+        row = dict(geneval_prompt='a teddy bear right of a dog',
+                   geneval_include=[{'class': 'teddy bear', 'count': 1},
+                                    {'class': 'dog', 'count': 1, 'position': ['right of', 0]}])
+        record = normalize(row, 3)
+        self.assertEqual(record['prompt'], 'a teddy bear right of a dog')
+        questions = [q for q, _ in record['vqa_list']]
+        self.assertIn('How many instances of teddy bear are in the image?', questions)
+        self.assertTrue(any('right of the teddy bear' in q for q in questions))
+
+    def test_geneval_pp_shape(self):
+        row = dict(category='counting', case_key='abc',
+                   benchmark_metadata=dict(prompt='A photo of six clocks',
+                                           include=[{'class': 'clock', 'count': 6}],
+                                           exclude=[{'class': 'clock', 'count': 7}]))
+        record = normalize(row)
+        self.assertEqual(record['prompt_id'], 'abc')
+        self.assertEqual(record['vqa_list'][0], ['How many instances of clock are in the image?', 'six'])
+        self.assertEqual(record['vqa_list'][-1], ['Are there any instances of clock in the image?', 'No'])
+
+    def test_direct_vqa_shape(self):
+        record = normalize(dict(prompt='x', vqa_list=[['q', 'Yes']], prompt_id='p'))
+        self.assertEqual(record['prompt_id'], 'p')
 
 
 class MetricTests(unittest.TestCase):
