@@ -22,7 +22,7 @@ resample  回退到同一 t_early，用新 seed 对该状态重新加噪，原 p
 - `loop` 与 `resample` 的 Euler 步数完全相同（`50 − rollback_index`），共享同一次 base 轨迹与同一次检出，因此是算力匹配的配对比较。
 - `--full-resample` 额外跑一条全新 50 步、换 seed 的完整重采，作为非等算力参考。
 - 修正文本由 `atoms.constraint` 确定性生成，例如：
-  - 计数：`exactly seven croissants`
+  - 计数：`exactly seven croissants`（清单里的计数原子是**验证式**问题：`Are there exactly seven ...?`，避免开放式计数的系统偏差；实测开放式 “How many instances of bus” 会把单辆公交答成 2，而验证式能正确回答 No）
   - 属性：`the backpack is green`
   - 位置：`the croissant is to the left of the dog`
   - 存在：`there is a dog`

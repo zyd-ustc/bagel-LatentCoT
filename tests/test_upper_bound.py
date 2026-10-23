@@ -20,11 +20,11 @@ class AtomTests(unittest.TestCase):
         self.assertFalse(match_answer('No.', 'Yes'))
         self.assertTrue(match_answer('green backpack', 'green backpack'))
 
-    def test_instances_template(self):
-        spec = parse_question('How many instances of bench are in the image?')
-        self.assertEqual(spec['noun'], 'bench')
-        text = correction_text([dict(question='How many instances of bench are in the image?', expected='one')])
+    def test_verify_count_template(self):
+        text = correction_text([dict(question='Are there exactly one bench in the image?', expected='Yes')])
         self.assertEqual(text, 'Ensure: exactly one bench.')
+        text = correction_text([dict(question='Are there exactly seven clock in the image?', expected='No')])
+        self.assertEqual(text, 'Ensure: not exactly seven clock.')
 
     def test_parse_and_constraint(self):
         spec = parse_question('How many backpacks are in the image?')
@@ -55,7 +55,7 @@ class ManifestTests(unittest.TestCase):
         record = normalize(row, 3)
         self.assertEqual(record['prompt'], 'a teddy bear right of a dog')
         questions = [q for q, _ in record['vqa_list']]
-        self.assertIn('How many instances of teddy bear are in the image?', questions)
+        self.assertIn('Are there exactly one teddy bear in the image?', questions)
         self.assertTrue(any('right of the teddy bear' in q for q in questions))
 
     def test_geneval_pp_shape(self):
@@ -65,8 +65,8 @@ class ManifestTests(unittest.TestCase):
                                            exclude=[{'class': 'clock', 'count': 7}]))
         record = normalize(row)
         self.assertEqual(record['prompt_id'], 'abc')
-        self.assertEqual(record['vqa_list'][0], ['How many instances of clock are in the image?', 'six'])
-        self.assertEqual(record['vqa_list'][-1], ['Are there any instances of clock in the image?', 'No'])
+        self.assertEqual(record['vqa_list'][0], ['Are there exactly six clock in the image?', 'Yes'])
+        self.assertEqual(record['vqa_list'][-1], ['Are there exactly seven clock in the image?', 'No'])
 
     def test_direct_vqa_shape(self):
         record = normalize(dict(prompt='x', vqa_list=[['q', 'Yes']], prompt_id='p'))

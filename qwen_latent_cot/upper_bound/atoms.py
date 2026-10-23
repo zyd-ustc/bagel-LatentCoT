@@ -14,6 +14,7 @@ NO = {'no', 'false', 'n'}
 
 COUNT_Q = re.compile(r'^how many (.+?) (?:are|is) (?:in|on) the image\??$', re.I)
 OBJECT_Q = re.compile(r'^are there (?:any|a|an) (.+?) (?:in|on) the image\??$', re.I)
+VERIFY_COUNT_Q = re.compile(r'^are there exactly (\w+) (.+?) (?:in|on) the image\??$', re.I)
 POSITION_Q = re.compile(
     r'^is the (.+?) (?:to the )?(left|right|above|below|behind|in front) of the (.+?)\??$', re.I)
 ATTR_SINGULAR_Q = re.compile(r'^is the (.+?) (.+?)\??$', re.I)
@@ -69,6 +70,9 @@ def parse_question(question):
     m = COUNT_Q.match(q)
     if m:
         return dict(kind='count', noun=_noun(m.group(1)))
+    m = VERIFY_COUNT_Q.match(q)
+    if m:
+        return dict(kind='count_verify', count=m.group(1).strip(), noun=m.group(2).strip())
     m = OBJECT_Q.match(q)
     if m:
         return dict(kind='object', noun=_noun(m.group(1)))
@@ -102,6 +106,10 @@ def constraint(question, expected):
         return f'exactly {e} {noun}'
     if kind == 'object':
         return f'there is {spec["noun"]}' if positive else f'there is no {spec["noun"]}'
+    if kind == 'count_verify':
+        if positive:
+            return f'exactly {spec["count"]} {spec["noun"]}'
+        return f'not exactly {spec["count"]} {spec["noun"]}'
     if kind == 'position':
         return f'the {spec["subject"]} is to the {spec["direction"]} of the {spec["reference"]}'
     if kind == 'attribute':

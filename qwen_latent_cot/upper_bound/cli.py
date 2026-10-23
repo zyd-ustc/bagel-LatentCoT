@@ -125,6 +125,8 @@ def main(argv=None):
     parser.add_argument('--device', default='npu:0')
     parser.add_argument('--limit', type=int, default=32)
     parser.add_argument('--ids', nargs='*')
+    parser.add_argument('--shard', type=int, default=0)
+    parser.add_argument('--shards', type=int, default=1)
     parser.add_argument('--seed', type=int)
     parser.add_argument('--read-index', nargs='*', type=int)
     parser.add_argument('--rollback-index', type=int)
@@ -144,6 +146,10 @@ def main(argv=None):
         config['full_resample'] = True
 
     records = load_manifest(args.manifest, args.limit, args.ids)
+    if args.shards > 1:
+        if not 0 <= args.shard < args.shards:
+            raise SystemExit('shard must be in [0, shards)')
+        records = records[args.shard::args.shards]
     if not records:
         raise SystemExit('no prompts selected')
     return build(records, config, args.output, args.device, args.model,

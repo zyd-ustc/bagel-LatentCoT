@@ -20,7 +20,7 @@ def _atoms_from_objects(objects, exclude=()):
         if not noun:
             continue
         count = int(entry.get('count', 1))
-        atoms.append([f'How many instances of {noun} are in the image?', _word(count)])
+        atoms.append([f'Are there exactly {_word(count)} {noun} in the image?', 'Yes'])
         if entry.get('color'):
             atoms.append([f'Is the {noun} {entry["color"]}?', 'Yes'])
         if entry.get('region') in ('left', 'right'):
@@ -32,8 +32,11 @@ def _atoms_from_objects(objects, exclude=()):
             if reference:
                 atoms.append([f'Is the {noun} to the {relation} the {reference}?', 'Yes'])
     for entry in exclude:
-        if entry.get('class'):
-            atoms.append([f'Are there any instances of {entry["class"]} in the image?', 'No'])
+        noun = entry.get('class')
+        if not noun:
+            continue
+        count = int(entry.get('count', 1))
+        atoms.append([f'Are there exactly {_word(count)} {noun} in the image?', 'No'])
     return atoms
 
 
