@@ -44,7 +44,7 @@ def train(model,corpus,output,provenance,saved=None):
             total_budget=cfg['steps'],observation_steps=cfg['observation_steps'],edit_steps=cfg['steps']-cfg['observation_steps'],
             adapter_parameters={role:sum(p.numel() for p in getattr(model,role).adapters().values()) for role in ('observation','feedback','editor')},
             new_output_heads=0,heads='frozen native lm_head and llm2vae',
-            trajectory='commit x <- x - t*safe(w-vc), re-read each actual state; native Euler after edits',
+            trajectory='re-noise edited clean estimate: x <- x - t*(1-t)*safe(w-vc); native Euler after edits',
             observation_in_edit='trainable',cross_round_gradient=True,train_pairs=len(sampler.ids),dataset=corpus.manifest))
     grid=times(cfg);nodes=[grid[i] for i in cfg['feedback_indices']]
     reset_peak_memory_stats(rt.device);began=time.perf_counter()

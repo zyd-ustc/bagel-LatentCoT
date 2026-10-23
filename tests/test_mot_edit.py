@@ -48,9 +48,9 @@ class Tests(unittest.TestCase):
         state1,w1,vc1,vg1,d1=m.round(x,.55,flow)
         handle.remove()
         torch.testing.assert_close(seen[-1],x.to(seen[-1].dtype))
-        torch.testing.assert_close(state1,x.float()-.55*d1)
+        torch.testing.assert_close(state1,x.float()-.55*(1-.55)*d1)
         state2,w2,vc2,vg2,d2=m.round(state1,.55,flow)
-        torch.testing.assert_close(state2,state1-.55*d2)
+        torch.testing.assert_close(state2,state1-.55*(1-.55)*d2)
         self.assertGreaterEqual(float((d2.detach()*(vg2-vc2).float()).sum()),-1e-4)
         cross=torch.autograd.grad(w2.square().mean(),w1,retain_graph=True)[0]
         self.assertGreater(float(cross.abs().sum()),0)
@@ -69,14 +69,15 @@ class Tests(unittest.TestCase):
         m=setup();x=torch.randn(4,8);flow=m.runtime.flow('p');m.set_stage('edit')
         a=m.round(x,.55,flow)[1];m.config['activation_checkpointing']=False;b=m.round(x,.55,flow)[1]
         torch.testing.assert_close(a,b,rtol=0,atol=0)
-    def test_edit_commits_clean_displacement_to_actual_state(self):
+    def test_edit_renoises_with_same_noise_anchor(self):
         x=torch.tensor([[2.,3.]])
         vc=torch.tensor([[.1,.2]]);vg=torch.tensor([[.3,.2]])
         w=torch.tensor([[.5,.6]])
         state,delta=apply_edit(x,.5,vc,vg,w)
-        torch.testing.assert_close(state,x-.5*delta)
-        # The clean preview displacement equals the committed latent displacement.
-        torch.testing.assert_close(state-x,(x-.5*(vg+delta))-(x-.5*vg))
+        clean=x-.5*vg;noise=x+(1-.5)*vg
+        edited_clean=clean-.5*delta
+        torch.testing.assert_close(state,(1-.5)*edited_clean+.5*noise)
+        torch.testing.assert_close(state-x,(1-.5)*(edited_clean-clean))
 
     def test_projection_zero_and_negative(self):
         g=torch.tensor([[1.,0.]])

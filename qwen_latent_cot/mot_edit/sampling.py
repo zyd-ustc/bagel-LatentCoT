@@ -20,6 +20,7 @@ def sample(model,prompt,seed,rounds=2):
                 g=vg.float()-vc.float();raw=w.float()-vc.float()
                 trace.append(dict(index=index,t=t,round=r+1,delta_rms=float(delta.square().mean().sqrt()),
                     raw_delta_rms=float(raw.square().mean().sqrt()),
+                    clean_edit_shift_rms=float(t*delta.square().mean().sqrt()),
                     delta_to_base_rms=float(delta.square().mean().sqrt()/vg.float().square().mean().sqrt().clamp_min(1e-12)),
                     committed_shift_rms=float((x-before).square().mean().sqrt()),
                     applied_guidance_coefficient=float((delta*g).sum()/g.square().sum().clamp_min(1e-12))))

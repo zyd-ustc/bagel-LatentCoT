@@ -17,9 +17,11 @@ def project_safe(delta,g):
 
 def apply_edit(x,t,vc,vg,w):
     delta=project_safe(w.float()-vc.float(),vg.float()-vc.float())
-    # Commit exactly the clean-preview displacement, preserving its noise anchor.
+    # clean=x-t*vg, noise=x+(1-t)*vg; edit clean by -t*delta.
+    # Re-noise the edited clean estimate with the SAME estimated noise:
+    # (1-t)*(clean-t*delta)+t*noise = x-t*(1-t)*delta.
     # Keep the state graph: later-round losses can train the earlier edit.
-    return x.float()-t*delta,delta
+    return x.float()-t*(1-t)*delta,delta
 
 
 class MoTEdit(nn.Module):
