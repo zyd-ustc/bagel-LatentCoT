@@ -1,4 +1,4 @@
-# Install PyTorch for your CUDA stack first, then pip install -e '.[dev]'.
+# Target: Huawei Ascend NPU (torch + torch_npu).
 einops>=0.7.0
 accelerate>=0.34.0
 transformers>=4.56.0,<4.58.0

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bagel-latent-cot"
 version = "0.7.0"
-description = "BAGEL direct spatial correction with the understanding expert"
+description = "Shared-base SenseNova-U1.5 trajectory correction on Ascend NPUs"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-bagel-correction = "qwen_latent_cot.correction.cli:main"
+u15-target-correction = "qwen_latent_cot.u15_target_correction.cli:main"
 
 [project.optional-dependencies]
 tracking = ["wandb==0.22.3", "protobuf>=3.19,<5"]
