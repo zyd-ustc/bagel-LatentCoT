@@ -47,14 +47,18 @@ def main():
         for i in range(dist.rank(),len(rows),dist.world_size()):
             row=rows[i];seed=row.get('seed',cfg['seed']+i)
             questions=row if 'questions' in row else None
+            raw_prompt=row.get('raw_prompt') or row.get('prompt')
+            if not raw_prompt:
+                raise ValueError(f"Row {i} is missing 'raw_prompt' or 'prompt'")
+            uid=row.get('uid') or row.get('prompt_id') or f'{i:05d}'
             if a.command=='trace':
-                trace=native_trace(rt,row['raw_prompt'],seed,cfg,questions)
+                trace=native_trace(rt,raw_prompt,seed,cfg,questions)
                 torch.save(trace,out/f'{i:05d}.pt');record=trace['record']
                 images={'preview':trace['preview'],'fail':trace['final']}
             else:
-                images,record=run(rt,row['raw_prompt'],seed,cfg,corrector=corrector,question_record=questions,compare_native=a.compare_native)
+                images,record=run(rt,raw_prompt,seed,cfg,corrector=corrector,question_record=questions,compare_native=a.compare_native)
                 record.update(checkpoint=a.checkpoint,step=meta['step'],ema=a.ema)
-            record['uid']=row['uid']
+            record['uid']=uid
             for key,image in images.items():save_image(out/f'{i:05d}_{key}.png',image)
             (out/f'{i:05d}.json').write_text(json.dumps(record,ensure_ascii=False,indent=2))
         dist.barrier()

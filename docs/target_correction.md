@@ -1,90 +1,150 @@
-# 目标驱动纠偏：当前实现
+# 目标驱动纠偏实现规范
 
-2026-11-04。kind=`u15_target_correction_v1`。当前训练和推理入口。只支持本方案的检查点。
+本文档记录 2026 年 11 月 4 日定稿的目标驱动纠偏实现，接口标识为 `kind="u15_target_correction_v1"`。该方案支持当前版本的检查点与轨迹数据。
 
-## 定稿落地
+## 机制与实现约定
 
-- 训练／部署均 `rho=0`，从真实历史态回退；不是非编辑区域保持的数学保证。
-- Tier-B 强编辑源为同种子原生完稿 `x_fail`，学生读取真实 preview。外部编辑指令与部署条件分开：训练 condition 只从轨迹 record 读取，不读取外部裁判的完稿诊断。
-- 图像优先 UND prefill；全部原生权重冻结，GEN 前 36/42 层 rank64 LoRA，零初始化 start_embedding 和 proposal_proj。
-- 当前原生 clean 外推经 GEN 图像嵌入后注入适配支；仅提案条件 detach，不截断实际状态链。额外图像编码有成本。
-- Stage 1：不退场的残差速度监督，线性桥指向编辑目标；该阶段不允许作为部署检查点。
-- Stage 2：窗口与尾段前向均为部署 Heun 网格（终点 Euler），反向分别为 5 步与 3 步 Euler 代理雅可比。代理梯度有偏。
-- 结构监督：冻结 UND 多层图像 token 特征 + 4×下采样 Charbonnier；非目标特征／像素 L1 保持；沿粗窗口实际状态计算低权重残差保持；padding 单独约束。
-- UND Yes/No 语义反传默认移除，外部 VLM 只做离线验收。
+1. **确定性历史回退**
+   训练和部署统一使用 `rho_deep = 0.0` 与 `rho_shallow = 0.0`。模型直接从真实历史状态回退，不混入新的高斯噪声。该设计消除了随机换噪导致的非编辑区域构图漂移。该设计不构成非编辑区域绝对不变的数学保证，但在采样中保留了原轨迹已建立的大部分主体结构。
 
-上游 NEOVisionModel 实际仅返回浅层嵌入，hidden_states=None。因此结构损失改用冻结 UND 解码器第约1/3、2/3及最后层的图像 token。它增加 UND 前反向成本；不能用旧 Stage A 显存或“26次调用”推算总预算。
+2. **训练样本与条件解耦**
+   Tier B 样本使用同种子的原生完稿图像作为强编辑器的输入源图，学生模型在训练中只读取原生前向保存的草图。外部编辑指令只用于离线生成目标图，不进入部署条件。训练输入条件仅从轨迹记录读取部署条件，不引入外部裁判针对完稿生成的诊断文本。
 
-## 源码
+3. **图像优先的前缀结构**
+   草图前缀使用图像优先的标记顺序，格式为 `<img>` 视觉标记后接条件文本。全部原生权重保持冻结状态。模型在生成器前 36 层添加秩为 64 的 LoRA 适配器，冻结最后 6 层生成层。起点时间嵌入与当前提案投影层均初始化为零。
 
-`qwen_latent_cot/u15_target_correction/`：model.py（条件与适配器）、field.py（精确前向/代理反向）、loss.py（结构和保持）、data.py（两层语料与统一RNG采样器）、train.py（两阶段/EMA/恢复）、sampling.py（文生图闭环与原生轨迹）、judge.py（外部API）、cli.py（入口）。
+4. **当前原生提案注入**
+   原生生成器在当前时间步预测的干净图像外推结果，经图像编码后注入适配支。该提案输入在计算中截断梯度，实际采样状态链路保持可微。注入额外图像编码会产生单步图像特征提取开销。
 
-配置：`configs/u15_proposal_correction/target_stage1.json`、`target_stage2.json`。
+5. **Stage 1 残差速度预训练**
+   Stage 1 为残差速度预训练阶段，残差在窗口内不衰减，使用指向编辑目标的双点线性桥。该阶段检查点仅用于初始化，不可直接用于部署推理。
 
-Stage1：6000步，batch256，lr1e-4；A/B/zero=80/15/5%。Stage2：4000步，batch128，lr3e-5；20/70/10%。Stage2 的每个 tier 都展开到成图：前向沿部署网格，反向为 5 步窗口加 3 步冻结尾段。编辑对的锚点仍是线性桥，不是真实失败历史。保存周期250步。每个样本仍逐个前反向、累计梯度，全局求和，底座与LoRA复制式并行。所有抽样随机状态归入 sampler checkpoint。
+6. **Stage 2 混合网格展开监督**
+   Stage 2 在前向过程中完整运行部署使用的 Heun 求解网格，终点步采用 Euler 法。反向传播时，纠偏窗口展开为 5 步 Euler，原生尾段展开为 3 步 Euler，以此提供代理梯度。代理梯度与细网格精确梯度存在离散化偏差。
 
-## 数据接口
+7. **分区域多层结构与保持损失**
+   结构损失提取冻结理解解码器第 14 层、第 28 层与第 42 层的图像标记特征距离，结合 4 倍下采样的 Charbonnier 损失。非目标区域约束图像特征与像素 L1 距离。模型还在粗网格窗口状态上计算低权重残差速度惩罚。画布填充区域单独计算损失，不稀释内容区域权重。
 
-语料是JSON manifest：`{"records":[...]}`。每行必须有 uid、family、split（train/val/test）、approved=true、tier。
+8. **离线独立验收**
+   训练损失不包含理解模块单词概率的语义反传项，改由外部视觉语言模型进行离线验收打分。
 
-Tier A：
+上游视觉模块不保存中间隐层状态。结构损失提取冻结理解解码器的多层图像标记特征。该操作会增加理解模块的前向与反向显存开销，计算资源预算不能直接套用早期阶段的估计值。
+
+## 代码与配置
+
+核心代码位于 `qwen_latent_cot/u15_target_correction/` 目录下：
+- `model.py`：条件前缀构建、适配层与速度残差网络。
+- `field.py`：精确前向积分、粗网格代理反向回传与配置验证。
+- `loss.py`：多层特征结构损失、非编辑区域保持损失与填充区域加权。
+- `data.py`：Tier A、Tier B 和 Zero 样本加载器与确定性采样器。
+- `train.py`：两阶段训练流程、权重指数移动平均与断点恢复。
+- `sampling.py`：文生图完整推理闭环与原生轨迹记录。
+- `judge.py`：外部视觉语言模型评分接口。
+- `cli.py`：命令行工具入口。
+
+训练配置文件位于 `configs/u15_proposal_correction/` 目录下：
+- `target_stage1.json`：Stage 1 配置，训练 6000 步，全局批大小为 256，学习率为 0.0001。数据采样比例为 Tier A 占 80%，Tier B 占 15%，Zero 占 5%。
+- `target_stage2.json`：Stage 2 配置，训练 4000 步，全局批大小为 128，学习率为 0.00003。数据采样比例调整为 Tier A 占 20%，Tier B 占 70%，Zero 占 10%。
+
+Stage 2 中每个样本都完整展开至成图阶段。前向沿部署细网格积分，反向沿 5 步纠偏窗口和 3 步尾段回传梯度。Tier A 样本的起始状态基于双点线性桥构造。模型每 250 步保存一次检查点。系统采用底座与适配器全卡复制的分布式策略，各进程独立计算前反向并同步累积梯度。数据采样的随机数状态完整保存在采样器检查点中。
+
+## 数据接口规范
+
+语料索引文件为 JSON 格式的清单文件，顶层键为 `records`。列表内每条记录必须包含 `uid`、`family`、`split`、`approved` 和 `tier` 字段。其中 `split` 取值为 `train`、`val` 或 `test`，`approved` 必须为 `true`。
+
+### Tier A 外部单轮编辑样本
+
 ```json
-{"uid":"a1","family":"source1","split":"train","approved":true,"tier":"A","source_image":"src.png","target_image":"edit.png","raw_prompt":"完整目标场景描述","instruction":"结构编辑指令"}
+{
+  "uid": "a1",
+  "family": "source1",
+  "split": "train",
+  "approved": true,
+  "tier": "A",
+  "source_image": "src.png",
+  "target_image": "edit.png",
+  "raw_prompt": "完整目标场景描述",
+  "instruction": "结构编辑指令"
+}
 ```
-源和目标使用同一适配矩形，不裁切；黑色padding单独监督。此阶段用源图作为参考上下文，不声称与真实预览同分布。
 
-Tier B：
+源图和目标图放置在同一适配画布内，不进行中心裁剪。黑色填充区域单独计算损失。此阶段将源图作为参考上下文，不假设与真实前瞻草图同分布。
+
+### Tier B 真实失败轨迹样本
+
 ```json
-{"uid":"b1","family":"prompt1","split":"train","approved":true,"tier":"B","trace":"trace/00000.pt","arm":"deep","target_image":"edited_native_final.png","raw_prompt":"原始生成提示词","target_edit_instruction":"仅用于离线生产目标的强编辑要求"}
+{
+  "uid": "b1",
+  "family": "prompt1",
+  "split": "train",
+  "approved": true,
+  "tier": "B",
+  "trace": "trace/00000.pt",
+  "arm": "deep",
+  "target_image": "edited_native_final.png",
+  "raw_prompt": "原始生成提示词",
+  "target_edit_instruction": "仅用于离线生产目标的强编辑要求"
+}
 ```
-trace须由新入口生成，绑定底座/CFG/网格/读取点/回退协议。target_image必须与原生成图画布大小一致，不能缩放真实状态。preview、历史态、x_fail、deployment condition均读取trace；不从编辑目标反演。
 
-zero行格式同B，tier改为zero，不需要target_image，目标自动取trace.final。只将经外部确认原生完稿正确的样本批准为zero。训练代码不使用完稿诊断重写在线条件。
+轨迹文件必须由本系统的 `trace` 命令生成，记录底座标识、分类自由引导缩放因子、时间网格与回退协议。目标图像分辨率必须与原生生成画布大小一致。前瞻草图、历史状态、原生完稿与部署条件均直接读取轨迹文件，不从编辑目标反演。
 
-评测family不可进入训练split；不要把现有GenEval2评测图迁入训练。
+### Zero 零残差保持样本
 
-## 命令（由用户执行，本次未执行）
+Zero 行格式与 Tier B 相同，`tier` 设置为 `"zero"`，不需要 `target_image` 字段。系统自动将目标设置为轨迹中记录的原生完稿 `final`。该类别仅收录经外部确认原生完稿正确的样本，用于训练模型在无需编辑时保持零输出。
 
-在仓库根目录，使用现有环境解释器，设置 MODEL/SOURCE/OUT/CORPUS/PROMPTS：
+评测集合所属的提示词组不可进入训练划分。
+
+## 运行命令
+
+以下命令在包含本仓库代码与依赖环境的机器上运行。设置 `MODEL`、`SOURCE`、`OUT`、`CORPUS` 和 `PROMPTS` 环境变量。
+
+### 生成原生轨迹
 
 ```bash
 python -m qwen_latent_cot.u15_target_correction.cli trace \
- --model "$MODEL" --source "$SOURCE" \
- --config configs/u15_proposal_correction/target_stage1.json \
- --prompts "$PROMPTS" --output "$TRACE_OUT" --device npu:0
-
-python -m qwen_latent_cot.u15_target_correction.cli train \
- --model "$MODEL" --source "$SOURCE" \
- --config configs/u15_proposal_correction/target_stage1.json \
- --corpus "$CORPUS" --output "$STAGE1_OUT" --device npu:0
-
-python -m qwen_latent_cot.u15_target_correction.cli train \
- --model "$MODEL" --source "$SOURCE" \
- --config configs/u15_proposal_correction/target_stage2.json \
- --init-checkpoint "$STAGE1_CHECKPOINT" \
- --corpus "$CORPUS" --output "$STAGE2_OUT" --device npu:0
-
-python -m qwen_latent_cot.u15_target_correction.cli sample \
- --model "$MODEL" --source "$SOURCE" \
- --config configs/u15_proposal_correction/target_stage2.json \
- --checkpoint "$STAGE2_CHECKPOINT" --ema \
- --prompts "$PROMPTS" --output "$OUT" --device npu:0 --compare-native
+  --model "$MODEL" --source "$SOURCE" \
+  --config configs/u15_proposal_correction/target_stage1.json \
+  --prompts "$PROMPTS" --output "$TRACE_OUT" --device npu:0
 ```
 
-torchrun多卡追加`--distributed`，沿用现有4节点16进程启动环境。`--resume`是同stage/config/world/corpus的精确恢复；`--init-checkpoint`仅移入EMA模型权重，优化器与采样器重置。改变stage不会放宽底座、适配器或轨迹协议匹配。
+### Stage 1 残差速度预训练
 
-## 外部 GLM 裁判
+```bash
+python -m qwen_latent_cot.u15_target_correction.cli train \
+  --model "$MODEL" --source "$SOURCE" \
+  --config configs/u15_proposal_correction/target_stage1.json \
+  --corpus "$CORPUS" --output "$STAGE1_OUT" --device npu:0
+```
+
+### Stage 2 轨迹展开端到端训练
+
+```bash
+python -m qwen_latent_cot.u15_target_correction.cli train \
+  --model "$MODEL" --source "$SOURCE" \
+  --config configs/u15_proposal_correction/target_stage2.json \
+  --init-checkpoint "$STAGE1_CHECKPOINT" \
+  --corpus "$CORPUS" --output "$STAGE2_OUT" --device npu:0
+```
+
+### 部署采样
+
+```bash
+python -m qwen_latent_cot.u15_target_correction.cli sample \
+  --model "$MODEL" --source "$SOURCE" \
+  --config configs/u15_proposal_correction/target_stage2.json \
+  --checkpoint "$STAGE2_CHECKPOINT" --ema \
+  --prompts "$PROMPTS" --output "$OUT" --device npu:0 --compare-native
+```
+
+多卡分布式运行追加 `--distributed` 参数。`--resume` 用于同一训练阶段、同一配置与同一语料的精确断点续训。`--init-checkpoint` 仅载入指数移动平均权重，优化器与采样器从头初始化。
+
+## 外部裁判验收
 
 ```bash
 python -m qwen_latent_cot.u15_target_correction.cli judge \
- --requests "$REQUESTS" --output "$JUDGE_OUT" \
- --base-url "$GLM_BASE_URL" --model "$GLM_MODEL" --key-env GLM_API_KEY
+  --requests "$REQUESTS" --output "$JUDGE_OUT" \
+  --base-url "$GLM_BASE_URL" --model "$GLM_MODEL" --key-env GLM_API_KEY
 ```
 
-请求JSONL：index（整数、用于文件名）、uid、instruction、images（每项role与path）。路径相对请求文件；可同时提供原生图与编辑目标。instruction写明原提示词和需要验收的要求。结果保存原请求、模型、JSON回答、用量，已有结果不重复调用。独立运行目录绑定同一批请求；不要在旧结果目录修改请求。API错误直接暴露，不暗中换模型。密钥从环境变量读取，不写入请求或日志。
-
-Qwen-Image-2.1生成接口尚未提供，因此不新增猜测的远端调用：消费既有编辑生产流水线输出的目标图和外部验收结果。GLM同样需要实际base URL、模型ID与环境变量；本次未调用API。
-
-## 运行成本
-
-精确前向需要完整窗口和尾段求值。粗网格代理反向减少保留激活的链长，不消除前向成本。
+请求文件为 JSONL 格式，每行包含 `index`、`uid`、`instruction` 和 `images` 列表。每个图像项包含 `role` 与 `path`。系统读取环境变量获取 API 密钥，并将评审结果保存为对应编号的 JSON 文件。

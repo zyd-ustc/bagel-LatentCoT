@@ -65,7 +65,7 @@ class Config(unittest.TestCase):
             validate_config(cfg)
         cfg = _cfg()
         cfg["kind"] = "u15_sc_soar_v4"
-        with self.assertRaisesRegex(ValueError, "deterministic history"):
+        with self.assertRaisesRegex(ValueError, "Target correction requires its own configuration/checkpoint"):
             validate_config(cfg)
 
     def test_protocol_binds_history_identity(self):
@@ -77,6 +77,22 @@ class Config(unittest.TestCase):
         self.assertEqual(bound["prefix"], "image_first")
         self.assertEqual(bound["rho_deep"], 0)
         self.assertEqual(bound["native"], "unit-native")
+
+    def test_entailment_cap_caps_relations_by_entities(self):
+        import math
+        from qwen_latent_cot.u15_target_correction.diagnosis import entailment_cap
+        questions = ["Is there a cat present in the scene?", "Is the cat behind the chair?"]
+        score = {
+            "questions": [
+                {"margin": -1.0, "p_yes": 0.2, "log_p_yes": -1.5},
+                {"margin": 2.0, "p_yes": 0.9, "log_p_yes": -0.1},
+            ]
+        }
+        res = entailment_cap(score, questions)
+        self.assertEqual(res["entity_indices"], [0])
+        self.assertEqual(res["relation_indices"], [1])
+        self.assertAlmostEqual(res["questions"][1]["log_p_yes"], -1.5)
+        self.assertAlmostEqual(res["questions"][1]["p_yes"], math.exp(-1.5))
 
 
 class _Velocity:
@@ -97,7 +113,7 @@ class Field(unittest.TestCase):
         self.assertFalse(out.requires_grad)
         self.assertTrue(torch.equal(out, history.detach()))
         out[0, 0, 0, 0] = -1
-        self.assertEqual(float(history[0, 0, 0, 0]), 0)
+        self.assertEqual(float(history[0, 0, 0, 0].detach()), 0)
 
     def test_handoff_drops_the_residual_and_detaches_the_proposal(self):
         seen = {}
