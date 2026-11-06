@@ -1,69 +1,189 @@
-"""Target-driven correction: train, trace native failures, sample, or judge offline."""
-import argparse,json
+"""Isochronic state flow: prepare caches, train, sample, native baselines, judge."""
+
+import argparse
+import json
+import time
 from pathlib import Path
+
+from .conditions import compact, derived_tail_condition
+from .config import load_config
+
+
+def _model_args(parser):
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--distributed", action="store_true")
+
+
+def _parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    judge = commands.add_parser("judge")
+    for key in ("requests", "output", "base-url", "model", "key-env"):
+        judge.add_argument("--" + key, required=True)
+
+    train = commands.add_parser("train")
+    _model_args(train)
+    train.add_argument("--linear", required=True)
+    train.add_argument("--inverted")
+    train.add_argument("--native")
+    train.add_argument("--output", required=True)
+    train.add_argument("--resume")
+    train.add_argument("--init-from")
+    train.add_argument("--steps", type=int)
+
+    sample = commands.add_parser("sample")
+    _model_args(sample)
+    sample.add_argument("--prompts", required=True)
+    sample.add_argument("--output", required=True)
+    sample.add_argument("--checkpoint")
+    sample.add_argument("--limit", type=int, default=32)
+
+    native = commands.add_parser("native")
+    _model_args(native)
+    native.add_argument("--mode", choices=("t2i", "it2i"), required=True)
+    native.add_argument("--prompts", required=True)
+    native.add_argument("--output", required=True)
+    native.add_argument("--limit", type=int, default=32)
+
+    prepare = commands.add_parser("prepare-state-pairs")
+    _model_args(prepare)
+    prepare.add_argument("--mode", choices=("inverted", "native-parent"), required=True)
+    prepare.add_argument("--output", required=True)
+    prepare.add_argument("--linear")
+    prepare.add_argument("--prompts")
+    prepare.add_argument("--targets")
+    prepare.add_argument("--limit", type=int)
+    prepare.add_argument("--seed", type=int)
+    prepare.add_argument("--shard-index", type=int, default=0)
+    prepare.add_argument("--shard-count", type=int, default=1)
+    prepare.add_argument("--skip-existing", action="store_true")
+    prepare.add_argument("--no-lpips", action="store_true")
+    prepare.add_argument("--cache-base-prediction", action="store_true")
+    return parser
+
+
+def _explicit_edit(row, raw):
+    """An explicit edit instruction replaces closed-loop diagnosis."""
+    instruction = str(row.get("edit_instruction", "")).strip()
+    if not instruction:
+        return None
+    edit = compact(instruction)
+    tail = row.get("tail_condition") or derived_tail_condition(raw, edit)
+    return dict(
+        edit_request=edit,
+        tail_condition=compact(tail),
+        preserve=compact(row.get("preserve")),
+    )
+
+
+def _train(args, cfg, device):
+    from .train import train
+
+    if args.resume and args.init_from:
+        raise ValueError("Use either --resume or --init-from, not both")
+    train(args, cfg, device)
+
+
+def _prepare(args, cfg, device):
+    from .loading import load_native
+    from .prepare_state_pairs import produce_inverted, produce_native_parent
+
+    rt = load_native(args.model, args.source, cfg, device, distributed=False)
+    if args.mode == "inverted":
+        if not args.linear:
+            raise ValueError("Inverted cache production needs --linear")
+        path = produce_inverted(rt, cfg, args)
+    else:
+        if not args.prompts:
+            raise ValueError("Native-parent production needs --prompts")
+        path = produce_native_parent(rt, cfg, args)
+    print(json.dumps(dict(manifest=str(path))))
+
+
+def _native(args, cfg, device):
+    from .loading import load_native
+    from .native import run_native
+
+    rt = load_native(args.model, args.source, cfg, device, distributed=False)
+    run_native(rt, cfg, args.mode, args.prompts, args.output, args.limit, device)
+
+
+def _sample(args, cfg, device):
+    from . import distributed as dist
+    from .checkpoint import editor_identity, load_stage_weights
+    from .data import read_rows
+    from .images import save_image
+    from .loading import load_native
+    from .model import StateEditor
+    from .sampling import run
+
+    rt = load_native(args.model, args.source, cfg, device, args.distributed)
+    editor = None
+    if args.checkpoint:
+        editor = StateEditor(rt, cfg).eval()
+        meta = load_stage_weights(args.checkpoint, editor, editor_identity(rt, cfg))
+        print(json.dumps(dict(checkpoint=str(args.checkpoint), stage=meta.get("stage"), step=meta.get("step"))))
+    if args.distributed and editor is not None:
+        dist.broadcast_parameters(editor)
+
+    out = Path(args.output).resolve()
+    if dist.rank() == 0:
+        out.mkdir(parents=True, exist_ok=False)
+    dist.barrier()
+
+    rows = read_rows(args.prompts)[: args.limit]
+    for index in range(dist.rank(), len(rows), dist.world_size()):
+        row = rows[index]
+        raw = row.get("raw_prompt") or row.get("prompt")
+        if not raw:
+            raise ValueError(f"Row {index} is missing a prompt")
+        seed = int(row.get("seed", cfg["seed"] + index))
+        uid = row.get("uid") or row.get("prompt_id") or f"{index:05d}"
+        explicit = _explicit_edit(row, raw)
+        began = time.perf_counter()
+        images, record = run(rt, raw, seed, cfg, editor=editor, explicit=explicit)
+        record["seconds"] = time.perf_counter() - began
+        record["uid"] = uid
+        record["checkpoint"] = args.checkpoint
+        record["mode"] = "explicit" if explicit else "closed_loop"
+        for key, image in images.items():
+            save_image(out / f"{index:05d}_{key}.png", image)
+        (out / f"{index:05d}.json").write_text(json.dumps(record, ensure_ascii=False, indent=2))
+    dist.barrier()
+    if dist.rank() == 0:
+        (out / "complete.json").write_text(json.dumps(dict(samples=len(rows))) + "\n")
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__)
-    subs=p.add_subparsers(dest='command',required=True)
-    j=subs.add_parser('judge')
-    for key in ('requests','output','base-url','model','key-env'):j.add_argument('--'+key,required=True)
-    for name in ('train','trace','sample'):
-        s=subs.add_parser(name)
-        for key in ('model','source','config','output'):s.add_argument('--'+key,required=True)
-        s.add_argument('--device',default='npu:0');s.add_argument('--distributed',action='store_true')
-        if name=='train':
-            s.add_argument('--corpus',required=True);s.add_argument('--resume');s.add_argument('--init-checkpoint')
-        else:
-            s.add_argument('--prompts',required=True);s.add_argument('--limit',type=int,default=32)
-        if name=='sample':
-            s.add_argument('--checkpoint',required=True);s.add_argument('--ema',action='store_true')
-            s.add_argument('--compare-native',action='store_true')
-    a=p.parse_args()
-    if a.command=='judge':
-        from .judge import judge
-        judge(a.requests,a.output,a.base_url,a.model,a.key_env);return
-    import torch
+    args = _parser().parse_args()
+    if args.command == "judge":
+        from .judge import judge as judge_rows
+
+        judge_rows(args.requests, args.output, args.base_url, args.model, args.key_env)
+        return
+
     from . import distributed as dist
     from .accelerator import set_device
-    from .loading import load_native
-    from .images import save_image
-    from .field import validate_config
-    cfg=json.loads(Path(a.config).read_text());validate_config(cfg)
-    device=dist.initialize(a.device) if a.distributed else set_device(a.device)
-    if a.command=='train':
-        from .train import train
-        train(a,cfg,device)
-    else:
-        rt=load_native(a.model,a.source,cfg,device,a.distributed)
-        out=Path(a.output)
-        if dist.rank()==0:out.mkdir(parents=True,exist_ok=False)
-        dist.barrier()
-        from .sampling import run,native_trace
-        if a.command=='sample':
-            from .train import load_for_inference
-            corrector,meta=load_for_inference(a.checkpoint,rt,cfg,ema=a.ema)
-        rows=[json.loads(l) for l in Path(a.prompts).read_text().splitlines() if l.strip()][:a.limit]
-        for i in range(dist.rank(),len(rows),dist.world_size()):
-            row=rows[i];seed=row.get('seed',cfg['seed']+i)
-            questions=row if 'questions' in row else None
-            raw_prompt=row.get('raw_prompt') or row.get('prompt')
-            if not raw_prompt:
-                raise ValueError(f"Row {i} is missing 'raw_prompt' or 'prompt'")
-            uid=row.get('uid') or row.get('prompt_id') or f'{i:05d}'
-            if a.command=='trace':
-                trace=native_trace(rt,raw_prompt,seed,cfg,questions)
-                torch.save(trace,out/f'{i:05d}.pt');record=trace['record']
-                images={'preview':trace['preview'],'fail':trace['final']}
-            else:
-                images,record=run(rt,raw_prompt,seed,cfg,corrector=corrector,question_record=questions,compare_native=a.compare_native)
-                record.update(checkpoint=a.checkpoint,step=meta['step'],ema=a.ema)
-            record['uid']=uid
-            for key,image in images.items():save_image(out/f'{i:05d}_{key}.png',image)
-            (out/f'{i:05d}.json').write_text(json.dumps(record,ensure_ascii=False,indent=2))
-        dist.barrier()
-        if dist.rank()==0:(out/'complete.json').write_text(json.dumps(dict(samples=len(rows))))
-    if a.distributed:torch.distributed.destroy_process_group()
+
+    cfg = load_config(args.config)
+    if args.command in ("prepare-state-pairs", "native") and args.distributed:
+        raise ValueError("Cache production and native baselines use prompt shards, not torchrun")
+    device = dist.initialize(args.device) if args.distributed else set_device(args.device)
+
+    runners = {
+        "train": _train,
+        "prepare-state-pairs": _prepare,
+        "native": _native,
+        "sample": _sample,
+    }
+    runners[args.command](args, cfg, device)
+    if args.distributed:
+        dist.shutdown()
 
 
-if __name__=='__main__':main()
+if __name__ == "__main__":
+    main()

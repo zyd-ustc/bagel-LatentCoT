@@ -28,14 +28,6 @@ def autocast(device):
 class Prefix:
     cache: object
     indexes: torch.Tensor
-    hidden: torch.Tensor
-
-
-@dataclass
-class Prediction:
-    velocity: torch.Tensor
-    observation: tuple[torch.Tensor, ...] | None
-    clean_prediction: torch.Tensor | None = None
 
 
 class Runtime:
@@ -84,7 +76,7 @@ class Runtime:
         with autocast(self.device):
             cache, hidden = self.model._t2i_prefix_forward(ids, positions, mask)
         indexes = self.model._build_t2i_image_indexes(*self.grid, positions.shape[1], device=self.device)
-        return Prefix(cache, indexes, hidden.detach())
+        return Prefix(cache, indexes)
 
     def noise_scale(self):
         model = self.model; sigma = float(model.noise_scale)
@@ -97,36 +89,28 @@ class Runtime:
         t = torch.linspace(0, 1, self.config['num_steps']+1, device=self.device)
         return self.model._apply_time_schedule(t, self.tokens, self.config['timestep_shift'])
 
-    def predict(self, image, t, prefix, capture=False):
-        model = self.model; batch = len(image); gh, gw = self.height//model.patch_size, self.width//model.patch_size
-        grid = torch.tensor([[gh,gw]]*batch, device=self.device)
+    def predict(self, image, t, prefix):
+        model = self.model
+        batch = len(image)
+        gh, gw = self.height // model.patch_size, self.width // model.patch_size
+        grid = torch.tensor([[gh, gw]] * batch, device=self.device)
         latent = model.patchify(image, self.patch)
         pixels = model.patchify(image, model.patch_size, channel_first=True)
-        observation = []; clean_prediction = []
-        handles = [layer.input_layernorm_mot_gen.register_forward_pre_hook(
-            lambda module, args: observation.append(args[0].detach())) for layer in self.decoder.layers] if capture else []
-        if capture:
-            handles.append(model.fm_modules['fm_head'].register_forward_hook(
-                lambda module,args,value: clean_prediction.append(value.detach())))
-        try:
-            with autocast(self.device):
-                hidden = model.extract_feature(pixels.reshape(batch*gh*gw,-1), gen_model=True, grid_hw=grid).reshape(batch,self.tokens,-1)
-                expanded = torch.as_tensor(t, device=self.device).expand(batch*self.tokens)
-                condition = model.fm_modules['timestep_embedder'](expanded).reshape_as(hidden)
-                if model.add_noise_scale_embedding:
-                    scale = torch.full_like(expanded, self.noise_scale()/model.noise_scale_max_value)
-                    condition = condition+model.fm_modules['noise_scale_embedder'](scale).reshape_as(hidden)
-                velocity = model._t2i_predict_v(hidden+condition, prefix.indexes,
-                    {'full_attention':None}, prefix.cache, torch.as_tensor(t,device=self.device),
-                    latent, image_token_num=self.tokens, timestep_embeddings=condition,
-                    image_size=(self.width,self.height))
-            velocity = model.unpatchify(velocity, self.patch, self.height, self.width)
-            clean = clean_prediction[0] if capture else None
-            if clean is not None and not model.use_pixel_head:
-                clean = model.unpatchify(clean,self.patch,self.height,self.width)
-            return Prediction(velocity, tuple(observation) if capture else None, clean)
-        finally:
-            for handle in handles: handle.remove()
+        with autocast(self.device):
+            hidden = model.extract_feature(
+                pixels.reshape(batch * gh * gw, -1), gen_model=True, grid_hw=grid
+            ).reshape(batch, self.tokens, -1)
+            expanded = torch.as_tensor(t, device=self.device).expand(batch * self.tokens)
+            condition = model.fm_modules["timestep_embedder"](expanded).reshape_as(hidden)
+            if model.add_noise_scale_embedding:
+                scale = torch.full_like(expanded, self.noise_scale() / model.noise_scale_max_value)
+                condition = condition + model.fm_modules["noise_scale_embedder"](scale).reshape_as(hidden)
+            velocity = model._t2i_predict_v(
+                hidden + condition, prefix.indexes, {"full_attention": None}, prefix.cache,
+                torch.as_tensor(t, device=self.device), latent, image_token_num=self.tokens,
+                timestep_embeddings=condition, image_size=(self.width, self.height),
+            )
+        return model.unpatchify(velocity, self.patch, self.height, self.width)
 
     def guided(self, conditional, reference, scale):
         value = cfg_velocity(conditional, reference, scale, self.config['cfg_norm'],

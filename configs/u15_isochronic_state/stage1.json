@@ -1,0 +1,15 @@
+{
+  "extends": "core.json",
+  "stage": 1,
+  "source_weights": {
+    "linear_pair": 1.0
+  },
+  "lr": 5e-05,
+  "lr_final": 1e-05,
+  "warmup_steps": 100,
+  "betas": [0.9, 0.95],
+  "eps": 1e-08,
+  "weight_decay": 0.0,
+  "max_steps": 6000,
+  "updates_per_pair": 8
+}

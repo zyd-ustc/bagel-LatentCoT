@@ -1,53 +1,70 @@
-# 目标驱动纠偏训练指南
+# 等时状态流训练
 
-本文档介绍两阶段目标驱动纠偏的训练流程。详细参数和数据格式见 [目标驱动纠偏实现规范](target_correction.md)。
+实现合同见 [等时生成态编辑](target_correction.md)，方案见 [训练方案](isochronic_state_flow_training_plan.md)。
 
-## 训练阶段设计
+每次更新只做一条单步 IFM：
 
-训练分为两阶段，分别解决局部编辑速度拟合和完整轨迹端到端对齐问题。
+1. 抽一个来源。Stage 1 只抽 `linear_pair`；Stage 2 按配置抽 L/I/R。约 10% 抽显式保持样本。
+2. 抽一个支持时间 `t` 和编辑进度 `s~U(0,1)`。
+3. L 数据用共享噪声构造 `a`、`b`，并用同一个前瞻函数生成 `P`；I/R 直接读取缓存的 `a,b,P`。
+4. 由锚点 `a` 计算一次冻结 `b0`，用 joint prefix 计算 `uθ`。
+5. 按有效区计算 `((uθ-(b-a))/t)^2`，反传、裁剪、更新。
 
-### Stage 1：残差速度预训练
+不混入终图 L1、LPIPS 反传、旧 `L_early` 或 repulsion loss。
 
-Stage 1 训练模型学习在给定草图和修正指令下的局部修改速度场。
+## 阶段
 
-1. **输入与起始点**：使用双点线性桥在历史回退点与目标图像之间插值生成状态。起始时间在深回退时间 0.07 与浅回退时间 0.15 之间交替选取。
-2. **监督目标**：模型拟合从起始状态到目标图像的恒定解析速度。窗口衰减函数在此阶段不生效。
-3. **数据比例**：使用 80% 的外部高质量编辑对（Tier A）、15% 的真实失败轨迹对（Tier B）和 5% 的零残差保持样本（Zero）。
-4. **超参数**：全局批大小为 256，学习率为 0.0001，训练 6000 步。
+**Stage 1**：现有编辑对上的状态编辑学习。数据是 L，含 10% 保持样本。学习率 `5e-5` 线性 warmup 100 步，余弦衰减到 `1e-5`。预算 `min(6000, ceil(8 N_L / 64))`。
 
-该阶段检查点仅作为 Stage 2 的权重初始化来源，不能直接用于推理部署。
+**Stage 2**：接续相容性适配。继续使用 Stage 1 权重并重置优化器。学习率 `1e-5` warmup 100 步，衰减到 `2e-6`。目标数据是 I 配对 1–2 万条、R 记录 2000–5000 条；缓存可以边生产边训练。有 R 时抽样 L:I:R=20:40:40；R 缺失时程序明确使用 L:I=20:80 并在日志记录。
 
-### Stage 2：真实轨迹端到端监督
+## 命令
 
-Stage 2 解决交接累积误差问题，确保模型在真实回退状态下积分后，经由原生尾段能生成满足编辑目标的完整图像。
-
-1. **确定性历史回退**：使用 `rho = 0.0`，直接从真实前向保存的历史状态恢复生成，避免噪声扰动破坏已有结构。
-2. **混合网格展开**：
-   - 前向过程：沿部署使用的 Heun 细网格积分。在纠偏窗口从回退点积分至时间 0.50，随后由冻结的原生生成器继续积分至成图时间 1.0。
-   - 反向过程：纠偏窗口采用 5 步 Euler 积分回传梯度，原生尾段采用 3 步 Euler 积分提供代理雅可比。
-3. **监督目标**：最终成图与目标图像之间的复合结构损失，包含冻结理解模块提取的多层图像特征距离、4 倍下采样图像损失以及非编辑区域保持损失。
-4. **数据比例**：使用 20% 的 Tier A 样本、70% 的 Tier B 样本和 10% 的 Zero 样本。
-5. **超参数**：全局批大小为 128，学习率为 0.00003，训练 4000 步。从 Stage 1 检查点载入权重后重置优化器状态。
-
-## 执行命令
-
-### 启动 Stage 1
+Stage 1：
 
 ```bash
-python -m qwen_latent_cot.u15_target_correction.cli train \
+u15-target-correction train \
   --model "$MODEL" --source "$SOURCE" \
-  --config configs/u15_proposal_correction/target_stage1.json \
-  --corpus "$CORPUS" --output "$STAGE1_OUT" --device npu:0
+  --config configs/u15_isochronic_state/stage1.json \
+  --linear "$LINEAR_MANIFEST" \
+  --output "$OUT" --device npu:0
 ```
 
-### 启动 Stage 2
+Stage 2：
 
 ```bash
-python -m qwen_latent_cot.u15_target_correction.cli train \
+u15-target-correction train \
   --model "$MODEL" --source "$SOURCE" \
-  --config configs/u15_proposal_correction/target_stage2.json \
-  --init-checkpoint "$STAGE1_OUT/step_006000" \
-  --corpus "$CORPUS" --output "$STAGE2_OUT" --device npu:0
+  --config configs/u15_isochronic_state/stage2.json \
+  --linear "$LINEAR_MANIFEST" \
+  --inverted "$INVERTED_CACHE" \
+  --native "$NATIVE_CACHE" \
+  --init-from "$STAGE1_CHECKPOINT" \
+  --output "$OUT" --device npu:0
 ```
 
-多卡分布式训练在命令末尾添加 `--distributed`。
+`--native` 可以省略。省略后抽样比例显式变成 L:I=20:80，检查点 `input_domains` 不会写 `native_history`。
+
+## I/R 缓存生产
+
+```bash
+u15-target-correction prepare-state-pairs \
+  --model "$MODEL" --source "$SOURCE" \
+  --config configs/u15_isochronic_state/stage2.json \
+  --mode inverted --linear "$LINEAR_MANIFEST" \
+  --output "$INVERTED_CACHE" --device npu:0 \
+  --cache-base-prediction
+
+u15-target-correction prepare-state-pairs \
+  --model "$MODEL" --source "$SOURCE" \
+  --config configs/u15_isochronic_state/stage2.json \
+  --mode native-parent --prompts "$PROMPTS" \
+  --targets "$TARGETS" \
+  --output "$NATIVE_CACHE" --device npu:0
+```
+
+`--targets` 只接受已经生成并通过质量审核的目标；没有可用目标生产接口时 R 不会伪造编辑记录。`--shard-index/--shard-count` 写 `manifest.shard_*.json`，训练入口指向同一目录即可合并。`--skip-existing` 用于续跑。
+
+## 记录
+
+`train.jsonl` 每步记录 `loss`、`gradient_norm`（裁剪前）、`source_kind`、`keep`、`time`、`progress`、调用数和实际 `input_domains`。检查点每 250 个更新及阶段末尾保存。`complete.json` 记录阶段、预算和是否使用 `--steps` 覆盖。

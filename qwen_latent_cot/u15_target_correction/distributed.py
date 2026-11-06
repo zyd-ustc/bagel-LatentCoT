@@ -29,6 +29,11 @@ def barrier():
     if dist.is_initialized():
         dist.barrier()
 
+
+def shutdown():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 @torch.no_grad()
 def broadcast_parameters(module):
     if world_size() == 1:
@@ -39,7 +44,7 @@ def broadcast_parameters(module):
 
 @torch.no_grad()
 def sum_gradients(module, *, allow_unused=False):
-    """Losses are divided by GLOBAL batch before backward; sum, do not average."""
+    """Caller divides each loss by world size; this sums so the step sees the mean."""
     parameters = [p for p in module.parameters() if p.requires_grad]
     if allow_unused:
         # Task masks can leave a trainable branch unused on one rank.
@@ -66,9 +71,3 @@ def sum_gradients(module, *, allow_unused=False):
         bucket.append(parameter); size += count
     if bucket:
         reduce_bucket(bucket)
-
-def sum_statistics(values, device):
-    tensor = torch.tensor(values, dtype=torch.float32, device=device)
-    if world_size() > 1:
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor.tolist()

@@ -1,0 +1,17 @@
+{
+  "extends": "core.json",
+  "stage": 2,
+  "source_weights": {
+    "linear_pair": 0.2,
+    "inverted_pair": 0.4,
+    "native_parent": 0.4
+  },
+  "lr": 1e-05,
+  "lr_final": 2e-06,
+  "warmup_steps": 100,
+  "betas": [0.9, 0.95],
+  "eps": 1e-08,
+  "weight_decay": 0.0,
+  "max_steps": 4000,
+  "updates_per_pair": 8
+}

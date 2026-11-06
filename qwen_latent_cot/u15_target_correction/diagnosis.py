@@ -20,10 +20,9 @@ DECOMPOSE_RULES = (
     "Ask an exact count ONLY when the request explicitly gives a number or a singular "
     "article for that subject. For a bare plural such as 'acrobats', ask 'two or more', "
     "never invent an exact number.\n"
-    "If there are two or more main entities, include a SEPARATE question checking that "
-    "they are physically distinct, coherent entities, not fused into a single object. "
-    "Allow the contact, overlap and occlusion explicitly requested; distinct does not "
-    "mean fully exposed or non-touching.\n"
+    "Do not ask about position, background, setting, or an action unless the user request "
+    "itself contains that spatial preposition, setting, or action verb. Never invent "
+    "behind, in front of, left, right, on, under, a plate, a wall, or a background.\n"
     "Do not combine text spelling with placement or other properties in one question. "
     "Dedicated exact-spelling questions will be appended separately."
 )
@@ -40,8 +39,8 @@ DECOMPOSE_SYSTEM_V2 = (
 
 
 QUESTION_SYSTEM = DECOMPOSE_SYSTEM_V2.replace("3 to 5", "3 to 4") + (
-    "\nKeep at most four core scene questions plus one dedicated distinct-entity question. "
-    "Check the direction of asymmetric relations against the raw request before returning. "
+    "\nKeep at most four questions. Relation questions are allowed only when the request "
+    "contains a spatial preposition or an action verb. "
     "For unnumbered plural subjects use two or more, never an invented exact count."
 )
 
@@ -143,25 +142,17 @@ def decompose(rt, raw, cfg):
         question="USER REQUEST:\n" + raw + "\nFINAL RULES:\n" + DECOMPOSE_RULES,
     )
     questions, edits = clean_questions(raw, result["plan"])
+    questions, dropped = drop_ungrounded(raw, questions)
+    if dropped:
+        edits.append(dict(dropped=dropped, reason="not_in_raw_prompt"))
     return questions, dict(response=result["response"], edits=edits)
 
 
 @torch.no_grad()
-def semantic_plan(rt, raw, config, *, system_message=None, question=None):
+def semantic_plan(rt, raw, config, *, system_message=None, question):
     """Text-only UND planning; identical information is available at deployment."""
     from sensenova_u1.models.neo_unify.conversation import get_conv_template
 
-    default_question = (
-        "Turn the user's image request into a concise visual construction plan. "
-        "Resolve subject identity, exact counts, who is in front of or behind whom, "
-        "and the main spatial arrangement. Preserve the requested style and exact quoted text. "
-        "Describe one complete coherent intended image in positive concrete terms. "
-        "Do not invent extra objects or claim to have inspected an image. "
-        "Do not write an editing critique, a caption of an existing image, or reasoning. "
-        "Use at most 80 words. Return only the construction plan.\nUSER REQUEST:\n"
-        + raw
-    )
-    question = default_question if question is None else question
     model, tokenizer = rt.model, rt.tokenizer
     model.img_context_token_id = tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
     model.img_start_token_id = tokenizer.convert_tokens_to_ids("<img>")
@@ -188,12 +179,7 @@ def semantic_plan(rt, raw, config, *, system_message=None, question=None):
     plan = response.rsplit("</think>", 1)[-1].strip()
     if not plan or "<think>" in plan:
         raise ValueError("UND did not finish its semantic plan: " + response)
-    return dict(
-        raw_prompt=raw,
-        response=response,
-        plan=plan,
-        condition=raw + "\nVisual construction plan:\n" + plan,
-    )
+    return dict(raw_prompt=raw, response=response, plan=plan)
 
 
 YES_VARIANTS = ("Yes", "yes", "YES", " Yes", " yes")
@@ -232,7 +218,7 @@ def und_log_reward(rt, image, questions, yes_ids=None, no_ids=None):
     img_tag = "<img>" + "<IMG_CONTEXT>" * rt.tokens + "</img>"
 
     with autocast(rt.device):
-        # 同一张预览图只跑 1 次理解侧 ViT
+        # One understanding-side ViT pass per preview image.
         vit_embeds = m.extract_feature(pixels, gen_model=False, grid_hw=grid)
         embed_tokens = m.language_model.get_input_embeddings()
         per_q = []
@@ -294,54 +280,198 @@ def und_score_image(rt, image, questions, yes_ids=None, no_ids=None):
     return summarize_question_scores(scores)
 
 
-def semantic_correction_condition(raw, clauses):
-    return raw + "\n[Semantic Corrections]:\n" + "\n".join(clauses) if clauses else raw
+_SPATIAL_Q = re.compile(
+    r"\b(behind|in front of|to the left of|to the right of|left of|right of|under|underneath|"
+    r"above|below|on top of|next to|beside|between|inside|near|foreground|background|"
+    r"located on|positioned|on the)\b",
+    re.I,
+)
+_SPATIAL_PROMPT = re.compile(
+    r"\b(behind|in front of|to the left of|to the right of|left of|right of|under|above|below|"
+    r"on top of|next to|beside|between|inside|near|over|on)\b",
+    re.I,
+)
+_ACTION = re.compile(
+    r"\b(playing with|chasing|jumping over|holding|riding|wearing|carrying|sitting|standing|"
+    r"running|flying|eating|looking at)\b",
+    re.I,
+)
+_SETTING_Q = re.compile(
+    r"\b(setting|background|environment|surface|plate|sky|outdoor|stone wall|tree)\b",
+    re.I,
+)
+_COLOR = (
+    "red|green|blue|yellow|black|white|brown|pink|purple|orange|grey|gray|"
+    "metal|metallic|wooden|stone|plastic|spotted|striped"
+)
+_COUNT_WORD = {
+    "a": "one", "an": "one", "one": "one", "two": "two", "three": "three", "four": "four",
+    "five": "five", "six": "six", "seven": "seven", "eight": "eight", "nine": "nine", "ten": "ten",
+}
+_RELATIONS = ("in front of", "behind", "on top of", "next to", "beside", "under", "above")
 
-def affirmative_constraints(questions, allowed_negations=frozenset()):
-    clauses = []
-    rejected = []
-    for question in questions:
-        quoted = re.match(r'Is the exact text "(.+)" clearly legible', question)
-        if quoted:
-            clauses.append(
-                f'Display the exact text "{quoted.group(1)}", clearly legible and accurately spelled.'
-            )
-            continue
-        text = question.strip().rstrip("?？")
-        text = re.sub(
-            r"\b(?:and )?not fused(?: into (?:a |one |the )?(?:single |same )?object)?",
-            "and physically distinct",
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r"\bwithout garbled letters\b", "with accurate lettering", text, flags=re.I
-        )
-        negatives = set(
-            re.findall(r"\b(no|not|missing|garbled|without)\b", text.lower())
-        )
-        if negatives - allowed_negations:
-            rejected.append(question)
-            continue
-        if "是否" in text:
-            clauses.append(text.replace("是否", "", 1) + "。")
-            continue
-        if re.match(r"^(Is|Are) there ", text, re.I):
-            text = re.sub(r"^(Is|Are) there ", "There must be ", text, flags=re.I)
-        else:
-            sentence = re.match(
-                r"^(Is|Are) (.+?) (present|visible|positioned|located|parked|balanced|"
-                r"older|younger|physically|morphing|holding|blocking|whispering|stitching|not)(.*)$",
-                text,
+
+def _same_subject(left, right):
+    left, right = left.lower().strip(), right.lower().strip()
+    return left.rstrip("s") == right.rstrip("s") or left in right or right in left
+
+
+def parse_entities(raw):
+    """Bind each count, color, and material to the noun phrase that carries it."""
+    text = re.sub(r"\s+", " ", raw.strip().rstrip("."))
+    pieces = re.split(r"\s+\b(?:" + "|".join(_RELATIONS) + r")\b\s+", text, flags=re.I)
+    entities = []
+    for piece in pieces:
+        for part in re.split(r"\s*(?:,| and )\s*", piece):
+            match = re.match(
+                r"(a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s+(.+)$",
+                part.strip(),
                 re.I,
             )
-            if sentence:
-                verb, subject, predicate, rest = sentence.groups()
-                text = f"{subject[0].upper() + subject[1:]} {verb.lower()} {predicate}{rest}"
-            else:
-                text = "Show " + re.sub(r"^(Is|Are) ", "", text, flags=re.I)
-        clauses.append(text + ".")
-    return clauses, rejected
+            if not match:
+                continue
+            words = match.group(2).split()
+            color = material = None
+            if words and re.fullmatch(_COLOR, words[0], re.I):
+                token = words[0].lower()
+                if token in {"metal", "metallic", "wooden", "stone", "plastic"}:
+                    material = token
+                else:
+                    color = token
+                words = words[1:]
+            if not words:
+                continue
+            entities.append({
+                "subject": " ".join(words),
+                "count": _COUNT_WORD[match.group(1).lower()],
+                "color": color,
+                "material": material,
+            })
+    return entities
+
+
+def _color_claim(question):
+    match = re.match(
+        rf"(?:Is|Are) (?:each |every |the )?(?!there\b)(.+?) ({_COLOR})(?: in color)?$",
+        question.strip().rstrip("?？"),
+        re.I,
+    )
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).lower()
+
+
+def question_grounded(raw, question):
+    """Relation, setting, and action questions must be licensed by the raw prompt."""
+    if _SPATIAL_Q.search(question) and not _SPATIAL_PROMPT.search(raw):
+        return False
+    if _ACTION.search(question) and not _ACTION.search(raw):
+        return False
+    if _SETTING_Q.search(question) and not _SETTING_Q.search(raw):
+        return False
+    if re.search(r"\b(person|people|man|woman|boy|girl|child)\b", question, re.I) and not re.search(
+        r"\b(person|people|man|woman|boy|girl|child)\b", raw, re.I
+    ):
+        return False
+    claim = _color_claim(question)
+    if claim is not None:
+        subject, color = claim
+        owners = [
+            entity["subject"] for entity in parse_entities(raw)
+            if entity.get("color") == color or entity.get("material") == color
+        ]
+        if not any(_same_subject(subject, owner) for owner in owners):
+            return False
+    return True
+
+
+def drop_ungrounded(raw, questions):
+    kept, dropped = [], []
+    for question in questions:
+        (kept if question_grounded(raw, question) else dropped).append(question)
+    return kept, dropped
+
+
+def _imperative(question):
+    text = question.strip().rstrip("?？")
+    if re.match(r"(?:Is|Are) the .+ an? ", text, re.I):
+        return ""
+    count = re.search(r"exactly\s+(\w+)\s+(.+?)\s+visible", text, re.I)
+    if count:
+        noun = re.sub(r"\s+", " ", count.group(2)).strip()
+        return f"Change the number of {noun} to exactly {count.group(1)}."
+    relation = re.match(
+        r"(?:Is|Are) the (.+?) (?:positioned |located )?(behind|in front of|to the left of|"
+        r"to the right of|under|above|on top of|next to|beside) the (.+)",
+        text,
+        re.I,
+    )
+    if relation:
+        subject, rel, obj = relation.groups()
+        return f"Put the {subject} {rel.lower()} the {obj}."
+    action = re.match(
+        r"(?:Is|Are) the (.+?) (playing with|chasing|jumping over|holding|riding|wearing|carrying) the (.+)",
+        text,
+        re.I,
+    )
+    if action:
+        return f"Make the {action.group(1)} {action.group(2).lower()} the {action.group(3)}."
+    existence = re.match(
+        r"(?:Is|Are) there (a|an|any) (.+?)(?: present| visible)?(?: in the (?:scene|image))?$",
+        text,
+        re.I,
+    )
+    if existence:
+        article = "" if existence.group(1).lower() == "any" else existence.group(1).lower() + " "
+        return f"Add {article}{existence.group(2).strip()}."
+    if re.search(r"\b(distinct|fused)\b", text, re.I):
+        return "Separate the subjects so they are not fused."
+    claim = _color_claim(text)
+    if claim:
+        return f"Make the {claim[0]} {claim[1]}."
+    return ""
+
+
+def _attribute_keep(question):
+    match = re.match(
+        rf"(?:Is|Are) (?:each |every |the )?(.+?) ({_COLOR})(?: in color)?$",
+        question.strip().rstrip("?？"),
+        re.I,
+    )
+    if not match:
+        return ""
+    noun = match.group(1).strip()
+    if noun.lower().startswith("there "):
+        return ""
+    return f"Keep the {noun} {match.group(2).lower()}."
+
+
+def feedback_from_questions(questions, failed):
+    """Split a diagnosis into an edit request, a preserve list, and rejections.
+
+    The request is the imperative form of failed questions. Preserve only
+    carries confirmed attributes that the image already satisfies. A failure
+    without an imperative form is rejected rather than smuggled into the edit.
+    """
+    failed_set = set(failed).intersection(questions)
+    changes, rejected = [], []
+    for question in questions:
+        if question not in failed_set:
+            continue
+        line = _imperative(question)
+        if line:
+            changes.append(line)
+        else:
+            rejected.append(question)
+    keeps = []
+    for question in questions:
+        if question in failed_set:
+            continue
+        keep = _attribute_keep(question)
+        if keep and keep not in keeps:
+            keeps.append(keep)
+    return " ".join(changes), " ".join(keeps), rejected
+
 
 def classify_question(question):
     text = question.lower()
@@ -382,4 +512,30 @@ def entailment_cap(score, questions):
         raw_score=score,
         entity_indices=entities,
         relation_indices=relations,
+    )
+
+
+@torch.no_grad()
+def review_preview(rt, image, raw, cfg):
+    """Decompose the request, score a preview, and turn failures into an edit."""
+    questions, decomposition = decompose(rt, raw, cfg)
+    preview_score = (
+        entailment_cap(und_score_image(rt, image, questions), questions)
+        if questions
+        else {"questions": []}
+    )
+    failed = [
+        question
+        for question, score in zip(questions, preview_score["questions"])
+        if score["p_yes"] < float(cfg["pass_threshold"])
+    ]
+    edit_request, preserve, rejected = feedback_from_questions(questions, failed)
+    return dict(
+        questions=questions,
+        decomposition=decomposition,
+        preview_score=preview_score,
+        failed=failed,
+        edit_request=edit_request,
+        preserve=preserve,
+        rejected=rejected,
     )

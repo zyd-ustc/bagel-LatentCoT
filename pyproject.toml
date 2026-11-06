@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bagel-latent-cot"
-version = "0.7.0"
-description = "Shared-base SenseNova-U1.5 trajectory correction on Ascend NPUs"
+version = "0.9.0"
+description = "Isochronic state-flow editing with the frozen SenseNova-U1.5 stack"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -26,6 +26,8 @@ u15-target-correction = "qwen_latent_cot.u15_target_correction.cli:main"
 
 [project.optional-dependencies]
 tracking = ["wandb==0.22.3", "protobuf>=3.19,<5"]
+metrics = ["lpips>=0.1.4"]
+judge = ["openai>=1.0"]
 dev = [
   "pytest>=8.0.0",
 ]
