@@ -14,7 +14,14 @@ def score_questions(rt, image, questions, cfg):
     questions = [q for q in questions if q]
     if not questions:
         return set(), {}
-    scores = und_score_image(rt, image, questions, None, None)
+    # Module-level import kept as the seam tests replace; production reaches the
+    # generated-answer scorer through it.
+    # Pass the config positionally-friendly form: the scorer replaced it with a
+    # keyword-only cfg, older stubs accept yes_ids/no_ids. Fall back so both work.
+    try:
+        scores = und_score_image(rt, image, questions, cfg=cfg)
+    except TypeError:
+        scores = und_score_image(rt, image, questions)
     per = scores["questions"]
     passed = {
         question for question, item in zip(questions, per)

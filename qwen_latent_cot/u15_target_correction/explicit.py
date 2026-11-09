@@ -194,7 +194,7 @@ def question_sets_error(edit_questions, preserve_questions):
     return None
 
 
-def edit_question_grounded(target, question):
+def edit_question_grounded(target, question, instruction=""):
     """An edit question is grounded when its content words appear in the target.
 
     The strict relational grounding used for diagnosis rejects questions whose
@@ -205,14 +205,18 @@ def edit_question_grounded(target, question):
     words = _tokens(question)
     if not words:
         return False
-    return len(words & _tokens(target)) >= max(1, len(words) // 3)
+    # A removal or a move asks about content the target no longer implies
+    # ("is the overlay removed?"), so the instruction is part of the evidence.
+    evidence = _tokens(target) | _tokens(instruction)
+    return len(words & evidence) >= max(1, len(words) // 3)
 
 
 def filter_questions(proposal, raw):
     """Drop questions that are not grounded in the text they claim to describe."""
     edit_kept = [
         question for question in proposal["edit_questions"]
-        if edit_question_grounded(proposal["target_condition"] or "", question)
+        if edit_question_grounded(proposal["target_condition"] or "", question,
+                                  proposal.get("instruction") or "")
     ]
     preserve_kept = [
         question for question in proposal["preserve_questions"]
@@ -355,3 +359,157 @@ def reverse_instruction(task, forward_prompt):
     if task == "T1":
         return "Restore the original text in the same place, font and colour."
     return None
+
+
+# ---------------------------------------------------------------------------
+# Active edits
+#
+# The failure-mining route made sample count depend on the base model failing
+# and the expert seeing it. An active edit does not ask whether the picture is
+# wrong: it reads what the completion *shows* and specifies one localised
+# change, so any correct picture is usable training material.
+# ---------------------------------------------------------------------------
+
+ACTIVE_EDIT_SYSTEM = (
+    "You design ONE localised edit for the scene described below.\n"
+    "Answer with three blocks and nothing else, each header copied exactly:\n"
+    "OPERATION: <one of: add, remove, move, relation, attribute>\n"
+    "EDIT: <imperative, at most 12 words, naming the single change>\n"
+    "EDIT_QUESTIONS: then one line per question, each starting with '- ', exactly one "
+    "question about that one object or relation, naming its colour and position; it "
+    "must be false for the current scene and true after the change\n"
+    "Rules:\n"
+    "Name an object the request already mentions, or one that clearly belongs in it.\n"
+    "Never ask about a summarised property of the whole scene.\n"
+    "Do not restate the whole scene; the caller already has it."
+)
+
+
+def propose_active_edit_from_request(rt, preview, raw_request, cfg, operation=None):
+    """Pick one localised edit for a request, without asking the expert to describe the picture.
+
+    Preserve questions are derived from ``raw_request`` by the caller: asking the
+    same model to write them from an image produced sets that its own judge then
+    scored false on that image (50 of 50 smoke attempts).
+    """
+    focus = "REQUIRED OPERATION:\n" + compact(operation) + "\n\n" if operation else ""
+    question = (
+        focus + "SCENE REQUEST:\n" + compact(raw_request) + "\n\n"
+        "Design one localised edit for this scene.\nFINAL RULES:\n" + REPAIR_RULES
+    )
+    answer = ask_with_image(rt, preview, question, cfg, system_message=ACTIVE_EDIT_SYSTEM)
+    proposal = parse_proposal(answer)
+    proposal["raw_output"] = answer
+    match = _OPERATION.search(answer or "")
+    proposal["operation"] = (match.group(1).strip().lower() if match else None)
+    error = instruction_error(proposal["instruction"], None)
+    if error is None and proposal["operation"] not in OPERATIONS:
+        error = "operation_missing"
+    if error is None and not proposal["edit_questions"]:
+        error = "no_edit_question"
+    if error is None and operation and proposal["operation"] != operation:
+        error = "operation_mismatch"
+    proposal["error"] = error
+    return proposal
+
+
+ACTIVE_SYSTEM = (
+    "You design ONE localised edit for the scene in the attached finished image.\n"
+    "Every question you write must ask about one specific, pointable object or one "
+    "specific relation between two objects, naming its colour and position.\n"
+    "Never ask about a summarised property of the whole scene "
+    "(no 'is there an animal', 'does the scene look natural', 'is the mood right').\n"
+    "Answer with the five blocks below and nothing else. Copy each header exactly, "
+    "including the colon, and always include both question blocks:\n"
+    "OPERATION: <one of: add, remove, move, relation, attribute>\n"
+    "EDIT: <imperative, at most 12 words, naming the single change>\n"
+    "TARGET: <the scene description after the change, at most 60 words, describing "
+    "only what is visible in the image plus this change>\n"
+    "EDIT_QUESTIONS: then one line per question, each starting with '- ', exactly one "
+    "question, true only after the change and false for the current image\n"
+    "PRESERVE_QUESTIONS: then one line per question, each starting with '- ', 2 to 3 "
+    "questions about things this change does not touch\n"
+    "Rules:\n"
+    "Pick an object that is clearly identifiable in the image; do not depend on "
+    "details a blurrier preview would not show.\n"
+    "Name it by appearance and position (for example 'the blue mug on the left').\n"
+    "One operation only, and only one object or one relation changes.\n"
+    "For remove, the removed object must not appear in PRESERVE_QUESTIONS.\n"
+    "Do not add anything the image does not already contain except for the single "
+    "addition when OPERATION is add.\n"
+    "PRESERVE_QUESTIONS must be things that are currently true of the image."
+)
+
+_OPERATION = re.compile(r"^OPERATION\s*[::]\s*(.+)$", re.I | re.M)
+OPERATIONS = ("add", "remove", "move", "relation", "attribute")
+# How the合格 pool should be split; a family is not weighted by how easy it is to produce.
+OPERATION_QUOTA = {"add": 0.20, "remove": 0.25, "move": 0.20,
+                   "relation": 0.15, "attribute": 0.20}
+
+
+def propose_active_edit(rt, completion, requirement, cfg, operation=None, require_preserve=True):
+    """Read the finished picture and specify one localised change.
+
+    ``requirement`` pins the operation the pool still needs, so the overall mix
+    follows the quota table instead of whatever the expert happens to produce.
+    """
+    focus = ""
+    if requirement:
+        focus = "REQUIRED OPERATION:\n" + compact(requirement) + "\n\n"
+    question = (
+        focus + "The attached image is the finished picture. Design one localised edit for it.\n"
+        "FINAL RULES:\n" + REPAIR_RULES
+    )
+    answer = ask_with_image(rt, completion, question, cfg, system_message=ACTIVE_SYSTEM)
+    proposal = parse_proposal(answer)
+    proposal["raw_output"] = answer
+    match = _OPERATION.search(answer or "")
+    proposal["operation"] = (match.group(1).strip().lower() if match else None)
+    proposal["requirement"] = operation
+    proposal = filter_questions(proposal, proposal.get("target_condition") or "")
+    error = instruction_error(proposal["instruction"], proposal["target_condition"])
+    if error is None and proposal["operation"] not in OPERATIONS:
+        error = "operation_missing"
+    if error is None and not proposal["edit_questions"]:
+        error = "no_edit_question"
+    if error is None and require_preserve:
+        error = question_sets_error(proposal["edit_questions"], proposal["preserve_questions"])
+    if error is None and not proposal["edit_questions"]:
+        error = "no_edit_question"
+    if error is None and operation and proposal["operation"] != operation:
+        error = "operation_mismatch"
+    proposal["error"] = error
+    return proposal
+
+
+FACTS_SYSTEM = (
+    "You describe what is visible in the image as short factual statements.\n"
+    "Answer with one line per statement, each starting with '- ', at most 8 lines.\n"
+    "Rules:\n"
+    "Each statement must be plainly visible and specific: name the object, its colour "
+    "and where it is.\n"
+    "No guesses about things outside the frame, no mood, no style commentary.\n"
+    "Do not describe anything that is only partially visible or hard to tell."
+)
+
+
+def propose_preserve_from_facts(rt, completion, cfg, count=3):
+    """Preserve questions taken from facts that are true of *this* picture.
+
+    Asking the expert to invent the edit, the target and the preserve set in one
+    reply produced preserve questions that the same judge then scored false on
+    the very image they were written from (18 of 20 smoke attempts). Deriving the
+    preserve set from described facts removes that mismatch by construction.
+    """
+    answer = ask_with_image(rt, completion, "Describe the image.", cfg,
+                            system_message=FACTS_SYSTEM)
+    facts = [
+        line.strip().lstrip("-*").strip()
+        for line in (answer or "").splitlines()
+        if line.strip().startswith(("-", "*"))
+    ]
+    questions = []
+    for fact in facts[:count]:
+        text = fact.rstrip(".")
+        questions.append("Is it true that " + text[0].lower() + text[1:] + "?")
+    return questions, answer

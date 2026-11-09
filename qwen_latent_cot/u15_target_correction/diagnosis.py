@@ -312,7 +312,44 @@ def ask_with_image(rt, image, question, cfg, system_message=None, max_new_tokens
 
 
 @torch.no_grad()
-def und_score_image(rt, image, questions, yes_ids=None, no_ids=None):
+def und_answer_image(rt, image, questions, cfg, max_new_tokens=6):
+    """Ask each question and read the first word of the reply.
+
+    ``und_log_reward`` reads the logits after an empty ``<think>`` block, which is
+    where generation would start thinking rather than answering. On the pooled
+    text-to-image images it returned p_yes = 0.000 for questions the model had
+    itself just answered as true, so scoring now uses the generated answer, the
+    same interface ``ask_with_image`` already uses for describing.
+    """
+    per_q = []
+    for question in questions:
+        answer = ask_with_image(
+            rt, image,
+            "Look at the image and answer with Yes or No only.\nQuestion: " + question,
+            cfg, max_new_tokens=max_new_tokens,
+        )
+        head = (answer or "").strip().lower()[:12]
+        if head.startswith("yes"):
+            p_yes, label = 0.99, "yes"
+        elif head.startswith("no"):
+            p_yes, label = 0.01, "no"
+        else:
+            p_yes, label = 0.5, "unparsed"
+        per_q.append(dict(p_yes=p_yes, label=label, answer=(answer or "")[:40]))
+    return per_q
+
+
+@torch.no_grad()
+def und_score_image(rt, image, questions, cfg=None, yes_ids=None, no_ids=None):
+    """Per-question scores. Uses the generated answer when a config is supplied.
+
+    ``und_log_reward`` stays available for callers that need the prefill margins,
+    but it is no longer what decides acceptance: on the pooled text-to-image
+    images it reported p_yes = 0.000 for facts the model had just described.
+    """
+    if cfg is not None:
+        per = und_answer_image(rt, image, questions, cfg)
+        return dict(questions=per, min_p_yes=min(q["p_yes"] for q in per))
     _, scores = und_log_reward(rt, image, questions, yes_ids, no_ids)
     return summarize_question_scores(scores)
 
