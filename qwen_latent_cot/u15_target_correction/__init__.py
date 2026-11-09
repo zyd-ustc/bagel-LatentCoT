@@ -22,9 +22,12 @@ ROLE_R_KEEP = "R_keep"
 # weighted and supervised separately.
 ROLE_L_REVERSE = "L_reverse"
 ROLE_R_REPAIR = "R_repair"
-ROLES = (ROLE_L_EDIT, ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_L_REVERSE, ROLE_R_REPAIR)
+# Active edit: an instructed change on a real history state, picked from what the
+# completion already shows. It does not need the base model to have failed.
+ROLE_R_ACTIVE = "R_active"
+ROLES = (ROLE_L_EDIT, ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_L_REVERSE, ROLE_R_REPAIR, ROLE_R_ACTIVE)
 # Which roles are trained through the frozen tail (terminal image supervision).
-TERMINAL_ROLES = frozenset({ROLE_R_EDIT, ROLE_R_REPAIR, ROLE_R_KEEP})
+TERMINAL_ROLES = frozenset({ROLE_R_EDIT, ROLE_R_REPAIR, ROLE_R_KEEP, ROLE_R_ACTIVE})
 
 CONDITION_PROTOCOL = "isochronic_condition_v1"
 CACHE_KIND = "u15_isochronic_state_pairs_v1"

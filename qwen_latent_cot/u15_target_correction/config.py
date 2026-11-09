@@ -5,7 +5,8 @@ import math
 from pathlib import Path
 
 from . import (
-    CONDITION_PROTOCOL, KIND, PROTOCOL_VERSION, ROLE_R_EDIT, ROLES,
+    CONDITION_PROTOCOL, KIND, PROTOCOL_VERSION, ROLE_R_ACTIVE, ROLE_R_EDIT,
+    ROLE_R_REPAIR, ROLES,
 )
 
 # Every name in this set belonged to a previous training or inference design.
@@ -167,11 +168,12 @@ def validate_config(cfg):
         if float(cfg.get("keep_fraction", 0)) != 0:
             raise ValueError("role_weights replaces keep_fraction; set keep_fraction to zero")
         if stage is not None and int(stage) == 2:
-            # The edit signal is the only mandatory role. Stage 2 runs exist with a
-            # single real-state pool (R-edit), and terminal supervision has no state
-            # target at all, so requiring L/R-keep here would block those runs.
-            if float(roles.get(ROLE_R_EDIT, 0)) <= 0:
-                raise ValueError("Stage 2 role weights must include " + ROLE_R_EDIT)
+            # Any one real-history edit pool can carry stage 2: a directly
+            # specified edit, a repair of a real failure, or an active edit.
+            edit_roles = (ROLE_R_EDIT, ROLE_R_REPAIR, ROLE_R_ACTIVE)
+            if not any(float(roles.get(role, 0)) > 0 for role in edit_roles):
+                raise ValueError(
+                    "Stage 2 role weights must include one of " + ", ".join(edit_roles))
 
     terminal = cfg.get("terminal")
     if terminal is not None:

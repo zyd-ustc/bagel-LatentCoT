@@ -10,7 +10,7 @@ import torch
 from . import (
     CACHE_KIND, INVERTED_PAIR, LINEAR_PAIR, NATIVE_PARENT,
     ROLE_I_EDIT, ROLE_L_EDIT, ROLE_L_REVERSE, ROLE_R_EDIT, ROLE_R_KEEP,
-    ROLE_R_REPAIR, ROLES,
+    ROLE_R_ACTIVE, ROLE_R_REPAIR, ROLES,
 )
 from .conditions import compact, derived_tail_condition
 from .field import protocol, sample_state_time, time_key, weighted_choice
@@ -28,6 +28,7 @@ ROLE_DOMAIN = {
     ROLE_I_EDIT: "inverted",
     ROLE_R_EDIT: "native_history",
     ROLE_R_REPAIR: "native_history",
+    ROLE_R_ACTIVE: "native_history",
     ROLE_R_KEEP: "native_history",
 }
 
@@ -493,7 +494,7 @@ class StatePairManifest:
             grouped.setdefault(self.rows[index]["role"], []).append(index)
         return {
             role: StatePairPool(self, role, grouped[role])
-            for role in (ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_R_REPAIR)
+            for role in (ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_R_REPAIR, ROLE_R_ACTIVE)
             if grouped.get(role)
         }
 
