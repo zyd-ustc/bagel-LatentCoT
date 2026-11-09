@@ -37,11 +37,18 @@
   ],
   "eps": 1e-08,
   "weight_decay": 0.0,
-  "max_steps": 150,
+  "max_steps": 1200,
   "updates_per_pair": 8,
-  "save_every": 50,
+  "save_every": 100,
   "source_weights": {
-    "linear_pair": 0.15,
-    "native_parent": 0.85
-  }
+    "linear_pair": 0.3,
+    "native_parent": 0.7
+  },
+  "eval_steps": [
+    150,
+    300,
+    600,
+    900,
+    1200
+  ]
 }

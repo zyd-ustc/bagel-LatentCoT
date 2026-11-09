@@ -225,7 +225,11 @@ def produce(rt, cfg, args):
         state_file = _save_payload(output, uid, read, payload)
         record = dict(
             uid=uid, source_kind="native_parent", split=request.get("split", "train"),
-            parent_branch_id=f"{pair['seed']}:coupled", role="R_edit",
+            parent_branch_id=f"{pair['seed']}:coupled",
+            # The role decides which loss trains this record, so it has to come
+            # from the task, not from a constant.
+            role={"repair": "R_repair", "active_edit": "R_active"}.get(
+                request.get("task_type", "explicit_edit"), "R_edit"),
             task_type=request.get("task_type", "explicit_edit"),
             diagnosis_status="coupled_pair",
             teacher=teacher,

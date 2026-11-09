@@ -17,7 +17,7 @@ from .field import NativeT2I, edit_state, euler, phase_grid, preview_image, segm
 from .loading import load_native
 from .loss import state_flow_matching
 from .model import StateEditor
-from .terminal import terminal_loss
+from .terminal import loss_options, terminal_loss
 
 
 def peak_memory_gib(device):
@@ -162,7 +162,7 @@ def _terminal_update(editor, sample, cfg, grid):
     )
     velocity = NativeT2I(editor.rt, sample["tail_condition"], cfg)
     picture = euler(edited.float(), segment_times(grid, time, 1.0), velocity)
-    options = {key: value for key, value in cfg["terminal"].items() if key != "enabled"}
+    options = loss_options(cfg["terminal"])
     loss, detail = terminal_loss(picture, x_teacher, x_source, valid, **options)
     return loss, dict(
         time=time, progress=1.0, mode="terminal",

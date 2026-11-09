@@ -409,7 +409,15 @@ class StatePairManifest:
         if time_key(payload.get("time", time)) != key:
             raise ValueError("Cached state file time differs: " + item["path"])
         state_a = payload["state_a"].float().to(self.rt.device)
-        state_b = payload["state_b"].float().to(self.rt.device)
+        # Terminal supervision scores the continued picture, so a cache without a
+        # label state is valid there. The state-flow branch still needs one, and
+        # says so instead of silently substituting b = a.
+        raw_b = payload.get("state_b")
+        terminal_roles = set((self.cfg.get("terminal") or {}).get("roles") or ())
+        role = row["role"]
+        if raw_b is None and role not in terminal_roles:
+            raise ValueError("A non-terminal role needs a label state: " + row["uid"])
+        state_b = None if raw_b is None else raw_b.float().to(self.rt.device)
         preview = payload["preview"].float().to(self.rt.device)
         base = payload.get("base_prediction")
         if base is not None:
@@ -425,13 +433,10 @@ class StatePairManifest:
             valid = torch.ones(1, 1, self.rt.height, self.rt.width, device=self.rt.device)
         if preview.shape != state_a.shape or valid.shape != (1, 1, self.rt.height, self.rt.width):
             raise ValueError("Cached state/preview/valid shape differs: " + item["path"])
-        if not (
-            torch.isfinite(state_a).all()
-            and torch.isfinite(state_b).all()
-            and torch.isfinite(preview).all()
-        ):
+        finite_state = state_b is None or torch.isfinite(state_b).all()
+        if not (torch.isfinite(state_a).all() and finite_state and torch.isfinite(preview).all()):
             raise ValueError("Cached state contains a nonfinite value: " + item["path"])
-        if keep:
+        if keep and state_b is not None:
             state_b = state_a.clone()
         edit, tail, preserve = _keep_or_edit(row, self.cfg, keep)
         terminal = bool((self.cfg.get("terminal") or {}).get("enabled", False))

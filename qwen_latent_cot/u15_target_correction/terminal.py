@@ -46,6 +46,15 @@ def edit_mask(teacher, source, valid, lo=0.6, hi=0.95, blur=3):
         return (mask * valid).clamp(0, 1)
 
 
+ROUTING_KEYS = frozenset({"enabled", "roles"})
+
+
+def loss_options(terminal):
+    """Drop routing keys: ``roles`` selects which roles use this loss, the rest are
+    its hyper-parameters. Passing everything used to raise a TypeError."""
+    return {key: value for key, value in (terminal or {}).items() if key not in ROUTING_KEYS}
+
+
 def terminal_loss(prediction, teacher, source, valid, *, preserve_weight=1.0,
                   frequency_weight=0.5, mask_low=0.6, mask_high=0.95,
                   ratio_low=0.75, ratio_high=1.15,
