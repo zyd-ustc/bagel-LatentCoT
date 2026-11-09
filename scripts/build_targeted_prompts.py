@@ -409,9 +409,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--families", default="crowd,pair,relation,text,occlusion,colour,cap")
     parser.add_argument("--per-family", type=int, default=1500)
+    parser.add_argument("--quota", default="",
+                        help="per-family counts, e.g. colour=5000,over=1500; "
+                             "overrides --per-family for the families it names")
     parser.add_argument("--seed", type=int, default=20261109)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+
+    quotas = {}
+    for item in [piece for piece in str(args.quota).split(",") if piece.strip()]:
+        name, _, count = item.partition("=")
+        if name.strip() not in BUILDERS:
+            raise SystemExit("unknown family in --quota: " + name)
+        quotas[name.strip()] = int(count)
 
     rng = random.Random(args.seed)
     rows, offset = [], 0
@@ -419,7 +429,12 @@ def main():
         family = family.strip()
         if family not in BUILDERS:
             raise SystemExit("unknown family: " + family)
-        produced = BUILDERS[family](offset, args.per_family, rng)
+        wanted = quotas.get(family, args.per_family)
+        if wanted <= 0:
+            continue
+        produced = BUILDERS[family](offset, wanted, rng)
+        for row in produced:
+            row["family_name"] = family
         offset += len(produced)
         rows.extend(produced)
     for row in rows:
