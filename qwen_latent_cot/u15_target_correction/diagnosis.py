@@ -196,15 +196,12 @@ def _single_token_ids(tokenizer, candidates):
         raise ValueError(f"No single-token encoding found for {candidates}")
     return ids
 
-@torch.no_grad()
-def und_log_reward(rt, image, questions, yes_ids=None, no_ids=None):
-    """Single-pass prefill Yes/No log-sigmoid conjunction score in (-inf, 0]."""
+
+def _image_inputs(rt, image):
+    """The image tag and understanding-side pixels for one protocol canvas."""
     m, tok = rt.model, rt.tokenizer
     m.img_context_token_id = tok.convert_tokens_to_ids("<IMG_CONTEXT>")
     m.img_start_token_id = tok.convert_tokens_to_ids("<img>")
-    yes_ids = yes_ids or _single_token_ids(tok, YES_VARIANTS)
-    no_ids = no_ids or _single_token_ids(tok, NO_VARIANTS)
-
     mean = image.new_tensor([0.485, 0.456, 0.406])[None, :, None, None]
     std = image.new_tensor([0.229, 0.224, 0.225])[None, :, None, None]
     rgb = ((image.detach().float().clamp(-1, 1) + 1) / 2 - mean) / std
@@ -215,7 +212,16 @@ def und_log_reward(rt, image, questions, yes_ids=None, no_ids=None):
         .reshape(gh * gw, -1)
         .to(m.vision_model.embeddings.patch_embedding.weight.dtype)
     )
-    img_tag = "<img>" + "<IMG_CONTEXT>" * rt.tokens + "</img>"
+    tag = "<img>" + "<IMG_CONTEXT>" * rt.tokens + "</img>"
+    return grid, pixels, tag
+
+@torch.no_grad()
+def und_log_reward(rt, image, questions, yes_ids=None, no_ids=None):
+    """Single-pass prefill Yes/No log-sigmoid conjunction score in (-inf, 0]."""
+    m, tok = rt.model, rt.tokenizer
+    yes_ids = yes_ids or _single_token_ids(tok, YES_VARIANTS)
+    no_ids = no_ids or _single_token_ids(tok, NO_VARIANTS)
+    grid, pixels, img_tag = _image_inputs(rt, image)
 
     with autocast(rt.device):
         # One understanding-side ViT pass per preview image.
@@ -275,6 +281,37 @@ def summarize_question_scores(per_q):
     )
 
 @torch.no_grad()
+def ask_with_image(rt, image, question, cfg, system_message=None, max_new_tokens=None):
+    """Text answer conditioned on one image; same canvas and normalization as scoring."""
+    from sensenova_u1.models.neo_unify.conversation import get_conv_template
+
+    m, tok = rt.model, rt.tokenizer
+    grid, pixels, img_tag = _image_inputs(rt, image)
+    query = m._build_t2i_query(
+        img_tag + "\n" + question,
+        system_message=system_message,
+        append_text="<think>\n\n</think>\n\n",
+    )
+    encoded = tok(query, return_tensors="pt")
+    separator = get_conv_template(m.template).sep.strip()
+    eos = tok.convert_tokens_to_ids(separator)
+    with autocast(rt.device):
+        vit = m.extract_feature(pixels, gen_model=False, grid_hw=grid)
+        output = m.generate(
+            input_ids=encoded["input_ids"].to(rt.device),
+            grid_hw=grid,
+            attention_mask=encoded["attention_mask"].to(rt.device),
+            visual_features=vit,
+            max_new_tokens=int(max_new_tokens or cfg["und_max_new_tokens"]),
+            do_sample=False,
+            eos_token_id=eos,
+            pad_token_id=eos,
+        )
+    text = tok.batch_decode(output, skip_special_tokens=True)[0].split(separator)[0].strip()
+    return text.rsplit("</think>", 1)[-1].strip()
+
+
+@torch.no_grad()
 def und_score_image(rt, image, questions, yes_ids=None, no_ids=None):
     _, scores = und_log_reward(rt, image, questions, yes_ids, no_ids)
     return summarize_question_scores(scores)
@@ -309,11 +346,111 @@ _COUNT_WORD = {
     "five": "five", "six": "six", "seven": "seven", "eight": "eight", "nine": "nine", "ten": "ten",
 }
 _RELATIONS = ("in front of", "behind", "on top of", "next to", "beside", "under", "above")
+_RELATION_WORDS = (
+    "in front of", "to the left of", "to the right of", "on top of",
+    "next to", "beside", "behind", "under", "above", "below",
+    "left of", "right of", "on",
+)
+_RELATION_ALTERNATION = "|".join(re.escape(word) for word in _RELATION_WORDS)
+_RELATION_INVERSE = {
+    "behind": "in front of",
+    "in front of": "behind",
+    "to the left of": "to the right of",
+    "to the right of": "to the left of",
+    "left of": "right of",
+    "right of": "left of",
+    "above": "below",
+    "below": "above",
+    "on top of": "under",
+    "under": "on top of",
+}
+_COUNT_NUMBER = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
 
 
 def _same_subject(left, right):
     left, right = left.lower().strip(), right.lower().strip()
     return left.rstrip("s") == right.rstrip("s") or left in right or right in left
+
+
+def _clean_entity(text):
+    text = re.sub(r"\s+", " ", str(text or "")).strip(" .,")
+    text = re.sub(r"^(?:the|a|an)\s+", "", text, flags=re.I)
+    text = re.sub(
+        r"\s+(?:visible|present|shown|in the (?:scene|image))\b.*$", "", text, flags=re.I
+    )
+    text = re.sub(r"\b(?:is|are|was|were|sits?|stands?|located|positioned)\b", " ", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip(" .,")
+
+
+def _relation_claim(question):
+    text = question.strip().rstrip("?？")
+    match = re.match(
+        r"(?:Is|Are)\s+(?:the\s+)?(.+?)\s+(?:positioned\s+|located\s+)?"
+        r"(" + _RELATION_ALTERNATION + r")\s+(?:the\s+)?(.+?)$",
+        text,
+        re.I,
+    )
+    if not match:
+        match = re.match(
+            r"(?:Is|Are) there\s+(?:(?:a|an|the)\s+)?(.+?)\s+"
+            r"(" + _RELATION_ALTERNATION + r")\s+(?:(?:a|an|the)\s+)?(.+?)$",
+            text,
+            re.I,
+        )
+    if not match:
+        return None
+    return _clean_entity(match.group(1)), match.group(2).lower(), _clean_entity(match.group(3))
+
+
+def raw_relations(raw):
+    """Extract explicit relation triples from the source prompt."""
+    text = re.sub(r"\s+", " ", str(raw or "").strip().rstrip("."))
+    pattern = re.compile(
+        r"(?:(?:the|a|an)\s+)?([a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,4}?)\s+"
+        r"(?:is\s+|are\s+|was\s+|were\s+)?(" + _RELATION_ALTERNATION + r")\s+"
+        r"(?:(?:the|a|an)\s+)?([a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,4}?)"
+        r"(?=\s*(?:[,.;]| and |$))",
+        re.I,
+    )
+    return [
+        (_clean_entity(match.group(1)), match.group(2).lower(), _clean_entity(match.group(3)))
+        for match in pattern.finditer(text)
+    ]
+
+
+def _count_claim(question):
+    text = re.sub(r"\s+", " ", question.strip().rstrip("?？"))
+    exact = bool(re.search(r"\bexactly\b", text, re.I))
+    lower = bool(re.search(r"\bor more\b", text, re.I))
+    match = re.match(
+        r"Are there\s+(?:exactly\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+        r"(?:\s+or more)?\s+(.+?)(?:\s+(?:visible|present|shown)\b.*)?$",
+        text,
+        re.I,
+    )
+    if match:
+        kind = "exact" if exact else "at_least" if lower else "exact"
+        subject = _clean_entity(match.group(2))
+        return kind, int(_COUNT_NUMBER.get(match.group(1).lower(), match.group(1))), subject
+    exists = re.match(
+        r"(?:Is|Are) there\s+(a|an|any)\s+(.+?)(?:\s+(?:visible|present|shown)\b.*)?$",
+        text,
+        re.I,
+    )
+    if exists:
+        return "exists", 1, _clean_entity(exists.group(2))
+    return None
+
+
+def _raw_mentions(raw, subject):
+    words = [word for word in re.findall(r"[a-z][a-z\-]*", subject.lower()) if word not in {"green", "red", "blue", "black", "white", "brown", "yellow", "pink", "purple", "orange", "grey", "gray"}]
+    if not words:
+        return False
+    pattern = r"\b" + r"\s+".join(re.escape(word) for word in words[-2:]) + r"s?\b"
+    return bool(re.search(pattern, raw, re.I))
 
 
 def parse_entities(raw):
@@ -362,9 +499,53 @@ def _color_claim(question):
 
 
 def question_grounded(raw, question):
-    """Relation, setting, and action questions must be licensed by the raw prompt."""
-    if _SPATIAL_Q.search(question) and not _SPATIAL_PROMPT.search(raw):
+    """Bind relations and counts to the entities and direction in the raw prompt."""
+    relation = _relation_claim(question)
+    if relation is not None:
+        left, relation_name, right = relation
+        licensed = False
+        for raw_left, raw_relation, raw_right in raw_relations(raw):
+            if (
+                _same_subject(left, raw_left)
+                and _same_subject(right, raw_right)
+                and relation_name == raw_relation
+            ):
+                licensed = True
+                break
+            if (
+                _same_subject(left, raw_right)
+                and _same_subject(right, raw_left)
+                and relation_name == _RELATION_INVERSE.get(raw_relation)
+            ):
+                licensed = True
+                break
+        if not licensed:
+            return False
+    elif _SPATIAL_Q.search(question) and not _SPATIAL_PROMPT.search(raw):
         return False
+
+    count = _count_claim(question)
+    if count is not None:
+        kind, number, subject = count
+        matching = [
+            entity for entity in parse_entities(raw)
+            if _same_subject(subject, entity["subject"])
+        ]
+        if kind == "exact":
+            if not matching or not any(
+                int(_COUNT_NUMBER.get(entity["count"], -1)) == number for entity in matching
+            ):
+                return False
+        elif kind == "at_least":
+            if matching and not any(
+                int(_COUNT_NUMBER.get(entity["count"], 0)) >= number for entity in matching
+            ):
+                return False
+            if not matching and not _raw_mentions(raw, subject):
+                return False
+        elif not matching and not _raw_mentions(raw, subject):
+            return False
+
     if _ACTION.search(question) and not _ACTION.search(raw):
         return False
     if _SETTING_Q.search(question) and not _SETTING_Q.search(raw):
@@ -446,17 +627,26 @@ def _attribute_keep(question):
     return f"Keep the {noun} {match.group(2).lower()}."
 
 
+_UNACTIONABLE = re.compile(
+    r"\b(other|besides|only subjects?|without any occlusion|partially obscured)\b", re.I
+)
+
+
 def feedback_from_questions(questions, failed):
     """Split a diagnosis into an edit request, a preserve list, and rejections.
 
     The request is the imperative form of failed questions. Preserve only
     carries confirmed attributes that the image already satisfies. A failure
-    without an imperative form is rejected rather than smuggled into the edit.
+    without a concrete imperative form is rejected rather than smuggled into
+    the edit.
     """
     failed_set = set(failed).intersection(questions)
     changes, rejected = [], []
     for question in questions:
         if question not in failed_set:
+            continue
+        if _UNACTIONABLE.search(question):
+            rejected.append(question)
             continue
         line = _imperative(question)
         if line:

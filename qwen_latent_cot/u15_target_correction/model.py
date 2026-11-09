@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .conditions import edit_prompt
-from .runtime import autocast
+from .runtime import autocast, native_pixels
 
 
 class GENLoRA(nn.Module):
@@ -136,17 +136,10 @@ class StateEditor(nn.Module):
 
     def _pixels(self, image):
         """ImageNet-normalize the protocol canvas. Never round-trip through PNG."""
-        from sensenova_u1.models.neo_unify.utils import IMAGENET_MEAN, IMAGENET_STD, preprocess_pixel_values
-
-        rt, m = self.rt, self.model
+        rt = self.rt
         if tuple(image.shape[-2:]) != (rt.height, rt.width):
             raise ValueError("Condition image must already use the protocol canvas")
-        rgb = (image.detach().float().clamp(-1, 1) + 1) * 0.5
-        mean = rgb.new_tensor(IMAGENET_MEAN).view(3, 1, 1)
-        std = rgb.new_tensor(IMAGENET_STD).view(3, 1, 1)
-        pixels, grid = preprocess_pixel_values((rgb[0] - mean) / std, patch_size=m.patch_size)
-        dtype = torch.bfloat16 if rt.device.type != "cpu" else torch.float32
-        return pixels.to(device=rt.device, dtype=dtype), grid.to(rt.device)
+        return native_pixels(rt, image)
 
     def _query(self, instruction, grid, *, image_only):
         from sensenova_u1.models.neo_unify.utils import SYSTEM_MESSAGE_FOR_GEN
@@ -264,7 +257,11 @@ class StateEditor(nn.Module):
         self.state_calls += 1
         return self._clean(state, float(t), prefix, s=float(s), use_lora=True)
 
-    def state_velocity(self, state, t, s, prefixes, base_prediction):
-        """Displacement per unit edit progress: t * [H(q,t,s) - b0]."""
-        clean = self.state_clean(state, t, s, prefixes["joint"])
+    def state_velocity(self, state, t, s, joint_prefix, base_prediction):
+        """Displacement per unit edit progress: t * [H(q,t,s) - b0].
+
+        ``joint_prefix`` is the already-selected tuple from ``prefixes()``;
+        callers must not pass the whole image/joint dictionary here.
+        """
+        clean = self.state_clean(state, t, s, joint_prefix)
         return (clean - base_prediction.float()) * float(t)

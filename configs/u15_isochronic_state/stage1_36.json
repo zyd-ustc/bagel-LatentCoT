@@ -1,0 +1,23 @@
+{
+  "extends": "core.json",
+  "stage": 1,
+  "read_time": 0.36,
+  "state_times": [0.36],
+  "state_time_probs": [1.0],
+  "keep_fraction": 0.0,
+  "role_weights": {
+    "L_edit": 1.0
+  },
+  "source_weights": {
+    "linear_pair": 1.0
+  },
+  "lr": 1e-05,
+  "lr_final": 2e-06,
+  "warmup_steps": 50,
+  "betas": [0.9, 0.95],
+  "eps": 1e-08,
+  "weight_decay": 0.0,
+  "max_steps": 1200,
+  "updates_per_pair": 8,
+  "save_every": 150
+}

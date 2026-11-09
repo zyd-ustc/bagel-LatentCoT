@@ -1,0 +1,38 @@
+{
+  "extends": "core.json",
+  "stage": 2,
+  "read_time": 0.36,
+  "state_times": [
+    0.36
+  ],
+  "state_time_probs": [
+    1.0
+  ],
+  "keep_fraction": 0.0,
+  "role_weights": {
+    "R_edit": 1.0
+  },
+  "terminal": {
+    "enabled": true,
+    "preserve_weight": 1.0,
+    "frequency_weight": 0.5,
+    "mask_low": 0.6,
+    "mask_high": 0.95
+  },
+  "recovery_prob": 0.0,
+  "lr": 2e-05,
+  "lr_final": 2e-05,
+  "warmup_steps": 0,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0.0,
+  "max_steps": 120,
+  "updates_per_pair": 120,
+  "save_every": 40,
+  "source_weights": {
+    "native_parent": 1.0
+  }
+}

@@ -4,7 +4,9 @@ import json
 import math
 from pathlib import Path
 
-from . import CONDITION_PROTOCOL, KIND, PROTOCOL_VERSION
+from . import (
+    CONDITION_PROTOCOL, KIND, PROTOCOL_VERSION, ROLE_R_EDIT, ROLES,
+)
 
 # Every name in this set belonged to a previous training or inference design.
 OLD_KEYS = frozenset(
@@ -22,7 +24,6 @@ OLD_KEYS = frozenset(
         "lambda_fm",
         "lambda_perceptual",
         "text_drop_prob",
-        "role_weights",
         "lookahead_nodes",
         "history_roles",
         "native_edit",
@@ -113,6 +114,8 @@ def validate_config(cfg):
         raise ValueError("keep_instruction must be non-empty")
     if cfg.get("condition_protocol") != CONDITION_PROTOCOL:
         raise ValueError("condition_protocol must use the frozen template version")
+    if not isinstance(cfg.get("allow_derived_tail", False), bool):
+        raise ValueError("allow_derived_tail must be a boolean")
 
     stage = cfg.get("stage")
     if stage is not None:
@@ -146,13 +149,81 @@ def validate_config(cfg):
             raise ValueError("source_weights must be non-negative")
         if int(stage) == 1 and set(weights) != {"linear_pair"}:
             raise ValueError("Stage 1 trains on linear pairs only")
-        if int(stage) == 2 and "inverted_pair" not in weights:
-            raise ValueError("Stage 2 must include inverted pairs")
+        if int(stage) == 2 and float(weights.get("native_parent", 0)) <= 0:
+            raise ValueError("Stage 2 must include native parent pairs")
+
+    roles = cfg.get("role_weights")
+    if roles is not None:
+        if not isinstance(roles, dict) or not roles:
+            raise ValueError("role_weights must be a non-empty mapping")
+        unknown = sorted(set(roles) - set(ROLES))
+        if unknown:
+            raise ValueError("role_weights contains an unknown role: " + ", ".join(unknown))
+        values = [float(value) for value in roles.values()]
+        if any(value < 0 for value in values):
+            raise ValueError("role_weights must be non-negative")
+        if abs(sum(values) - 1) > 1e-6:
+            raise ValueError("role_weights must sum to one")
+        if float(cfg.get("keep_fraction", 0)) != 0:
+            raise ValueError("role_weights replaces keep_fraction; set keep_fraction to zero")
+        if stage is not None and int(stage) == 2:
+            # The edit signal is the only mandatory role. Stage 2 runs exist with a
+            # single real-state pool (R-edit), and terminal supervision has no state
+            # target at all, so requiring L/R-keep here would block those runs.
+            if float(roles.get(ROLE_R_EDIT, 0)) <= 0:
+                raise ValueError("Stage 2 role weights must include " + ROLE_R_EDIT)
+
+    terminal = cfg.get("terminal")
+    if terminal is not None:
+        if not isinstance(terminal, dict):
+            raise ValueError("terminal must be a mapping")
+        if terminal.get("enabled"):
+            for key in ("preserve_weight", "frequency_weight"):
+                if float(terminal.get(key, 0)) < 0:
+                    raise ValueError("terminal." + key + " must be non-negative")
+            low = float(terminal.get("mask_low", 0.6))
+            high = float(terminal.get("mask_high", 0.95))
+            if not 0 <= low < high <= 1:
+                raise ValueError("terminal mask quantiles must satisfy 0 <= low < high <= 1")
+            if float(cfg.get("recovery_prob", 0)) > 0:
+                raise ValueError("Terminal supervision replaces the recovery bridge")
+            named = terminal.get("roles")
+            if named is not None:
+                if not isinstance(named, list) or not named:
+                    raise ValueError("terminal.roles must be a non-empty list")
+                unknown = sorted(set(named) - set(ROLES))
+                if unknown:
+                    raise ValueError("terminal.roles has an unknown role: " + ", ".join(unknown))
+
+    start = int(cfg.get("recovery_start_step", 0))
+    probability = float(cfg.get("recovery_prob", 0.0))
+    recovery_step = float(cfg.get("recovery_step", 0.0))
+    if start < 0:
+        raise ValueError("recovery_start_step must be non-negative")
+    if not 0 <= probability < 1:
+        raise ValueError("recovery_prob must lie in [0, 1)")
+    if probability > 0:
+        if not 0 < recovery_step < 1:
+            raise ValueError("recovery_step must lie in (0, 1)")
+        subdivision = round(1 / recovery_step)
+        if subdivision < 2 or abs(subdivision * recovery_step - 1) > 1e-9:
+            raise ValueError("recovery_step must divide one into equal steps, e.g. 0.125")
 
     inversion = cfg.get("inversion", {})
     if inversion:
+        solver = str(inversion.get("solver", "reverse_heun"))
+        if solver not in ("reverse_heun", "discrete_fixpoint"):
+            raise ValueError("inversion.solver must be reverse_heun or discrete_fixpoint")
         if int(inversion.get("substeps", 0)) < 1:
             raise ValueError("Inversion substeps must be positive")
+        if solver == "discrete_fixpoint":
+            if int(inversion.get("iterations", 0)) < 1:
+                raise ValueError("Inversion iterations must be positive")
+            damping = float(inversion.get("damping", 0.0))
+            if not 0 < damping <= 1:
+                raise ValueError("Inversion damping must lie in (0, 1]")
+            if float(inversion.get("max_residual", 0)) <= 0:
+                raise ValueError("max_residual must be positive")
         for key in ("source_l1_max", "target_l1_max"):
             if float(inversion.get(key, 1)) <= 0:
                 raise ValueError(key + " must be positive")
@@ -161,12 +232,15 @@ def validate_config(cfg):
     return cfg
 
 
-def stage_updates(records, cfg):
-    """The plan's finite update budget: 8 passes over independent records."""
+def stage_updates(records, cfg, global_batch=None):
+    """Eight passes over independent records at the actual global batch."""
     records = int(records)
     if records < 1:
         raise ValueError("A stage needs at least one independent training record")
+    batch = int(global_batch or cfg["global_batch"])
+    if batch < 1:
+        raise ValueError("global_batch must be positive")
     return min(
         int(cfg["max_steps"]),
-        math.ceil(int(cfg["updates_per_pair"]) * records / int(cfg["global_batch"])),
+        math.ceil(int(cfg["updates_per_pair"]) * records / batch),
     )

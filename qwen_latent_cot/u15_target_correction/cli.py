@@ -49,6 +49,17 @@ def _parser():
     native.add_argument("--output", required=True)
     native.add_argument("--limit", type=int, default=32)
 
+    evaluate = commands.add_parser("eval-linear")
+    _model_args(evaluate)
+    evaluate.add_argument("--linear", required=True)
+    evaluate.add_argument("--checkpoint", required=True)
+    evaluate.add_argument("--output", required=True)
+    evaluate.add_argument("--limit", type=int, default=32)
+    evaluate.add_argument("--seed", type=int, default=20261107)
+    evaluate.add_argument("--time", type=float)
+    evaluate.add_argument("--steps", type=int, default=8)
+    evaluate.add_argument("--no-lpips", action="store_true")
+
     prepare = commands.add_parser("prepare-state-pairs")
     _model_args(prepare)
     prepare.add_argument("--mode", choices=("inverted", "native-parent"), required=True)
@@ -61,8 +72,28 @@ def _parser():
     prepare.add_argument("--shard-index", type=int, default=0)
     prepare.add_argument("--shard-count", type=int, default=1)
     prepare.add_argument("--skip-existing", action="store_true")
+    prepare.add_argument(
+        "--refresh-needs-edit",
+        action="store_true",
+        help="With --skip-existing, recompute markers whose target has since arrived",
+    )
     prepare.add_argument("--no-lpips", action="store_true")
     prepare.add_argument("--cache-base-prediction", action="store_true")
+    prepare.add_argument(
+        "--explicit-requests",
+        help="Produce explicit-edit records only, keyed by uid, from approved targets",
+    )
+    prepare.add_argument(
+        "--reconstruct-parent",
+        action="store_true",
+        help="Also invert each parent final image and record its round-trip error",
+    )
+    prepare.add_argument(
+        "--keep-share",
+        type=float,
+        default=0.0,
+        help="Fraction of native-parent prompts designated R-keep by uid hash",
+    )
     return parser
 
 
@@ -72,7 +103,11 @@ def _explicit_edit(row, raw):
     if not instruction:
         return None
     edit = compact(instruction)
-    tail = row.get("tail_condition") or derived_tail_condition(raw, edit)
+    tail = row.get("tail_condition")
+    if not str(tail or "").strip():
+        if not bool(row.get("allow_derived_tail")):
+            raise ValueError("Explicit edits require an independent full tail_condition")
+        tail = derived_tail_condition(raw, edit)
     return dict(
         edit_request=edit,
         tail_condition=compact(tail),
@@ -112,20 +147,26 @@ def _native(args, cfg, device):
     run_native(rt, cfg, args.mode, args.prompts, args.output, args.limit, device)
 
 
+def _load_editor(rt, cfg, checkpoint):
+    """Build the editor and load only its trainable weights."""
+    from .checkpoint import editor_identity, load_stage_weights
+    from .model import StateEditor
+
+    editor = StateEditor(rt, cfg).eval()
+    return editor, load_stage_weights(checkpoint, editor, editor_identity(rt, cfg))
+
+
 def _sample(args, cfg, device):
     from . import distributed as dist
-    from .checkpoint import editor_identity, load_stage_weights
     from .data import read_rows
     from .images import save_image
     from .loading import load_native
-    from .model import StateEditor
     from .sampling import run
 
     rt = load_native(args.model, args.source, cfg, device, args.distributed)
     editor = None
     if args.checkpoint:
-        editor = StateEditor(rt, cfg).eval()
-        meta = load_stage_weights(args.checkpoint, editor, editor_identity(rt, cfg))
+        editor, meta = _load_editor(rt, cfg, args.checkpoint)
         print(json.dumps(dict(checkpoint=str(args.checkpoint), stage=meta.get("stage"), step=meta.get("step"))))
     if args.distributed and editor is not None:
         dist.broadcast_parameters(editor)
@@ -158,6 +199,32 @@ def _sample(args, cfg, device):
         (out / "complete.json").write_text(json.dumps(dict(samples=len(rows))) + "\n")
 
 
+def _eval_linear(args, cfg, device):
+    from . import distributed as dist
+    from .data import LinearManifest
+    from .eval_linear import evaluate_linear
+    from .loading import load_native
+
+    rt = load_native(args.model, args.source, cfg, device, args.distributed)
+    editor, _ = _load_editor(rt, cfg, args.checkpoint)
+    editor.checkpoint = args.checkpoint
+    if args.distributed:
+        dist.broadcast_parameters(editor)
+    manifest = LinearManifest(args.linear, rt, cfg)
+    evaluate_linear(
+        rt,
+        cfg,
+        editor,
+        manifest,
+        args.output,
+        limit=args.limit,
+        seed=args.seed,
+        time=args.time if args.time is not None else float(cfg["read_time"]),
+        steps=args.steps,
+        no_lpips=args.no_lpips,
+    )
+
+
 def main():
     args = _parser().parse_args()
     if args.command == "judge":
@@ -179,6 +246,7 @@ def main():
         "prepare-state-pairs": _prepare,
         "native": _native,
         "sample": _sample,
+        "eval-linear": _eval_linear,
     }
     runners[args.command](args, cfg, device)
     if args.distributed:

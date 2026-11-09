@@ -7,7 +7,11 @@ from pathlib import Path
 
 import torch
 
-from . import CACHE_KIND, INVERTED_PAIR, LINEAR_PAIR, NATIVE_PARENT
+from . import (
+    CACHE_KIND, INVERTED_PAIR, LINEAR_PAIR, NATIVE_PARENT,
+    ROLE_I_EDIT, ROLE_L_EDIT, ROLE_L_REVERSE, ROLE_R_EDIT, ROLE_R_KEEP,
+    ROLE_R_REPAIR, ROLES,
+)
 from .conditions import compact, derived_tail_condition
 from .field import protocol, sample_state_time, time_key, weighted_choice
 from .images import load_canvas, load_pair, valid_mask
@@ -16,6 +20,15 @@ DOMAIN = {
     LINEAR_PAIR: "linear",
     INVERTED_PAIR: "inverted",
     NATIVE_PARENT: "native_history",
+}
+
+ROLE_DOMAIN = {
+    ROLE_L_EDIT: "linear",
+    ROLE_L_REVERSE: "linear",
+    ROLE_I_EDIT: "inverted",
+    ROLE_R_EDIT: "native_history",
+    ROLE_R_REPAIR: "native_history",
+    ROLE_R_KEEP: "native_history",
 }
 
 
@@ -58,6 +71,13 @@ def _family(row, key, fallback):
     return row.get(key) or fallback
 
 
+def _keep_or_edit(row, cfg, keep):
+    """The instruction triple for a keep draw or for the record's own edit."""
+    if keep:
+        return cfg["keep_instruction"], row["parent_condition"], ""
+    return row["edit_instruction"], row["tail_condition"], row["preserve"]
+
+
 class LinearManifest:
     """Existing high-quality edit pairs consumed directly as L data."""
 
@@ -85,8 +105,11 @@ class LinearManifest:
 
     def _normalize(self, row):
         role = row.get("role")
-        if role not in (None, "native_edit", LINEAR_PAIR):
+        allowed_linear = (None, "native_edit", LINEAR_PAIR, ROLE_L_EDIT, ROLE_L_REVERSE)
+        if role not in allowed_linear:
             raise ValueError("A linear manifest only carries edit pairs")
+        if role != ROLE_L_REVERSE:
+            role = ROLE_L_EDIT
         split = row.get("split")
         if split not in ("train", "val", "test"):
             raise ValueError("Split must be train, val, or test")
@@ -112,8 +135,12 @@ class LinearManifest:
         tail = row.get("tail_condition")
         if str(tail or "").strip():
             tail = compact(tail)
-            tail_source = "declared"
+            tail_source = str(row.get("tail_source") or "declared")
         else:
+            if not (bool(row.get("allow_derived_tail")) or bool(self.cfg.get("allow_derived_tail"))):
+                raise ValueError(
+                    "A linear pair needs an independent full tail_condition: " + uid
+                )
             tail = derived_tail_condition(parent, edit)
             tail_source = "derived_parent_plus_edit"
         frozen = row.get("condition_protocol") or self.cfg["condition_protocol"]
@@ -138,11 +165,24 @@ class LinearManifest:
             semantic_quality_source=row.get("semantic_quality_source", "legacy_semantic_approved"),
             target_quality_source=row.get("target_quality_source", "legacy_semantic_approved"),
             task=row.get("task"),
+            geometry=row.get("geometry"),
+            role=role,
         )
 
     @property
     def count(self):
         return len(self.train_indices)
+
+    def role_pools(self):
+        """Forward and reversed pairs are sampled apart even though both are linear."""
+        grouped = {}
+        for index in self.train_indices:
+            grouped.setdefault(self.rows[index]["role"], []).append(index)
+        return {
+            "linear": self,
+            ROLE_L_EDIT: LinearPool(self, grouped.get(ROLE_L_EDIT, [])),
+            ROLE_L_REVERSE: LinearPool(self, grouped.get(ROLE_L_REVERSE, [])),
+        }
 
     def available_times(self):
         return [float(t) for t in self.cfg["state_times"]]
@@ -160,22 +200,20 @@ class LinearManifest:
     def sample(self, index, time, keep=False):
         row = self.rows[index]
         if keep:
+            declared = row.get("geometry") or {}
+            crop = declared.get("source") if isinstance(declared, dict) else None
             source, valid, _ = load_canvas(
-                row["source_image"], self.rt.width, self.rt.height, self.rt.device
+                row["source_image"], self.rt.width, self.rt.height, self.rt.device,
+                crop=None if crop in (None, "full") else crop,
             )
             target = source.clone()
-            edit = self.cfg["keep_instruction"]
-            tail = row["parent_condition"]
-            preserve = ""
             frozen = self.cfg["condition_protocol"]
         else:
             source, target, valid, _ = load_pair(
                 row, self.rt.width, self.rt.height, self.rt.device
             )
-            edit = row["edit_instruction"]
-            tail = row["tail_condition"]
-            preserve = row["preserve"]
             frozen = row["condition_protocol"]
+        edit, tail, preserve = _keep_or_edit(row, self.cfg, keep)
         return dict(
             uid=row["uid"],
             source_kind=LINEAR_PAIR,
@@ -198,7 +236,36 @@ class LinearManifest:
             prompt_family=row["prompt_family"],
             semantic_quality_source=row["semantic_quality_source"],
             target_quality_source=row["target_quality_source"],
+            role=row["role"],
         )
+
+
+
+class LinearPool:
+    """One sub-role of the linear manifest, with the same interface as a state pool."""
+
+    def __init__(self, manifest, indices):
+        self.manifest = manifest
+        self.indices = list(indices)
+        self.cfg = manifest.cfg
+
+    @property
+    def count(self):
+        return len(self.indices)
+
+    def available_times(self):
+        return self.manifest.available_times()
+
+    def choose_time(self, rng, time=None):
+        return self.manifest.choose_time(rng, time)
+
+    def choose_index(self, time, rng):
+        if not self.indices:
+            raise ValueError("An empty linear sub-role pool was sampled")
+        return rng.choice(self.indices)
+
+    def sample(self, index, time, keep=False):
+        return self.manifest.sample(index, time, keep=keep)
 
 
 class StatePairManifest:
@@ -297,6 +364,7 @@ class StatePairManifest:
             valid_region=row.get("valid_region"),
             semantic_quality_source=row.get("semantic_quality_source"),
             target_quality_source=row.get("target_quality_source"),
+            role=row.get("role") or self._default_role(row),
         )
 
     @property
@@ -364,19 +432,32 @@ class StatePairManifest:
             raise ValueError("Cached state contains a nonfinite value: " + item["path"])
         if keep:
             state_b = state_a.clone()
-            edit = self.cfg["keep_instruction"]
-            tail = row["parent_condition"]
-            preserve = ""
-        else:
-            edit = row["edit_instruction"]
-            tail = row["tail_condition"]
-            preserve = row["preserve"]
+        edit, tail, preserve = _keep_or_edit(row, self.cfg, keep)
+        terminal = bool((self.cfg.get("terminal") or {}).get("enabled", False))
+        x_source = x_teacher = None
+        if terminal:
+            x_source, _, _ = load_canvas(
+                _resolve(self.root, row["source_image"]),
+                self.rt.width, self.rt.height, self.rt.device,
+                crop=(row.get("geometry") or {}).get("source"),
+            )
+            target_path = row.get("target_image")
+            if keep or not target_path:
+                x_teacher = x_source
+            else:
+                x_teacher, _, _ = load_canvas(
+                    _resolve(self.root, target_path),
+                    self.rt.width, self.rt.height, self.rt.device,
+                    crop=(row.get("geometry") or {}).get("target"),
+                )
         return dict(
             uid=row["uid"],
             source_kind=row["source_kind"],
             keep=bool(keep),
             source=None,
             target=None,
+            x_source=x_source,
+            x_teacher=x_teacher,
             state_a=state_a,
             state_b=state_b,
             preview=preview,
@@ -392,72 +473,183 @@ class StatePairManifest:
             prompt_family=row["prompt_family"],
             semantic_quality_source=row.get("semantic_quality_source"),
             target_quality_source=row.get("target_quality_source"),
+            role=row["role"],
         )
+
+    def _default_role(self, row):
+        """Older caches carry no role; keep is derivable from how it was made."""
+        if self.expected_kind == INVERTED_PAIR:
+            return ROLE_I_EDIT
+        kept = (
+            row.get("target_quality_source") == "native_keep"
+            or row.get("diagnosis_status") == "passed"
+        )
+        return ROLE_R_KEEP if kept else ROLE_R_EDIT
+
+    def role_pools(self):
+        """One sampling pool per role present in this cache."""
+        grouped = {}
+        for index in self.train_indices:
+            grouped.setdefault(self.rows[index]["role"], []).append(index)
+        return {
+            role: StatePairPool(self, role, grouped[role])
+            for role in (ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_R_REPAIR)
+            if grouped.get(role)
+        }
+
+
+class StatePairPool:
+    """A role restricted to one cache: its indices, accepted times, and draws."""
+
+    def __init__(self, manifest, role, indices):
+        self.manifest = manifest
+        self.role = role
+        self.indices = list(indices)
+        self.by_time = {key: [] for key in manifest.by_time}
+        for index in self.indices:
+            for key, item in manifest.rows[index]["states"].items():
+                if item["accepted"] and key in self.by_time:
+                    self.by_time[key].append(index)
+
+    @property
+    def count(self):
+        return len(self.indices)
+
+    def available_times(self):
+        return [
+            float(t) for t in self.manifest.cfg["state_times"]
+            if self.by_time[time_key(t)]
+        ]
+
+    def choose_time(self, rng, time=None):
+        available = self.available_times()
+        if not available:
+            raise ValueError("No accepted state time in " + self.role)
+        if time is not None:
+            if float(time) not in available:
+                raise ValueError("The selected state time has no accepted label")
+            return float(time)
+        configured = [float(t) for t in self.manifest.cfg["state_times"]]
+        probs = [
+            float(self.manifest.cfg["state_time_probs"][configured.index(value)])
+            for value in available
+        ]
+        return weighted_choice(rng, available, probs, total=sum(probs))
+
+    def choose_index(self, time, rng):
+        indices = self.by_time[time_key(time)]
+        if not indices:
+            raise ValueError("No " + self.role + " record at the requested state time")
+        return rng.choice(indices)
+
+    def sample(self, index, time, keep=False):
+        return self.manifest.sample(index, time, keep=keep)
 
 
 class TrainingSampler:
-    """Stage-aware source, time, and explicit-keep sampling."""
+    """Role-aware source, time, and keep sampling.
+
+    ``role_weights`` draws the four roles explicitly, so a changing cache
+    acceptance rate cannot silently change the training task; keep records then
+    come only from the R-keep pool. Without it, the legacy source-kind weights
+    and ``keep_fraction`` apply unchanged.
+    """
 
     def __init__(self, linear, inverted, native, cfg, rank=0):
         self.cfg = cfg
         self.rng = random.Random(int(cfg["seed"]) + int(rank))
-        self.pools = {
-            LINEAR_PAIR: linear,
-            INVERTED_PAIR: inverted,
-            NATIVE_PARENT: native,
-        }
-        configured = {k: float(v) for k, v in cfg["source_weights"].items()}
-        weights = {
-            kind: value for kind, value in configured.items()
-            if value > 0 and self.pools.get(kind) is not None and self.pools[kind].count > 0
-        }
-        if not weights:
-            raise ValueError("No configured source has a usable training record")
-        if int(cfg["stage"]) == 2 and INVERTED_PAIR not in weights:
-            raise ValueError("Stage 2 needs inverted pairs for the requested mix")
-        if int(cfg["stage"]) == 2 and configured.get(NATIVE_PARENT, 0) > 0 and NATIVE_PARENT not in weights:
-            # The plan's explicit fallback when R is not ready.
-            weights = {LINEAR_PAIR: 0.2, INVERTED_PAIR: 0.8}
-        total = sum(weights.values())
-        self.weights = {kind: value / total for kind, value in weights.items()}
-        self.keep_fraction = float(cfg["keep_fraction"])
-        self.seen_kinds = set()
-        self.draws = 0
         self.keep_draws = 0
+        self.draws = 0
+        roles = {key: float(value) for key, value in (cfg.get("role_weights") or {}).items()}
+        if roles:
+            self.pools = {}
+            if linear is not None and linear.count:
+                for role, pool in linear.role_pools().items():
+                    if role == "linear" or not pool.count:
+                        continue
+                    self.pools[role] = pool
+                # Legacy manifests carry no sub-role; keep them usable as L-edit.
+                if ROLE_L_EDIT not in self.pools:
+                    self.pools[ROLE_L_EDIT] = linear
+            for manifest in (inverted, native):
+                if manifest is not None:
+                    self.pools.update(manifest.role_pools())
+            missing = sorted(
+                role for role, weight in roles.items() if weight > 0 and role not in self.pools
+            )
+            if missing:
+                raise ValueError(
+                    "Role weights ask for records this run does not have: " + ", ".join(missing)
+                )
+            weights = {role: weight for role, weight in roles.items() if weight > 0}
+            total = sum(weights.values())
+            self.weights = {role: weight / total for role, weight in weights.items()}
+            self.configured = dict(roles)
+            self.keep_fraction = 0.0
+        else:
+            self.pools = {
+                LINEAR_PAIR: linear,
+                INVERTED_PAIR: inverted,
+                NATIVE_PARENT: native,
+            }
+            configured = {k: float(v) for k, v in cfg["source_weights"].items()}
+            weights = {
+                kind: value for kind, value in configured.items()
+                if value > 0 and self.pools.get(kind) is not None and self.pools[kind].count > 0
+            }
+            if not weights:
+                raise ValueError("No configured source has a usable training record")
+            if int(cfg["stage"]) == 2 and INVERTED_PAIR not in weights:
+                raise ValueError("Stage 2 needs inverted pairs for the requested mix")
+            if int(cfg["stage"]) == 2 and configured.get(NATIVE_PARENT, 0) > 0 and NATIVE_PARENT not in weights:
+                # The plan's explicit fallback when R is not ready.
+                weights = {LINEAR_PAIR: 0.2, INVERTED_PAIR: 0.8}
+            total = sum(weights.values())
+            self.weights = {kind: value / total for kind, value in weights.items()}
+            self.configured = dict(configured)
+            self.keep_fraction = float(cfg["keep_fraction"])
+        self.seen = set()
 
     @property
     def configured_weights(self):
-        return dict(self.cfg["source_weights"])
+        return dict(self.configured)
 
     @property
     def actual_weights(self):
         return dict(self.weights)
 
     def input_domains(self):
-        return [DOMAIN[kind] for kind in (LINEAR_PAIR, INVERTED_PAIR, NATIVE_PARENT) if kind in self.seen_kinds]
+        domains = []
+        for key in (*ROLES, LINEAR_PAIR, INVERTED_PAIR, NATIVE_PARENT):
+            if key in self.seen:
+                domain = ROLE_DOMAIN.get(key) or DOMAIN[key]
+                if domain not in domains:
+                    domains.append(domain)
+        return domains
 
-    def _kind(self):
-        kinds = list(self.weights)
-        return weighted_choice(self.rng, kinds, [self.weights[kind] for kind in kinds])
+    def _role(self):
+        keys = list(self.weights)
+        return weighted_choice(self.rng, keys, [self.weights[key] for key in keys])
 
     def draw(self, time=None):
-        kind = self._kind()
-        pool = self.pools[kind]
-        keep = self.rng.random() < self.keep_fraction
+        role = self._role()
+        pool = self.pools[role]
+        keep = self.keep_fraction > 0 and self.rng.random() < self.keep_fraction
         chosen_time = pool.choose_time(self.rng, time)
         index = pool.choose_index(chosen_time, self.rng)
         sample = pool.sample(index, chosen_time, keep=keep)
-        self.seen_kinds.add(kind)
+        sample["role"] = role
+        self.seen.add(role)
         self.draws += 1
-        self.keep_draws += int(keep)
+        self.keep_draws += int(bool(sample.get("keep")))
         return sample
 
     def state_dict(self):
-        return dict(rng=self.rng.getstate(), seen=sorted(self.seen_kinds), draws=self.draws, keep=self.keep_draws)
+        return dict(rng=self.rng.getstate(), seen=sorted(self.seen), draws=self.draws, keep=self.keep_draws)
 
     def load_state_dict(self, state):
         self.rng.setstate(state["rng"])
-        self.seen_kinds = set(state.get("seen", []))
+        self.seen = set(state.get("seen", []))
         self.draws = int(state.get("draws", 0))
         self.keep_draws = int(state.get("keep", 0))
 

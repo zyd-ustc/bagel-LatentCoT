@@ -23,6 +23,23 @@ def masked_l1(prediction, target, valid):
     return _masked_mean((prediction - target).abs(), valid)
 
 
+def masked_mse(prediction, target, valid):
+    return _masked_mean((prediction - target).square(), valid)
+
+
+def high_frequency(image):
+    """Mean |Laplacian| per sample: a texture proxy, never a gate."""
+    gray = image.mean(1, keepdim=True)
+    lap = (
+        4 * gray[:, :, 1:-1, 1:-1]
+        - gray[:, :, :-2, 1:-1]
+        - gray[:, :, 2:, 1:-1]
+        - gray[:, :, 1:-1, :-2]
+        - gray[:, :, 1:-1, 2:]
+    )
+    return lap.abs().flatten(1).mean(1)
+
+
 def render(image, valid):
     """Clamp to the display range and crop the shared valid rectangle."""
     shown = image.clamp(-1, 1)

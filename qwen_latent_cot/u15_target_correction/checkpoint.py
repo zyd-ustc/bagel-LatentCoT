@@ -28,21 +28,27 @@ def editor_identity(rt, cfg):
     )
 
 
-def save(path, editor, optimizer, sampler, step, cfg, identity, device, *, data_version, input_domains):
+def save(
+    path, editor, optimizer, sampler, step, cfg, identity, device,
+    *, data_version, input_domains, total_steps, budget,
+):
     path = Path(path)
     if dist.rank() == 0:
         path.mkdir(parents=True, exist_ok=False)
     dist.barrier()
     partial = path / f"rank_{dist.rank():05d}.partial"
-    torch.save(
-        dict(
+    if dist.rank() == 0:
+        payload = dict(
             weights=cpu(canonical_parameters(editor)),
             optimizer=cpu(optimizer.state_dict()),
             sampler=sampler.state_dict(),
             rng=rng(device),
-        ),
-        partial,
-    )
+        )
+    else:
+        # Replicated training: weights and optimizer are identical on all
+        # ranks. Only the rank-specific RNG/sampler state needs a copy.
+        payload = dict(sampler=sampler.state_dict(), rng=rng(device))
+    torch.save(payload, partial)
     partial.replace(partial.with_suffix(".pt"))
     dist.barrier()
     if dist.rank() == 0:
@@ -56,6 +62,8 @@ def save(path, editor, optimizer, sampler, step, cfg, identity, device, *, data_
             parameter_layout="gen_lora_all_layers+edit_s_embedder",
             data_version=data_version,
             input_domains=list(input_domains),
+            total_steps=int(total_steps),
+            budget=int(budget),
         )
         (path / "manifest.partial").write_text(json.dumps(meta, indent=2) + "\n")
         (path / "manifest.partial").replace(path / "manifest.json")
@@ -86,7 +94,7 @@ def _copy_weights(path, editor, *, rank_file):
     return state
 
 
-def resume(path, editor, optimizer, sampler, cfg, identity):
+def resume(path, editor, optimizer, sampler, cfg, identity, *, data_version, total_steps):
     """Resume the same stage; cross-stage loading must use load_stage_weights."""
     meta = _manifest(path)
     if meta.get("kind") != KIND:
@@ -97,11 +105,26 @@ def resume(path, editor, optimizer, sampler, cfg, identity):
         raise ValueError("Checkpoint world size differs")
     if meta.get("config") != cfg or meta.get("identity") != identity:
         raise ValueError("Checkpoint config or identity differs")
-    state = _copy_weights(path, editor, rank_file=f"rank_{dist.rank():05d}.pt")
-    optimizer.load_state_dict(state["optimizer"])
-    sampler.load_state_dict(state["sampler"])
-    restore_rng(state["rng"], next(editor.parameters()).device)
-    return meta, state
+    if meta.get("data_version") != data_version:
+        raise ValueError("Checkpoint data version differs")
+    if int(meta.get("total_steps", -1)) != int(total_steps):
+        raise ValueError("Checkpoint total-step budget differs")
+    # Weights/optimizer live in rank 0. Each rank restores only its own
+    # RNG/sampler state; older checkpoints may still carry full per-rank files.
+    base = _copy_weights(path, editor, rank_file="rank_00000.pt")
+    optimizer.load_state_dict(base["optimizer"])
+    if dist.rank() == 0:
+        own = base
+    else:
+        own = torch.load(
+            str(Path(path) / f"rank_{dist.rank():05d}.pt"),
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+    sampler.load_state_dict(own["sampler"])
+    restore_rng(own["rng"], next(editor.parameters()).device)
+    return meta, base
 
 
 def load_stage_weights(path, editor, identity):

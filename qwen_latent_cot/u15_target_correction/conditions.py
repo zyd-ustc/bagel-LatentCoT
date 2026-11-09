@@ -24,10 +24,11 @@ def edit_prompt(edit_request, tail_condition, preserve=""):
 
 
 def derived_tail_condition(parent_condition, edit_request):
-    """Legacy linear pairs without a stored full target description.
+    """Explicit legacy fallback for pairs without a full target description.
 
-    The fallback is deterministic and uses only the parent scene and the short
-    instruction. It never inspects the target image.
+    This concatenation can retain old semantics; formal L/I data must provide
+    an independent ``tail_condition``. The loader only reaches this function
+    when ``allow_derived_tail`` is set explicitly.
     """
     parent = compact(parent_condition)
     request = compact(edit_request)
