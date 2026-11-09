@@ -151,6 +151,9 @@ EXTRA_SCENES = ["on a weathered wooden table", "on a white kitchen counter",
                 "on a red picnic blanket", "inside a glass display case",
                 "on a marble counter", "on a wooden floor", "on a metal tray"]
 EXTRA_LEVELS = ["8", "9", "10", "11", "12", "14"]
+EXTRA_COLOURS = ["red", "orange", "yellow", "green", "blue", "purple",
+                 "pink", "brown", "grey", "black", "white", "teal"]
+EXTRA_MATERIALS = ["wooden", "ceramic", "glass", "metal", "woven", "stone"]
 
 
 def _crowd_prompts(start, limit, rng):
@@ -159,7 +162,7 @@ def _crowd_prompts(start, limit, rng):
     for offset in range(int(limit)):
         number = start + offset
         n = EXTRA_LEVELS[number % len(EXTRA_LEVELS)]
-        obj = rng.choice(EXTRA_OBJECTS)
+        obj = f"{EXTRA_COLOURS[number % 12]} {EXTRA_MATERIALS[(number // 12) % 6]} {rng.choice(EXTRA_OBJECTS)}"
         scene = rng.choice(EXTRA_SCENES)
         uid = f"tgt_crowd_{number:05d}"
         rows.append(dict(uid=uid, family="over", target_count=int(n),
@@ -171,66 +174,179 @@ def _crowd_prompts(start, limit, rng):
 def _pair_prompts(start, limit, rng):
     """Two same-kind subjects with crossing attributes: the usual failure is swapping them."""
     rows = []
-    things = [("a blue ceramic mug", "a blue ceramic plate"),
-              ("a red wooden chair", "a red wooden stool"),
-              ("a green glass bottle", "a green glass jar"),
-              ("a yellow knitted hat", "a yellow knitted scarf")]
+    shapes = [("mug", "plate"), ("chair", "stool"), ("bottle", "jar"), ("hat", "scarf"),
+              ("cup", "saucer"), ("box", "crate"), ("vase", "bowl"), ("spoon", "fork")]
+    relations = ["on the left", "in the foreground", "near the window", "on the shelf"]
     for offset in range(int(limit)):
         number = start + offset
-        a, b = things[number % len(things)]
-        relation = "on the left" if number % 2 == 0 else "in the foreground"
+        colour = EXTRA_COLOURS[number % len(EXTRA_COLOURS)]
+        material = EXTRA_MATERIALS[(number // len(EXTRA_COLOURS)) % len(EXTRA_MATERIALS)]
+        shape = shapes[(number // (len(EXTRA_COLOURS) * len(EXTRA_MATERIALS))) % len(shapes)]
+        relation = relations[(number // (len(EXTRA_COLOURS) * len(EXTRA_MATERIALS) * len(shapes)))
+                             % len(relations)]
+        left, right = shape
         uid = f"tgt_pair_{number:05d}"
         rows.append(dict(uid=uid, family="attr",
-                         raw_prompt=f"A photo of {a} {relation} and {b} next to it, "
+                         raw_prompt=f"A photo of a {colour} {material} {left} {relation} and a "
+                                    f"{colour} {material} {right} next to it, "
                                     f"only one of each, both clearly visible."))
     return rows
 
 
 def _relation_prompts(start, limit, rng):
-    """Explicit spatial relations with two named, distinguishable subjects."""
+    """Explicit spatial relations; each row picks a fresh pair/axis/colour combination.
+
+    The first version indexed a five-item list with ``number % len(pairs)``, so
+    1,500 prompts collapsed to five distinct sentences and the family was spent
+    after a handful of images. Combinations are drawn without replacement here.
+    """
     rows = []
-    pairs = [("a red bicycle", "a blue ladder", "left", "right"),
-             ("a tall green cactus", "a short grey rock", "left", "right"),
-             ("a bright lamp", "a dark wooden crate", "above", "below"),
-             ("a white cat", "a black dog", "left", "right"),
-             ("a glass jar", "a metal can", "above", "below")]
-    for offset in range(int(limit)):
-        number = start + offset
-        first, second, a, b = pairs[number % len(pairs)]
-        uid = f"tgt_rel_{number:05d}"
-        rows.append(dict(uid=uid, family="space",
-                         raw_prompt=f"A photo where {first} is on the {a} and {second} is on the {b}, "
-                                    f"both at the same distance from the camera."))
+    shapes = ["bicycle", "ladder", "cactus", "rock", "lamp", "crate", "cat", "dog",
+              "jar", "can", "stool", "bucket", "sign", "rope", "fruit bowl", "kettle"]
+    seen = set()
+    number = start
+    while len(rows) < int(limit):
+        first = shapes[(number + rng.randrange(len(shapes))) % len(shapes)]
+        second = shapes[(number * 3 + rng.randrange(len(shapes)) + 1) % len(shapes)]
+        if first == second:
+            number += 1
+            continue
+        c1, c2 = rng.sample(EXTRA_COLOURS, 2)
+        a, b = rng.choice([("left", "right"), ("above", "below"),
+                           ("nearer the camera than", "farther from the camera than")])
+        key = (first, second, c1, c2, a)
+        number += 1
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(dict(uid=f"tgt_rel_{start + len(rows):05d}", family="space",
+                         raw_prompt=f"A photo where the {c1} {first} is {a} the {c2} {second}, "
+                                    f"both the same size and both fully visible."))
     return rows
 
 
 def _text_prompts(start, limit, rng):
     """Legible text in the frame: models frequently drop or garble part of it."""
     rows = []
-    words = ["OPEN", "SALE", "KITCHEN", "EXIT", "FRESH", "BAKERY", "CAFE", "STUDIO"]
+    words = ["OPEN", "SALE", "KITCHEN", "EXIT", "FRESH", "BAKERY", "CAFE", "STUDIO",
+             "ENTRANCE", "CLOSED", "MARKET", "GALLERY"]
+    where = ["on a wooden sign", "on a shop window", "on a metal plate",
+             "on a chalkboard", "on a white wall", "on a brick pillar",
+             "on a hanging board", "on a glass door"]
+    shade = ["in daylight", "at dusk", "under warm light", "in overcast light",
+             "under a single spotlight", "in soft morning light"]
     for offset in range(int(limit)):
         number = start + offset
         word = words[number % len(words)]
-        where = ["on a wooden sign", "on a shop window", "on a metal plate",
-                 "on a chalkboard"][(number // len(words)) % 4]
+        where_i = (number // len(words)) % len(where)
+        shade_i = (number // (len(words) * len(where))) % len(shade)
+        extra = (number // (len(words) * len(where) * len(shade))) % len(EXTRA_COLOURS)
         uid = f"tgt_text_{number:05d}"
         rows.append(dict(uid=uid, family="text",
-                         raw_prompt=f"A photo of the word \"{word}\" written clearly {where}, "
+                         raw_prompt=f"A photo of the {EXTRA_COLOURS[extra]} word \"{word}\" written "
+                                    f"clearly {where[where_i]} {shade[shade_i]}, "
                                     f"the whole word legible and centred."))
     return rows
 
+
+# Failure shapes that a text-to-image model actually makes on a crowded or
+# relational scene. Each one states a requirement the picture can visibly break,
+# so a completion-side audit has something concrete to find.
+EXTRA_OBJECTS = ["red apples", "green croissants", "blue coffee mugs", "yellow ducks",
+                 "wooden pencils", "white sheep", "orange balloons", "purple candles",
+                 "silver spoons", "brown ceramic cups", "pink peonies", "green watermelons",
+                 "red toy cars", "brass keys", "white eggs", "blue marbles"]
+EXTRA_SCENES = ["on a weathered wooden table", "on a white kitchen counter",
+                "inside a wicker basket", "on a bookshelf", "on a stone terrace",
+                "on a red picnic blanket", "inside a glass display case",
+                "on a marble counter", "on a wooden floor", "on a metal tray"]
+EXTRA_LEVELS = ["8", "9", "10", "11", "12", "14"]
+EXTRA_COLOURS = ["red", "orange", "yellow", "green", "blue", "purple",
+                 "pink", "brown", "grey", "black", "white", "teal"]
+EXTRA_MATERIALS = ["wooden", "ceramic", "glass", "metal", "woven", "stone"]
+
+
+def _crowd_prompts(start, limit, rng):
+    """Many instances, all entirely inside the frame: the usual failure is under-drawing."""
+    rows = []
+    for offset in range(int(limit)):
+        number = start + offset
+        n = EXTRA_LEVELS[number % len(EXTRA_LEVELS)]
+        obj = f"{EXTRA_COLOURS[number % 12]} {EXTRA_MATERIALS[(number // 12) % 6]} {rng.choice(EXTRA_OBJECTS)}"
+        scene = rng.choice(EXTRA_SCENES)
+        uid = f"tgt_crowd_{number:05d}"
+        rows.append(dict(uid=uid, family="over", target_count=int(n),
+                         raw_prompt=f"An overhead photo of exactly {n} {obj} laid out side by side {scene}, "
+                                    f"every object entirely inside the frame."))
+    return rows
+
+
+def _pair_prompts(start, limit, rng):
+    """Two same-kind subjects with crossing attributes: the usual failure is swapping them."""
+    rows = []
+    shapes = [("mug", "plate"), ("chair", "stool"), ("bottle", "jar"), ("hat", "scarf"),
+              ("cup", "saucer"), ("box", "crate"), ("vase", "bowl"), ("spoon", "fork")]
+    relations = ["on the left", "in the foreground", "near the window", "on the shelf"]
+    for offset in range(int(limit)):
+        number = start + offset
+        colour = EXTRA_COLOURS[number % len(EXTRA_COLOURS)]
+        material = EXTRA_MATERIALS[(number // len(EXTRA_COLOURS)) % len(EXTRA_MATERIALS)]
+        shape = shapes[(number // (len(EXTRA_COLOURS) * len(EXTRA_MATERIALS))) % len(shapes)]
+        relation = relations[(number // (len(EXTRA_COLOURS) * len(EXTRA_MATERIALS) * len(shapes)))
+                             % len(relations)]
+        left, right = shape
+        uid = f"tgt_pair_{number:05d}"
+        rows.append(dict(uid=uid, family="attr",
+                         raw_prompt=f"A photo of a {colour} {material} {left} {relation} and a "
+                                    f"{colour} {material} {right} next to it, "
+                                    f"only one of each, both clearly visible."))
+    return rows
+
+
+def _relation_prompts(start, limit, rng):
+    """Explicit spatial relations; each row picks a fresh pair/axis/colour combination.
+
+    The first version indexed a five-item list with ``number % len(pairs)``, so
+    1,500 prompts collapsed to five distinct sentences and the family was spent
+    after a handful of images. Combinations are drawn without replacement here.
+    """
+    rows = []
+    shapes = ["bicycle", "ladder", "cactus", "rock", "lamp", "crate", "cat", "dog",
+              "jar", "can", "stool", "bucket", "sign", "rope", "fruit bowl", "kettle"]
+    seen = set()
+    number = start
+    while len(rows) < int(limit):
+        first = shapes[(number + rng.randrange(len(shapes))) % len(shapes)]
+        second = shapes[(number * 3 + rng.randrange(len(shapes)) + 1) % len(shapes)]
+        if first == second:
+            number += 1
+            continue
+        c1, c2 = rng.sample(EXTRA_COLOURS, 2)
+        a, b = rng.choice([("left", "right"), ("above", "below"),
+                           ("nearer the camera than", "farther from the camera than")])
+        key = (first, second, c1, c2, a)
+        number += 1
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(dict(uid=f"tgt_rel_{start + len(rows):05d}", family="space",
+                         raw_prompt=f"A photo where the {c1} {first} is {a} the {c2} {second}, "
+                                    f"both the same size and both fully visible."))
+    return rows
 
 
 def _occlusion_prompts(start, limit, rng):
     """Two objects where one must stay behind the other: models merge or swap them."""
     rows = []
-    pairs = [("a tall metal water bottle", "a short glass cup"),
-             ("a large cardboard box", "a small red ball"),
-             ("a tall potted palm", "a small stool"),
-             ("a wide framed painting", "a narrow candle")]
+    fronts = ["water bottle", "cardboard box", "potted palm", "framed painting",
+              "tall vase", "lamp", "crate", "ladder", "book stack", "bowl", "clock", "basket"]
+    backs = ["glass cup", "red ball", "stool", "candle", "small bowl", "book", "mug", "pencil"]
     for offset in range(int(limit)):
         number = start + offset
-        front, back = pairs[number % len(pairs)]
+        f_i = number % 12
+        b_i = (f_i + 1 + (number // 12) % 11) % 12
+        front = f"a {EXTRA_COLOURS[f_i]} {fronts[(number // 12) % len(fronts)]}"
+        back = f"a {EXTRA_COLOURS[b_i]} {backs[(number // (12 * len(fronts))) % len(backs)]}"
         uid = f"tgt_occ_{number:05d}"
         rows.append(dict(uid=uid, family="occlusion",
                          raw_prompt=f"A photo where {front} stands fully in front of {back}, "
@@ -241,15 +357,19 @@ def _occlusion_prompts(start, limit, rng):
 def _colour_bind_prompts(start, limit, rng):
     """Same shape, different colours: the usual failure is one colour for both."""
     rows = []
-    shapes = [("two identical ceramic bowls", "red", "blue"),
-              ("two identical wooden crates", "green", "yellow"),
-              ("two identical glass vases", "orange", "purple")]
+    objects = ["ceramic bowls", "wooden crates", "glass vases", "clay pots", "metal tins",
+               "paper cups", "linen cushions", "stone blocks"]
+    placements = ["side by side", "on a bright surface", "in a row", "near the window",
+                  "on a shelf", "on the floor"]
     for offset in range(int(limit)):
         number = start + offset
-        shape, c1, c2 = shapes[number % len(shapes)]
+        obj = objects[(number // 132) % len(objects)]
+        placement = placements[(number // (132 * len(objects))) % len(placements)]
+        c1 = EXTRA_COLOURS[number % 12]
+        c2 = EXTRA_COLOURS[(number % 12 + 1 + ((number // 12) % 11)) % 12]
         uid = f"tgt_col_{number:05d}"
         rows.append(dict(uid=uid, family="colour",
-                         raw_prompt=f"A photo of {shape} side by side, the left one {c1} "
+                         raw_prompt=f"A photo of two identical {obj} {placement}, the left one {c1} "
                                     f"and the right one {c2}, no other colours."))
     return rows
 
@@ -260,7 +380,8 @@ def _count_cap_prompts(start, limit, rng):
     for offset in range(int(limit)):
         number = start + offset
         n = [2, 3, 4][number % 3]
-        obj = EXTRA_OBJECTS[number % len(EXTRA_OBJECTS)]
+        obj = (f"{EXTRA_COLOURS[number % 12]} {EXTRA_MATERIALS[(number // 12) % 6]} "
+               f"{EXTRA_OBJECTS[(number // 72) % len(EXTRA_OBJECTS)]}")
         scene = EXTRA_SCENES[(number // 3) % len(EXTRA_SCENES)]
         uid = f"tgt_cap_{number:05d}"
         rows.append(dict(uid=uid, family="under", target_count=n,
