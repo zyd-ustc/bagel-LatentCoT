@@ -105,7 +105,21 @@ def build_pair(rt, cfg, grid, request, source, *, teacher="it2i", teacher_image=
         else euler(a.float(), segment_times(grid, read, 1.0), NativeT2I(rt, parent, cfg))
     )
 
-    if task_type == "explicit_edit":
+    # A repair is an instructed edit too: the teacher has to see the very
+    # instruction the expert derived, otherwise it falls into the text-only
+    # rewrite branch and never renders the specific fix.
+    # Cheap rejections first: they need neither the teacher nor the tail.
+    questions = list(request.get("edit_questions") or []) + list(request.get("preserve_questions") or [])
+    passed_before, _ = score_questions(rt, before, questions, cfg)
+    edit_set = set(request.get("edit_questions") or [])
+    if edit_set and edit_set <= passed_before:
+        return None, "edit_not_needed"      # the request already holds: nothing to repair
+    if task_type in ("explicit_edit", "repair") and not (
+        set(request.get("preserve_questions") or []) & passed_before
+    ):
+        return None, "no_protected_requirement"   # nothing could be shown to survive
+
+    if task_type in ("explicit_edit", "repair"):
         tail = compact(request["tail_condition"])
         if teacher == "text":
             velocity = NativeT2I(rt, tail, cfg)
@@ -137,7 +151,8 @@ def build_pair(rt, cfg, grid, request, source, *, teacher="it2i", teacher_image=
         effective = euler(b.float(), segment_times(grid, read, 1.0), NativeT2I(rt, tail, cfg))
 
     return dict(a=a, b=b.float(), preview=preview, before=before.float(),
-                effective=effective.float(), calls=calls, seed=seed, tail=tail), None
+                effective=effective.float(), calls=calls, seed=seed, tail=tail,
+                passed_before=sorted(passed_before)), None
 
 
 def produce(rt, cfg, args):
@@ -185,11 +200,10 @@ def produce(rt, cfg, args):
         if pair is None:
             _write_jsonl(log, dict(uid=uid, skipped=error))
             continue
-        questions = list(request.get("edit_questions") or []) + list(request.get("preserve_questions") or [])
-        passed_before, _ = score_questions(rt, pair["before"], questions, cfg)
+        # build_pair already scored the source image; do not pay for it twice.
         verdict = _explicit_acceptance(
             rt, pair["before"], pair["effective"],
-            dict(request, passed_before_source=sorted(passed_before)), cfg,
+            dict(request, passed_before_source=pair["passed_before"]), cfg,
         )
         reason = None if verdict["approved"] else "effective_" + str(verdict["reason"])
         finite = bool(

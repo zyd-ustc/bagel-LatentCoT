@@ -139,7 +139,92 @@ def _attr_prompts(start, limit, rng):
     return rows
 
 
+# Failure shapes that a text-to-image model actually makes on a crowded or
+# relational scene. Each one states a requirement the picture can visibly break,
+# so a completion-side audit has something concrete to find.
+EXTRA_OBJECTS = ["red apples", "green croissants", "blue coffee mugs", "yellow ducks",
+                 "wooden pencils", "white sheep", "orange balloons", "purple candles",
+                 "silver spoons", "brown ceramic cups", "pink peonies", "green watermelons",
+                 "red toy cars", "brass keys", "white eggs", "blue marbles"]
+EXTRA_SCENES = ["on a weathered wooden table", "on a white kitchen counter",
+                "inside a wicker basket", "on a bookshelf", "on a stone terrace",
+                "on a red picnic blanket", "inside a glass display case",
+                "on a marble counter", "on a wooden floor", "on a metal tray"]
+EXTRA_LEVELS = ["8", "9", "10", "11", "12", "14"]
+
+
+def _crowd_prompts(start, limit, rng):
+    """Many instances, all entirely inside the frame: the usual failure is under-drawing."""
+    rows = []
+    for offset in range(int(limit)):
+        number = start + offset
+        n = EXTRA_LEVELS[number % len(EXTRA_LEVELS)]
+        obj = rng.choice(EXTRA_OBJECTS)
+        scene = rng.choice(EXTRA_SCENES)
+        uid = f"tgt_crowd_{number:05d}"
+        rows.append(dict(uid=uid, family="over", target_count=int(n),
+                         raw_prompt=f"An overhead photo of exactly {n} {obj} laid out side by side {scene}, "
+                                    f"every object entirely inside the frame."))
+    return rows
+
+
+def _pair_prompts(start, limit, rng):
+    """Two same-kind subjects with crossing attributes: the usual failure is swapping them."""
+    rows = []
+    things = [("a blue ceramic mug", "a blue ceramic plate"),
+              ("a red wooden chair", "a red wooden stool"),
+              ("a green glass bottle", "a green glass jar"),
+              ("a yellow knitted hat", "a yellow knitted scarf")]
+    for offset in range(int(limit)):
+        number = start + offset
+        a, b = things[number % len(things)]
+        relation = "on the left" if number % 2 == 0 else "in the foreground"
+        uid = f"tgt_pair_{number:05d}"
+        rows.append(dict(uid=uid, family="attr",
+                         raw_prompt=f"A photo of {a} {relation} and {b} next to it, "
+                                    f"only one of each, both clearly visible."))
+    return rows
+
+
+def _relation_prompts(start, limit, rng):
+    """Explicit spatial relations with two named, distinguishable subjects."""
+    rows = []
+    pairs = [("a red bicycle", "a blue ladder", "left", "right"),
+             ("a tall green cactus", "a short grey rock", "left", "right"),
+             ("a bright lamp", "a dark wooden crate", "above", "below"),
+             ("a white cat", "a black dog", "left", "right"),
+             ("a glass jar", "a metal can", "above", "below")]
+    for offset in range(int(limit)):
+        number = start + offset
+        first, second, a, b = pairs[number % len(pairs)]
+        uid = f"tgt_rel_{number:05d}"
+        rows.append(dict(uid=uid, family="space",
+                         raw_prompt=f"A photo where {first} is on the {a} and {second} is on the {b}, "
+                                    f"both at the same distance from the camera."))
+    return rows
+
+
+def _text_prompts(start, limit, rng):
+    """Legible text in the frame: models frequently drop or garble part of it."""
+    rows = []
+    words = ["OPEN", "SALE", "KITCHEN", "EXIT", "FRESH", "BAKERY", "CAFE", "STUDIO"]
+    for offset in range(int(limit)):
+        number = start + offset
+        word = words[number % len(words)]
+        where = ["on a wooden sign", "on a shop window", "on a metal plate",
+                 "on a chalkboard"][(number // len(words)) % 4]
+        uid = f"tgt_text_{number:05d}"
+        rows.append(dict(uid=uid, family="text",
+                         raw_prompt=f"A photo of the word \"{word}\" written clearly {where}, "
+                                    f"the whole word legible and centred."))
+    return rows
+
+
 BUILDERS = {
+    "crowd": lambda start, limit, rng: _crowd_prompts(start, limit, rng),
+    "pair": lambda start, limit, rng: _pair_prompts(start, limit, rng),
+    "relation": lambda start, limit, rng: _relation_prompts(start, limit, rng),
+    "text": lambda start, limit, rng: _text_prompts(start, limit, rng),
     "over": lambda start, limit, rng: _over_prompts(start, limit, rng),
     "count": lambda start, limit, rng: _count_prompts(start, limit, rng),
     "under": lambda start, limit, rng: _under_prompts(start, limit, rng),
@@ -150,7 +235,7 @@ BUILDERS = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--families", default="over,under,space,attr")
+    parser.add_argument("--families", default="crowd,pair,relation,text")
     parser.add_argument("--per-family", type=int, default=1500)
     parser.add_argument("--seed", type=int, default=20261109)
     parser.add_argument("--out", required=True)

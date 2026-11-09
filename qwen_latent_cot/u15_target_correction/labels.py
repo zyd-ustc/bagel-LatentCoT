@@ -38,7 +38,11 @@ def effective_acceptance(rt, before_image, effective, request, cfg):
     edit_questions = list(request.get("edit_questions") or [])
     preserve_questions = list(request.get("preserve_questions") or [])
     questions = list(request.get("questions") or (edit_questions + preserve_questions))
-    explicit = request.get("task_type", "explicit_edit") == "explicit_edit"
+    # Repairs are judged with the same two-set rule as explicit edits: the
+    # edit question must be false before and true after, and the requirements
+    # the fix does not touch must survive. The self-correction branch below has
+    # no notion of "protected", which would reject every repair.
+    explicit = request.get("task_type", "explicit_edit") in ("explicit_edit", "repair")
     after, p_yes = score_questions(rt, effective, questions, cfg)
     before = {str(q) for q in (request.get("passed_before_source") or [])}
     if not before:

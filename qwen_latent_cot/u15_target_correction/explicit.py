@@ -44,10 +44,13 @@ _RULES = (
     "the source description's other content word for word. One EDIT question only."
 )
 
+# Order matters: a question header has to be tested before the field header,
+# and ``EDIT:`` must not swallow ``EDIT_QUESTIONS:``. ``FAILED:`` sits inside
+# the field alternation so it can never be read as a question block.
 _QUESTION_BLOCK = re.compile(
-    r"^(EDIT_QUESTIONS?|EDIT_QS?|PRESERVE_QUESTIONS?|PRESERVE_QS?)\s*[::]?\s*(.*)$", re.I
+    r"^((?:EDIT|PRESERVE)_(?:QUESTIONS?|QS?))\s*[::]?\s*(.*)$", re.I
 )
-_FIELD = re.compile(r"^(EDIT|TARGET)\s*[::]\s*(.+)$", re.I)
+_FIELD = re.compile(r"^(FAILED|EDIT|TARGET)\s*[::]\s*(.+)$", re.I)
 _BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s*")
 
 
@@ -71,7 +74,7 @@ def _question_text(line):
 
 def parse_proposal(text):
     """Split the labelled blocks; empty values mean the reply was unusable."""
-    instruction = target = None
+    instruction = target = failed = None
     edit_questions, preserve_questions = [], []
     block = None
     for line in str(text or "").splitlines():
@@ -88,8 +91,11 @@ def parse_proposal(text):
         field = _FIELD.match(stripped)
         if field:
             block = None
-            if field.group(1).lower() == "edit":
+            label = field.group(1).lower()
+            if label == "edit":
                 instruction = compact(field.group(2))
+            elif label == "failed":
+                failed = compact(field.group(2))
             else:
                 target = compact(field.group(2))
             continue
@@ -100,6 +106,7 @@ def parse_proposal(text):
     return dict(
         instruction=instruction,
         target_condition=target,
+        failed=failed,
         edit_questions=_dedupe(edit_questions),
         preserve_questions=_dedupe(preserve_questions),
     )
@@ -116,17 +123,30 @@ def _dedupe(items):
     return out
 
 
-def proposal_error(raw, instruction, target_condition):
-    """Why this proposal cannot be used, or ``None`` when it can."""
-    raw_text = compact(raw)
-    if not instruction or not target_condition:
+def instruction_error(instruction, target_condition=None):
+    """Shape checks that hold for any proposal, edit or repair."""
+    if not instruction:
         return "unparsed"
     if not 2 <= len(instruction.split()) <= 16:
         return "instruction_length"
     if instruction.rstrip().endswith("?") or instruction.lower().startswith("keep"):
         return "instruction_form"
-    if not 6 <= len(target_condition.split()) <= 80:
+    if target_condition is not None and not 6 <= len(target_condition.split()) <= 80:
         return "target_length"
+    return None
+
+
+def proposal_error(raw, instruction, target_condition):
+    """Why an *edit* proposal cannot be used, or ``None`` when it can.
+
+    The rewrite checks (target differs from the request, target does not quote
+    the instruction) belong to edits: an edit has to state a new scene. A repair
+    legitimately keeps the request as its target, so it must not run these.
+    """
+    raw_text = compact(raw)
+    error = instruction_error(instruction, target_condition)
+    if error is not None or not target_condition:
+        return error or "unparsed"
     if compact(target_condition).casefold() == raw_text.casefold():
         return "target_equals_request"
     if compact(instruction).casefold() in compact(target_condition).casefold():
@@ -299,12 +319,13 @@ def propose_repair(rt, preview, raw, cfg, *, requirement=None, require_preserve=
     proposal = parse_proposal(answer)
     proposal["raw_output"] = answer
     proposal = filter_questions(proposal, raw)
-    error = proposal_error(raw, proposal["instruction"], proposal["target_condition"])
+    # A repair keeps the original request as its target, so only shape checks apply.
+    error = instruction_error(proposal["instruction"], proposal["target_condition"])
     if error is None and require_preserve:
         error = question_sets_error(proposal["edit_questions"], proposal["preserve_questions"])
-    # The repair target is the original request; a rewrite would let the expert
-    # do the editor's job for it.
-    if error is None and compact(proposal["target_condition"]) != compact(raw):
+    # Restore the request verbatim: a rewrite would let the expert do the
+    # editor's job for it.
+    if proposal.get("target_condition"):
         proposal["target_condition"] = compact(raw)
     proposal["error"] = error
     return proposal

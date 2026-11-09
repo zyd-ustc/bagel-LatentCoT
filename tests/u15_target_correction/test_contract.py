@@ -1034,3 +1034,33 @@ def test_repair_role_is_terminal_but_linear_pairs_are_not():
     assert ROLE_R_REPAIR in TERMINAL_ROLES
     assert ROLE_L_EDIT not in TERMINAL_ROLES
     assert ROLE_L_REVERSE not in TERMINAL_ROLES
+
+
+def test_repair_keeps_the_request_as_target_but_edit_must_not():
+    """A repair's target *is* the original request, so the edit-only rewrite
+    checks would reject every repair proposal."""
+    from qwen_latent_cot.u15_target_correction.explicit import instruction_error, proposal_error
+
+    raw = "A photo of exactly 5 pink peonies on a table."
+    fix = "Add 2 more pink peonies to the table"
+    assert instruction_error(fix, raw) is None
+    assert proposal_error(raw, fix, raw) == "target_equals_request"
+    # Shape rules still apply to repairs.
+    assert instruction_error("Add " + "very " * 20 + "pink peonies", raw) == "instruction_length"
+    assert instruction_error("Keep the current scene unchanged", raw) == "instruction_form"
+
+
+def test_repair_is_judged_like_an_explicit_edit():
+    """The self-correction branch has no ``protected`` set, so a repair routed
+    there is rejected even when it is fixed. Pin the routing."""
+    import inspect
+    from qwen_latent_cot.u15_target_correction import coupled, labels
+
+    source = inspect.getsource(labels.effective_acceptance)
+    assert '"explicit_edit", "repair"' in source
+    build = inspect.getsource(coupled.build_pair)
+    assert '("explicit_edit", "repair")' in build
+    # and the cheap rejection has to run before the teacher is sampled
+    early = build.index("no_protected_requirement")
+    teacher = build.index("teacher_state(")
+    assert early < teacher

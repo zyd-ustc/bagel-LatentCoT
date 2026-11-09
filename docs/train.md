@@ -1,70 +1,132 @@
-# 等时状态流训练
+# 等时状态流训练 (Training)
 
-实现合同见 [等时生成态编辑](target_correction.md)，方案见 [训练方案](isochronic_state_flow_training_plan.md)。
+本文档介绍等时状态流（Isochronic State Flow）的训练原理、目标函数、训练阶段与操作命令。
 
-每次更新只做一条单步 IFM：
+---
 
-1. 抽一个来源。Stage 1 只抽 `linear_pair`；Stage 2 按配置抽 L/I/R。约 10% 抽显式保持样本。
-2. 抽一个支持时间 `t` 和编辑进度 `s~U(0,1)`。
-3. L 数据用共享噪声构造 `a`、`b`，并用同一个前瞻函数生成 `P`；I/R 直接读取缓存的 `a,b,P`。
-4. 由锚点 `a` 计算一次冻结 `b0`，用 joint prefix 计算 `uθ`。
-5. 按有效区计算 `((uθ-(b-a))/t)^2`，反传、裁剪、更新。
+## 1. 核心原理（通俗易懂）
 
-不混入终图 L1、LPIPS 反传、旧 `L_early` 或 repulsion loss。
+### 1.1 什么是“等时编辑”？
+普通扩散模型和流匹配文生图（T2I）是一个**单向去噪过程**：时间 $t$ 从 $0$（纯高斯噪声）单调推进到 $1$（清晰图像）。
+如果模型在中间时刻（例如 $t=0.36$）生成了错误的内容（比如把“7个牛角包”画成了“6个”，或者把“紫色袋鼠”的颜色错绑到了大象上）：
+- **传统做法**：要么等生成完再拿整图重绘（耗时且容易把背景破坏），要么扔掉当前结果退回纯噪声重采样（纯碰运气）。
+- **等时编辑做法**：**暂停生成时间 $t$**，在原点就地开启一条独立的“编辑轴” $s \in [0, 1]$。我们在这个轴上只花 8 步，把当前的带噪状态 $a$“推”到修正后的相容状态 $b$。改完之后，直接交还给原本完全冻结的生图底座，继续沿 $t \to 1$ 生成。
 
-## 阶段
+这种机制就叫**原地变轨**：不重启、不倒退时间、不破坏已有合理结构。
 
-**Stage 1**：现有编辑对上的状态编辑学习。数据是 L，含 10% 保持样本。学习率 `5e-5` 线性 warmup 100 步，余弦衰减到 `1e-5`。预算 `min(6000, ceil(8 N_L / 64))`。
+```
+原生生成轴 t:  0(噪声) -------> 0.36(读取点) -------------------------> 1.0(终图)
+                                   |                                        ^
+                                   | 暂停时间 t                              |
+                                   v                                        |
+等时编辑轴 s:                     a (s=0) ===[8步等时流匹配 uθ]===> b̂ (s=1) --+
+```
 
-**Stage 2**：接续相容性适配。继续使用 Stage 1 权重并重置优化器。学习率 `1e-5` warmup 100 步，衰减到 `2e-6`。目标数据是 I 配对 1–2 万条、R 记录 2000–5000 条；缓存可以边生产边训练。有 R 时抽样 L:I:R=20:40:40；R 缺失时程序明确使用 L:I=20:80 并在日志记录。
+### 1.2 训练谁？不训练谁？
+- **完全冻结**：SenseNova-U1.5 原生底座（8B 跨模态 MoT 模型全部主干权重冻结）。
+- **仅训练两处微量参数**：
+  1. 生成分支（GEN）的全层 **rank-64 LoRA**；
+  2. 编辑进度嵌入层 **`edit_s_embedder`**。
 
-## 命令
+### 1.3 核心变量与符号
+- $t$：原生生成时间（固定为部署读取点 $t=0.36$）。
+- $s$：状态编辑进度，$s \in [0, 1]$。
+- $a$：时间 $t$ 输入的带噪状态（学生当前看到的错误或待改状态）。
+- $b$：时间 $t$ 对应的目标相容状态（学生需要达到的理想状态）。
+- $P$：从 $a$ 副本快速两步前瞻得到的半成品**预览图**（让理解专家看清当前场景）。
+- $b_0 = \text{sg}[H_0(a, t; P)]$：关闭 LoRA 的原生单图前向基准（anchor），在编辑中作为基线参考（stop-gradient，不反传）。
+- $u_\theta(q_s, t, s) = t \cdot [H_\theta(q_s, t, s; P, e, c_{\text{tail}}) - b_0]$：模型输出的等时状态位移速度。
 
-Stage 1：
+---
 
+## 2. 两种训练目标函数
+
+代码支持两种监督模式：
+
+### 模式 A：等时条件流匹配（CFM，状态损失，默认极快）
+直接在状态空间做回归。在编辑轨迹 $q_s = (1-s)a + sb$ 上随机采样进度 $s \sim U(0,1)$，让网络预测理想位移 $(b-a)$：
+
+$$L_{\text{state}} = \frac{1}{|\Omega|} \sum \left( \frac{u_\theta(q_s, t, s) - (b - a)}{t} \right)^2$$
+
+- **特点**：单步损失，不需要展开完整的后续生成尾段，单步耗时仅 **~1.7 秒**。
+- **注意**：如果目标标签 $b$ 本身带有粗糙纹理（例如反演标签），状态回归会不加甄别地全盘吸收这些高频噪声。
+
+### 模式 B：终端图像监督（Terminal Loss，质量保真）
+把状态编辑完的预测结果 $\hat{b}$ 真正送入冻结的原生尾段，接续生成出最终图像 $\hat{x} = \Phi_{1 \leftarrow t}^{c_{\text{tail}}}(\hat{b})$，在图像像素级进行多目标分工监督：
+
+$$L_{\text{terminal}} = L_{\text{struct}} + \lambda_p L_{\text{preserve}} + \lambda_{\text{hf}} L_{\text{hf}}$$
+
+1. **结构修改损失（$L_{\text{struct}}$）**：在编辑区域内（由软掩码 $M$ 圈出），贴近教师目标图 $x_{\text{teacher}}$ 的 L1 距离。
+2. **背景保持损失（$L_{\text{preserve}}$）**：在非编辑区域（$1 - M$），贴近原生无害完稿图 $x_{\text{src}}$ 的 L1 距离。
+3. **高频纹理抑制（$L_{\text{hf}}$）**：约束最终成图的高频能量 $hf(\hat{x})$ 不超出原生干净完稿 $hf(x_{\text{src}})$。
+- **特点**：计算穿透整个 19 步尾段（反传梯度），单步耗时 **~31 秒**；但能打破“教师标签变糙”的诅咒，使成图高频比稳在 1.05~1.12。
+
+### 训练辅助机制：学生一步恢复桥（Recovery Bridge）
+真实自回归积分中，前一步的微小误差会逐步累积（曝光偏差）。在第 251 步起，按一定概率（默认 25%）引入学生恢复桥：从学生真实迈出一步后的状态出发，截断前一步梯度，只训练剩余步数的回归位移，提升推理轨迹自愈能力。
+
+---
+
+## 3. 训练阶段与数据配比
+
+### Stage 1：基础编辑能力预训练
+- **数据**：线性编辑对（L-edit），含约 10% 显式保持样本。
+- **目标**：让 LoRA 和 `edit_s_embedder` 掌握基本的增删主体、改属性、改文字能力。
+- **超参**：学习率 `5e-5` 线性 warmup 100 步，余弦衰减至 `1e-5`。
+
+### Stage 2：真实生成态接续适配
+- **数据**：混合 L、R-edit（真实前向轨迹编辑）、R-keep（真实前向轨迹保持）。
+- **说明**：淘汰了反演构造的 I 数据；现行单点配方（如 `stage2_v5.json`）推荐比例为：
+  `L: 10% / R-edit: 15% / R-keep: 75%`（或纯真实态 `R-edit: 55% / R-keep: 30% / L: 15%`）。
+- **超参**：从 Stage 1 检查点初始化，重置优化器；学习率 `1e-5` 余弦衰减至 `2e-6`。
+
+---
+
+## 4. 训练命令与脚本
+
+### 4.1 单节点运行 (CLI 入口)
+
+#### Stage 1 训练
 ```bash
 u15-target-correction train \
-  --model "$MODEL" --source "$SOURCE" \
-  --config configs/u15_isochronic_state/stage1.json \
-  --linear "$LINEAR_MANIFEST" \
-  --output "$OUT" --device npu:0
+  --model "$MODEL_DIR" \
+  --source "$SOURCE_DIR" \
+  --config configs/u15_isochronic_state/stage1_36.json \
+  --linear "$DATA_DIR/L_manifest.json" \
+  --output "$OUT_DIR/stage1" \
+  --device npu:0
 ```
 
-Stage 2：
-
+#### Stage 2 训练
 ```bash
 u15-target-correction train \
-  --model "$MODEL" --source "$SOURCE" \
-  --config configs/u15_isochronic_state/stage2.json \
-  --linear "$LINEAR_MANIFEST" \
-  --inverted "$INVERTED_CACHE" \
-  --native "$NATIVE_CACHE" \
-  --init-from "$STAGE1_CHECKPOINT" \
-  --output "$OUT" --device npu:0
+  --model "$MODEL_DIR" \
+  --source "$SOURCE_DIR" \
+  --config configs/u15_isochronic_state/stage2_v5.json \
+  --linear "$DATA_DIR/L_manifest.json" \
+  --native "$DATA_DIR/train_v5" \
+  --init-from "$OUT_DIR/stage1/step_001200" \
+  --output "$OUT_DIR/stage2" \
+  --device npu:0
 ```
 
-`--native` 可以省略。省略后抽样比例显式变成 L:I=20:80，检查点 `input_domains` 不会写 `native_history`。
-
-## I/R 缓存生产
-
+### 4.2 64 卡集群分布式训练 (torchrun)
+通过项目脚本一键拉起多节点分布式训练：
 ```bash
-u15-target-correction prepare-state-pairs \
-  --model "$MODEL" --source "$SOURCE" \
-  --config configs/u15_isochronic_state/stage2.json \
-  --mode inverted --linear "$LINEAR_MANIFEST" \
-  --output "$INVERTED_CACHE" --device npu:0 \
-  --cache-base-prediction
-
-u15-target-correction prepare-state-pairs \
-  --model "$MODEL" --source "$SOURCE" \
-  --config configs/u15_isochronic_state/stage2.json \
-  --mode native-parent --prompts "$PROMPTS" \
-  --targets "$TARGETS" \
-  --output "$NATIVE_CACHE" --device npu:0
+python scripts/launch_train64.py \
+  --config configs/u15_isochronic_state/stage2_v5.json \
+  --code "$PROJECT_DIR" \
+  --python "$PYTHON_ENV" \
+  --skip-preflight
 ```
 
-`--targets` 只接受已经生成并通过质量审核的目标；没有可用目标生产接口时 R 不会伪造编辑记录。`--shard-index/--shard-count` 写 `manifest.shard_*.json`，训练入口指向同一目录即可合并。`--skip-existing` 用于续跑。
+---
 
-## 记录
+## 5. 检查点与恢复规则
 
-`train.jsonl` 每步记录 `loss`、`gradient_norm`（裁剪前）、`source_kind`、`keep`、`time`、`progress`、调用数和实际 `input_domains`。检查点每 250 个更新及阶段末尾保存。`complete.json` 记录阶段、预算和是否使用 `--steps` 覆盖。
+1. **保存内容**：
+   - 检查点仅保存 `adapters.*`（GEN LoRA）和 `edit_s_embedder.*` 权重，以及优化器状态与随机数种子。
+   - 默认每 250 步或 50 步（终端监督模式）保存一次。
+2. **同阶段恢复（`--resume`）**：
+   - 必须保持阶段、世界大小、配置、模型标识完全一致，完整恢复权重与优化器动量。
+3. **跨阶段继承（`--init-from`）**：
+   - 仅加载上阶段模型权重（如 Stage 1 产物进入 Stage 2），优化器动量重新初始化。
