@@ -220,7 +220,58 @@ def _text_prompts(start, limit, rng):
     return rows
 
 
+
+def _occlusion_prompts(start, limit, rng):
+    """Two objects where one must stay behind the other: models merge or swap them."""
+    rows = []
+    pairs = [("a tall metal water bottle", "a short glass cup"),
+             ("a large cardboard box", "a small red ball"),
+             ("a tall potted palm", "a small stool"),
+             ("a wide framed painting", "a narrow candle")]
+    for offset in range(int(limit)):
+        number = start + offset
+        front, back = pairs[number % len(pairs)]
+        uid = f"tgt_occ_{number:05d}"
+        rows.append(dict(uid=uid, family="occlusion",
+                         raw_prompt=f"A photo where {front} stands fully in front of {back}, "
+                                    f"both clearly distinct and neither merged with the other."))
+    return rows
+
+
+def _colour_bind_prompts(start, limit, rng):
+    """Same shape, different colours: the usual failure is one colour for both."""
+    rows = []
+    shapes = [("two identical ceramic bowls", "red", "blue"),
+              ("two identical wooden crates", "green", "yellow"),
+              ("two identical glass vases", "orange", "purple")]
+    for offset in range(int(limit)):
+        number = start + offset
+        shape, c1, c2 = shapes[number % len(shapes)]
+        uid = f"tgt_col_{number:05d}"
+        rows.append(dict(uid=uid, family="colour",
+                         raw_prompt=f"A photo of {shape} side by side, the left one {c1} "
+                                    f"and the right one {c2}, no other colours."))
+    return rows
+
+
+def _count_cap_prompts(start, limit, rng):
+    """A small exact count in a cluttered context: models over-draw."""
+    rows = []
+    for offset in range(int(limit)):
+        number = start + offset
+        n = [2, 3, 4][number % 3]
+        obj = EXTRA_OBJECTS[number % len(EXTRA_OBJECTS)]
+        scene = EXTRA_SCENES[(number // 3) % len(EXTRA_SCENES)]
+        uid = f"tgt_cap_{number:05d}"
+        rows.append(dict(uid=uid, family="under", target_count=n,
+                         raw_prompt=f"A sparse photo with exactly {n} {obj} {scene} and nothing else "
+                                    f"resting on the same surface."))
+    return rows
+
 BUILDERS = {
+    "occlusion": lambda start, limit, rng: _occlusion_prompts(start, limit, rng),
+    "colour": lambda start, limit, rng: _colour_bind_prompts(start, limit, rng),
+    "cap": lambda start, limit, rng: _count_cap_prompts(start, limit, rng),
     "crowd": lambda start, limit, rng: _crowd_prompts(start, limit, rng),
     "pair": lambda start, limit, rng: _pair_prompts(start, limit, rng),
     "relation": lambda start, limit, rng: _relation_prompts(start, limit, rng),
@@ -235,7 +286,7 @@ BUILDERS = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--families", default="crowd,pair,relation,text")
+    parser.add_argument("--families", default="crowd,pair,relation,text,occlusion,colour,cap")
     parser.add_argument("--per-family", type=int, default=1500)
     parser.add_argument("--seed", type=int, default=20261109)
     parser.add_argument("--out", required=True)
