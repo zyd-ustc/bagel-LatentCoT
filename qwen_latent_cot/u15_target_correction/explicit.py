@@ -513,3 +513,45 @@ def propose_preserve_from_facts(rt, completion, cfg, count=3):
         text = fact.rstrip(".")
         questions.append("Is it true that " + text[0].lower() + text[1:] + "?")
     return questions, answer
+
+
+def propose_active_edit_multi(rt, image, raw_request, cfg, count=5):
+    """Ask for several localised edits at once and return them all.
+
+    Forcing one operation per call does not work on this model: told to design a
+    removal it still produced an addition (66% mismatch, unchanged by a retry).
+    Generating candidates and selecting by the quota moves the choice to code.
+    """
+    question = (
+        "SCENE REQUEST:\n" + compact(raw_request) + "\n\n"
+        f"Design {count} different localised edits for this scene, one per operation "
+        "from add, remove, move, relation and attribute.\n"
+        "Use the format below once per edit, separated by a blank line:\n"
+        "OPERATION: <add|remove|move|relation|attribute>\n"
+        "EDIT: <imperative, at most 12 words>\n"
+        "EDIT_QUESTIONS: one line starting with '- ' holding exactly one yes/no "
+        "question, naming the object's colour and position; false now, true after\n"
+        "FINAL RULES:\n" + REPAIR_RULES
+    )
+    answer = ask_with_image(rt, image, question, cfg, system_message=ACTIVE_EDIT_SYSTEM)
+    blocks, current = [], []
+    for line in (answer or "").splitlines():
+        if re.match(r"^OPERATION\s*[::]", line.strip(), re.I) and current:
+            blocks.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    proposals = []
+    for block in blocks:
+        proposal = parse_proposal(block)
+        match = _OPERATION.search(block)
+        proposal["operation"] = (match.group(1).strip().lower() if match else None)
+        error = instruction_error(proposal["instruction"], None)
+        if error is None and proposal["operation"] not in OPERATIONS:
+            error = "operation_missing"
+        if error is None and not proposal["edit_questions"]:
+            error = "no_edit_question"
+        proposal["error"] = error
+        proposals.append(proposal)
+    return proposals

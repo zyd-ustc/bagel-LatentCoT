@@ -22,7 +22,9 @@ from pathlib import Path
 
 from qwen_latent_cot.u15_target_correction.accelerator import set_device
 from qwen_latent_cot.u15_target_correction.config import load_config
-from qwen_latent_cot.u15_target_correction.explicit import OPERATION_QUOTA, propose_active_edit_from_request
+from qwen_latent_cot.u15_target_correction.explicit import (
+    OPERATION_QUOTA, propose_active_edit_from_request, propose_active_edit_multi,
+)
 from qwen_latent_cot.u15_target_correction.diagnosis import decompose
 from qwen_latent_cot.u15_target_correction.labels import score_questions
 from qwen_latent_cot.u15_target_correction.loading import load_native
@@ -99,43 +101,53 @@ def main():
         completion = read_image(image_path, rt)
         operation = next_operation(counts, OPERATION_QUOTA)
         raw_request = spec.get("raw_prompt") or ""
-        proposal = propose_active_edit_from_request(rt, completion, raw_request, cfg,
-                                                    operation=operation)
-        if proposal.get("error") == "operation_mismatch":
-            # One retry on the same picture with the operation restated; the
-            # expert drifts towards "add" and this is the cheapest fix.
-            retry_op = next_operation(counts, OPERATION_QUOTA)
-            proposal = propose_active_edit_from_request(rt, completion, raw_request, cfg,
-                                                        operation=retry_op)
-            operation = retry_op
-        if proposal.get("error") is None:
-            # Preserve set comes from the request text, not from a description of
-            # the picture: the same model judging its own description rejected it
-            # on 50 of 50 smoke attempts.
-            requirements, _ = decompose(rt, raw_request, cfg)
-            proposal["preserve_questions"] = [
+        # Ask for several operations in one call, then take the one the quota needs.
+        proposals = propose_active_edit_multi(rt, completion, raw_request, cfg, count=5)
+        requirements, _ = decompose(rt, raw_request, cfg)
+        usable = []
+        for candidate in proposals:
+            if candidate.get("error") is not None:
+                continue
+            asked = candidate["edit_questions"]
+            passed_edit, per_edit = score_questions(rt, completion, asked, cfg)
+            if all(q in passed_edit for q in asked):
+                continue                      # already true on this picture
+            keep = [
                 q for q in requirements
-                if not any(w in proposal["instruction"].lower() for w in q.lower().split() if len(w) > 4)
+                if not any(w in candidate["instruction"].lower()
+                           for w in q.lower().split() if len(w) > 4)
             ][:3]
-        if proposal.get("error"):
-            log.write(json.dumps(dict(uid=uid, operation=proposal.get("operation"),
-                                      skipped=proposal["error"],
-                                      out=(proposal.get("raw_output") or "")[:1200]),
-                                 ensure_ascii=False) + "\n")
+            if not keep:
+                continue
+            passed_keep, per_keep = score_questions(rt, completion, keep, cfg)
+            keep = [q for q in keep if q in passed_keep]
+            if not keep:
+                continue
+            candidate["preserve_questions"] = keep
+            candidate["scores"] = {q: round(float(v), 3) for q, v in
+                                   {**per_edit, **per_keep}.items()}
+            usable.append(candidate)
+        if not usable:
+            log.write(json.dumps(dict(uid=uid, skipped="no_usable_operation",
+                                      ops=[c.get("operation") for c in proposals])) + "\n")
             log.flush()
             continue
-        # The edit question has to be false on the picture the expert just read.
-        asked = proposal["edit_questions"] + proposal["preserve_questions"]
-        passed, per = score_questions(rt, completion, asked, cfg)
-        edit_true = all(q in passed for q in proposal["edit_questions"])
-        protected = [q for q in proposal["preserve_questions"] if q in passed]
-        if edit_true or not protected:
-            log.write(json.dumps(dict(uid=uid, operation=proposal["operation"],
-                                      skipped="edit_true" if edit_true else "no_protected",
-                                      scores={q: round(float(v), 3) for q, v in per.items()}),
-                                 ensure_ascii=False) + "\n")
+        # Only now spend the quota. An operation already over its share is
+        # refused even when a valid candidate exists, otherwise the pool drifts
+        # towards whichever operation the expert writes most easily.
+        total = sum(counts.values()) + 1
+        within = [
+            c for c in usable
+            if counts.get(c["operation"], 0) / total < OPERATION_QUOTA.get(c["operation"], 0)
+        ]
+        if not within:
+            log.write(json.dumps(dict(uid=uid, skipped="quota_full",
+                                      ops=[c["operation"] for c in usable])) + "\n")
             log.flush()
             continue
+        wanted = next_operation(counts, OPERATION_QUOTA)
+        proposal = next((c for c in within if c["operation"] == wanted), within[0])
+        operation = proposal["operation"]
         row = dict(
             uid=uid,
             parent_uid=uid,
@@ -147,7 +159,7 @@ def main():
             edit_questions=list(proposal["edit_questions"]),
             preserve_questions=list(proposal["preserve_questions"]),
             source_image=image_path,
-            completion_scores={q: round(float(v), 3) for q, v in per.items()},
+            completion_scores=proposal["scores"],
             task_type="active_edit",
             split=spec.get("split", "train"),
             source_family=spec.get("family") or hashlib.sha1(str(uid).encode()).hexdigest()[:12],
