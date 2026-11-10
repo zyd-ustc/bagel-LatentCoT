@@ -3,10 +3,14 @@
   "stage": 2,
   "read_time": 0.36,
   "state_times": [
-    0.36
+    0.25,
+    0.36,
+    0.5
   ],
   "state_time_probs": [
-    1.0
+    0.3,
+    0.4,
+    0.3
   ],
   "keep_fraction": 0.0,
   "role_weights": {

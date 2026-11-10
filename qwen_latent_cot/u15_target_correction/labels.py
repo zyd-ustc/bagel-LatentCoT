@@ -23,11 +23,19 @@ def score_questions(rt, image, questions, cfg):
     except TypeError:
         scores = und_score_image(rt, image, questions)
     per = scores["questions"]
+    # A reply the parser could not read is not evidence either way: it must not be
+    # folded into "no", or an unreadable answer would silently satisfy an edit
+    # question and become a valid training prmise.
     passed = {
         question for question, item in zip(questions, per)
-        if float(item["p_yes"]) >= float(cfg["pass_threshold"])
+        if item.get("p_yes") is not None and float(item["p_yes"]) >= float(cfg["pass_threshold"])
     }
-    return passed, {q: float(item["p_yes"]) for q, item in zip(questions, per)}
+    return passed, {q: item.get("p_yes") for q, item in zip(questions, per)}
+
+
+def unreadable_questions(per):
+    """Questions the judge could not answer, kept apart from a negative verdict."""
+    return [item.get("answer") for item in per if item.get("p_yes") is None]
 
 
 def high_frequency(image):
@@ -49,7 +57,9 @@ def effective_acceptance(rt, before_image, effective, request, cfg):
     # edit question must be false before and true after, and the requirements
     # the fix does not touch must survive. The self-correction branch below has
     # no notion of "protected", which would reject every repair.
-    explicit = request.get("task_type", "explicit_edit") in ("explicit_edit", "repair")
+    explicit = request.get("task_type", "explicit_edit") in (
+        "explicit_edit", "repair", "active_edit"
+    )
     after, p_yes = score_questions(rt, effective, questions, cfg)
     before = {str(q) for q in (request.get("passed_before_source") or [])}
     if not before:

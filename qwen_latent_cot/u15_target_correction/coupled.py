@@ -50,7 +50,12 @@ def continue_from(rt, cfg, state, prompt, grid, read_time):
 
 
 def load_source(cache, uid, read_key):
-    """The cached source state, preview and final image for one uid."""
+    """The cached source state, preview and final image for one uid.
+
+    A parent rendered at several read times carries one state per time. The
+    teacher runs at one of them, but the record must keep every sibling so the
+    same target can supervise the other times later.
+    """
     from .prepare_state_pairs import _safe
 
     marker = Path(cache) / "progress" / f"{_safe(uid)}.json"
@@ -62,12 +67,20 @@ def load_source(cache, uid, read_key):
         return None
     payload = torch.load(Path(cache) / item["path"], map_location="cpu", weights_only=False)
     final = Path(cache) / record.get("source_image", "") if record.get("source_image") else None
+    sibling = {}
+    for key, other in (record.get("states") or {}).items():
+        if key == read_key:
+            continue
+        path = Path(cache) / other["path"]
+        if path.exists():
+            sibling[key] = str(path)
     return dict(
         state_a=payload["state_a"].float(),
         preview=payload["preview"].float(),
         final_image=str(final) if final and final.exists() else None,
         seed=int(record.get("source_seed_or_linear_noise_seed") or 0),
         parent_branch_id=record.get("parent_branch_id"),
+        sibling_states=sibling,
     )
 
 
@@ -119,7 +132,7 @@ def build_pair(rt, cfg, grid, request, source, *, teacher="it2i", teacher_image=
     ):
         return None, "no_protected_requirement"   # nothing could be shown to survive
 
-    if task_type in ("explicit_edit", "repair"):
+    if task_type in ("explicit_edit", "repair", "active_edit"):
         tail = compact(request["tail_condition"])
         if teacher == "text":
             velocity = NativeT2I(rt, tail, cfg)
@@ -243,6 +256,8 @@ def produce(rt, cfg, args):
             parent_condition=compact(request["parent_condition"]),
             tail_condition=pair["tail"],
             preserve=compact(request.get("preserve")),
+            edit_box=request.get("edit_box"),
+            preserve_boxes=request.get("preserve_boxes"),
             condition_protocol=cfg["condition_protocol"],
             valid_region=None,
             source_seed_or_linear_noise_seed=pair["seed"],

@@ -334,7 +334,7 @@ def und_answer_image(rt, image, questions, cfg, max_new_tokens=6):
         elif head.startswith("no"):
             p_yes, label = 0.01, "no"
         else:
-            p_yes, label = 0.5, "unparsed"
+            p_yes, label = None, "unparsed"
         per_q.append(dict(p_yes=p_yes, label=label, answer=(answer or "")[:40]))
     return per_q
 
@@ -349,7 +349,8 @@ def und_score_image(rt, image, questions, cfg=None, yes_ids=None, no_ids=None):
     """
     if cfg is not None:
         per = und_answer_image(rt, image, questions, cfg)
-        return dict(questions=per, min_p_yes=min(q["p_yes"] for q in per))
+        answered = [q["p_yes"] for q in per if q["p_yes"] is not None]
+        return dict(questions=per, min_p_yes=min(answered) if answered else None)
     _, scores = und_log_reward(rt, image, questions, yes_ids, no_ids)
     return summarize_question_scores(scores)
 
