@@ -26,12 +26,11 @@ pip install -e ".[metrics,judge]"
 - 状态编辑：固定 `t`，`s` 上 8 步 Euler；训练 `s~U(0,1)`。
 - 数据来源：`linear_pair`、`inverted_pair`、`native_parent`，另有约 10% 显式保持样本。
 - 检查点只保存 LoRA 与 `edit_s_embedder`，区分同阶段 resume 和跨阶段权重加载。
+- 当前训练适配采用单点协议（`t=0.36`），四角色配比为 R_active 50% / L_edit 30% / R_repair 10% / R_keep 10%（`terminal_active.json`），以主动编辑为主力，淘汰反演 I 数据。
 
 ## 文档
 
-- [实现合同](docs/target_correction.md)
-- [训练](docs/train.md)
-- [推理](docs/inference.md)
-- [等时生成态编辑方案](docs/isochronic_state_flow_training_plan.md)
-- [历史方案：选择性语义修复](docs/selective_semantic_correction_plan.md)
-- [历史结果：E1 记录](docs/e1_20261105_results_and_training.md)
+- [训练指南](docs/train.md)
+- [推理指南](docs/inference.md)
+- [数据方案](docs/data.md)
+- [实验记录](docs/experiment.md)

@@ -256,6 +256,11 @@ def produce(rt, cfg, args):
             parent_condition=compact(request["parent_condition"]),
             tail_condition=pair["tail"],
             preserve=compact(request.get("preserve")),
+            # The acceptance questions have to travel with the record: without
+            # them a produced pair cannot be re-judged, and the first teacher pass
+            # lost all 674 of them this way.
+            edit_questions=list(request.get("edit_questions") or []),
+            preserve_questions=list(request.get("preserve_questions") or []),
             edit_box=request.get("edit_box"),
             preserve_boxes=request.get("preserve_boxes"),
             condition_protocol=cfg["condition_protocol"],
