@@ -4,32 +4,34 @@
 
 ## 数据与支持范围
 
+冻结清单和 CPI 评分模板已只读复制到 `modelarts-64` 的 `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/`。下表使用该目录中的实际路径。编辑榜的源图和评分元数据仍需按题复制，并按冻结记录校验。
+
 ### 文生图
 
 | 榜单 | 冻结清单 |
 |---|---|
-| GenEval、GenEval++、T2I-CompBench++、DPG、T2I-CoReBench、WISE-Verified | `/mnt/sfs/250010019/unimoe_r3/outputs/0_eval62326_qwen27b_sixbench_20261019/foundation_v1/inputs/score_manifests/` 下对应的 `.jsonl` |
-| OneIG-Bench、PRISM-Bench、SpatialGenEval、GenEval 2 | `/mnt/sfs/250010019/unimoe_r3/outputs/0_extra_bench_qwen21_20261027/inputs_four_bench_v1/manifest.jsonl` |
-| TIIF-Bench、DSG、UniGenBench、GenAI-Bench | `/mnt/sfs/250010019/unimoe_r3/outputs/0_extra_bench_qwen21_20261027/inputs_recovered_offline_20261027/manifest.jsonl` |
+| GenEval、GenEval++、T2I-CompBench++、DPG、T2I-CoReBench、WISE-Verified | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/outputs/0_eval62326_qwen27b_sixbench_20261019/foundation_v1/inputs/score_manifests/` 下对应的 `.jsonl` |
+| OneIG-Bench、PRISM-Bench、SpatialGenEval、GenEval 2 | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/outputs/0_extra_bench_qwen21_20261027/inputs_four_bench_v1/manifest.jsonl` |
+| TIIF-Bench、DSG、UniGenBench、GenAI-Bench | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/outputs/0_extra_bench_qwen21_20261027/inputs_recovered_offline_20261027/manifest.jsonl` |
 
-五榜固定样本可用 `/mnt/sfs/250010019/unimoe_r3/outputs/0_eval_official_t2i_fivebench10_20261108_v1/ROWS.json`，其中有 610 条记录。该文件保存了样本使用的原题和种子。
+五榜固定样本可用 `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/outputs/0_eval_official_t2i_fivebench10_20261108_v1/ROWS.json`，其中有 610 条记录。该文件保存了样本使用的原题和种子。
 
 ### 编辑
 
 | 榜单 | 冻结清单 | 评分状态 |
 |---|---|---|
-| ImgEdit Basic / UGE | `/mnt/sfs/250010019/unimoe_r3/data/benchmark_editing7_20261030/imgedit/prepared784_v1/MANIFEST.jsonl` | GLM 原评分模板和解析规则 |
-| MagicBrush | `/mnt/sfs/250010019/unimoe_r3/data/benchmark_editing7_20261030/magicbrush/prepared_single_v1/MANIFEST.jsonl` | 冻结 CLIP、DINO、L1 等工具 |
-| Emu Edit | `/mnt/sfs/250010019/unimoe_r3/data/benchmark_editing7_20261030/emu_edit/prepared_single_v1/MANIFEST.jsonl` | 冻结 CLIP、DINO 等工具，沿用内部口径 |
-| GEdit v2 | `/mnt/sfs/250010019/unimoe_r3/data/benchmark_editing7_20261030/gedit_v2/prepared_single_v1/MANIFEST.jsonl` | 已接成对评分；需要冻结评分模板和 `both` 生成结果，尚未进行真实裁判测试 |
-| CPI 单图 | `benchmark_editing7_20261030/cpi_bench/generation_single_raw_v1/MANIFEST.jsonl` | 生成入口可读取；评分尚未接入。需先确认清单中待审的画布协议 |
-| ABACUS | `benchmark_editing7_20261030/abacus/generation_single_raw_v1/MANIFEST.jsonl` | GLM 内部数量诊断；先确认清单中待审的提示词协议 |
-| GEdit v1 | `/mnt/sfs/250010019/unimoe_r3/outputs/0_qwen21_gedit_threeway_recovery_20261027/MANIFEST.jsonl` | GLM 复用 SC/PQ 模板和解析规则 |
+| ImgEdit Basic / UGE | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/data/benchmark_editing7_20261030/imgedit/prepared784_v1/MANIFEST.jsonl` | GLM 原评分模板和解析规则 |
+| MagicBrush | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/data/benchmark_editing7_20261030/magicbrush/prepared_single_v1/MANIFEST.jsonl` | 冻结 CLIP、DINO、L1 等工具 |
+| Emu Edit | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/data/benchmark_editing7_20261030/emu_edit/prepared_single_v1/MANIFEST.jsonl` | 冻结 CLIP、DINO 等工具，沿用内部口径 |
+| GEdit v2 | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/data/benchmark_editing7_20261030/gedit_v2/prepared_single_v1/MANIFEST.jsonl` | 已接成对评分；需要冻结评分模板和 `both` 生成结果，尚未进行真实裁判测试 |
+| CPI 单图 | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/data/benchmark_editing7_20261030/cpi_bench/generation_single_raw_v1/MANIFEST.jsonl` | 生成入口可读取；评分尚未接入。需先确认清单中待审的画布协议 |
+| ABACUS | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/data/benchmark_editing7_20261030/abacus/generation_single_raw_v1/MANIFEST.jsonl` | GLM 内部数量诊断；先确认清单中待审的提示词协议 |
+| GEdit v1 | `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/frozen/outputs/0_qwen21_gedit_threeway_recovery_20261027/MANIFEST.jsonl` | GLM 复用 SC/PQ 模板和解析规则 |
 | CPI 多图 | 多图输入 | 当前编辑器只接受单张源图，尚不支持 |
 
 ## 模型与裁判
 
-以下在 `modelarts-64` 上执行。该节点可以访问 Metto，但没有挂载 `/mnt/sfs/250010019`：运行前需将所选冻结记录和源图复制到该节点可访问的路径。不要使用 `modelarts-64b` 的加速卡。
+以下在 `modelarts-64` 上执行。该节点可以访问 Metto，但没有挂载 `/mnt/sfs/250010019`：冻结清单已复制，编辑题的源图及所需元数据须另行复制。不要使用 `modelarts-64b` 的加速卡。
 
 ```bash
 CODE=/data/zyd_workspace/bagel-LatentCoT/code/bagel-loop-layer-NPU
@@ -93,3 +95,7 @@ MagicBrush 和 Emu Edit 使用独立的本地 CLIP、DINO 与像素指标，不�
 评分保留各榜的冻结问题、模板、解析和单图聚合规则，但裁判已经从 27B 改成 GLM。输出是 **GLM 内部口径**，不是官方榜单分，也不能直接当成原 27B 数值的同口径对比。模型、榜单、题目、图片、原始回答和有效状态均写入单题结果。不同榜单的量纲保持原样，不合并为总分。GEdit v2 的 `--rubric-root` 指向冻结模板仓库；`--reference-arm` 指定比较图，两种图片顺序分别判断，平票记半胜。
 
 评分无效或无法判断时，结果为 `unknown` 或命令报错，不计作零分。正式比较时，分别报告各组覆盖率，并只在共同有效题上计算配对差值；类别宏平均的榜单保持类别宏平均。
+
+## 单题联通记录
+
+`modelarts-64` 上已用 `step_014723` 和不加载检查点两种模式生成 GenEval 2 与 ImgEdit Basic 各一题，输出位于 `/data/zyd_workspace/isochronic_data_20261107/benchmark_migration_smoke_20261112/`。ImgEdit 题 `imgedit_basic_1082` 的检查点结果已通过 GLM 实际评分：三个维度各 3 分，平均 3.0（1–5 分）。这只是管线联通结果，不代表模型的榜单表现。文生图首次评分请求没有留下结果，需核对服务端请求状态。
