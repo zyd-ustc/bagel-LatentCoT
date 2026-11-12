@@ -10,7 +10,7 @@ import torch
 from . import (
     CACHE_KIND, INVERTED_PAIR, LINEAR_PAIR, NATIVE_PARENT,
     ROLE_I_EDIT, ROLE_L_EDIT, ROLE_L_REVERSE, ROLE_R_EDIT, ROLE_R_KEEP,
-    ROLE_R_ACTIVE, ROLE_R_REPAIR, ROLES,
+    ROLE_R_ACTIVE, ROLE_R_SATISFIED, ROLE_R_REPAIR, ROLES,
 )
 from .conditions import compact, derived_tail_condition
 from .field import protocol, sample_state_time, time_key, weighted_choice
@@ -30,6 +30,7 @@ ROLE_DOMAIN = {
     ROLE_R_REPAIR: "native_history",
     ROLE_R_ACTIVE: "native_history",
     ROLE_R_KEEP: "native_history",
+    ROLE_R_SATISFIED: "native_history",
 }
 
 
@@ -348,6 +349,15 @@ class StatePairManifest:
             if not path.exists():
                 raise ValueError("Cached state file is missing: " + str(path))
             states[key] = dict(item, path=str(path), accepted=bool(item.get("accepted")))
+        if self.cfg.get("semantic_weights"):
+            if row.get("role") not in (ROLE_R_ACTIVE, ROLE_R_REPAIR, ROLE_R_KEEP, ROLE_R_SATISFIED):
+                raise ValueError("Semantic cache has an unsupported role: " + uid)
+            if not row.get("source_image"):
+                raise ValueError("Semantic cache is missing the original completion: " + uid)
+            if row["role"] in (ROLE_R_ACTIVE, ROLE_R_REPAIR) and (
+                not row.get("target_image") or not row.get("edit_regions")
+            ):
+                raise ValueError("Semantic edit needs an approved target and edit regions: " + uid)
         return dict(
             uid=uid,
             source_kind=row["source_kind"],
@@ -363,6 +373,10 @@ class StatePairManifest:
             condition_protocol=row["condition_protocol"],
             states=states,
             valid_region=row.get("valid_region"),
+            edit_regions=row.get("edit_regions"),
+            semantic_task=row.get("semantic_task"),
+            count_direction=row.get("count_direction"),
+            geometry=row.get("geometry"),
             semantic_quality_source=row.get("semantic_quality_source"),
             target_quality_source=row.get("target_quality_source"),
             role=row.get("role") or self._default_role(row),
@@ -438,6 +452,7 @@ class StatePairManifest:
             raise ValueError("Cached state contains a nonfinite value: " + item["path"])
         if keep and state_b is not None:
             state_b = state_a.clone()
+        keep = keep or role == ROLE_R_KEEP
         edit, tail, preserve = _keep_or_edit(row, self.cfg, keep)
         terminal = bool((self.cfg.get("terminal") or {}).get("enabled", False))
         x_source = x_teacher = None
@@ -448,7 +463,7 @@ class StatePairManifest:
                 crop=(row.get("geometry") or {}).get("source"),
             )
             target_path = row.get("target_image")
-            if keep or not target_path:
+            if keep or role == ROLE_R_SATISFIED or not target_path:
                 x_teacher = x_source
             else:
                 x_teacher, _, _ = load_canvas(
@@ -464,6 +479,10 @@ class StatePairManifest:
             target=None,
             x_source=x_source,
             x_teacher=x_teacher,
+            edit_regions=row["edit_regions"],
+            satisfied=role == ROLE_R_SATISFIED,
+            semantic_task=row["semantic_task"],
+            count_direction=row["count_direction"],
             state_a=state_a,
             state_b=state_b,
             preview=preview,
@@ -499,23 +518,52 @@ class StatePairManifest:
             grouped.setdefault(self.rows[index]["role"], []).append(index)
         return {
             role: StatePairPool(self, role, grouped[role])
-            for role in (ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_R_REPAIR, ROLE_R_ACTIVE)
+            for role in (ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_R_REPAIR, ROLE_R_ACTIVE, ROLE_R_SATISFIED)
             if grouped.get(role)
         }
+
+
+    def semantic_pools(self, repair_cap):
+        grouped = {}
+        for index in self.train_indices:
+            row = self.rows[index]
+            role = row["role"]
+            if role == ROLE_R_KEEP:
+                task = "keep"
+            elif role == ROLE_R_SATISFIED:
+                task = "satisfied"
+            else:
+                task = row["count_direction"] if row["semantic_task"] == "count" else row["semantic_task"]
+            if task:
+                grouped.setdefault(task, []).append(index)
+        return {task: StatePairPool(self, task, indices, repair_cap=repair_cap)
+                for task, indices in grouped.items()}
 
 
 class StatePairPool:
     """A role restricted to one cache: its indices, accepted times, and draws."""
 
-    def __init__(self, manifest, role, indices):
+    def __init__(self, manifest, role, indices, repair_cap=None):
         self.manifest = manifest
         self.role = role
         self.indices = list(indices)
+        self.repair_cap = repair_cap
         self.by_time = {key: [] for key in manifest.by_time}
         for index in self.indices:
             for key, item in manifest.rows[index]["states"].items():
                 if item["accepted"] and key in self.by_time:
                     self.by_time[key].append(index)
+        if repair_cap is not None:
+            self.repairs = {
+                key: [i for i in indices if manifest.rows[i]["role"] == ROLE_R_REPAIR]
+                for key, indices in self.by_time.items()
+            }
+            self.other = {
+                key: [i for i in indices if manifest.rows[i]["role"] != ROLE_R_REPAIR]
+                for key, indices in self.by_time.items()
+            }
+            if any(self.repairs[key] and not self.other[key] for key in self.by_time):
+                raise ValueError("Semantic task needs active examples at each sampled time: " + role)
 
     @property
     def count(self):
@@ -546,6 +594,11 @@ class StatePairPool:
         indices = self.by_time[time_key(time)]
         if not indices:
             raise ValueError("No " + self.role + " record at the requested state time")
+        if self.repair_cap is not None:
+            key = time_key(time)
+            repairs = self.repairs[key]
+            share = min(self.repair_cap, len(repairs) / len(indices))
+            indices = repairs if rng.random() < share else self.other[key]
         return rng.choice(indices)
 
     def sample(self, index, time, keep=False):
@@ -567,7 +620,18 @@ class TrainingSampler:
         self.keep_draws = 0
         self.draws = 0
         roles = {key: float(value) for key, value in (cfg.get("role_weights") or {}).items()}
-        if roles:
+        semantic = cfg.get("semantic_weights")
+        if semantic:
+            if native is None:
+                raise ValueError("Semantic sampling needs a native-parent cache")
+            self.pools = native.semantic_pools(float(cfg["repair_cap"]))
+            self.weights = {task: float(weight) for task, weight in semantic.items() if weight > 0}
+            missing = self.weights.keys() - self.pools.keys()
+            if missing:
+                raise ValueError("Missing semantic pools: " + ", ".join(sorted(missing)))
+            self.configured = dict(semantic)
+            self.keep_fraction = 0.0
+        elif roles:
             self.pools = {}
             if linear is not None and linear.count:
                 for role, pool in linear.role_pools().items():
@@ -644,8 +708,9 @@ class TrainingSampler:
         chosen_time = pool.choose_time(self.rng, time)
         index = pool.choose_index(chosen_time, self.rng)
         sample = pool.sample(index, chosen_time, keep=keep)
-        sample["role"] = role
-        self.seen.add(role)
+        if not self.cfg.get("semantic_weights"):
+            sample["role"] = role
+        self.seen.add(sample["role"])
         self.draws += 1
         self.keep_draws += int(bool(sample.get("keep")))
         return sample

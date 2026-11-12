@@ -27,7 +27,7 @@ def _parser():
 
     train = commands.add_parser("train")
     _model_args(train)
-    train.add_argument("--linear", required=True)
+    train.add_argument("--linear")
     train.add_argument("--inverted")
     train.add_argument("--native")
     train.add_argument("--output", required=True)
@@ -40,6 +40,8 @@ def _parser():
     sample.add_argument("--prompts", required=True)
     sample.add_argument("--output", required=True)
     sample.add_argument("--checkpoint")
+    sample.add_argument("--paired", action="store_true", help="Save direct continuation under the same target")
+    sample.add_argument("--post-edit", action="store_true", help="Include matched native IT2I after generation")
     sample.add_argument("--limit", type=int, default=32)
 
     native = commands.add_parser("native")
@@ -105,9 +107,8 @@ def _explicit_edit(row, raw):
     edit = compact(instruction)
     tail = row.get("tail_condition")
     if not str(tail or "").strip():
-        if not bool(row.get("allow_derived_tail")):
-            raise ValueError("Explicit edits require an independent full tail_condition")
-        tail = derived_tail_condition(raw, edit)
+        if row.get("allow_derived_tail"):
+            tail = derived_tail_condition(raw, edit)
     return dict(
         edit_request=edit,
         tail_condition=compact(tail),
@@ -159,7 +160,7 @@ def _load_editor(rt, cfg, checkpoint):
 def _sample(args, cfg, device):
     from . import distributed as dist
     from .data import read_rows
-    from .images import save_image
+    from .images import load_canvas, save_image
     from .loading import load_native
     from .sampling import run
 
@@ -186,9 +187,21 @@ def _sample(args, cfg, device):
         uid = row.get("uid") or row.get("prompt_id") or f"{index:05d}"
         explicit = _explicit_edit(row, raw)
         began = time.perf_counter()
-        images, record = run(rt, raw, seed, cfg, editor=editor, explicit=explicit)
+        alternate_preview = row.get("conditioning_preview")
+        if alternate_preview and not explicit:
+            raise ValueError("A conditioning preview intervention requires an explicit edit")
+        if alternate_preview:
+            preview_path = Path(args.prompts).resolve().parent / alternate_preview
+            alternate_preview, _, _ = load_canvas(preview_path, rt.width, rt.height, rt.device)
+        images, record = run(
+            rt, raw, seed, cfg, editor=editor, explicit=explicit,
+            paired=args.paired, post_edit=args.post_edit, conditioning_preview=alternate_preview,
+        )
         record["seconds"] = time.perf_counter() - began
         record["uid"] = uid
+        record["vqa_list"] = row.get("vqa_list", [])
+        record["skills"] = row.get("skills", [])
+        record["conditioning_preview"] = row.get("conditioning_preview")
         record["checkpoint"] = args.checkpoint
         record["mode"] = "explicit" if explicit else "closed_loop"
         for key, image in images.items():

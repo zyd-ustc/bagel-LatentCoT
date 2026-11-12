@@ -12,7 +12,6 @@ CODE = Path("/data/zyd_workspace/bagel-LatentCoT/code/isochronic-state-flow-2026
 PY = "/data/zyd_workspace/bagel-LatentCoT/venvs/u15-NPU/bin/python"
 SOURCE = "/data/zyd_workspace/bagel-LatentCoT/code/sensenova-u15-c35c83b"
 MODEL = "/data/zyd_workspace/models/SenseNova-U1.5-8B-MoT"
-CONFIGS = CODE / "configs/u15_isochronic_state"
 
 
 def _hosts():
@@ -61,7 +60,7 @@ def _preflight(hosts, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", type=int, choices=(1, 2), required=True)
-    parser.add_argument("--linear", required=True)
+    parser.add_argument("--linear")
     parser.add_argument("--inverted")
     parser.add_argument("--native")
     parser.add_argument("--init-from")
@@ -80,11 +79,21 @@ def main():
     output = Path(args.output).resolve()
     log_dir = output.with_name(output.name + "_logs")
     default_cfg = "stage1_36.json" if args.stage == 1 else "stage2_36.json"
-    stage_cfg = Path(args.config) if args.config else CONFIGS / default_cfg
+    from qwen_latent_cot.u15_target_correction.config import load_config
+
+    stage_cfg = Path(args.config).resolve() if args.config else Path(args.code).resolve() / "configs/u15_isochronic_state" / default_cfg
+    cfg = load_config(stage_cfg)
+    if int(cfg["stage"]) != args.stage:
+        parser.error("--stage must match the selected config")
+    if args.stage == 1 and not args.linear:
+        parser.error("Stage 1 requires --linear")
     if args.stage == 1 and (args.inverted or args.native):
         parser.error("Stage 1 does not accept --inverted or --native")
-    if args.stage == 2 and not args.inverted:
-        parser.error("Stage 2 requires --inverted")
+    if cfg.get("semantic_weights") and not args.native:
+        parser.error("Semantic Stage 2 requires --native")
+    if args.stage == 2 and not (args.inverted or cfg.get("role_weights")
+                                or (cfg.get("terminal") or {}).get("enabled")):
+        parser.error("This Stage 2 config requires --inverted")
 
     launch_env = dict(
         PYTHONPATH=str(Path(args.code).resolve()),
@@ -121,9 +130,10 @@ def main():
             "--distributed", "--device", "npu:0",
             "--model", MODEL, "--source", SOURCE,
             "--config", str(stage_cfg),
-            "--linear", args.linear,
             "--output", str(output),
         ]
+        if args.linear:
+            command += ["--linear", args.linear]
         if args.inverted:
             command += ["--inverted", args.inverted]
         if args.native:

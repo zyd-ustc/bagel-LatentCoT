@@ -163,6 +163,12 @@ def _terminal_update(editor, sample, cfg, grid):
     velocity = NativeT2I(editor.rt, sample["tail_condition"], cfg)
     picture = euler(edited.float(), segment_times(grid, time, 1.0), velocity)
     options = loss_options(cfg["terminal"])
+    if cfg["terminal"].get("region_supervision"):
+        options.update(
+            regions=sample["edit_regions"],
+            no_change=sample["keep"] or sample.get("satisfied", False),
+            perceptual=editor.terminal_perceptual,
+        )
     loss, detail = terminal_loss(picture, x_teacher, x_source, valid, **options)
     return loss, dict(
         time=time, progress=1.0, mode="terminal",
@@ -236,11 +242,13 @@ def train(args, cfg, device):
     dist.barrier()
 
     rt = load_native(args.model, args.source, cfg, device, args.distributed)
-    linear = LinearManifest(args.linear, rt, cfg)
+    linear = LinearManifest(args.linear, rt, cfg) if args.linear else None
     inverted = StatePairManifest(args.inverted, rt, cfg, INVERTED_PAIR) if args.inverted else None
     native = StatePairManifest(args.native, rt, cfg, NATIVE_PARENT) if args.native else None
 
     if int(cfg["stage"]) == 1:
+        if linear is None:
+            raise ValueError("Stage 1 requires --linear")
         independent = linear.count
     else:
         independent = (inverted.count if inverted else 0) + (native.count if native else 0)
@@ -254,6 +262,10 @@ def train(args, cfg, device):
     torch.manual_seed(int(cfg["seed"]) + dist.rank())
     editor = StateEditor(rt, cfg).train()
     dist.broadcast_parameters(editor)
+    if (cfg.get("terminal") or {}).get("region_supervision"):
+        from .loss import build_perceptual
+
+        object.__setattr__(editor, "terminal_perceptual", build_perceptual(rt.device))
     params = canonical_parameters(editor)
     optimizer = torch.optim.AdamW(
         params.values(),
@@ -264,7 +276,7 @@ def train(args, cfg, device):
         foreach=False,
     )
     identity = editor_identity(rt, cfg)
-    version = hash_data(linear.path, inverted.path if inverted else None, native.path if native else None)
+    version = hash_data(linear.path if linear else None, inverted.path if inverted else None, native.path if native else None)
 
     start = 0
     if args.resume:
@@ -309,6 +321,8 @@ def train(args, cfg, device):
             seconds=time.perf_counter() - began,
             source_kind=sample["source_kind"],
             role=fields["role"],
+            semantic_task=sample.get("semantic_task"),
+            count_direction=sample.get("count_direction"),
             mode=fields["mode"],
             uid=sample["uid"],
             keep=fields["keep"],
@@ -326,7 +340,7 @@ def train(args, cfg, device):
             configured_global_batch=int(cfg["global_batch"]),
             batch_mismatch=dist.world_size() != int(cfg["global_batch"]),
         )
-        for key in ("structure", "preserve", "frequency", "hf_ratio", "edited_fraction", "tail_calls"):
+        for key in ("structure", "perceptual", "preserve", "frequency", "hf_ratio", "edited_fraction", "tail_calls"):
             if key in fields:
                 stats[key] = fields[key]
         if dist.rank() == 0:

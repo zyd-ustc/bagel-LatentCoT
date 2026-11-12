@@ -298,6 +298,7 @@ def ask_with_image(rt, image, question, cfg, system_message=None, max_new_tokens
     with autocast(rt.device):
         vit = m.extract_feature(pixels, gen_model=False, grid_hw=grid)
         output = m.generate(
+            pixel_values=pixels,
             input_ids=encoded["input_ids"].to(rt.device),
             grid_hw=grid,
             attention_mask=encoded["attention_mask"].to(rt.device),
@@ -767,3 +768,25 @@ def review_preview(rt, image, raw, cfg):
         preserve=preserve,
         rejected=rejected,
     )
+
+
+def review_atomic_edit(rt, image, raw, cfg):
+    """Propose one visible correction using the training instruction format."""
+    from .edit_request import SCHEMA, parse_edit
+
+    prompt = (
+        "Inspect this draft against the original prompt. Identify at most one visible "
+        "violation. Use the target quantity, spatial relation, or attribute from the "
+        "prompt. If an object is present but has the wrong attribute, request an "
+        "attribute change. Treat ambiguous or already satisfied requirements as none. "
+        + SCHEMA + "\nOriginal prompt: " + raw
+    )
+    response = ask_with_image(rt, image, prompt, cfg)
+    try:
+        edit = parse_edit(response)
+        status = "edit" if edit else "no_failure"
+    except ValueError:
+        edit, status = None, "failed_unconverted"
+    return dict(questions=[], decomposition={"response": response}, preview_score={"questions": []},
+                failed=[], rejected=[], edit_request=edit["instruction"] if edit else "",
+                preserve=edit["preserve"] if edit else "", atomic_edit=edit, diagnosis_outcome=status)

@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--prompts", required=True,
                         help="jsonl with uid and prompt (or raw_prompt)")
     parser.add_argument("--out", required=True)
-    parser.add_argument("--times", default="0.25,0.36,0.50")
+    parser.add_argument("--times", help="Comma-separated grid nodes; defaults to state_times")
     parser.add_argument("--limit", type=int, default=50000)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
@@ -54,8 +54,11 @@ def main():
     device = set_device(args.device)
     cfg = load_config(args.config)
     rt = load_native(args.model, args.source, cfg, device, distributed=False)
-    times = [float(t) for t in args.times.split(",")]
+    default_times = cfg["state_times"] if cfg.get("semantic_weights") else [0.25, 0.36, 0.50]
+    times = [float(t) for t in args.times.split(",")] if args.times else default_times
     grid = phase_grid(rt, cfg)
+    if any(time not in grid for time in times):
+        raise ValueError("Every requested parent state must be a grid node")
 
     rows = []
     with open(args.prompts) as handle:
@@ -84,16 +87,21 @@ def main():
         # Same naming as prepare_state_pairs so coupled.load_source finds it.
         marker = out / "progress" / f"{_safe(uid)}.json"
         if args.skip_existing and marker.exists():
-            records.append(json.loads(marker.read_text()))
-            continue
+            cached = json.loads(marker.read_text())
+            if cached.get("phase_grid") == grid and all(
+                cached["states"].get(time_key(t), {}).get("preview_image") for t in times
+            ):
+                records.append(cached)
+                continue
         began = time.perf_counter()
-        seed = int(row.get("seed") or (abs(hash(uid)) % (2**31)))
+        seed = int(row.get("seed", int(hashlib.sha256(uid.encode()).hexdigest()[:8], 16)))
         generator = torch.Generator(device=rt.device).manual_seed(seed)
         noise = torch.randn((1, 3, rt.height, rt.width), device=rt.device,
                             generator=generator) * rt.noise_scale()
         velocity = NativeT2I(rt, row["prompt"], cfg)
         walked = native_forward_states(noise, grid, times, velocity)
 
+        stem = _safe(uid)
         states = {}
         for t in times:
             key = time_key(t)
@@ -105,25 +113,31 @@ def main():
                 preview=walked["previews"][key].cpu(),
                 valid=torch.ones(1, 1, rt.height, rt.width),
             )
-            path = out / "states" / f"{uid}_{key}.pt"
+            path = out / "states" / f"{stem}_{key}.pt"
             torch.save(payload, path)
-            states[key] = dict(path=str(path), accepted=True)
-        completion = out / "targets" / f"{uid}_source_final.png"
+            preview_path = out / "targets" / f"{stem}_{key}_preview.png"
+            save_image(preview_path, walked["previews"][key])
+            states[key] = dict(path=str(path), preview_image=str(preview_path), accepted=True)
+        completion = out / "targets" / f"{stem}_source_final.png"
         save_image(completion, walked["final"])
 
+        prompt_family = str(row.get("prompt_family") or row.get("family") or row["prompt"])
+        split_bucket = int(hashlib.sha256(prompt_family.encode()).hexdigest()[:8], 16) % 100
+        default_split = "val" if cfg.get("semantic_weights") and split_bucket < 5 else "train"
         record = dict(
             uid=uid,
             source_kind="native_parent",
-            split=row.get("split", "train"),
+            split=row.get("split", default_split),
             role="R_active",
             parent_condition=row["prompt"],
             tail_condition=row["prompt"],
             edit_instruction="",
             source_image=str(completion),
             source_family=row.get("family") or hashlib.sha1(uid.encode()).hexdigest()[:12],
-            prompt_family=row.get("family") or uid,
+            prompt_family=prompt_family,
             seed=seed,
             read_times=times,
+            phase_grid=grid,
             states=states,
             seconds=round(time.perf_counter() - began, 2),
         )

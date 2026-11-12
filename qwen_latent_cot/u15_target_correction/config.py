@@ -99,6 +99,9 @@ def validate_config(cfg):
         raise ValueError("state_times must be strictly increasing")
     if len(probs) != len(times) or abs(sum(probs) - 1) > 1e-6:
         raise ValueError("state_time_probs must match state_times and sum to one")
+    grid_times = [float(t) for t in cfg.get("phase_grid_times", times)]
+    if any(not 0 < t < 1 for t in grid_times) or not set(times).issubset(grid_times):
+        raise ValueError("phase_grid_times must contain the sampled state times")
     if read not in times:
         raise ValueError("read_time must be one of the supported state times")
 
@@ -175,12 +178,27 @@ def validate_config(cfg):
                 raise ValueError(
                     "Stage 2 role weights must include one of " + ", ".join(edit_roles))
 
+    semantic = cfg.get("semantic_weights")
+    if semantic is not None:
+        tasks = {"count_increase", "count_reduce", "spatial", "attribute", "keep", "satisfied"}
+        if (not isinstance(semantic, dict) or not semantic or set(semantic) - tasks
+                or any(not math.isfinite(float(w)) or float(w) < 0 for w in semantic.values())
+                or not math.isclose(sum(map(float, semantic.values())), 1.0)):
+            raise ValueError("semantic_weights must assign normalized weights to semantic tasks")
+        if roles or cfg["keep_fraction"] or stage != 2:
+            raise ValueError("semantic_weights require Stage 2 without role_weights or keep_fraction")
+        if not 0 <= float(cfg.get("repair_cap", -1)) <= 1:
+            raise ValueError("repair_cap must lie between zero and one")
+        terminal_options = cfg.get("terminal") or {}
+        if not (terminal_options.get("enabled") and terminal_options.get("region_supervision")):
+            raise ValueError("Semantic Stage 2 requires region supervision")
+
     terminal = cfg.get("terminal")
     if terminal is not None:
         if not isinstance(terminal, dict):
             raise ValueError("terminal must be a mapping")
         if terminal.get("enabled"):
-            for key in ("preserve_weight", "frequency_weight"):
+            for key in ("preserve_weight", "frequency_weight", "pixel_weight"):
                 if float(terminal.get(key, 0)) < 0:
                     raise ValueError("terminal." + key + " must be non-negative")
             low = float(terminal.get("mask_low", 0.6))

@@ -1,0 +1,60 @@
+{
+  "extends": "core.json",
+  "stage": 2,
+  "atomic_edits": true,
+  "read_time": 0.36,
+  "state_times": [
+    0.36
+  ],
+  "state_time_probs": [
+    1.0
+  ],
+  "phase_grid_times": [
+    0.25,
+    0.36,
+    0.5
+  ],
+  "keep_fraction": 0.0,
+  "semantic_weights": {
+    "count_increase": 0.2,
+    "count_reduce": 0.2,
+    "spatial": 0.35,
+    "attribute": 0.1,
+    "satisfied": 0.1,
+    "keep": 0.05
+  },
+  "repair_cap": 0.2,
+  "terminal": {
+    "enabled": true,
+    "region_supervision": true,
+    "pixel_weight": 0.1,
+    "preserve_weight": 1.0,
+    "frequency_weight": 0.0,
+    "roles": [
+      "R_active",
+      "R_repair",
+      "R_keep",
+      "R_satisfied"
+    ]
+  },
+  "lr": 1e-05,
+  "lr_final": 2e-06,
+  "warmup_steps": 20,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0.0,
+  "max_steps": 150,
+  "updates_per_pair": 300,
+  "save_every": 50,
+  "source_weights": {
+    "native_parent": 1.0
+  },
+  "eval_steps": [
+    50,
+    100,
+    150
+  ]
+}

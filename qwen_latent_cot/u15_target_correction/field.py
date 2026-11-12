@@ -8,6 +8,7 @@ from . import GEOMETRY_PROTOCOL, KIND, PROTOCOL_VERSION
 
 def protocol(rt, cfg):
     return dict(
+        **({"phase_grid_times": cfg["phase_grid_times"]} if "phase_grid_times" in cfg else {}),
         kind=KIND,
         protocol_version=PROTOCOL_VERSION,
         geometry=GEOMETRY_PROTOCOL,
@@ -38,7 +39,7 @@ def protocol(rt, cfg):
 def phase_grid(rt, cfg):
     """The native grid plus every supported state time and the read time."""
     values = [float(t) for t in rt.times()]
-    extras = [float(cfg["read_time"]), *[float(t) for t in cfg["state_times"]]]
+    extras = [float(t) for t in cfg.get("phase_grid_times", cfg["state_times"])]
     for value in extras:
         values = [t for t in values if abs(t - value) > 1e-7] + [value]
     return sorted(values)

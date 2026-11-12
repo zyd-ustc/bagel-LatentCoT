@@ -16,6 +16,7 @@ ROLE_L_EDIT = "L_edit"
 ROLE_I_EDIT = "I_edit"
 ROLE_R_EDIT = "R_edit"
 ROLE_R_KEEP = "R_keep"
+ROLE_R_SATISFIED = "R_satisfied"
 # Sub-roles exist because the losses differ per task, not only per source domain:
 # a repaired real failure and a directly specified edit both land in R_edit, and a
 # forward pair and its reversed counterpart both land in L_edit, yet they must be
@@ -25,9 +26,9 @@ ROLE_R_REPAIR = "R_repair"
 # Active edit: an instructed change on a real history state, picked from what the
 # completion already shows. It does not need the base model to have failed.
 ROLE_R_ACTIVE = "R_active"
-ROLES = (ROLE_L_EDIT, ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_L_REVERSE, ROLE_R_REPAIR, ROLE_R_ACTIVE)
+ROLES = (ROLE_L_EDIT, ROLE_I_EDIT, ROLE_R_EDIT, ROLE_R_KEEP, ROLE_L_REVERSE, ROLE_R_REPAIR, ROLE_R_ACTIVE, ROLE_R_SATISFIED)
 # Which roles are trained through the frozen tail (terminal image supervision).
-TERMINAL_ROLES = frozenset({ROLE_R_EDIT, ROLE_R_REPAIR, ROLE_R_KEEP, ROLE_R_ACTIVE})
+TERMINAL_ROLES = frozenset({ROLE_R_EDIT, ROLE_R_REPAIR, ROLE_R_KEEP, ROLE_R_ACTIVE, ROLE_R_SATISFIED})
 
 CONDITION_PROTOCOL = "isochronic_condition_v1"
 CACHE_KIND = "u15_isochronic_state_pairs_v1"

@@ -3,7 +3,7 @@
 import torch
 
 from .conditions import edit_prompt
-from .diagnosis import review_preview
+from .diagnosis import review_atomic_edit, review_preview, semantic_plan
 from .field import NativeT2I, edit_state, euler, phase_grid, preview_image, protocol, segment_times
 
 
@@ -27,7 +27,8 @@ def prepare(rt, raw, seed, cfg, *, diagnose=True):
         raise RuntimeError("Native preparation produced a nonfinite state")
 
     if diagnose:
-        review = review_preview(rt, preview, raw, cfg)
+        reviewer = review_atomic_edit if cfg.get("atomic_edits") else review_preview
+        review = reviewer(rt, preview, raw, cfg)
     else:
         review = dict(
             questions=[], decomposition={}, preview_score={"questions": []},
@@ -45,6 +46,8 @@ def prepare(rt, raw, seed, cfg, *, diagnose=True):
         parent_condition=raw,
         tail_condition=tail_condition,
         preview_score=review["preview_score"],
+        atomic_edit=review.get("atomic_edit"),
+        diagnosis_outcome=review.get("diagnosis_outcome"),
         decomposition=review["decomposition"],
         questions=review["questions"],
         failed_questions=review["failed"],
@@ -68,7 +71,7 @@ def prepare(rt, raw, seed, cfg, *, diagnose=True):
 
 
 @torch.no_grad()
-def run(rt, raw, seed, cfg, *, editor=None, explicit=None):
+def run(rt, raw, seed, cfg, *, editor=None, explicit=None, paired=False, post_edit=False, conditioning_preview=None):
     explicit = dict(explicit or {})
     native, grid, state, preview, record = prepare(
         rt, raw, seed, cfg, diagnose=not bool(explicit)
@@ -76,10 +79,20 @@ def run(rt, raw, seed, cfg, *, editor=None, explicit=None):
     read = float(cfg["read_time"])
     images = {"preview": preview}
 
+    if post_edit and not paired:
+        raise ValueError("Post-edit comparison needs paired sampling")
     if explicit:
+        goal = explicit.get("tail_condition")
+        if not goal:
+            goal = semantic_plan(
+                rt, raw, cfg,
+                question=("Rewrite the original description to reflect the single requested change. "
+                          "Preserve all unrelated details. Return only the final scene description.\n"
+                          f"Original: {raw}\nEdit: {explicit['edit_request']}"),
+            )["plan"]
         record.update(
             edit_request=explicit["edit_request"],
-            tail_condition=explicit["tail_condition"],
+            tail_condition=goal,
             preserve=explicit.get("preserve", ""),
             early_exit=False,
             route="explicit_state_edit",
@@ -95,6 +108,12 @@ def run(rt, raw, seed, cfg, *, editor=None, explicit=None):
         if not torch.isfinite(result).all():
             raise RuntimeError("Native continuation produced a nonfinite image")
         images["result"] = result
+        if paired:
+            images["baseline"] = result
+            record["baseline_nfe"] = record["nfe"]["tail"]
+        if post_edit:
+            images["post_edit"] = result
+            record["post_edit_steps"] = 0
         return images, record
     else:
         record["route"] = "self_correct_state_edit"
@@ -110,6 +129,10 @@ def run(rt, raw, seed, cfg, *, editor=None, explicit=None):
     prefixes = editor.prefixes(
         preview, record["edit_request"], record["tail_condition"], record["preserve"]
     )
+    if conditioning_preview is not None:
+        prefixes["joint"] = editor.prefixes(
+            conditioning_preview, record["edit_request"], record["tail_condition"], record["preserve"]
+        )["joint"]
     base = editor.image_clean(state, read, prefixes["image"])
     edited, _ = edit_state(
         editor,
@@ -131,10 +154,27 @@ def run(rt, raw, seed, cfg, *, editor=None, explicit=None):
     else:
         tail = NativeT2I(rt, record["tail_condition"], cfg)
         record["nfe"]["tail_prefix"] = 1 + int(tail.negative is not None)
+    if paired:
+        before = tail.calls
+        images["baseline"] = euler(state, segment_times(grid, read, 1.0), tail)
+        record["baseline_nfe"] = tail.calls - before
     before = tail.calls
     result = euler(edited, segment_times(grid, read, 1.0), tail)
     record["nfe"]["tail"] = tail.calls - before
     if not torch.isfinite(result).all():
         raise RuntimeError("Native continuation produced a nonfinite image")
     images["result"] = result
+    if paired and tail is not native:
+        before = native.calls
+        images["source"] = euler(state, segment_times(grid, read, 1.0), native)
+        record["source_nfe"] = native.calls - before
+    if post_edit:
+        from PIL import Image
+        from .native import it2i
+
+        source = images.get("source", images["baseline"])
+        rgb = ((source[0].detach().float().cpu().clamp(-1, 1) + 1) * 127.5)
+        source_image = Image.fromarray(rgb.round().byte().permute(1, 2, 0).numpy())
+        images["post_edit"] = it2i(rt, cfg, source_image, record["edit_condition"], seed)
+        record["post_edit_steps"] = int(cfg["num_steps"])
     return images, record

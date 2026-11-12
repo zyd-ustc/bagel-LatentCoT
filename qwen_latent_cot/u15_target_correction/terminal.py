@@ -46,6 +46,45 @@ def edit_mask(teacher, source, valid, lo=0.6, hi=0.95, blur=3):
         return (mask * valid).clamp(0, 1)
 
 
+def box_mask(regions, valid):
+    """Rasterize normalized xyxy boxes on the same canvas as the supervision."""
+    import math
+
+    mask = torch.zeros_like(valid)
+    height, width = valid.shape[-2:]
+    for x1, y1, x2, y2 in regions:
+        if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+            raise ValueError("Invalid normalized edit region")
+        mask[..., math.floor(y1 * height):math.ceil(y2 * height),
+             math.floor(x1 * width):math.ceil(x2 * width)] = 1
+    return mask * valid
+
+
+def region_losses(prediction, teacher, source, valid, regions, no_change, perceptual):
+    if no_change:
+        zero = prediction.new_zeros(())
+        return zero, zero, masked_l1(prediction, source, valid), torch.zeros_like(valid)
+    if not regions:
+        raise ValueError("A terminal edit needs annotated regions")
+    mask = box_mask(regions, valid)
+    rows, columns = torch.where(mask[0, 0] > 0)
+    if not rows.numel():
+        raise ValueError("The edit region does not overlap the valid canvas")
+    # Include surrounding context for the perceptual term.
+    height, width = mask.shape[-2:]
+    y0, y1 = max(0, int(rows.min()) - 16), min(height, int(rows.max()) + 17)
+    x0, x1 = max(0, int(columns.min()) - 16), min(width, int(columns.max()) + 17)
+    pred_crop = prediction[..., y0:y1, x0:x1].float().clamp(-1, 1)
+    target_crop = teacher[..., y0:y1, x0:x1].float().clamp(-1, 1)
+    if min(pred_crop.shape[-2:]) < 32:
+        pad = (0, max(0, 32 - pred_crop.shape[-1]), 0, max(0, 32 - pred_crop.shape[-2]))
+        pred_crop = F.pad(pred_crop, pad, mode="replicate")
+        target_crop = F.pad(target_crop, pad, mode="replicate")
+    feature = perceptual(pred_crop, target_crop).mean()
+    return (masked_l1(prediction, teacher, mask), feature,
+            masked_l1(prediction, source, (1 - mask) * valid), mask)
+
+
 ROUTING_KEYS = frozenset({"enabled", "roles"})
 
 
@@ -58,17 +97,25 @@ def loss_options(terminal):
 def terminal_loss(prediction, teacher, source, valid, *, preserve_weight=1.0,
                   frequency_weight=0.5, mask_low=0.6, mask_high=0.95,
                   ratio_low=0.75, ratio_high=1.15,
-                  frequency_floor=0.01):
+                  frequency_floor=0.01, region_supervision=False, pixel_weight=0.1,
+                  regions=None, no_change=False, perceptual=None):
     """Structure on the edit, preservation outside it, and an explicit HF band.
 
     The band is two-sided on purpose: too rough is the failure we measured, but
     an unguarded penalty would happily trade texture for blur, which the audits
     would then score as "clean" while the picture is mush.
     """
-    mask = edit_mask(teacher, source, valid, mask_low, mask_high).detach()
-    outside = (1.0 - mask) * valid
-    structure = masked_l1(prediction, teacher, mask)
-    preserve = masked_l1(prediction, source, outside)
+    if region_supervision:
+        structure, feature, preserve, mask = region_losses(
+            prediction, teacher, source, valid, regions, no_change, perceptual
+        )
+        edit = float(pixel_weight) * structure + feature
+    else:
+        mask = edit_mask(teacher, source, valid, mask_low, mask_high).detach()
+        structure = masked_l1(prediction, teacher, mask)
+        preserve = masked_l1(prediction, source, (1.0 - mask) * valid)
+        feature = prediction.new_zeros(())
+        edit = structure
     reference = high_frequency(source).detach().clamp_min(float(frequency_floor))
     ratio = high_frequency(prediction) / reference
 
@@ -84,10 +131,11 @@ def terminal_loss(prediction, teacher, source, valid, *, preserve_weight=1.0,
         _huber((ratio - float(ratio_high)).clamp_min(0))
         + _huber((float(ratio_low) - ratio).clamp_min(0))
     ).mean()
-    total = structure + float(preserve_weight) * preserve + float(frequency_weight) * frequency
+    total = edit + float(preserve_weight) * preserve + float(frequency_weight) * frequency
     return total, dict(
         loss=float(total.detach()),
         structure=float(structure.detach()),
+        perceptual=float(feature.detach()),
         preserve=float(preserve.detach()),
         frequency=float(frequency.detach()),
         hf_ratio=float(

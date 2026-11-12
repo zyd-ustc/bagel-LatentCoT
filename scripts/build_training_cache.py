@@ -49,6 +49,11 @@ def main():
         root, manifests = _manifests(cache)
         for manifest_path in manifests:
             data = json.loads(manifest_path.read_text())
+            if header is not None and (
+                header.get("kind") != data.get("kind")
+                or header.get("protocol") != data.get("protocol")
+            ):
+                raise ValueError(f"Incompatible training cache protocol: {manifest_path}")
             header = header or {k: v for k, v in data.items() if k != "records"}
             allow_here = per_cache.get(str(root), allowed)
             for record in data.get("records", []):
