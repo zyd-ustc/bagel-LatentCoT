@@ -11,13 +11,17 @@
   "source_weights": {
     "linear_pair": 1.0
   },
-  "lr": 1e-05,
-  "lr_final": 2e-06,
-  "warmup_steps": 50,
+  "lr": 5e-05,
+  "lr_final": 1e-05,
+  "warmup_steps": 500,
   "betas": [0.9, 0.95],
   "eps": 1e-08,
   "weight_decay": 0.0,
-  "max_steps": 1200,
-  "updates_per_pair": 8,
-  "save_every": 150
+  "max_steps": 14723,
+  "updates_per_pair": 2,
+  "save_every": 1000,
+  "eval_steps": [2000, 5000, 8000, 11000, 14723],
+  "global_batch": 64,
+  "gradient_clip": 1.0,
+  "seed": 17
 }

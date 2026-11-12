@@ -5,35 +5,15 @@ def compact(text):
     return " ".join(str(text or "").split())
 
 
-def edit_prompt(edit_request, tail_condition, preserve=""):
-    """Text seen by the joint UND prefix. It never contains target pixels."""
-    request = compact(edit_request)
-    target = compact(tail_condition)
-    if not request:
-        raise ValueError("An edit request is required")
-    if not target:
-        raise ValueError("A full generation target is required")
-    lines = [
-        "Edit request: " + request,
-        "Generation target after editing: " + target,
-    ]
-    kept = compact(preserve)
-    if kept:
-        lines.append("Preserve: " + kept)
-    return "\n".join(lines)
+def edit_prompt(edit_request):
+    """The editor's only text condition: the short instruction, nothing else.
 
-
-def derived_tail_condition(parent_condition, edit_request):
-    """Explicit legacy fallback for pairs without a full target description.
-
-    This concatenation can retain old semantics; formal L/I data must provide
-    an independent ``tail_condition``. The loader only reaches this function
-    when ``allow_derived_tail`` is set explicitly.
+    No target scene, no preserve list, no preview caption. Deployment hands the
+    diagnoser's short instruction and the state; anything more here would be
+    information the closed loop never has, so the editor would learn to read a
+    condition that disappears at test time.
     """
-    parent = compact(parent_condition)
     request = compact(edit_request)
-    if not parent:
-        raise ValueError("A parent scene description is required")
     if not request:
         raise ValueError("An edit request is required")
-    return parent + "\nApply this edit to the scene: " + request
+    return "Edit request: " + request

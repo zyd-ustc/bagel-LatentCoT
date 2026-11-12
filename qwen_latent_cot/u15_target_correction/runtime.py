@@ -24,19 +24,6 @@ def autocast(device):
     return torch.autocast(device.type, dtype=torch.bfloat16) if device.type != 'cpu' else nullcontext()
 
 
-def native_pixels(rt, image):
-    """ImageNet-normalize a protocol canvas into the native patch layout."""
-    from sensenova_u1.models.neo_unify.utils import IMAGENET_MEAN, IMAGENET_STD, preprocess_pixel_values
-
-    model = rt.model
-    rgb = (image.detach().float().clamp(-1, 1) + 1) * 0.5
-    mean = rgb.new_tensor(IMAGENET_MEAN).view(3, 1, 1)
-    std = rgb.new_tensor(IMAGENET_STD).view(3, 1, 1)
-    pixels, grid = preprocess_pixel_values((rgb[0] - mean) / std, patch_size=model.patch_size)
-    dtype = torch.bfloat16 if rt.device.type != 'cpu' else torch.float32
-    return pixels.to(device=rt.device, dtype=dtype), grid.to(rt.device)
-
-
 @dataclass
 class Prefix:
     cache: object

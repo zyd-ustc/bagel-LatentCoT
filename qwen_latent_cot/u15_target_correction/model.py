@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .conditions import edit_prompt
-from .runtime import autocast, native_pixels
+from .runtime import autocast
 
 
 class GENLoRA(nn.Module):
@@ -134,89 +134,29 @@ class StateEditor(nn.Module):
             clean = m.fm_modules["fm_head"](hidden)
         return m.unpatchify(clean, rt.patch, rt.height, rt.width)
 
-    def _pixels(self, image):
-        """ImageNet-normalize the protocol canvas. Never round-trip through PNG."""
-        rt = self.rt
-        if tuple(image.shape[-2:]) != (rt.height, rt.width):
-            raise ValueError("Condition image must already use the protocol canvas")
-        return native_pixels(rt, image)
+    @torch.no_grad()
+    def prefixes(self, edit_request):
+        """Text-only UND prefills — the edit branch never sees a picture.
 
-    def _query(self, instruction, grid, *, image_only):
-        from sensenova_u1.models.neo_unify.utils import SYSTEM_MESSAGE_FOR_GEN
+        ``image``  the unconditional reference the frozen H0 is measured against
+                   (text-only T2I, the same path the deployment baseline uses);
+        ``joint``  the short instruction, also text-only.
 
-        m, tok = self.model, self.rt.tokenizer
-        m.img_context_token_id = tok.convert_tokens_to_ids("<IMG_CONTEXT>")
-        m.img_start_token_id = tok.convert_tokens_to_ids("<img>")
-        prompt = "<image>" if image_only else "<image>\n" + instruction
-        if image_only:
-            query = m._build_t2i_query(prompt, append_text="<img>")
-        else:
-            query = m._build_t2i_query(
-                prompt,
-                system_message=SYSTEM_MESSAGE_FOR_GEN,
-                append_text="<think>\n\n</think>\n\n<img>",
-            )
-        count = int(grid[0, 0] * grid[0, 1] * m.downsample_ratio**2)
-        tokens = "<img>" + "<IMG_CONTEXT>" * count + "</img>"
-        return query.replace("<image>", tokens, 1)
+        Conditioning on a preview was the training-time luxury that made the
+        editor rely on captions and lookaheads the closed loop cannot supply.
+        The start state enters only as the denoising input ``a_t``.
+        """
+        instruction = edit_prompt(edit_request)
+        return {
+            "image": self._t2i_prefix(None),
+            "joint": self._t2i_prefix(instruction),
+        }
 
-    def _it2i_inputs(self, query, vit, grid):
-        from sensenova_u1.models.neo_unify.modeling_qwen3 import create_block_causal_mask
-
-        m, tok = self.model, self.rt.tokenizer
-        encoded = tok(query, return_tensors="pt")
-        input_ids = encoded["input_ids"].to(self.rt.device)
-        indexes = m.get_thw_indexes(input_ids[0], grid)
-        attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
-        embeds = m.language_model.get_input_embeddings()(input_ids)
-        batch, length, channels = embeds.shape
-        flat = input_ids.reshape(batch * length)
-        selected = flat == m.img_context_token_id
-        visual = vit.reshape(-1, channels)
-        if int(selected.sum()) != visual.shape[0]:
-            raise ValueError("Preview image tokens differ from the generation canvas")
-        embeds = embeds.reshape(batch * length, channels).clone()
-        embeds[selected] = visual.to(embeds.dtype)
-        return embeds.reshape(batch, length, channels), indexes, attention_mask
-
-    def _prefill(self, query, vit, grid):
-        m = self.model
-        embeds, indexes, mask = self._it2i_inputs(query, vit, grid)
-        with autocast(self.rt.device):
-            cache, _ = m._it2i_prefix_forward(embeds, indexes, mask)
-            gen_index = m._build_t2i_image_indexes(
-                *self.rt.grid, int(indexes[0].max()) + 1, device=self.rt.device
-            )
+    def _t2i_prefix(self, prompt):
+        """One text-only T2I prefill, shaped like ``prefixes`` entries."""
+        prefix = self.rt.prefix(prompt)
         self.prefix_calls += 1
-        return cache, gen_index, None
-
-    @torch.no_grad()
-    def _preview_vision(self, preview):
-        pixels, grid = self._pixels(preview)
-        expected = int(grid[0, 0] * grid[0, 1] * self.model.downsample_ratio**2)
-        if expected != self.rt.tokens:
-            raise ValueError("Condition image tokens differ from the generation canvas")
-        with autocast(self.rt.device):
-            vit = self.model.extract_feature(pixels, grid_hw=grid)
-        self.prefix_vision_calls += 1
-        return vit, grid
-
-    @torch.no_grad()
-    def prefixes(self, preview, edit_request, tail_condition, preserve=""):
-        """Two UND prefills: image-only baseline and joint edit condition."""
-        instruction = edit_prompt(edit_request, tail_condition, preserve)
-        vit, grid = self._preview_vision(preview)
-        caches = {}
-        for name, image_only in (("image", True), ("joint", False)):
-            query = self._query("" if image_only else instruction, grid, image_only=image_only)
-            caches[name] = self._prefill(query, vit, grid)
-        return caches
-
-    @torch.no_grad()
-    def image_prefix(self, preview):
-        vit, grid = self._preview_vision(preview)
-        query = self._query("", grid, image_only=True)
-        return {"image": self._prefill(query, vit, grid)}
+        return (prefix.cache, prefix.indexes, None)
 
     def _block(self, layers, index, hidden, prefix):
         cache, indexes, mask = prefix

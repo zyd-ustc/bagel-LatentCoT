@@ -9,6 +9,3 @@ tqdm>=4.66.0
 numpy>=1.26.0
 scipy>=1.10.0
 pytest>=8.0.0
-# Optional: lpips for I/R cache quality and evaluation; openai for the external judge.
-# lpips>=0.1.4
-# openai>=1.0

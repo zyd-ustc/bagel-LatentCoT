@@ -26,8 +26,6 @@ u15-target-correction = "qwen_latent_cot.u15_target_correction.cli:main"
 
 [project.optional-dependencies]
 tracking = ["wandb==0.22.3", "protobuf>=3.19,<5"]
-metrics = ["lpips>=0.1.4"]
-judge = ["openai>=1.0"]
 dev = [
   "pytest>=8.0.0",
 ]

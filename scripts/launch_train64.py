@@ -1,4 +1,4 @@
-"""Launch Stage 1/2 training on four 16-chip ModelArts workers."""
+"""Launch Stage 1 training on four 16-chip ModelArts workers."""
 
 import argparse
 import json
@@ -8,7 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 
-CODE = Path("/data/zyd_workspace/bagel-LatentCoT/code/isochronic-state-flow-20261107")
+CODE = Path(__file__).resolve().parent.parent
 PY = "/data/zyd_workspace/bagel-LatentCoT/venvs/u15-NPU/bin/python"
 SOURCE = "/data/zyd_workspace/bagel-LatentCoT/code/sensenova-u15-c35c83b"
 MODEL = "/data/zyd_workspace/models/SenseNova-U1.5-8B-MoT"
@@ -59,11 +59,7 @@ def _preflight(hosts, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", type=int, choices=(1, 2), required=True)
-    parser.add_argument("--linear")
-    parser.add_argument("--inverted")
-    parser.add_argument("--native")
-    parser.add_argument("--init-from")
+    parser.add_argument("--linear", required=True)
     parser.add_argument("--resume")
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int)
@@ -78,22 +74,13 @@ def main():
     hosts = _hosts()
     output = Path(args.output).resolve()
     log_dir = output.with_name(output.name + "_logs")
-    default_cfg = "stage1_36.json" if args.stage == 1 else "stage2_36.json"
+    default_cfg = "stage1_full490k.json"
     from qwen_latent_cot.u15_target_correction.config import load_config
 
     stage_cfg = Path(args.config).resolve() if args.config else Path(args.code).resolve() / "configs/u15_isochronic_state" / default_cfg
     cfg = load_config(stage_cfg)
-    if int(cfg["stage"]) != args.stage:
-        parser.error("--stage must match the selected config")
-    if args.stage == 1 and not args.linear:
-        parser.error("Stage 1 requires --linear")
-    if args.stage == 1 and (args.inverted or args.native):
-        parser.error("Stage 1 does not accept --inverted or --native")
-    if cfg.get("semantic_weights") and not args.native:
-        parser.error("Semantic Stage 2 requires --native")
-    if args.stage == 2 and not (args.inverted or cfg.get("role_weights")
-                                or (cfg.get("terminal") or {}).get("enabled")):
-        parser.error("This Stage 2 config requires --inverted")
+    if int(cfg["stage"]) != 1:
+        parser.error("Stage 1 configuration is required")
 
     launch_env = dict(
         PYTHONPATH=str(Path(args.code).resolve()),
@@ -134,12 +121,6 @@ def main():
         ]
         if args.linear:
             command += ["--linear", args.linear]
-        if args.inverted:
-            command += ["--inverted", args.inverted]
-        if args.native:
-            command += ["--native", args.native]
-        if args.init_from:
-            command += ["--init-from", args.init_from]
         if args.resume:
             command += ["--resume", args.resume]
         if args.steps:

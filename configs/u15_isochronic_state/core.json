@@ -30,7 +30,7 @@
   "lookahead_steps": 2,
   "lora_rank": 64,
   "activation_checkpointing": true,
-  "condition_protocol": "isochronic_condition_v1",
+  "condition_protocol": "isochronic_condition_v2",
   "allow_derived_tail": false,
   "keep_instruction": "Keep the current scene unchanged.",
   "keep_fraction": 0.1,
