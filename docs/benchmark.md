@@ -86,7 +86,7 @@ cd "$CODE"
 
 文生图可把 `--arm result` 改为 `--arm baseline`，单独评分原生基线。`both` 模式下还可用 `--arm native_result` 评分未加载检查点的编辑结果。编辑评分默认读取原始源图；若评分机器只能访问已校验副本，也可传 `--source-image`。DPG 的问题依赖冻结评分数据，默认从 `/data/zyd_workspace/isochronic_data_20261107/benchmark_assets/scoring_sources` 读取；该文件复制自冻结评分数据，也可用 `--source-root` 指向已复制的数据。
 
-MagicBrush 和 Emu Edit 使用独立的本地 CLIP、DINO 与像素指标，不调用 GLM。运行前需将冻结指标资产复制到 `modelarts-64`，使用 `--metrics-assets` 指定目录。当前评分器仍要求清单中 `evaluation_metadata` 和其中的参考图路径可访问；64 的路径映射尚未接入。MagicBrush 还需要 `--captions /mnt/sfs/250010019/unimoe_r3/data/benchmark_editing7_20261030/magicbrush/source/test_metadata/local_descriptions.json`；这两榜应在能访问冻结评测数据和 `tool_assets` 的机器及对应 CPU 环境中运行。MagicBrush 参考目标图，Emu Edit 的图像相似度参考源图。ABACUS 诊断同样需要清单中原始 `evaluation_metadata` 路径可访问；复制后路径映射尚未接入。
+MagicBrush 和 Emu Edit 使用独立的本地 CLIP、DINO 与像素指标，不调用 GLM。运行前需将冻结指标资产复制到 `modelarts-64`，使用 `--metrics-assets` 指定目录。可用 `--metadata-file` 和 `--reference-image` 指定复制后的元数据与目标图；程序根据冻结清单检查它们。MagicBrush 还需要原始 `local_descriptions.json`，通过 `--captions` 指定；复制 `READY.json` 后可用 `--prepared-ready` 指定，以校验清单和说明文件。这两榜应在能访问冻结评测数据和 `tool_assets` 的机器及对应 CPU 环境中运行。MagicBrush 参考目标图，Emu Edit 的图像相似度参考源图。ABACUS 诊断也可用 `--metadata-file` 指定已复制的冻结元数据。MagicBrush、Emu Edit 和 ABACUS 的这些复制路径尚未做真实评分测试。
 
 ## 分数含义
 

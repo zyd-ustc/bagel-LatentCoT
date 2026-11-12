@@ -38,6 +38,9 @@ def parser():
     score.add_argument('--source-image', help='Verified local copy of the frozen edit source')
     score.add_argument('--metrics-assets', default='/mnt/sfs/250010019/unimoe_r3/outputs/0_editing7_execution_20261030/tool_assets')
     score.add_argument('--captions', help='Frozen MagicBrush local_descriptions.json')
+    score.add_argument('--prepared-ready', help='Frozen MagicBrush READY.json')
+    score.add_argument('--metadata-file', help='Verified copy of frozen evaluation metadata')
+    score.add_argument('--reference-image', help='Verified copy of the MagicBrush target image')
     score.add_argument('--metrics-device', default='cpu')
     score.add_argument('--rubric-root', help='Frozen GEdit v2 rubric repository')
     score.add_argument('--reference-arm', choices=('native_result', 'result'), default='native_result')
@@ -144,9 +147,11 @@ def score(args):
     elif case.benchmark == 'imgedit':
         result = score_imgedit(case.row, case.source_image, image)
     elif case.benchmark == 'abacus':
-        result = score_abacus(case.row, case.source_image, image)
+        result = score_abacus(case.row, case.source_image, image, args.metadata_file)
     elif case.benchmark in ('magicbrush', 'emu_edit'):
-        result = score_edit_metrics(case.row, image, args.metrics_assets, args.captions, args.metrics_device)
+        result = score_edit_metrics(case.row, image, args.metrics_assets, args.captions, args.metrics_device,
+                                    args.metadata_file, args.reference_image, case.source_image,
+                                    args.prepared_ready, args.manifest)
     else:
         raise ValueError('No migrated editing scorer for ' + case.benchmark)
     judge = None if case.benchmark in ('magicbrush', 'emu_edit') else MODEL

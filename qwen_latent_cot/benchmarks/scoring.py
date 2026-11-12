@@ -2,6 +2,7 @@
 
 import base64
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -192,7 +193,16 @@ def score_imgedit(row, source_image, image):
             'labels': labels, 'values': values, 'raw': raw}
 
 
-def score_edit_metrics(row, image, assets_root, captions_path=None, device='cpu'):
+def _metadata_path(row, override=None):
+    path = Path(override or row['evaluation_metadata'])
+    if hashlib.sha256(path.read_bytes()).hexdigest() != row['evaluation_metadata_sha256']:
+        raise ValueError('evaluation metadata differs from the frozen record')
+    return path
+
+
+def score_edit_metrics(row, image, assets_root, captions_path=None, device='cpu',
+                       metadata_override=None, reference_override=None, source_image=None,
+                       prepared_ready=None, manifest=None):
     """Reuse the frozen CLIP/DINO and pixel metrics for MagicBrush and Emu Edit."""
     from types import SimpleNamespace
     from .reference import edit_metrics as metrics
@@ -202,9 +212,43 @@ def score_edit_metrics(row, image, assets_root, captions_path=None, device='cpu'
     if ready.get('status') != 'READY':
         raise ValueError('Editing metric assets are not ready')
     captions = json.loads(Path(captions_path).read_text()) if captions_path else None
-    if row['benchmark'] == 'magicbrush' and captions is None:
-        raise ValueError('MagicBrush requires its frozen local caption file')
-    ref = metrics.reference_for(row, captions)
+    if row['benchmark'] == 'magicbrush':
+        if captions is None or not manifest:
+            raise ValueError('MagicBrush requires its frozen manifest and local caption file')
+        receipt_path = Path(prepared_ready or (Path(manifest).parent / 'READY.json'))
+        receipt = json.loads(receipt_path.read_text())
+        manifest_hash = hashlib.sha256(Path(manifest).read_bytes()).hexdigest()
+        if receipt.get('benchmark') != 'magicbrush' or receipt.get('manifest_sha256') != manifest_hash:
+            raise ValueError('MagicBrush frozen manifest differs from its ready receipt')
+        caption_file = Path(captions_path)
+        entries = [item for item in receipt['source_files'] if Path(item['path']).name == caption_file.name]
+        if len(entries) != 1 or hashlib.sha256(caption_file.read_bytes()).hexdigest() != entries[0]['sha256']:
+            raise ValueError('MagicBrush caption file differs from the frozen source')
+    metadata = json.loads(_metadata_path(row, metadata_override).read_text())
+    if metadata['record_id'] != row['record_id'] or metadata['benchmark'] != row['benchmark']:
+        raise ValueError('evaluation metadata belongs to another case')
+    data = metadata['data']
+    if row['benchmark'] == 'magicbrush':
+        asset = data['target_img']
+        if isinstance(asset, dict) and 'bytes' in asset:
+            asset = asset['bytes']
+        asset = asset['embedded_asset']
+        target = Path(reference_override or asset['path'])
+        if hashlib.sha256(target.read_bytes()).hexdigest() != asset['sha256']:
+            raise ValueError('reference image differs from the frozen target')
+        session, turn = str(row['session_id']), int(row['turn_index'])
+        name = f'{session}-output{turn}.png'
+        caption = (captions or {}).get(session, {}).get(name)
+        ref = dict(reference_image=str(target), reference_sha256=asset['sha256'], role='GT_target',
+                   output_caption=caption if isinstance(caption, str) and caption.strip() else None,
+                   caption_key=[session, name])
+    else:
+        source = Path(source_image or row['source_image'])
+        if hashlib.sha256(source.read_bytes()).hexdigest() != row['source_sha256']:
+            raise ValueError('reference image differs from the frozen source')
+        ref = dict(reference_image=str(source), reference_sha256=row['source_sha256'],
+                   role='input_source_NOT_edited_GT', input_caption=data.get('input_caption'),
+                   output_caption=data.get('output_caption'))
     options = dict(device=device)
     for name, code, weights in (('clip', 'CLIP', 'ViT-B-32.pt'),
                                  ('dino', 'dino', 'dino_deitsmall16_pretrain.pth')):
@@ -220,11 +264,12 @@ def score_edit_metrics(row, image, assets_root, captions_path=None, device='cpu'
     return value
 
 
-def score_abacus(row, source_image, image):
+def score_abacus(row, source_image, image, metadata_override=None):
     """Score operation count as a change, never as the target total."""
     from .reference import abacus_protocol as source
 
-    label = source.labels(row)
+    metadata = _metadata_path(row, metadata_override)
+    label = source.labels(dict(row, evaluation_metadata=str(metadata)))
     prompt = source.prompt(label, row['instruction'])
     raw = call_judge(source.SYSTEM, prompt, [image_url(source_image), image_url(image)],
                      max_tokens=2048, image_labels=('ORIGINAL', 'RESULT'))

@@ -265,3 +265,27 @@ def test_abacus_never_confuses_operation_count_with_final_total():
     payload['observations']['changed_count']=None
     result=original.parse_response({'labels':label},{'choices':[{'finish_reason':'stop','message':{'content':json.dumps(payload)}}]})
     assert result is None
+
+
+def test_metadata_override_checks_frozen_identity(tmp_path):
+    import hashlib
+    from qwen_latent_cot.benchmarks.scoring import _metadata_path
+    file=tmp_path/'metadata.json'; file.write_text('{"id":"r1"}')
+    row={'evaluation_metadata':'/old/metadata.json','evaluation_metadata_sha256':hashlib.sha256(file.read_bytes()).hexdigest()}
+    assert _metadata_path(row,file)==file
+    file.write_text('{"id":"r2"}')
+    with pytest.raises(ValueError,match='metadata'):
+        _metadata_path(row,file)
+
+
+def test_magicbrush_rejects_nonfrozen_caption_before_loading_models(tmp_path):
+    import hashlib
+    from qwen_latent_cot.benchmarks.scoring import score_edit_metrics
+    assets=tmp_path/'assets'; assets.mkdir(); (assets/'TOOL_ASSETS_READY.json').write_text('{"status":"READY"}')
+    manifest=tmp_path/'MANIFEST.jsonl'; manifest.write_text('frozen manifest\n')
+    captions=tmp_path/'local_descriptions.json'; captions.write_text('{}')
+    receipt={'benchmark':'magicbrush','manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),
+             'source_files':[{'path':'/original/local_descriptions.json','sha256':'different'}]}
+    (tmp_path/'READY.json').write_text(json.dumps(receipt))
+    with pytest.raises(ValueError,match='caption file'):
+        score_edit_metrics({'benchmark':'magicbrush'},tmp_path/'image.png',assets,captions,manifest=manifest)
