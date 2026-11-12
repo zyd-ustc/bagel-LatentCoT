@@ -60,3 +60,7 @@ python scripts/launch_train64.py \
 ```
 
 使用 `--resume /path/to/step` 恢复同一配置、数据清单、步数和 64 卡规模的训练。训练输出、数据、模型和现有检查点均在代码目录之外。
+
+## 评测
+
+文生图与编辑榜的冻结清单、单题生成和评分方法见 [评测指南](docs/benchmark.md)。

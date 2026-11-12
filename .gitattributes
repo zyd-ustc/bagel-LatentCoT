@@ -1,1 +1,4 @@
 patches/*.patch -whitespace
+
+# Frozen upstream scoring sources retain their original rubric text.
+qwen_latent_cot/benchmarks/reference/gedit_*.py -whitespace

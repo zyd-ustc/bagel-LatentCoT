@@ -19,10 +19,13 @@ dependencies = [
   "tqdm>=4.66.0",
   "numpy>=1.26.0",
   "scipy>=1.10.0",
+  "requests>=2.31.0",
+  "regex>=2024.0.0",
 ]
 
 [project.scripts]
 u15-target-correction = "qwen_latent_cot.u15_target_correction.cli:main"
+u15-benchmark = "qwen_latent_cot.benchmarks.cli:main"
 
 [project.optional-dependencies]
 tracking = ["wandb==0.22.3", "protobuf>=3.19,<5"]
@@ -40,3 +43,6 @@ include = ["qwen_latent_cot*"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"qwen_latent_cot.benchmarks" = ["reference/*.json", "reference/*.txt", "reference/scoring_sources/**/*.py"]
