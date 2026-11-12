@@ -289,3 +289,46 @@ def test_magicbrush_rejects_nonfrozen_caption_before_loading_models(tmp_path):
     (tmp_path/'READY.json').write_text(json.dumps(receipt))
     with pytest.raises(ValueError,match='caption file'):
         score_edit_metrics({'benchmark':'magicbrush'},tmp_path/'image.png',assets,captions,manifest=manifest)
+
+
+def test_t2i_malformed_judge_answer_is_saved_as_unknown(monkeypatch, tmp_path):
+    from qwen_latent_cot.benchmarks import scoring
+    image = tmp_path / 'result.png'
+    Image.new('RGB', (2, 2)).save(image)
+    raw = '{"answer": "There is one dog."}'
+    monkeypatch.setattr(scoring, 'call_judge', lambda *args, **kwargs: raw)
+    row = {'benchmark': 'geneval2', 'original_prompt': 'a dog', 'evaluation_prompt': 'a dog',
+           'native_qa': [{'question': 'How many dogs?', 'expected_answer': 'one'}]}
+    result = scoring.score_t2i(row, image, source_root='unused')
+    assert result['status'] == 'unknown'
+    assert result['score'] is None
+    assert result['raw'] == [raw]
+
+
+def test_geneval2_prompts_judge_for_supported_answer_format(monkeypatch, tmp_path):
+    from qwen_latent_cot.benchmarks import scoring
+    image = tmp_path / 'result.png'
+    Image.new('RGB', (2, 2)).save(image)
+    systems = []
+    def judge(system, *args, **kwargs):
+        systems.append(system)
+        return '{"answer":"yes"}'
+    monkeypatch.setattr(scoring, 'call_judge', judge)
+    row = {'benchmark': 'geneval2', 'original_prompt': 'a dog', 'evaluation_prompt': 'a dog',
+           'native_qa': [{'question': 'Is there a dog?', 'expected_answer': 'yes'}]}
+    assert scoring.score_t2i(row, image, source_root='unused')['score'] == 100
+    assert 'exactly yes, no, unknown, or a single numeral from 0 to 9' in systems[0]
+
+
+def test_geneval2_accepts_exact_plain_answer_without_guessing(monkeypatch, tmp_path):
+    from qwen_latent_cot.benchmarks import scoring
+    image = tmp_path / 'result.png'
+    Image.new('RGB', (2, 2)).save(image)
+    responses = iter(['1', 'yes'])
+    monkeypatch.setattr(scoring, 'call_judge', lambda *args, **kwargs: next(responses))
+    row = {'benchmark': 'geneval2', 'original_prompt': 'a dog', 'evaluation_prompt': 'a dog',
+           'native_qa': [{'question': 'How many dogs?', 'expected_answer': 'one'},
+                         {'question': 'Is there a dog?', 'expected_answer': 'yes'}]}
+    result = scoring.score_t2i(row, image, source_root='unused')
+    assert result['score'] == 100
+    assert result['raw'] == ['1', 'yes']

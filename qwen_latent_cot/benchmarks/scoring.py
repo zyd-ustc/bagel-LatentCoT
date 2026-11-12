@@ -107,9 +107,18 @@ def score_t2i(row, image, source_root):
         questions = protocol.questions(row)
         answers, raw = [], []
         for item in questions:
-            response = call_judge(item['system'], item['question'], [image_url(image)], max_tokens=256)
+            system = item['system']
+            if bench == 'geneval2':
+                system += ' The answer field must contain exactly yes, no, unknown, or a single numeral from 0 to 9. Do not explain.'
+            response = call_judge(system, item['question'], [image_url(image)], max_tokens=256)
             raw.append(response)
-            answers.append(protocol.parse_response(bench, response, 'stop'))
+            try:
+                if bench == 'geneval2' and re.fullmatch(r'\s*(?:yes|no|unknown|[0-9])\s*', response, re.I):
+                    answers.append(protocol.normalize(bench, response))
+                else:
+                    answers.append(protocol.parse_response(bench, response, 'stop'))
+            except ValueError:
+                answers.append(None)
         score = protocol.image_score(row, answers)
         return {'status': 'scored' if score is not None else 'unknown', 'score': score,
                 'answers': answers, 'raw': raw, 'protocol': t2i_metadata(bench)}
